@@ -10,13 +10,13 @@ use std::time::Duration;
 use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
-use crate::memory::error::{ClosedAs, failed_call};
-use crate::memory::backup::Reason;
-use crate::memory::clock::TimestampMs;
-use crate::memory::project_delete::{deleted_in, deleted_message, ids_of_in};
-use crate::memory::relocate::{merge_in, undo_move_in, MoveError, Span, Supersede};
-use crate::memory::workspace::{Adopted, Dropped, WorkspaceManager};
-use crate::memory::{MemoryError, MemoryStore};
+use crate::memory::store::error::{ClosedAs, failed_call};
+use crate::memory::store::backup::Reason;
+use crate::memory::domain::clock::TimestampMs;
+use crate::memory::projects::project_delete::{deleted_in, deleted_message, ids_of_in};
+use crate::memory::projects::relocate::{merge_in, undo_move_in, MoveError, Span, Supersede};
+use crate::memory::retrieval::workspace::{Adopted, Dropped, WorkspaceManager};
+use crate::memory::{store::error::MemoryError, store::db::MemoryStore};
 
 /// How far [`canonical_in`] follows `merged_into`. A merge points every
 /// tombstone at a live project, so a store it wrote needs one hop; the bound
@@ -663,7 +663,7 @@ pub async fn merge_core(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::MemoryStore;
+    use crate::memory::store::db::MemoryStore;
 
     async fn store_with(projects: &[(&'static str, Option<&'static str>)]) -> MemoryStore {
         let store = MemoryStore::new_for_test().await.unwrap();
@@ -728,10 +728,10 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
-    use crate::memory::events::{MemoryEvent, MemorySource};
-    use crate::memory::relocate::Supersede;
-    use crate::memory::workspace::WorkspaceManager;
-    use crate::memory::worker::save_for_test;
+    use crate::memory::domain::events::{MemoryEvent, MemorySource};
+    use crate::memory::projects::relocate::Supersede;
+    use crate::memory::retrieval::workspace::WorkspaceManager;
+    use crate::memory::ingest::worker::save_for_test;
     use crate::models::chat::Role;
 
     const A: &str = "app-aaaa";

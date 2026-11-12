@@ -2119,7 +2119,7 @@ mod tests {
     fn a_load_holds_the_model_file_against_writes_until_the_session_returns() {
         use std::os::windows::fs::OpenOptionsExt;
         let tmp = TestDir::new("carga-\u{f1}and\u{fa}");
-        let onnx = crate::memory::embedder::minimal_onnx();
+        let onnx = crate::memory::embedding::embedder::minimal_onnx();
         let path = tmp.path().join("model.onnx");
         let other = tmp.path().join("other.partial");
         let moved = tmp.path().join("moved.onnx");
@@ -2140,7 +2140,7 @@ mod tests {
         assert!(read.is_ok(), "a reader that shares reading opens it");
         drop(read);
 
-        let session = crate::memory::embedder::build_session(&view).expect("the session is built from the view");
+        let session = crate::memory::embedding::embedder::build_session(&view).expect("the session is built from the view");
         drop(view);
         std::fs::OpenOptions::new().write(true).open(&path).expect("writable again");
         std::fs::rename(&other, &path).expect("renamed over again");
@@ -2160,7 +2160,7 @@ mod tests {
         let lock = CacheLock::new();
 
         let view = verified_onnx(&path, &sha256_hex(&garbage), lock.read_now()).expect("the bytes verify");
-        let failed = crate::memory::embedder::build_session(&view);
+        let failed = crate::memory::embedding::embedder::build_session(&view);
         assert!(failed.is_err(), "garbage is not a model");
         drop(view);
         assert!(lock.0.try_write().is_ok(), "the lock went with the view");
@@ -2202,11 +2202,11 @@ mod tests {
     /// the model is never dropped, and a repair would wait for it forever.
     #[test]
     fn a_loaded_model_leaves_the_cache_free_for_a_repair() {
-        use crate::memory::embedder::{Embedder, FakeEmbedder};
+        use crate::memory::embedding::embedder::{Embedder, FakeEmbedder};
         use tokenizers::models::wordlevel::WordLevel;
 
         let tmp = TestDir::new("loader-lets-go");
-        let onnx = crate::memory::embedder::minimal_onnx();
+        let onnx = crate::memory::embedding::embedder::minimal_onnx();
         let path = tmp.path().join("model.onnx");
         std::fs::write(&path, &onnx).unwrap();
         let lock = CacheLock::new();
@@ -2227,7 +2227,7 @@ mod tests {
             Ok(tokenizers::Tokenizer::new(WordLevel::builder().vocab(vocab).build().expect("a word-level model")))
         };
         let expected = onnx.clone();
-        let load = crate::memory::bootstrap::model_loader(
+        let load = crate::memory::upkeep::bootstrap::model_loader(
             Arc::new(once_cell::sync::OnceCell::new()),
             parse,
             move |bytes, _tokenizer, _files| {

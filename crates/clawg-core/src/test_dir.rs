@@ -72,8 +72,8 @@ impl Drop for TestDir {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::db::MemoryStore;
-    use crate::memory::store_lock::StoreHolder;
+    use crate::memory::store::db::MemoryStore;
+    use crate::memory::store::store_lock::StoreHolder;
 
     #[tokio::test]
     async fn a_test_dir_waits_for_its_store_to_let_the_files_go() {

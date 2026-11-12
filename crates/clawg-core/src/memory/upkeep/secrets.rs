@@ -1,27 +1,27 @@
 //! Secrets already in the store: finding the rows that hold one, and purging
 //! a row for good.
 //!
-//! New saves are masked on the way in (see [`crate::memory::redact`]); this
+//! New saves are masked on the way in (see [`crate::memory::domain::redact`]); this
 //! is for what was stored before, which nothing rewrites on its own.
 
 use std::path::{Path, PathBuf};
 
 use rusqlite::OptionalExtension;
 
-use crate::memory::backup::{
+use crate::memory::store::backup::{
     known_migrations, open_existing, open_for_probe, parse_snapshot_name, read_history, schema_plan,
     BackupError, SchemaPlan,
 };
-use crate::memory::clock::TimestampMs;
-use crate::memory::dispute::release_challengers;
-pub use crate::memory::error::PurgeError;
-use crate::memory::redact::{redact, SecretKind};
-use crate::memory::revival::{revive_after_delete_of_piece, Revived};
-use crate::memory::store_lock::{StoreHolder, StoreLock};
-use crate::memory::project_delete::Counts;
+use crate::memory::domain::clock::TimestampMs;
+use crate::memory::revision::dispute::release_challengers;
+pub use crate::memory::store::error::PurgeError;
+use crate::memory::domain::redact::{redact, SecretKind};
+use crate::memory::revision::revival::{revive_after_delete_of_piece, Revived};
+use crate::memory::store::store_lock::{StoreHolder, StoreLock};
+use crate::memory::projects::project_delete::Counts;
 use crate::memory::project_docs::drop_root_index_in;
-use crate::memory::workspace::{project_workspaces, workspaces_holding_any, Holding};
-use crate::memory::MemoryError;
+use crate::memory::retrieval::workspace::{project_workspaces, workspaces_holding_any, Holding};
+use crate::memory::store::error::MemoryError;
 
 /// A `memory` row whose content holds at least one secret. Carries what the
 /// row is and what it holds, never the content itself.
@@ -58,7 +58,7 @@ pub fn scan(base_dir: &Path) -> Result<Scanned, MemoryError> {
     if !path.exists() {
         return Err(BackupError::NoStore { path }.into());
     }
-    crate::memory::db::ensure_vec0_registered();
+    crate::memory::store::db::ensure_vec0_registered();
     let c = open_for_probe(&path)?;
     let mut stmt = c.prepare("SELECT id, content, deleted_at IS NOT NULL FROM memory ORDER BY id")?;
     let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, bool>(2)?)))?;
@@ -537,7 +537,7 @@ fn outbox_holds(c: &rusqlite::Connection, held: &OutboxMatch) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::MemoryStore;
+    use crate::memory::store::db::MemoryStore;
 
     const INSERT_ROW: &str = "INSERT INTO memory \
         (scope, agent_id, content, memory_type, source, \
@@ -665,7 +665,7 @@ mod tests {
 
     #[tokio::test]
     async fn masking_reasons_rewrites_only_the_ones_with_a_secret() {
-        use crate::memory::backup::backup_offline;
+        use crate::memory::store::backup::backup_offline;
         let dir = crate::test_dir::test_dir();
         let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
         let a = insert(&store, "the deploy runs on fridays".to_string()).await;
@@ -719,7 +719,7 @@ mod tests {
     #[tokio::test]
     async fn the_scan_of_a_store_from_before_the_pairs_lists_rows_only() {
         let dir = crate::test_dir::test_dir();
-        crate::memory::db::seed_on_disk(dir.path(), Some(14)).await;
+        crate::memory::store::db::seed_on_disk(dir.path(), Some(14)).await;
         rusqlite::Connection::open(dir.path().join("memory.db"))
             .unwrap()
             .execute(INSERT_ROW, [format!("ci token {}", fake("ghp_", "a1B2", 36))])
@@ -787,7 +787,7 @@ mod tests {
     }
 
     fn nearest(dir: &Path, n: usize) -> i64 {
-        crate::memory::db::ensure_vec0_registered();
+        crate::memory::store::db::ensure_vec0_registered();
         let c = rusqlite::Connection::open(dir.join("memory.db")).unwrap();
         c.query_row("SELECT rowid FROM memory_vectors WHERE embedding MATCH ?1 AND k = 1", [axis(n)], |r| r.get(0))
             .unwrap()
@@ -802,7 +802,7 @@ mod tests {
     }
 
     fn count(dir: &Path, sql: &str, id: i64) -> i64 {
-        crate::memory::db::ensure_vec0_registered();
+        crate::memory::store::db::ensure_vec0_registered();
         let c = rusqlite::Connection::open(dir.join("memory.db")).unwrap();
         c.query_row(sql, [id], |r| r.get(0)).unwrap()
     }
@@ -959,8 +959,8 @@ mod tests {
     #[tokio::test]
     async fn purge_refuses_a_store_with_pending_migrations_untouched() {
         let dir = crate::test_dir::test_dir();
-        let older = crate::memory::backup::latest_known() - 1;
-        crate::memory::db::seed_on_disk(dir.path(), Some(older)).await;
+        let older = crate::memory::store::backup::latest_known() - 1;
+        crate::memory::store::db::seed_on_disk(dir.path(), Some(older)).await;
         let before = std::fs::read(dir.path().join("memory.db")).unwrap();
 
         let err = purge(dir.path(), 1).unwrap_err();
@@ -972,10 +972,10 @@ mod tests {
 
     #[tokio::test]
     async fn purge_names_the_backups_that_still_hold_the_row() {
-        use crate::memory::backup::backup_offline;
+        use crate::memory::store::backup::backup_offline;
         let pause = || std::thread::sleep(std::time::Duration::from_millis(5));
         let dir = crate::test_dir::test_dir();
-        crate::memory::db::seed_on_disk(dir.path(), None).await;
+        crate::memory::store::db::seed_on_disk(dir.path(), None).await;
         let without = backup_offline(dir.path()).unwrap();
         pause();
         let c = rusqlite::Connection::open(dir.path().join("memory.db")).unwrap();
@@ -1023,7 +1023,7 @@ mod tests {
     #[tokio::test]
     async fn purging_the_current_revision_brings_the_previous_one_back() {
         let dir = crate::test_dir::test_dir();
-        crate::memory::db::seed_on_disk(dir.path(), None).await;
+        crate::memory::store::db::seed_on_disk(dir.path(), None).await;
         let c = rusqlite::Connection::open(dir.path().join("memory.db")).unwrap();
         let mut ids = Vec::new();
         for text in ["deploy to fly", "deploy to render", "a rule a verdict replaced", SECRET] {
@@ -1057,7 +1057,7 @@ mod tests {
 
     #[tokio::test]
     async fn purge_names_the_workspaces_that_still_hold_the_text() {
-        use crate::memory::workspace::{AUTO_END, AUTO_START, USER_END, USER_START};
+        use crate::memory::retrieval::workspace::{AUTO_END, AUTO_START, USER_END, USER_START};
         let dir = crate::test_dir::test_dir();
         let id = store_with_a_secret(dir.path(), false).await;
         let root = dir.path().join("workspaces");
@@ -1089,7 +1089,7 @@ mod tests {
     #[tokio::test]
     async fn purging_the_first_piece_empties_the_head_of_its_save() {
         let dir = crate::test_dir::test_dir();
-        crate::memory::db::seed_on_disk(dir.path(), None).await;
+        crate::memory::store::db::seed_on_disk(dir.path(), None).await;
         let c = rusqlite::Connection::open(dir.path().join("memory.db")).unwrap();
         let mut ids = Vec::new();
         for text in [SECRET, "and the second piece of it", "and the third piece of it"] {
@@ -1127,7 +1127,7 @@ mod tests {
     #[tokio::test]
     async fn purge_keeps_other_agents_and_longer_saves_in_the_outbox() {
         let dir = crate::test_dir::test_dir();
-        crate::memory::db::seed_on_disk(dir.path(), None).await;
+        crate::memory::store::db::seed_on_disk(dir.path(), None).await;
         let c = rusqlite::Connection::open(dir.path().join("memory.db")).unwrap();
         c.execute(INSERT_ROW, ["use pnpm"]).unwrap();
         let id = c.last_insert_rowid();
@@ -1147,9 +1147,9 @@ mod tests {
 
     #[tokio::test]
     async fn purge_removes_the_text_from_the_outbox() {
-        use crate::memory::backup::backup_offline;
+        use crate::memory::store::backup::backup_offline;
         let dir = crate::test_dir::test_dir();
-        crate::memory::db::seed_on_disk(dir.path(), None).await;
+        crate::memory::store::db::seed_on_disk(dir.path(), None).await;
         let c = rusqlite::Connection::open(dir.path().join("memory.db")).unwrap();
         add_outbox_row(&c, "op-1", SECRET);
         add_outbox_row(&c, "op-2", "nothing to do with it");
@@ -1173,8 +1173,8 @@ mod tests {
         let dir = crate::test_dir::test_dir();
         let backups = crate::paths::backups_dir(dir.path());
         std::fs::create_dir_all(&backups).unwrap();
-        let old = backups.join(crate::memory::backup::snapshot_name(0, crate::memory::backup::Reason::Manual));
-        crate::memory::db::seed_on_disk(dir.path(), Some(crate::memory::backup::latest_known() - 1)).await;
+        let old = backups.join(crate::memory::store::backup::snapshot_name(0, crate::memory::store::backup::Reason::Manual));
+        crate::memory::store::db::seed_on_disk(dir.path(), Some(crate::memory::store::backup::latest_known() - 1)).await;
         std::fs::copy(dir.path().join("memory.db"), &old).unwrap();
 
         let held = OutboxMatch { agent: Some("agent-s"), content: SECRET, piece: false };
@@ -1191,8 +1191,8 @@ mod tests {
 
     // ── purging a project delete ────────────────────────────────────────
 
-    use crate::memory::project_delete::{delete_core, Counts};
-    use crate::memory::workspace::WorkspaceManager;
+    use crate::memory::projects::project_delete::{delete_core, Counts};
+    use crate::memory::retrieval::workspace::WorkspaceManager;
 
     const GONE: &str = "gone-aaaa";
     const WEB: &str = "web-bbbb";
@@ -1271,12 +1271,12 @@ mod tests {
     }
 
     fn sql(dir: &Path, sql: &str) {
-        crate::memory::db::ensure_vec0_registered();
+        crate::memory::store::db::ensure_vec0_registered();
         rusqlite::Connection::open(dir.join("memory.db")).unwrap().execute_batch(sql).unwrap();
     }
 
     fn total(dir: &Path, sql: &str) -> i64 {
-        crate::memory::db::ensure_vec0_registered();
+        crate::memory::store::db::ensure_vec0_registered();
         let c = rusqlite::Connection::open(dir.join("memory.db")).unwrap();
         c.query_row(sql, [], |r| r.get(0)).unwrap()
     }
@@ -1377,8 +1377,8 @@ mod tests {
 
     #[tokio::test]
     async fn purging_a_delete_names_the_backups_and_workspaces_that_hold_its_text() {
-        use crate::memory::backup::backup_offline;
-        use crate::memory::workspace::{AUTO_END, AUTO_START, USER_END, USER_START};
+        use crate::memory::store::backup::backup_offline;
+        use crate::memory::retrieval::workspace::{AUTO_END, AUTO_START, USER_END, USER_START};
         let d = deleted_project().await;
         let dir = d.dir.path();
         let write = |agent: &str, project: &str, auto: &str, user: &str| {

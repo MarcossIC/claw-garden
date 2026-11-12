@@ -26,16 +26,16 @@ use std::sync::Arc;
 
 use rusqlite::{Connection, OptionalExtension};
 
-use crate::memory::error::{ClosedAs, failed_call};
-use crate::memory::backup::Reason;
-use crate::memory::clock::TimestampMs;
-use crate::memory::identity::{candidate_id, derive_project_id, Checkout, Ground, RootCommit, CANDIDATES};
-use crate::memory::registry::{name_key, project_name};
-use crate::memory::merge::canonical_in;
-use crate::memory::relocate::{merge_in, Span};
-use crate::memory::subfolder::declared_in;
-use crate::memory::workspace::WorkspaceManager;
-use crate::memory::{MemoryError, MemoryStore};
+use crate::memory::store::error::{ClosedAs, failed_call};
+use crate::memory::store::backup::Reason;
+use crate::memory::domain::clock::TimestampMs;
+use crate::memory::projects::identity::{candidate_id, derive_project_id, Checkout, Ground, RootCommit, CANDIDATES};
+use crate::memory::projects::registry::{name_key, project_name};
+use crate::memory::projects::merge::canonical_in;
+use crate::memory::projects::relocate::{merge_in, Span};
+use crate::memory::projects::subfolder::declared_in;
+use crate::memory::retrieval::workspace::WorkspaceManager;
+use crate::memory::{store::error::MemoryError, store::db::MemoryStore};
 
 /// What a caller asks of [`register_project`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1000,8 +1000,8 @@ pub async fn register_project(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::identity::{candidate_id, FakeGround};
-    use crate::memory::relocate::undo_move_core;
+    use crate::memory::projects::identity::{candidate_id, FakeGround};
+    use crate::memory::projects::relocate::undo_move_core;
 
     #[test]
     fn project_ids_are_a_name_a_dash_and_four_hex_digits() {
@@ -1948,7 +1948,7 @@ mod tests {
         let a = f.register(f.found(app, None, "s1", known("c1"))).await.unwrap();
         let c = f.register(f.found(copy, None, "s2", known("c1"))).await.unwrap();
 
-        crate::memory::registry::keep_apart(&f.store, &c.project_id, &a.project_id).await.unwrap();
+        crate::memory::projects::registry::keep_apart(&f.store, &c.project_id, &a.project_id).await.unwrap();
         f.register(f.found(copy, None, "s2", known("c1"))).await.unwrap();
 
         let answered = (c.project_id.clone(), a.project_id.clone(), "root_commit".to_string(), Some("apart".to_string()));
@@ -2207,13 +2207,13 @@ mod tests {
         f.declare(&m, "apps/web", "web", 1).await;
         let reached = |subpath: &'static str| f.reached(cloned(mono, "github.com/acme/monorepo"), subpath);
 
-        crate::memory::merge::merge_core(&f.store, &f.ws, &f.backups, &m, "zeta", false).await.unwrap();
+        crate::memory::projects::merge::merge_core(&f.store, &f.ws, &f.backups, &m, "zeta", false).await.unwrap();
         assert_eq!(reached("").await, "zeta", "the root leads to the project its own was merged into");
         assert_eq!(reached("apps/web").await, "web", "and its declaration with it");
 
-        let merged = crate::memory::merge::merge_core(&f.store, &f.ws, &f.backups, "web", "zeta", false).await.unwrap();
+        let merged = crate::memory::projects::merge::merge_core(&f.store, &f.ws, &f.backups, "web", "zeta", false).await.unwrap();
         assert_eq!(reached("apps/web").await, "zeta", "a declaration that leads to the repository answers it");
-        crate::memory::merge::undo_merge_core(&f.store, &f.ws, &f.backups, merged.merge_id.unwrap(), false).await.unwrap();
+        crate::memory::projects::merge::undo_merge_core(&f.store, &f.ws, &f.backups, merged.merge_id.unwrap(), false).await.unwrap();
         assert_eq!(reached("apps/web").await, "web", "undoing the merge gives it back");
     }
 

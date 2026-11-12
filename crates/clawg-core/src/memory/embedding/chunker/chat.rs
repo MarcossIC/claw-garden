@@ -85,7 +85,7 @@ impl ChatChunker {
     /// keep working (with a coarser cap estimate) rather than block ingestion.
     #[cfg(test)]
     pub(crate) fn new_from_base_dir(base_dir: &Path) -> Self {
-        Self::from_tokenizer(crate::memory::model_download::load_tokenizer(base_dir))
+        Self::from_tokenizer(crate::memory::embedding::model_download::load_tokenizer(base_dir))
     }
 
     /// Test-only — pre-wired tokenizer.
@@ -249,7 +249,7 @@ mod tests {
 
     #[test]
     fn the_head_ends_at_a_word_boundary() {
-        use crate::memory::chunker::token_splitter::tests::{subword_tokenizer, subword_words};
+        use crate::memory::embedding::chunker::token_splitter::tests::{subword_tokenizer, subword_words};
         // Words of two and three tokens in turn: 480 of them are 1200 tokens,
         // and the first k of them hold 5 * (k / 2) + 2 * (k % 2).
         let words = subword_words(480);
@@ -266,7 +266,7 @@ mod tests {
 
     #[test]
     fn no_piece_of_a_long_save_starts_inside_a_word() {
-        use crate::memory::chunker::token_splitter::tests::{assert_cut_at_word_boundaries, subword_tokenizer, subword_words};
+        use crate::memory::embedding::chunker::token_splitter::tests::{assert_cut_at_word_boundaries, subword_tokenizer, subword_words};
         let content = subword_words(480).join(" ");
         let tok = subword_tokenizer();
         let split = ChatChunker::with_tokenizer(tok.clone()).split_save(&content);

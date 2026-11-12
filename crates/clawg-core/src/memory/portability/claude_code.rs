@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use super::foreign::{parse_utc, ForeignError, ForeignExport, ForeignNote, NoteKind, When};
 
-pub use crate::memory::provenance::CLAUDE_CODE as SOURCE;
+pub use crate::memory::domain::provenance::CLAUDE_CODE as SOURCE;
 /// The index of a memory directory, one line per memory.
 pub(crate) const INDEX: &str = "MEMORY.md";
 /// The directory of a project that holds its memory.

@@ -13,13 +13,13 @@ use std::sync::Arc;
 use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
-use crate::memory::error::{ClosedAs, failed_call};
-use crate::memory::clock::TimestampMs;
-use crate::memory::identity::Ground;
-use crate::memory::merge::{canonical_in, MAX_MERGE_HOPS};
-use crate::memory::project::is_project_id;
-use crate::memory::project_delete::{deleted_in, deleted_message};
-use crate::memory::{MemoryError, MemoryStore, StorageError};
+use crate::memory::store::error::{ClosedAs, failed_call};
+use crate::memory::domain::clock::TimestampMs;
+use crate::memory::projects::identity::Ground;
+use crate::memory::projects::merge::{canonical_in, MAX_MERGE_HOPS};
+use crate::memory::projects::project::is_project_id;
+use crate::memory::projects::project_delete::{deleted_in, deleted_message};
+use crate::memory::{store::error::MemoryError, store::db::MemoryStore, store::error::StorageError};
 
 /// The name a project has until someone gives it one: its id without the
 /// `-` and four hex digits `derive_project_id` appends, or the whole id when
@@ -659,7 +659,7 @@ const MAX_SLUG_CHARS: usize = 40;
 const NEW_ID_TRIES: u32 = 64;
 
 /// The `n`-th id a project named `name`, made at `now_ms`, may take: the
-/// shape of [`derive_project_id`](crate::memory::identity::derive_project_id),
+/// shape of [`derive_project_id`](crate::memory::projects::identity::derive_project_id),
 /// a slug of ASCII letters, digits and `-`, then four hex digits of a hash.
 /// The time is in the hash so a new project never takes the id of a deleted
 /// one of the same name, whose name is free and whose id is not.
@@ -797,7 +797,7 @@ fn folders_of_in(c: &Connection, project: &str) -> rusqlite::Result<Vec<Resolved
         return Ok(own);
     }
     let mut repositories: Vec<String> = Vec::new();
-    for declared in crate::memory::subfolder::leading_to_in(c, project)? {
+    for declared in crate::memory::projects::subfolder::leading_to_in(c, project)? {
         if declared.repository_id != project && !repositories.contains(&declared.repository_id) {
             repositories.push(declared.repository_id);
         }
@@ -962,11 +962,11 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::memory::events::{MemoryEvent, MemorySource};
-    use crate::memory::identity::{FakeGround, RootCommit};
-    use crate::memory::relocate::{move_memories_core, undo_move_core, MoveFilter};
-    use crate::memory::worker::save_for_test;
-    use crate::memory::MemoryStore;
+    use crate::memory::domain::events::{MemoryEvent, MemorySource};
+    use crate::memory::projects::identity::{FakeGround, RootCommit};
+    use crate::memory::projects::relocate::{move_memories_core, undo_move_core, MoveFilter};
+    use crate::memory::ingest::worker::save_for_test;
+    use crate::memory::store::db::MemoryStore;
     use crate::models::chat::Role;
 
     #[tokio::test]

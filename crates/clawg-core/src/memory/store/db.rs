@@ -4,11 +4,11 @@ use std::sync::{Arc, Once};
 use rusqlite::OptionalExtension;
 use tokio_rusqlite::Connection;
 
-use crate::memory::error::{failed_migration};
-use crate::memory::backup::{self, SchemaPlan};
-use crate::memory::error::MemoryError;
-use crate::memory::latency::KnnLatency;
-use crate::memory::store_lock::{StoreHolder, StoreLock};
+use crate::memory::store::error::{failed_migration};
+use crate::memory::store::backup::{self, SchemaPlan};
+use crate::memory::store::error::MemoryError;
+use crate::memory::store::latency::KnnLatency;
+use crate::memory::store::store_lock::{StoreHolder, StoreLock};
 use crate::metrics::{EventKind, Recorder};
 
 // ---------------------------------------------------------------------------
@@ -359,7 +359,7 @@ impl MemoryStore {
 
                 match existing {
                     None => {
-                        let created_at = crate::memory::clock::TimestampMs::now();
+                        let created_at = crate::memory::domain::clock::TimestampMs::now();
                         c.execute(
                             "INSERT INTO embedding_contract \
                              (id, model_id, dim, metric, normalized, query_prefix, passage_prefix, created_at) \
@@ -411,9 +411,9 @@ impl MemoryStore {
 /// is safe by construction. New UDFs go inside this function — never as a
 /// separate call beside run_migrations.
 async fn register_udfs(conn: &Connection) -> Result<(), MemoryError> {
-    crate::memory::dedup::register_content_hash_udf(conn).await?;
-    crate::memory::tier::register_tier_udf(conn).await?;
-    crate::memory::tier::register_demote_udf(conn).await?;
+    crate::memory::store::dedup::register_content_hash_udf(conn).await?;
+    crate::memory::store::tier::register_tier_udf(conn).await?;
+    crate::memory::store::tier::register_demote_udf(conn).await?;
     Ok(())
 }
 
@@ -456,7 +456,7 @@ async fn check_schema(conn: &Connection) -> Result<SchemaPlan, MemoryError> {
 
 async fn run_migrations(conn: &Connection) -> Result<(), MemoryError> {
     conn.call(|c: &mut rusqlite::Connection| -> Result<refinery::Report, refinery::Error> {
-        configured(crate::memory::migrations::runner()).run(&mut crate::memory::migrations::Driver(c))
+        configured(crate::memory::store::migrations::runner()).run(&mut crate::memory::store::migrations::Driver(c))
     })
     .await
     .map_err(failed_migration)
@@ -472,12 +472,12 @@ pub(crate) async fn seed_on_disk(dir: &Path, target: Option<i32>) {
     let conn = Connection::open(dir.join("memory.db")).await.unwrap();
     register_udfs(&conn).await.unwrap();
     conn.call(move |c| {
-        let runner = crate::memory::migrations::runner();
+        let runner = crate::memory::store::migrations::runner();
         let runner = match target {
             Some(v) => runner.set_target(refinery::Target::Version(v)),
             None => runner,
         };
-        runner.run(&mut crate::memory::migrations::Driver(c))
+        runner.run(&mut crate::memory::store::migrations::Driver(c))
     })
     .await
     .unwrap();
@@ -512,9 +512,9 @@ mod tests {
         register_udfs(&conn).await.unwrap();
         let broken = conn
             .call(|c| {
-                let mut migrations = crate::memory::migrations::runner().get_migrations().clone();
+                let mut migrations = crate::memory::store::migrations::runner().get_migrations().clone();
                 migrations.push(refinery::Migration::unapplied("V9__broken", "THIS IS NOT SQL;").unwrap());
-                configured(refinery::Runner::new(&migrations)).run(&mut crate::memory::migrations::Driver(c))
+                configured(refinery::Runner::new(&migrations)).run(&mut crate::memory::store::migrations::Driver(c))
             })
             .await;
         let Err(tokio_rusqlite::Error::Error(cause)) = broken else {
@@ -592,9 +592,9 @@ mod tests {
 
         // Stop at V5: the schema has no content_hash column yet.
         conn.call(|c| {
-            crate::memory::migrations::runner()
+            crate::memory::store::migrations::runner()
                 .set_target(refinery::Target::Version(5))
-                .run(&mut crate::memory::migrations::Driver(c))
+                .run(&mut crate::memory::store::migrations::Driver(c))
         })
         .await
         .unwrap();
@@ -614,7 +614,7 @@ mod tests {
         .unwrap();
 
         // Now run V6 — the row above is exactly the legacy case it targets.
-        conn.call(|c| crate::memory::migrations::runner().run(&mut crate::memory::migrations::Driver(c)))
+        conn.call(|c| crate::memory::store::migrations::runner().run(&mut crate::memory::store::migrations::Driver(c)))
             .await
             .unwrap();
 
@@ -631,7 +631,7 @@ mod tests {
 
         assert_eq!(
             hash.as_deref(),
-            Some(crate::memory::dedup::content_hash("pre-v6 content").as_str()),
+            Some(crate::memory::store::dedup::content_hash("pre-v6 content").as_str()),
             "V6 must backfill content_hash for rows that predate the column, in the same hash \
              space the runtime write path uses"
         );
@@ -664,11 +664,11 @@ mod tests {
 
         let result = conn
             .call(|c| {
-                let mut migrations = crate::memory::migrations::runner().get_migrations().clone();
+                let mut migrations = crate::memory::store::migrations::runner().get_migrations().clone();
                 migrations.push(
                     refinery::Migration::unapplied("V9__broken", "THIS IS NOT SQL;").unwrap(),
                 );
-                configured(refinery::Runner::new(&migrations)).run(&mut crate::memory::migrations::Driver(c))
+                configured(refinery::Runner::new(&migrations)).run(&mut crate::memory::store::migrations::Driver(c))
             })
             .await;
         assert!(result.is_err(), "the broken V9 must fail the run");
@@ -697,7 +697,7 @@ mod tests {
         ensure_vec0_registered();
         let conn = Connection::open_in_memory().await.unwrap();
         register_udfs(&conn).await.unwrap();
-        conn.call(|c| crate::memory::migrations::runner().run(&mut crate::memory::migrations::Driver(c)))
+        conn.call(|c| crate::memory::store::migrations::runner().run(&mut crate::memory::store::migrations::Driver(c)))
             .await
             .unwrap();
         conn.call(|c| {
@@ -742,9 +742,9 @@ mod tests {
         let conn = Connection::open_in_memory().await.unwrap();
         register_udfs(&conn).await.unwrap();
         conn.call(|c| {
-            configured(crate::memory::migrations::runner())
+            configured(crate::memory::store::migrations::runner())
                 .set_target(refinery::Target::Version(8))
-                .run(&mut crate::memory::migrations::Driver(c))
+                .run(&mut crate::memory::store::migrations::Driver(c))
         })
         .await
         .unwrap();
@@ -797,9 +797,9 @@ mod tests {
         let conn = Connection::open_in_memory().await.unwrap();
         register_udfs(&conn).await.unwrap();
         conn.call(|c| {
-            configured(crate::memory::migrations::runner())
+            configured(crate::memory::store::migrations::runner())
                 .set_target(refinery::Target::Version(9))
-                .run(&mut crate::memory::migrations::Driver(c))
+                .run(&mut crate::memory::store::migrations::Driver(c))
         })
         .await
         .unwrap();
@@ -853,9 +853,9 @@ mod tests {
         let conn = Connection::open_in_memory().await.unwrap();
         register_udfs(&conn).await.unwrap();
         conn.call(|c| {
-            configured(crate::memory::migrations::runner())
+            configured(crate::memory::store::migrations::runner())
                 .set_target(refinery::Target::Version(11))
-                .run(&mut crate::memory::migrations::Driver(c))
+                .run(&mut crate::memory::store::migrations::Driver(c))
         })
         .await
         .unwrap();
@@ -920,9 +920,9 @@ mod tests {
         let conn = Connection::open_in_memory().await.unwrap();
         register_udfs(&conn).await.unwrap();
         conn.call(|c| {
-            configured(crate::memory::migrations::runner())
+            configured(crate::memory::store::migrations::runner())
                 .set_target(refinery::Target::Version(12))
-                .run(&mut crate::memory::migrations::Driver(c))
+                .run(&mut crate::memory::store::migrations::Driver(c))
         })
         .await
         .unwrap();
@@ -990,9 +990,9 @@ mod tests {
         let conn = Connection::open_in_memory().await.unwrap();
         register_udfs(&conn).await.unwrap();
         conn.call(|c| {
-            configured(crate::memory::migrations::runner())
+            configured(crate::memory::store::migrations::runner())
                 .set_target(refinery::Target::Version(13))
-                .run(&mut crate::memory::migrations::Driver(c))
+                .run(&mut crate::memory::store::migrations::Driver(c))
         })
         .await
         .unwrap();
@@ -1046,9 +1046,9 @@ mod tests {
         let conn = Connection::open_in_memory().await.unwrap();
         register_udfs(&conn).await.unwrap();
         conn.call(|c| {
-            configured(crate::memory::migrations::runner())
+            configured(crate::memory::store::migrations::runner())
                 .set_target(refinery::Target::Version(14))
-                .run(&mut crate::memory::migrations::Driver(c))
+                .run(&mut crate::memory::store::migrations::Driver(c))
         })
         .await
         .unwrap();
@@ -1117,9 +1117,9 @@ mod tests {
         let conn = Connection::open_in_memory().await.unwrap();
         register_udfs(&conn).await.unwrap();
         conn.call(|c| {
-            configured(crate::memory::migrations::runner())
+            configured(crate::memory::store::migrations::runner())
                 .set_target(refinery::Target::Version(15))
-                .run(&mut crate::memory::migrations::Driver(c))
+                .run(&mut crate::memory::store::migrations::Driver(c))
         })
         .await
         .unwrap();
@@ -1180,9 +1180,9 @@ mod tests {
         let conn = Connection::open_in_memory().await.unwrap();
         register_udfs(&conn).await.unwrap();
         conn.call(|c| {
-            configured(crate::memory::migrations::runner())
+            configured(crate::memory::store::migrations::runner())
                 .set_target(refinery::Target::Version(16))
-                .run(&mut crate::memory::migrations::Driver(c))
+                .run(&mut crate::memory::store::migrations::Driver(c))
         })
         .await
         .unwrap();
@@ -1792,8 +1792,8 @@ mod tests {
     /// their own id when it is one. An id only the history names gets none.
     #[tokio::test]
     async fn a_database_from_the_previous_version_opens_with_a_project_for_every_id_in_use() {
-        use crate::memory::admin::{list_memories_core, ListParams};
-        use crate::memory::identity::candidate_id;
+        use crate::memory::upkeep::admin::{list_memories_core, ListParams};
+        use crate::memory::projects::identity::candidate_id;
 
         let dir = crate::test_dir::test_dir();
         seed_on_disk(dir.path(), Some(26)).await;
@@ -1897,7 +1897,7 @@ mod tests {
             .await
             .unwrap();
         conn.close().await.unwrap();
-        let facts_before = crate::memory::inspect::inspect(dir.path()).facts.expect("facts before");
+        let facts_before = crate::memory::projects::inspect::inspect(dir.path()).facts.expect("facts before");
 
         let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
 
@@ -1964,7 +1964,7 @@ mod tests {
         assert_eq!(listed(Some(api_collided.clone())).await, vec![13]);
         assert_eq!(listed(None).await, vec![1, 18]);
 
-        let facts_after = crate::memory::inspect::inspect(dir.path()).facts.expect("facts after");
+        let facts_after = crate::memory::projects::inspect::inspect(dir.path()).facts.expect("facts after");
         assert_eq!((facts_after.projects, facts_after.remotes), (facts_before.projects, facts_before.remotes));
         let snapshots = std::fs::read_dir(crate::paths::backups_dir(dir.path())).unwrap().count();
         assert_eq!(snapshots, 1, "the pre-migration snapshot is the way back");
@@ -2047,7 +2047,7 @@ mod tests {
         assert_eq!(merged, 0, "no project is a tombstone");
         assert_eq!(journal, (0, 0), "the journal of merges starts empty");
         for id in ["app-1a2b", "copia-85a9", "idea", "unknown-9f9f"] {
-            assert_eq!(crate::memory::merge::canonical(&store, id).await.unwrap(), id);
+            assert_eq!(crate::memory::projects::merge::canonical(&store, id).await.unwrap(), id);
         }
         let snapshots = std::fs::read_dir(crate::paths::backups_dir(dir.path())).unwrap().count();
         assert_eq!(snapshots, 1, "the pre-migration snapshot is the way back");
@@ -2355,9 +2355,9 @@ mod tests {
         let conn = Connection::open_in_memory().await.unwrap();
         register_udfs(&conn).await.unwrap();
         conn.call(|c| {
-            configured(crate::memory::migrations::runner())
+            configured(crate::memory::store::migrations::runner())
                 .set_target(refinery::Target::Version(18))
-                .run(&mut crate::memory::migrations::Driver(c))
+                .run(&mut crate::memory::store::migrations::Driver(c))
         })
         .await
         .unwrap();
@@ -2401,7 +2401,7 @@ mod tests {
             let conn = Connection::open_in_memory().await.unwrap();
             register_udfs(&conn).await.unwrap();
 
-            conn.call(move |c| configured_to(crate::memory::migrations::runner(), cap).run(&mut crate::memory::migrations::Driver(c)))
+            conn.call(move |c| configured_to(crate::memory::store::migrations::runner(), cap).run(&mut crate::memory::store::migrations::Driver(c)))
                 .await
                 .unwrap();
 
@@ -2539,9 +2539,9 @@ mod tests {
         register_udfs(&conn).await.unwrap();
 
         conn.call(|c| {
-            crate::memory::migrations::runner()
+            crate::memory::store::migrations::runner()
                 .set_target(refinery::Target::Version(3))
-                .run(&mut crate::memory::migrations::Driver(c))
+                .run(&mut crate::memory::store::migrations::Driver(c))
         })
         .await
         .unwrap();
@@ -2558,7 +2558,7 @@ mod tests {
             .unwrap();
         assert_eq!(before, 1, "V3 must have created the view for this test to mean anything");
 
-        conn.call(|c| crate::memory::migrations::runner().run(&mut crate::memory::migrations::Driver(c)))
+        conn.call(|c| crate::memory::store::migrations::runner().run(&mut crate::memory::store::migrations::Driver(c)))
             .await
             .unwrap();
 
@@ -2835,9 +2835,9 @@ mod tests {
         register_udfs(&conn).await.unwrap();
 
         conn.call(|c| {
-            crate::memory::migrations::runner()
+            crate::memory::store::migrations::runner()
                 .set_target(refinery::Target::Version(7))
-                .run(&mut crate::memory::migrations::Driver(c))
+                .run(&mut crate::memory::store::migrations::Driver(c))
         })
         .await
         .unwrap();
@@ -2849,9 +2849,9 @@ mod tests {
         assert_eq!(before, 7, "test setup: must actually stop at V7");
 
         let to_v8 = |c: &mut rusqlite::Connection| {
-            crate::memory::migrations::runner()
+            crate::memory::store::migrations::runner()
                 .set_target(refinery::Target::Version(8))
-                .run(&mut crate::memory::migrations::Driver(c))
+                .run(&mut crate::memory::store::migrations::Driver(c))
         };
         conn.call(to_v8).await.unwrap();
         let after: i64 = conn
@@ -2882,9 +2882,9 @@ mod tests {
         // Stop at V7: memory_fts does not exist yet, so this insert cannot be
         // caught by any trigger — it is exactly the row the backfill exists for.
         conn.call(|c| {
-            crate::memory::migrations::runner()
+            crate::memory::store::migrations::runner()
                 .set_target(refinery::Target::Version(7))
-                .run(&mut crate::memory::migrations::Driver(c))
+                .run(&mut crate::memory::store::migrations::Driver(c))
         })
         .await
         .unwrap();
@@ -2904,7 +2904,7 @@ mod tests {
         .unwrap();
 
         // Now run V8 — the row above predates the FTS table and its triggers.
-        conn.call(|c| crate::memory::migrations::runner().run(&mut crate::memory::migrations::Driver(c)))
+        conn.call(|c| crate::memory::store::migrations::runner().run(&mut crate::memory::store::migrations::Driver(c)))
             .await
             .unwrap();
 
@@ -2986,9 +2986,9 @@ mod tests {
 
         // Stop at V7: memory_fts does not exist yet.
         conn.call(|c| {
-            crate::memory::migrations::runner()
+            crate::memory::store::migrations::runner()
                 .set_target(refinery::Target::Version(7))
-                .run(&mut crate::memory::migrations::Driver(c))
+                .run(&mut crate::memory::store::migrations::Driver(c))
         })
         .await
         .unwrap();
@@ -3009,7 +3009,7 @@ mod tests {
         .await
         .unwrap();
 
-        conn.call(|c| crate::memory::migrations::runner().run(&mut crate::memory::migrations::Driver(c)))
+        conn.call(|c| crate::memory::store::migrations::runner().run(&mut crate::memory::store::migrations::Driver(c)))
             .await
             .unwrap();
 

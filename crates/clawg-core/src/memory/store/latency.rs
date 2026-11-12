@@ -188,7 +188,7 @@ impl std::fmt::Display for LatencySnapshot {
 const _: fn() = || {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<KnnLatency>();
-    assert_send_sync::<crate::memory::MemoryStore>();
+    assert_send_sync::<crate::memory::store::db::MemoryStore>();
 };
 
 // ---------------------------------------------------------------------------

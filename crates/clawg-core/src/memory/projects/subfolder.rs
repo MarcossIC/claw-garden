@@ -12,12 +12,12 @@ use std::path::Path;
 use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
-use crate::memory::error::{ClosedAs, failed_call};
-use crate::memory::clock::TimestampMs;
-use crate::memory::merge::{canonical_in, merge_core, MergeError, MergeReport};
-use crate::memory::project_delete::{deleted_in, deleted_message};
-use crate::memory::workspace::WorkspaceManager;
-use crate::memory::{MemoryError, MemoryStore};
+use crate::memory::store::error::{ClosedAs, failed_call};
+use crate::memory::domain::clock::TimestampMs;
+use crate::memory::projects::merge::{canonical_in, merge_core, MergeError, MergeReport};
+use crate::memory::projects::project_delete::{deleted_in, deleted_message};
+use crate::memory::retrieval::workspace::WorkspaceManager;
+use crate::memory::{store::error::MemoryError, store::db::MemoryStore};
 
 /// A row of `project_subfolder`.
 #[derive(Debug, Clone, PartialEq, Eq)]

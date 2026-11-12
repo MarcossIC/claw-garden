@@ -7,16 +7,16 @@
 use rusqlite::Connection;
 use serde::Serialize;
 
-use crate::memory::error::{ClosedAs, failed_call};
-use crate::memory::clock::TimestampMs;
-use crate::memory::contradiction::{excerpt, Candidate};
-use crate::memory::dispute::{release_challengers, SUPERSEDE_SQL};
-use crate::memory::error::MemoryError;
-use crate::memory::events::MemoryEvent;
-use crate::memory::pieces::{link_in, StoredPiece};
-use crate::memory::search::{reach_predicate, reader_bind};
-use crate::memory::sharing::Reader;
-use crate::memory::MemoryStore;
+use crate::memory::store::error::{ClosedAs, failed_call};
+use crate::memory::domain::clock::TimestampMs;
+use crate::memory::revision::contradiction::{excerpt, Candidate};
+use crate::memory::revision::dispute::{release_challengers, SUPERSEDE_SQL};
+use crate::memory::store::error::MemoryError;
+use crate::memory::domain::events::MemoryEvent;
+use crate::memory::retrieval::pieces::{link_in, StoredPiece};
+use crate::memory::retrieval::search::{reach_predicate, reader_bind};
+use crate::memory::domain::sharing::Reader;
+use crate::memory::store::db::MemoryStore;
 
 /// Longest key accepted, in characters.
 pub(crate) const MAX_TOPIC_KEY_LEN: usize = 80;
@@ -289,7 +289,7 @@ mod tests {
         let plan: Vec<String> = store
             .conn
             .call(|c| -> rusqlite::Result<Vec<String>> {
-                let saver = Reader::new("a", crate::memory::sharing::Reach::AllBut(Vec::new()));
+                let saver = Reader::new("a", crate::memory::domain::sharing::Reach::AllBut(Vec::new()));
                 let mut stmt = c.prepare(&format!("EXPLAIN QUERY PLAN {SCOPE_ROWS_SQL}"))?;
                 let rows = stmt
                     .query_map(rusqlite::params![reader_bind(Some(&saver)), Option::<String>::None, "k"], |r| r.get(3))?

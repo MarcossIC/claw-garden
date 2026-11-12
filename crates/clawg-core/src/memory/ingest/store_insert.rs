@@ -5,19 +5,19 @@
 //! atomically in the same transaction. The episodic and procedural writers
 //! further down exist only for tests.
 
-use crate::memory::chunker::Chunk;
-use crate::memory::clock::TimestampMs;
-use crate::memory::contradiction::Candidate;
-use crate::memory::events::{MemoryEvent, MemorySource};
-use crate::memory::language;
-use crate::memory::vector::to_unit;
-use crate::memory::outbox::{apply_note, OutboxNote};
-use crate::memory::provenance::{is_stated, seal};
-pub use crate::memory::record::{MemoryType, UnknownMemoryType};
-pub(crate) use crate::memory::record::CreatedByType;
-use crate::memory::search::{reach_predicate, reader_bind};
-use crate::memory::sharing::Reader;
-use crate::memory::MemoryStore;
+use crate::memory::embedding::chunker::Chunk;
+use crate::memory::domain::clock::TimestampMs;
+use crate::memory::revision::contradiction::Candidate;
+use crate::memory::domain::events::{MemoryEvent, MemorySource};
+use crate::memory::retrieval::language;
+use crate::memory::domain::vector::to_unit;
+use crate::memory::ingest::outbox::{apply_note, OutboxNote};
+use crate::memory::domain::provenance::{is_stated, seal};
+pub use crate::memory::domain::record::{MemoryType, UnknownMemoryType};
+pub(crate) use crate::memory::domain::record::CreatedByType;
+use crate::memory::retrieval::search::{reach_predicate, reader_bind};
+use crate::memory::domain::sharing::Reader;
+use crate::memory::store::db::MemoryStore;
 use crate::models::chat::Role;
 use rusqlite::OptionalExtension;
 
@@ -469,7 +469,7 @@ impl PreparedRow {
             // Compute the initial tier explicitly instead of relying
             // on the schema DEFAULT — the single source of truth for every
             // producer. PROMOTE-ONLY, starts from current=3 (see memory/tier.rs).
-            tier: crate::memory::tier::compute_tier(3, record.importance, 0, record.memory_type.as_str()),
+            tier: crate::memory::store::tier::compute_tier(3, record.importance, 0, record.memory_type.as_str()),
             status: if disputed { "disputed" } else { "active" },
             disputed_against: disputed
                 .then(|| serde_json::to_string(&escalated).expect("Vec<i64> serialises infallibly")),
@@ -477,7 +477,7 @@ impl PreparedRow {
             // Same normalization the write-border dedup gate hashes against
             // (worker.rs, before embed) — writing it here too keeps every row
             // dedup-eligible regardless of which producer inserted it.
-            content_hash: crate::memory::dedup::content_hash(&record.content),
+            content_hash: crate::memory::store::dedup::content_hash(&record.content),
             // The row's own text, already masked: a piece is long enough to
             // tell, and the import and the maintenance pass see rows too.
             lang: language::column_value(language::detect(&record.content)),
@@ -550,7 +550,7 @@ fn serialize_f32_vec(v: &[f32]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use crate::memory::sharing::Reach;
+    use crate::memory::domain::sharing::Reach;
 
     /// `agent` as a policy that hides nothing lets it save.
     fn shared(agent: &str) -> Reader {
@@ -583,7 +583,7 @@ mod tests {
             project_id,
             content: "test content".to_string(),
             memory_type: MemoryType::ChatMessage,
-            source: crate::memory::events::MemorySource::Chat,
+            source: crate::memory::domain::events::MemorySource::Chat,
             created_by_type: CreatedByType::User,
             created_by_ref: agent_id.to_string(),
             importance: 5.0,
@@ -601,7 +601,7 @@ mod tests {
 
     #[tokio::test]
     async fn insert_memory_with_vector_returns_rowid() {
-        let store = crate::memory::db::MemoryStore::new_for_test().await.unwrap();
+        let store = crate::memory::store::db::MemoryStore::new_for_test().await.unwrap();
         let record = make_record("a", None);
         let embedding = make_embedding_384();
         let id = store.insert_memory_with_vector(record, embedding).await.unwrap();
@@ -612,7 +612,7 @@ mod tests {
     async fn insert_memory_with_vector_returns_err_on_wrong_dimension() {
         // Proxy test for connection error: pass a 10-dim embedding and assert
         // Err(MemoryStoreError::DimensionMismatch { expected: 384, actual: 10 })
-        let store = crate::memory::db::MemoryStore::new_for_test().await.unwrap();
+        let store = crate::memory::store::db::MemoryStore::new_for_test().await.unwrap();
         let record = make_record("a", None);
         let small_embedding = vec![0.1_f32; 10];
         let err = store.insert_memory_with_vector(record, small_embedding).await.unwrap_err();
@@ -627,7 +627,7 @@ mod tests {
 
     #[tokio::test]
     async fn both_rows_present_after_successful_insert() {
-        let store = crate::memory::db::MemoryStore::new_for_test().await.unwrap();
+        let store = crate::memory::store::db::MemoryStore::new_for_test().await.unwrap();
         let record = make_record("a", None);
         let embedding = make_embedding_384();
         let id = store.insert_memory_with_vector(record, embedding).await.unwrap();
@@ -657,7 +657,7 @@ mod tests {
     #[tokio::test]
     async fn vector_insert_failure_leaves_no_memory_row() {
         // Wrong dimension → DimensionMismatch → NO rows inserted anywhere.
-        let store = crate::memory::db::MemoryStore::new_for_test().await.unwrap();
+        let store = crate::memory::store::db::MemoryStore::new_for_test().await.unwrap();
         let record = make_record("a", None);
         let bad_embedding = vec![0.1_f32; 10];
         let _ = store.insert_memory_with_vector(record, bad_embedding).await;
@@ -672,7 +672,7 @@ mod tests {
 
     #[tokio::test]
     async fn insert_agent_scope_no_project_passes_check() {
-        let store = crate::memory::db::MemoryStore::new_for_test().await.unwrap();
+        let store = crate::memory::store::db::MemoryStore::new_for_test().await.unwrap();
         let record = make_record("a", None);
         let embedding = make_embedding_384();
         let result = store.insert_memory_with_vector(record, embedding).await;
@@ -681,7 +681,7 @@ mod tests {
 
     #[tokio::test]
     async fn insert_agent_scope_with_project_passes_check() {
-        let store = crate::memory::db::MemoryStore::new_for_test().await.unwrap();
+        let store = crate::memory::store::db::MemoryStore::new_for_test().await.unwrap();
         let record = make_record("a", Some("proj-1".to_string()));
         let embedding = make_embedding_384();
         let result = store.insert_memory_with_vector(record, embedding).await;
@@ -698,8 +698,8 @@ mod tests {
 
     #[test]
     fn new_memory_record_from_event_and_chunk_has_no_candidates() {
-        use crate::memory::events::{MemoryEvent, MemorySource};
-        use crate::memory::chunker::Chunk;
+        use crate::memory::domain::events::{MemoryEvent, MemorySource};
+        use crate::memory::embedding::chunker::Chunk;
         use crate::models::chat::Role;
         let evt = MemoryEvent {
             agent_id: "agent-x".to_string(),
@@ -725,8 +725,8 @@ mod tests {
 
     #[test]
     fn from_event_and_chunk_compaction_source_yields_session_summary_system_6() {
-        use crate::memory::events::{MemoryEvent, MemorySource};
-        use crate::memory::chunker::Chunk;
+        use crate::memory::domain::events::{MemoryEvent, MemorySource};
+        use crate::memory::embedding::chunker::Chunk;
         use crate::models::chat::Role;
         let evt = MemoryEvent {
             agent_id: "agent-x".to_string(),
@@ -757,8 +757,8 @@ mod tests {
     fn explicit_event(
         memory_type: Option<&str>,
         importance: Option<f64>,
-    ) -> crate::memory::events::MemoryEvent {
-        crate::memory::events::MemoryEvent {
+    ) -> crate::memory::domain::events::MemoryEvent {
+        crate::memory::domain::events::MemoryEvent {
             agent_id: "agent-x".to_string(),
             project_id: None,
             role: crate::models::chat::Role::User,
@@ -775,8 +775,8 @@ mod tests {
         }
     }
 
-    fn chunk_of(text: &str) -> crate::memory::chunker::Chunk {
-        crate::memory::chunker::Chunk { text: text.to_string() }
+    fn chunk_of(text: &str) -> crate::memory::embedding::chunker::Chunk {
+        crate::memory::embedding::chunker::Chunk { text: text.to_string() }
     }
 
     #[test]
@@ -864,7 +864,7 @@ mod tests {
 
     #[tokio::test]
     async fn explicit_source_is_stored_as_the_string_explicit() {
-        let store = crate::memory::db::MemoryStore::new_for_test().await.unwrap();
+        let store = crate::memory::store::db::MemoryStore::new_for_test().await.unwrap();
         let evt = explicit_event(Some("user_preference"), Some(9.5));
         let record = NewMemoryRecord::from_event_and_chunk(&evt, &chunk_of("x"));
         let id = store
@@ -883,7 +883,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_save_records_the_language_of_each_row() {
-        let store = crate::memory::db::MemoryStore::new_for_test().await.unwrap();
+        let store = crate::memory::store::db::MemoryStore::new_for_test().await.unwrap();
         let mut ids = Vec::new();
         for content in [
             "El daemon guarda cada memoria en una sola transacción, y la búsqueda las encuentra.",
@@ -910,7 +910,7 @@ mod tests {
 
     #[tokio::test]
     async fn insert_with_no_dispute_writes_active_status() {
-        let store = crate::memory::db::MemoryStore::new_for_test().await.unwrap();
+        let store = crate::memory::store::db::MemoryStore::new_for_test().await.unwrap();
         let record = make_record("a", None);
         let embedding = make_embedding_384();
         let id = store.insert_memory_with_vector(record, embedding).await.unwrap();
@@ -938,7 +938,7 @@ mod tests {
 
     #[tokio::test]
     async fn insert_with_dispute_writes_disputed_status_and_json() {
-        let store = crate::memory::db::MemoryStore::new_for_test().await.unwrap();
+        let store = crate::memory::store::db::MemoryStore::new_for_test().await.unwrap();
         let mut record = make_record("a", None);
         record.candidates = vec![candidate(12, 0.2, true), candidate(34, 0.3, true)];
         let embedding = make_embedding_384();
@@ -965,7 +965,7 @@ mod tests {
         assert_eq!(lda, Some(created_at_ms), "last_disputed_at must equal created_at when disputed");
     }
 
-    async fn conflict_rows(store: &crate::memory::db::MemoryStore) -> Vec<(i64, i64, Option<f64>, String, i64)> {
+    async fn conflict_rows(store: &crate::memory::store::db::MemoryStore) -> Vec<(i64, i64, Option<f64>, String, i64)> {
         store
             .conn
             .call(|c| {
@@ -981,7 +981,7 @@ mod tests {
 
     #[tokio::test]
     async fn insert_writes_one_conflict_row_per_candidate() {
-        let store = crate::memory::db::MemoryStore::new_for_test().await.unwrap();
+        let store = crate::memory::store::db::MemoryStore::new_for_test().await.unwrap();
         let mut record = make_record("a", None);
         record.candidates = vec![candidate(7, 0.25, false), candidate(9, 0.31, true)];
         let id = store.insert_memory_with_vector(record, make_embedding_384()).await.unwrap();
@@ -1004,7 +1004,7 @@ mod tests {
 
     #[tokio::test]
     async fn pending_candidates_alone_leave_the_row_active() {
-        let store = crate::memory::db::MemoryStore::new_for_test().await.unwrap();
+        let store = crate::memory::store::db::MemoryStore::new_for_test().await.unwrap();
         let mut record = make_record("a", None);
         record.candidates = vec![candidate(7, 0.25, false)];
         let id = store.insert_memory_with_vector(record, make_embedding_384()).await.unwrap();
@@ -1025,7 +1025,7 @@ mod tests {
     #[tokio::test]
     async fn insert_with_dispute_is_atomic_single_transaction() {
         // Verify both memory and memory_vectors rows exist after disputed insert
-        let store = crate::memory::db::MemoryStore::new_for_test().await.unwrap();
+        let store = crate::memory::store::db::MemoryStore::new_for_test().await.unwrap();
         let mut record = make_record("a", None);
         record.candidates = vec![candidate(99, 0.2, true)];
         let embedding = make_embedding_384();
@@ -1060,7 +1060,7 @@ mod tests {
         rec
     }
 
-    async fn insert_and_fetch_tier(store: &crate::memory::db::MemoryStore, record: NewMemoryRecord) -> i64 {
+    async fn insert_and_fetch_tier(store: &crate::memory::store::db::MemoryStore, record: NewMemoryRecord) -> i64 {
         let embedding = make_embedding_384();
         let id = store.insert_memory_with_vector(record, embedding).await.unwrap();
         let conn = store.conn.clone();
@@ -1078,7 +1078,7 @@ mod tests {
     // chat_message imp=5.0 → tier=3 (regression lock).
     #[tokio::test]
     async fn insert_chat_message_importance_5_yields_tier_3() {
-        let store = crate::memory::db::MemoryStore::new_for_test().await.unwrap();
+        let store = crate::memory::store::db::MemoryStore::new_for_test().await.unwrap();
         let record = make_record_typed(MemoryType::ChatMessage, 5.0);
         let tier = insert_and_fetch_tier(&store, record).await;
         assert_eq!(tier, 3, "chat_message imp=5.0 must insert at tier=3");
@@ -1087,7 +1087,7 @@ mod tests {
     // tool_error imp=6.0 → tier=3 (regression lock).
     #[tokio::test]
     async fn insert_tool_error_importance_6_yields_tier_3() {
-        let store = crate::memory::db::MemoryStore::new_for_test().await.unwrap();
+        let store = crate::memory::store::db::MemoryStore::new_for_test().await.unwrap();
         let record = make_record_typed(MemoryType::ToolError, 6.0);
         let tier = insert_and_fetch_tier(&store, record).await;
         assert_eq!(tier, 3, "tool_error imp=6.0 must insert at tier=3");
@@ -1098,7 +1098,7 @@ mod tests {
     // workspace.md (session_summary is not a workspace producer).
     #[tokio::test]
     async fn insert_session_summary_importance_6_yields_tier_2() {
-        let store = crate::memory::db::MemoryStore::new_for_test().await.unwrap();
+        let store = crate::memory::store::db::MemoryStore::new_for_test().await.unwrap();
         let record = make_record_typed(MemoryType::SessionSummary, 6.0);
         let tier = insert_and_fetch_tier(&store, record).await;
         assert_eq!(tier, 2, "session_summary imp=6.0 must insert at tier=2 (corrected from DEFAULT 3)");
@@ -1107,7 +1107,7 @@ mod tests {
     // user_preference imp=5.0 → tier=1 (pivotal, type-based rule).
     #[tokio::test]
     async fn insert_user_preference_importance_5_yields_tier_1() {
-        let store = crate::memory::db::MemoryStore::new_for_test().await.unwrap();
+        let store = crate::memory::store::db::MemoryStore::new_for_test().await.unwrap();
         let record = make_record_typed(MemoryType::UserPreference, 5.0);
         let tier = insert_and_fetch_tier(&store, record).await;
         assert_eq!(tier, 1, "user_preference imp=5.0 must insert at tier=1");
@@ -1116,7 +1116,7 @@ mod tests {
     // architectural_decision imp=5.0 → tier=2 (pivotal, type-based rule).
     #[tokio::test]
     async fn insert_architectural_decision_importance_5_yields_tier_2() {
-        let store = crate::memory::db::MemoryStore::new_for_test().await.unwrap();
+        let store = crate::memory::store::db::MemoryStore::new_for_test().await.unwrap();
         let record = make_record_typed(MemoryType::ArchitecturalDecision, 5.0);
         let tier = insert_and_fetch_tier(&store, record).await;
         assert_eq!(tier, 2, "architectural_decision imp=5.0 must insert at tier=2");
@@ -1125,7 +1125,7 @@ mod tests {
     // semantic_fact imp=5.0 → tier=3 (no promotion rule).
     #[tokio::test]
     async fn insert_semantic_fact_importance_5_yields_tier_3() {
-        let store = crate::memory::db::MemoryStore::new_for_test().await.unwrap();
+        let store = crate::memory::store::db::MemoryStore::new_for_test().await.unwrap();
         let record = make_record_typed(MemoryType::SemanticFact, 5.0);
         let tier = insert_and_fetch_tier(&store, record).await;
         assert_eq!(tier, 3, "semantic_fact imp=5.0 must insert at tier=3 (no promotion rule)");
@@ -1134,7 +1134,7 @@ mod tests {
     // semantic_fact imp=9.5 → tier=1 (importance>=9 fast-track overrides type).
     #[tokio::test]
     async fn insert_semantic_fact_importance_9_5_yields_tier_1() {
-        let store = crate::memory::db::MemoryStore::new_for_test().await.unwrap();
+        let store = crate::memory::store::db::MemoryStore::new_for_test().await.unwrap();
         let record = make_record_typed(MemoryType::SemanticFact, 9.5);
         let tier = insert_and_fetch_tier(&store, record).await;
         assert_eq!(tier, 1, "semantic_fact imp=9.5 must insert at tier=1 (importance>=9 override)");
@@ -1161,7 +1161,7 @@ mod tests {
 
     #[tokio::test]
     async fn insert_normalizes_to_unit_length() {
-        let store = crate::memory::db::MemoryStore::new_for_test().await.unwrap();
+        let store = crate::memory::store::db::MemoryStore::new_for_test().await.unwrap();
         let record = make_record("a", None);
         // Non-unit on purpose: ||v|| = sqrt(384 * 0.01) ≈ 1.9596.
         let embedding = make_embedding_384();
@@ -1174,7 +1174,7 @@ mod tests {
 
     #[tokio::test]
     async fn insert_writes_content_hash_matching_dedup_content_hash() {
-        let store = crate::memory::db::MemoryStore::new_for_test().await.unwrap();
+        let store = crate::memory::store::db::MemoryStore::new_for_test().await.unwrap();
         let record = make_record("a", None); // content = "test content"
         let embedding = make_embedding_384();
         let id = store.insert_memory_with_vector(record, embedding).await.unwrap();
@@ -1192,14 +1192,14 @@ mod tests {
             .unwrap();
         assert_eq!(
             stored_hash.as_deref(),
-            Some(crate::memory::dedup::content_hash("test content").as_str()),
+            Some(crate::memory::store::dedup::content_hash("test content").as_str()),
             "insert must write content_hash = dedup::content_hash(content)"
         );
     }
 
     #[tokio::test]
     async fn zero_embedding_is_rejected_and_writes_nothing() {
-        let store = crate::memory::db::MemoryStore::new_for_test().await.unwrap();
+        let store = crate::memory::store::db::MemoryStore::new_for_test().await.unwrap();
         let record = make_record("a", None);
         let zero_embedding = vec![0.0_f32; 384];
         let result = store.insert_memory_with_vector(record, zero_embedding).await;
@@ -1418,7 +1418,7 @@ mod tests {
     /// number drifts loudly instead of silently.
     #[tokio::test]
     async fn architectural_decision_promotes_to_tier_1_after_two_reinforcements() {
-        let store = crate::memory::db::MemoryStore::new_for_test().await.unwrap();
+        let store = crate::memory::store::db::MemoryStore::new_for_test().await.unwrap();
         let record = make_record_typed(MemoryType::ArchitecturalDecision, 5.0);
         let content = record.content.clone();
         let agent_id = record.agent_id.clone().unwrap();
@@ -1426,7 +1426,7 @@ mod tests {
             .insert_memory_with_vector(record, make_embedding_384())
             .await
             .unwrap();
-        let hash = crate::memory::dedup::content_hash(&content);
+        let hash = crate::memory::store::dedup::content_hash(&content);
 
         let (access_count, tier) = fetch_access_count_and_tier(&store, id).await;
         assert_eq!(access_count, 1, "insert must write access_count = 1");

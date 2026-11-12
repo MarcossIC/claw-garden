@@ -8,10 +8,10 @@
 //! dependency; with too little evidence the answer is undecided. The detector
 //! is pure; [`count_saves_in`] reads the column it fills.
 
-use crate::memory::error::{ClosedAs, failed_call};
-use crate::memory::search::{memory_project_predicate, project_bind, projects_bind, reader_bind, reader_predicate};
-use crate::memory::sharing::Reader;
-use crate::memory::{MemoryError, MemoryStore};
+use crate::memory::store::error::{ClosedAs, failed_call};
+use crate::memory::retrieval::search::{memory_project_predicate, project_bind, projects_bind, reader_bind, reader_predicate};
+use crate::memory::domain::sharing::Reader;
+use crate::memory::{store::error::MemoryError, store::db::MemoryStore};
 use crate::preferences::Lang;
 
 /// Live saves in language `?1` of the scope a search of the projects `?2`
@@ -172,7 +172,7 @@ fn without_code(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::sharing::Reach;
+    use crate::memory::domain::sharing::Reach;
 
     #[test]
     fn spanish_prose_is_spanish() {
@@ -331,7 +331,7 @@ mod tests {
     #[tokio::test]
     async fn counting_by_language_uses_its_index() {
         let store = seeded(vec![row(1, Some("r"), Some("pa"), Some("en"))], &[]).await;
-        let reader = crate::memory::search::reader_bind(Some(&Reader::new("r", Reach::AllBut(Vec::new()))));
+        let reader = crate::memory::retrieval::search::reader_bind(Some(&Reader::new("r", Reach::AllBut(Vec::new()))));
         let plan: Vec<String> = store
             .conn
             .call(move |c| {

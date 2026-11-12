@@ -281,9 +281,10 @@ fn every_public_memory_module_is_named_outside_core() {
 
 /// The modules the root of `memory` shows to the other crates: each
 /// `pub mod <module>;` it declares, and each `pub use <folder>::<module>;`
-/// that re-exports a module of a folder it declares with `mod <folder>;`.
+/// that re-exports a module of a folder it keeps to the crate with
+/// `pub(crate) mod <folder>;`.
 fn public_memory_modules(root: &str) -> Vec<&str> {
-    let folders: Vec<&str> = root.lines().filter_map(|line| line.strip_prefix("mod ")?.strip_suffix(';')).collect();
+    let folders: Vec<&str> = root.lines().filter_map(|line| line.strip_prefix("pub(crate) mod ")?.strip_suffix(';')).collect();
     let is_module = |name: &str| !name.is_empty() && name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
     root.lines()
         .filter_map(|line| {
@@ -298,7 +299,7 @@ fn public_memory_modules(root: &str) -> Vec<&str> {
 
 #[test]
 fn public_memory_modules_reads_declarations_and_reexports() {
-    let root = "pub mod portability;\nmod store;\npub(crate) mod hidden;\npub use store::db;\npub use store::db::MemoryStore;\npub(crate) use store::error;\npub use elsewhere::thing;\n";
+    let root = "pub mod portability;\npub(crate) mod store;\npub use store::db;\npub use store::db::MemoryStore;\npub(crate) use store::error;\npub use elsewhere::thing;\n";
     assert_eq!(public_memory_modules(root), ["portability", "db"]);
 }
 
@@ -329,13 +330,14 @@ const NAMES_THROUGH_THE_ROOT: [&str; 1] = ["project_docs"];
 /// each inside one folder, with why it stays.
 const MEMORY_CYCLES: [(&[&str], &str); 5] = [
     (
-        &["store/backup", "store/db", "store/dedup", "store/error", "store/store_lock", "store/tier"],
-        "MemoryError carries BackupError and StoreOwner, and the modules that define them, and the ones the store registers its SQL \
-         functions from, fail with MemoryError",
+        &["store/backup", "store/db", "store/dedup", "store/error", "store/latency", "store/store_lock", "store/tier"],
+        "MemoryError carries BackupError and StoreOwner, and the modules that define them fail with MemoryError, as do the ones the \
+         store registers its SQL functions from; the store keeps the latency of its vector search, which is measured on the store",
     ),
     (
-        &["retrieval/listing", "retrieval/pieces", "retrieval/search"],
-        "a hit carries the place of its piece in a save, and a save is read back whole from the row of its head",
+        &["retrieval/listing", "retrieval/pieces", "retrieval/search", "retrieval/search_log"],
+        "a hit carries the place of its piece in a save, a save is read back whole from the row of its head, and the log lines of a \
+         search count its hits",
     ),
     (&["retrieval/prompt_builder", "retrieval/workspace"], "workspace.md is written with the prompt's indentation, and the prompt reads it"),
     (
@@ -399,7 +401,8 @@ fn memory_modules(memory: &Path) -> Vec<MemoryModule> {
 
 /// The paths `text` starts with, each as its segments: one path, or every
 /// path of a `{…}` group, a nested group opened under what leads to it. A
-/// `self` or a `*` ends a path at what leads to it.
+/// `self` or a `*` ends a path at what leads to it, and what is left after
+/// the last comma of a group is no path.
 fn leading_paths(text: &str) -> Vec<Vec<String>> {
     fn walk(text: &str, prefix: &[String], out: &mut Vec<Vec<String>>) {
         let text = text.trim_start();
@@ -412,7 +415,9 @@ fn leading_paths(text: &str) -> Vec<Vec<String>> {
         let end = text.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).unwrap_or(text.len());
         let (segment, rest) = text.split_at(end);
         if segment.is_empty() || segment == "self" {
-            out.push(prefix.to_vec());
+            if !prefix.is_empty() {
+                out.push(prefix.to_vec());
+            }
             return;
         }
         let mut path = prefix.to_vec();
@@ -436,6 +441,7 @@ fn leading_paths_opens_groups_under_what_leads_to_them() {
         paths("{clock::TimestampMs, store::{db::{self, MemoryStore}, error::*},\n    MemoryError};"),
         ["clock::TimestampMs", "store::db", "store::db::MemoryStore", "store::error", "MemoryError"]
     );
+    assert_eq!(paths("{\n    domain::clock::TimestampMs,\n    store::db::MemoryStore,\n};"), ["domain::clock::TimestampMs", "store::db::MemoryStore"]);
 }
 
 /// The lines of the production code of `source`, a comment line left empty

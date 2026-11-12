@@ -8,11 +8,11 @@
 
 use rusqlite::{Connection, OptionalExtension};
 
-use crate::memory::clock::TimestampMs;
-use crate::memory::contradiction::excerpt;
-use crate::memory::dispute::{settle_challengers, settle_row, REVIVE_SQL};
-use crate::memory::search::reader_predicate;
-use crate::memory::topic::Replaced;
+use crate::memory::domain::clock::TimestampMs;
+use crate::memory::revision::contradiction::excerpt;
+use crate::memory::revision::dispute::{settle_challengers, settle_row, REVIVE_SQL};
+use crate::memory::retrieval::search::reader_predicate;
+use crate::memory::revision::topic::Replaced;
 
 /// The live row a save of the same text would reinforce instead of storing
 /// it again (`REINFORCE_LOOKUP_SQL` in `store_insert.rs`): the project's, of

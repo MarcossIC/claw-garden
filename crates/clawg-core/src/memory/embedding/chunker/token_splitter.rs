@@ -294,7 +294,7 @@ pub(crate) mod tests {
     #[test]
     fn counting_together_counts_each_text_as_alone() {
         let texts = ["", "one", "two words", "  spaced   out  words here ", "caf\u{e9} \u{4e16}\u{754c} \u{1f600} done", "a longer text with several more words in it"];
-        for splitter in [TokenSplitter::with_tokenizer(crate::memory::chunker::word_tokenizer()), TokenSplitter::fallback()] {
+        for splitter in [TokenSplitter::with_tokenizer(crate::memory::embedding::chunker::word_tokenizer()), TokenSplitter::fallback()] {
             let alone: Vec<usize> = texts.iter().map(|t| splitter.count(t)).collect();
             assert_eq!(splitter.count_all(&texts), alone);
             assert_eq!(splitter.count_all(&[]), Vec::<usize>::new());

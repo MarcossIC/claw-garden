@@ -6,8 +6,8 @@
 //! never ambiguous, an inference, a conclusion or an import, and a row without
 //! a mark may be the user's.
 
-use crate::memory::events::MemorySource;
-use crate::memory::record::CreatedByType;
+use crate::memory::domain::events::MemorySource;
+use crate::memory::domain::record::CreatedByType;
 use crate::models::chat::Role;
 
 /// The name an import of Claude Code's native memory goes by: the source of
@@ -65,8 +65,8 @@ pub(crate) fn preference_mark(memory_type: &str, source: Option<&str>, created_b
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::admin::get_memory_core;
-    use crate::memory::MemoryStore;
+    use crate::memory::upkeep::admin::get_memory_core;
+    use crate::memory::store::db::MemoryStore;
 
     #[test]
     fn seal_cases() {

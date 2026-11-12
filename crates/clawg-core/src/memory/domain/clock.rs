@@ -159,7 +159,7 @@ mod tests {
 
     #[tokio::test]
     async fn to_sql_binds_without_manual_extraction() {
-        let store = crate::memory::db::MemoryStore::new_for_test().await.unwrap();
+        let store = crate::memory::store::db::MemoryStore::new_for_test().await.unwrap();
         let ts = TimestampMs::from_unix_millis(1_700_000_000_000);
         store
             .conn

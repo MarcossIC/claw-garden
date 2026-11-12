@@ -26,8 +26,8 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
 use tokio_rusqlite::Connection;
 
-use crate::memory::clock::TimestampMs;
-use crate::memory::RankedHit;
+use crate::memory::domain::clock::TimestampMs;
+use crate::memory::retrieval::search::RankedHit;
 
 /// Buffers retrieved memory IDs and forwards them to the async flush worker.
 pub struct AccessTracker {
@@ -390,8 +390,8 @@ mod tests {
 
     // ── which hits count as an access ─────────────────────────────
 
-    fn ranked(id: i64, score: f64) -> crate::memory::RankedHit {
-        crate::memory::RankedHit {
+    fn ranked(id: i64, score: f64) -> crate::memory::retrieval::search::RankedHit {
+        crate::memory::retrieval::search::RankedHit {
             id,
             content: String::new(),
             memory_type: String::new(),
@@ -447,7 +447,7 @@ mod tests {
     /// flush would quietly lose them.
     #[tokio::test]
     async fn access_tracker_flushes_its_buffer_on_shutdown() {
-        let store = crate::memory::db::MemoryStore::new_for_test().await.unwrap();
+        let store = crate::memory::store::db::MemoryStore::new_for_test().await.unwrap();
         let row_id = seed_memory_row(&store.conn, "chat_message", 3, 0, 5.0).await;
         let tracker = AccessTracker::new(store.conn.clone());
 
@@ -464,7 +464,7 @@ mod tests {
 
     #[tokio::test]
     async fn access_tracker_flushes_its_buffer_when_every_sender_is_dropped() {
-        let store = crate::memory::db::MemoryStore::new_for_test().await.unwrap();
+        let store = crate::memory::store::db::MemoryStore::new_for_test().await.unwrap();
         let row_id = seed_memory_row(&store.conn, "chat_message", 3, 0, 5.0).await;
         let tracker = AccessTracker::new(store.conn.clone());
 
@@ -478,7 +478,7 @@ mod tests {
 
     #[tokio::test]
     async fn shutting_down_twice_is_harmless() {
-        let store = crate::memory::db::MemoryStore::new_for_test().await.unwrap();
+        let store = crate::memory::store::db::MemoryStore::new_for_test().await.unwrap();
         let tracker = AccessTracker::new(store.conn.clone());
         tracker.shutdown().await;
         tracker.shutdown().await;
@@ -495,7 +495,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn timer_triggers_flush_after_30_seconds() {
-        let store = crate::memory::db::MemoryStore::new_for_test().await.unwrap();
+        let store = crate::memory::store::db::MemoryStore::new_for_test().await.unwrap();
         let row_id = seed_memory_row(&store.conn, "chat_message", 3, 0, 5.0).await;
 
         let tracker = AccessTracker::new(store.conn.clone());
@@ -531,7 +531,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn size_trigger_at_500_entries_flushes_immediately() {
-        let store = crate::memory::db::MemoryStore::new_for_test().await.unwrap();
+        let store = crate::memory::store::db::MemoryStore::new_for_test().await.unwrap();
         let row_id = seed_memory_row(&store.conn, "chat_message", 3, 0, 5.0).await;
 
         let tracker = AccessTracker::new(store.conn.clone());
@@ -562,7 +562,7 @@ mod tests {
 
     #[tokio::test]
     async fn flush_db_error_does_not_panic_worker() {
-        let store = crate::memory::db::MemoryStore::new_for_test().await.unwrap();
+        let store = crate::memory::store::db::MemoryStore::new_for_test().await.unwrap();
         let tracker = AccessTracker::new(store.conn.clone());
 
         // Corrupt the DB: drop `memory` so the flush SQL fails.
@@ -595,7 +595,7 @@ mod tests {
 
     #[tokio::test]
     async fn flush_promotes_tier_atomically_in_same_cte_statement() {
-        let store = crate::memory::db::MemoryStore::new_for_test().await.unwrap();
+        let store = crate::memory::store::db::MemoryStore::new_for_test().await.unwrap();
         let row_id =
             seed_memory_row(&store.conn, "architectural_decision", 2, 2, 7.0).await;
 
@@ -632,7 +632,7 @@ mod tests {
     #[tokio::test]
     async fn concurrent_1000_record_calls_no_stall() {
         use std::sync::Arc;
-        let store = crate::memory::db::MemoryStore::new_for_test().await.unwrap();
+        let store = crate::memory::store::db::MemoryStore::new_for_test().await.unwrap();
         let tracker = Arc::new(AccessTracker::new(store.conn.clone()));
 
         let handles: Vec<_> = (0i64..1_000)
@@ -656,7 +656,7 @@ mod tests {
 
     #[tokio::test]
     async fn flush_500_distinct_ids_respects_variable_limit() {
-        let store = crate::memory::db::MemoryStore::new_for_test().await.unwrap();
+        let store = crate::memory::store::db::MemoryStore::new_for_test().await.unwrap();
         let ids = seed_n_rows(&store.conn, 500).await;
         assert_eq!(ids.len(), 500);
 

@@ -2,7 +2,7 @@
 //! `score()` combining cosine similarity, tier-floor-bounded recency decay,
 //! an importance multiplier, and a live-status gate into one ranking value.
 
-use crate::memory::clock::TimestampMs;
+use crate::memory::domain::clock::TimestampMs;
 
 // ---------------------------------------------------------------------------
 // Config

@@ -5,12 +5,12 @@
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
-use crate::memory::error::{ClosedAs, failed_call};
-use crate::memory::clock::TimestampMs;
-use crate::memory::prompt_builder::indent_continuations;
-use crate::memory::search::{reach_predicate, reader_bind};
-use crate::memory::sharing::{Reach, Reader};
-use crate::memory::{MemoryError, MemoryStore};
+use crate::memory::store::error::{ClosedAs, failed_call};
+use crate::memory::domain::clock::TimestampMs;
+use crate::memory::retrieval::prompt_builder::indent_continuations;
+use crate::memory::retrieval::search::{reach_predicate, reader_bind};
+use crate::memory::domain::sharing::{Reach, Reader};
+use crate::memory::{store::error::MemoryError, store::db::MemoryStore};
 
 pub(crate) const DEFAULT_PROJECT_SEGMENT: &str = "default";
 pub(crate) const AUTO_START: &str = "<!-- AUTO-START -->";
@@ -792,7 +792,7 @@ fn is_windows_device_name(name: &str) -> bool {
 mod tests {
     use super::*;
     use std::collections::HashSet;
-    use crate::memory::db::MemoryStore;
+    use crate::memory::store::db::MemoryStore;
 
     #[test]
     fn the_sections_holding_a_text_are_told_apart() {

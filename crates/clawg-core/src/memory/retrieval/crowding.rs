@@ -16,15 +16,15 @@ use std::collections::HashMap;
 
 use rusqlite::params;
 
-use crate::memory::clock::TimestampMs;
-use crate::memory::contradiction::{detect_contradiction, CONTRADICTION_THRESHOLD, NEAR_DUPLICATE_FLOOR};
-use crate::memory::score::ScoringConfig;
-use crate::memory::search::{memory_project_predicate, project_bind, reach_predicate, reader_bind, search_all_memories, SearchScope};
-use crate::memory::sharing::{Reach, Reader};
-use crate::memory::record::MemoryType;
-use crate::memory::store_lock::StoreHolder;
-use crate::memory::vector::{to_unit, EMBEDDING_DIM};
-use crate::memory::MemoryStore;
+use crate::memory::domain::clock::TimestampMs;
+use crate::memory::revision::contradiction::{detect_contradiction, CONTRADICTION_THRESHOLD, NEAR_DUPLICATE_FLOOR};
+use crate::memory::retrieval::score::ScoringConfig;
+use crate::memory::retrieval::search::{memory_project_predicate, project_bind, reach_predicate, reader_bind, search_all_memories, SearchScope};
+use crate::memory::domain::sharing::{Reach, Reader};
+use crate::memory::domain::record::MemoryType;
+use crate::memory::store::store_lock::StoreHolder;
+use crate::memory::domain::vector::{to_unit, EMBEDDING_DIM};
+use crate::memory::store::db::MemoryStore;
 use crate::metrics::SeriesKey;
 use crate::test_dir::{test_dir, TestDir};
 

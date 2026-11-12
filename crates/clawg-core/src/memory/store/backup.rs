@@ -2,8 +2,8 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::memory::store_lock::{StoreHolder, StoreLock};
-use crate::memory::{MemoryError, StorageError};
+use crate::memory::store::store_lock::{StoreHolder, StoreLock};
+use crate::memory::{store::error::MemoryError, store::error::StorageError};
 
 /// One migration as the schema plan compares it: applied to a database
 /// (`refinery_schema_history`) or embedded in this binary.
@@ -41,7 +41,7 @@ pub(crate) fn read_history(c: &rusqlite::Connection) -> rusqlite::Result<Vec<Mig
 /// The migrations embedded in this binary; a `testing` build stamped with a
 /// cap knows only up to it.
 pub fn known_migrations() -> Vec<MigrationId> {
-    let all = crate::memory::migrations::runner()
+    let all = crate::memory::store::migrations::runner()
         .get_migrations()
         .iter()
         .map(|m| MigrationId {
@@ -522,7 +522,7 @@ pub(crate) fn check_restorable(path: &Path) -> Result<SchemaPlan, BackupError> {
             wal.display()
         )));
     }
-    crate::memory::db::ensure_vec0_registered();
+    crate::memory::store::db::ensure_vec0_registered();
     let c = rusqlite::Connection::open_with_flags(
         path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -623,7 +623,7 @@ pub(crate) fn open_existing(base_dir: &Path) -> Result<rusqlite::Connection, Mem
     if !path.exists() {
         return Err(BackupError::NoStore { path }.into());
     }
-    crate::memory::db::ensure_vec0_registered();
+    crate::memory::store::db::ensure_vec0_registered();
     Ok(rusqlite::Connection::open_with_flags(
         &path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -633,8 +633,8 @@ pub(crate) fn open_existing(base_dir: &Path) -> Result<rusqlite::Connection, Mem
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::db::seed_on_disk;
-    use crate::memory::MemoryStore;
+    use crate::memory::store::db::seed_on_disk;
+    use crate::memory::store::db::MemoryStore;
 
     const INSERT_ROW: &str = "INSERT INTO memory \
         (scope, agent_id, content, memory_type, source, \

@@ -8,13 +8,13 @@
 
 use std::collections::HashMap;
 
-use crate::memory::error::{ClosedAs, failed_call};
-use crate::memory::listing::get_memory_core;
-use crate::memory::chunker::token_splitter::MIN_OVERLAP_CHARS;
-use crate::memory::error::MemoryError;
-use crate::memory::search::PiecePosition;
-use crate::memory::sharing::Reader;
-use crate::memory::MemoryStore;
+use crate::memory::store::error::{ClosedAs, failed_call};
+use crate::memory::retrieval::listing::get_memory_core;
+use crate::memory::embedding::chunker::token_splitter::MIN_OVERLAP_CHARS;
+use crate::memory::store::error::MemoryError;
+use crate::memory::retrieval::search::PiecePosition;
+use crate::memory::domain::sharing::Reader;
+use crate::memory::store::db::MemoryStore;
 
 /// One piece the worker stored: the row that holds it and the head its
 /// vector was embedded behind, empty when it was not embedded with one.
@@ -275,7 +275,7 @@ fn existing_save(c: &rusqlite::Connection, pieces: &[StoredPiece]) -> rusqlite::
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::sharing::Reach;
+    use crate::memory::domain::sharing::Reach;
 
     /// `agent` as a policy that hides nothing lets it read.
     fn shared(agent: &str) -> Reader {
@@ -349,7 +349,7 @@ mod tests {
     #[test]
     fn the_pieces_of_a_split_save_join_back_into_its_text() {
         let text: String = (0..900).map(|i| format!("word{i} ")).collect();
-        let split = crate::memory::chunker::ChatChunker::with_fallback().split_save(&text);
+        let split = crate::memory::embedding::chunker::ChatChunker::with_fallback().split_save(&text);
         assert!(split.pieces.len() > 2, "the fixture is a long save");
         let pieces: Vec<&str> = split.pieces.iter().map(|c| c.text.as_str()).collect();
         assert_eq!(join_pieces(&pieces), text);
@@ -357,9 +357,9 @@ mod tests {
 
     #[test]
     fn the_pieces_of_a_subword_split_save_join_back_into_its_text() {
-        use crate::memory::chunker::token_splitter::tests::{subword_tokenizer, subword_words};
+        use crate::memory::embedding::chunker::token_splitter::tests::{subword_tokenizer, subword_words};
         let text = subword_words(480).join(" ");
-        let split = crate::memory::chunker::ChatChunker::with_tokenizer(subword_tokenizer()).split_save(&text);
+        let split = crate::memory::embedding::chunker::ChatChunker::with_tokenizer(subword_tokenizer()).split_save(&text);
         assert!(split.pieces.len() > 10, "the fixture is a long save");
         let pieces: Vec<&str> = split.pieces.iter().map(|c| c.text.as_str()).collect();
         assert_eq!(join_pieces(&pieces), text, "no line break where the text has none");
@@ -518,10 +518,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_save_split_at_the_old_cap_is_still_found_and_read() {
-        use crate::memory::search::{search_all_memories, SearchScope};
+        use crate::memory::retrieval::search::{search_all_memories, SearchScope};
 
         let store = MemoryStore::new_for_test().await.unwrap();
-        let chunker = crate::memory::chunker::ChatChunker::with_fallback();
+        let chunker = crate::memory::embedding::chunker::ChatChunker::with_fallback();
         let old_text: String = (0..500).map(|i| format!("old{i} ")).collect();
         // Cut the way the previous version cut a long save: 424 tokens with
         // the 64 of a chunk.
@@ -551,14 +551,14 @@ mod tests {
     struct Recorder(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
 
     #[async_trait::async_trait]
-    impl crate::memory::embedder::Embedder for Recorder {
+    impl crate::memory::embedding::embedder::Embedder for Recorder {
         async fn embed_with_role(
             &self,
             text: &str,
-            role: crate::memory::embedder::EmbedRole,
-        ) -> Result<Vec<f32>, crate::memory::embedder::EmbedError> {
+            role: crate::memory::embedding::embedder::EmbedRole,
+        ) -> Result<Vec<f32>, crate::memory::embedding::embedder::EmbedError> {
             self.0.lock().unwrap().push(text.to_string());
-            crate::memory::embedder::FakeEmbedder::default().embed_with_role(text, role).await
+            crate::memory::embedding::embedder::FakeEmbedder::default().embed_with_role(text, role).await
         }
         fn dimensions(&self) -> usize { 384 }
         fn model_id(&self) -> &str { "recorder" }
@@ -585,9 +585,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_save_cut_inside_words_before_is_still_found_read_and_reembedded() {
-        use crate::memory::chunker::embedding_text;
-        use crate::memory::chunker::token_splitter::tests::{is_word_boundary, piece_ranges, subword_tokenizer, subword_words};
-        use crate::memory::search::{search_all_memories, SearchScope};
+        use crate::memory::embedding::chunker::embedding_text;
+        use crate::memory::embedding::chunker::token_splitter::tests::{is_word_boundary, piece_ranges, subword_tokenizer, subword_words};
+        use crate::memory::retrieval::search::{search_all_memories, SearchScope};
 
         let store = MemoryStore::new_for_test().await.unwrap();
         let tok = subword_tokenizer();
@@ -601,7 +601,7 @@ mod tests {
         );
         assert!(!is_word_boundary(&old_text, old_head.len()), "the old head ends inside a word");
         let new_text = words[340..].join(" ");
-        let new_split = crate::memory::chunker::ChatChunker::with_tokenizer(tok).split_save(&new_text);
+        let new_split = crate::memory::embedding::chunker::ChatChunker::with_tokenizer(tok).split_save(&new_text);
         let new_pieces: Vec<String> = new_split.pieces.into_iter().map(|c| c.text).collect();
         let new_head = new_split.head.expect("a long save has a head");
         assert_eq!((old_pieces.len(), new_pieces.len()), (12, 12), "two saves of 12 pieces");
@@ -620,8 +620,8 @@ mod tests {
         }
 
         let texts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let plan = crate::memory::maintenance::ReInferPlan::new(std::sync::Arc::new(Recorder(texts.clone())));
-        crate::memory::maintenance::reembed_all(&store, crate::memory::maintenance::ReembedMode::ReInfer(plan)).await;
+        let plan = crate::memory::upkeep::maintenance::ReInferPlan::new(std::sync::Arc::new(Recorder(texts.clone())));
+        crate::memory::upkeep::maintenance::reembed_all(&store, crate::memory::upkeep::maintenance::ReembedMode::ReInfer(plan)).await;
         let mut embedded = texts.lock().unwrap().clone();
         let mut expected: Vec<String> = [(&old_pieces, &old_head), (&new_pieces, &new_head)]
             .into_iter()
@@ -640,9 +640,9 @@ mod tests {
     /// own text.
     #[tokio::test]
     async fn rows_from_v10_survive_the_piece_table() {
-        use crate::memory::embedder::{EmbedRole, Embedder, FakeEmbedder};
+        use crate::memory::embedding::embedder::{EmbedRole, Embedder, FakeEmbedder};
         let dir = crate::test_dir::test_dir();
-        crate::memory::db::seed_on_disk(dir.path(), Some(10)).await;
+        crate::memory::store::db::seed_on_disk(dir.path(), Some(10)).await;
         let pieces = [
             "Notes on clawg-ledger, the crate that settles balances, first part",
             "a second part that never names the crate it belongs to",
@@ -673,19 +673,19 @@ mod tests {
             }
         }
 
-        let store = MemoryStore::open(dir.path(), crate::memory::store_lock::StoreHolder::Eval).await.unwrap();
+        let store = MemoryStore::open(dir.path(), crate::memory::store::store_lock::StoreHolder::Eval).await.unwrap();
 
         assert_eq!(std::fs::read_dir(dir.path().join("backups")).unwrap().count(), 1, "a pre-migration snapshot");
         assert!(links(&store).await.is_empty(), "no row is linked by the migration");
-        let listed = crate::memory::admin::list_memories_core(&store, Default::default()).await.unwrap();
+        let listed = crate::memory::upkeep::admin::list_memories_core(&store, Default::default()).await.unwrap();
         assert_eq!(listed.len(), 4, "the seeded rows are all listed");
         let query = fake.embed_with_role(pieces[1], EmbedRole::Query).await.unwrap();
-        let hits = crate::memory::search_all_memories(
+        let hits = crate::memory::retrieval::search::search_all_memories(
             &store,
             &query,
             Some(pieces[1]),
             "agent-seed",
-            crate::memory::SearchScope::all_default(),
+            crate::memory::retrieval::search::SearchScope::all_default(),
             10,
         )
         .await
@@ -697,8 +697,8 @@ mod tests {
         assert_eq!((save.pieces, save.text.as_str()), (1, pieces[1]), "an unlinked row reads as a save of one piece");
 
         let texts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let plan = crate::memory::maintenance::ReInferPlan::new(std::sync::Arc::new(Recorder(texts.clone())));
-        crate::memory::maintenance::reembed_all(&store, crate::memory::maintenance::ReembedMode::ReInfer(plan)).await;
+        let plan = crate::memory::upkeep::maintenance::ReInferPlan::new(std::sync::Arc::new(Recorder(texts.clone())));
+        crate::memory::upkeep::maintenance::reembed_all(&store, crate::memory::upkeep::maintenance::ReembedMode::ReInfer(plan)).await;
         let texts = texts.lock().unwrap();
         for p in pieces {
             assert!(texts.iter().any(|t| t == p), "{p} is re-embedded from its own text");

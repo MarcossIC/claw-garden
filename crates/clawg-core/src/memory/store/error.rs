@@ -1,4 +1,4 @@
-use crate::memory::store_lock::StoreOwner;
+use crate::memory::store::store_lock::StoreOwner;
 
 /// A failure of the store's backend, shown as the backend gave it: the error
 /// that wraps it puts the heading.
@@ -154,7 +154,7 @@ pub enum MemoryError {
 
     /// A snapshot of the store could not be written.
     #[error(transparent)]
-    Backup(#[from] crate::memory::backup::BackupError),
+    Backup(#[from] crate::memory::store::backup::BackupError),
 
     /// A purge was refused, or could not finish.
     #[error(transparent)]
@@ -218,8 +218,8 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    async fn closed_store() -> crate::memory::MemoryStore {
-        let store = crate::memory::MemoryStore::new_for_test().await.unwrap();
+    async fn closed_store() -> crate::memory::store::db::MemoryStore {
+        let store = crate::memory::store::db::MemoryStore::new_for_test().await.unwrap();
         store.conn.clone().close().await.unwrap();
         store
     }
@@ -227,7 +227,7 @@ mod tests {
     #[tokio::test]
     async fn each_storage_failure_keeps_its_text() {
         use crate::preferences::Lang;
-        use crate::memory::sharing::{Reach, Reader};
+        use crate::memory::domain::sharing::{Reach, Reader};
 
         let sqlite = MemoryError::from(rusqlite::Error::InvalidQuery);
         assert_eq!(sqlite.to_string(), "SQLite error: Query is not read-only");
@@ -236,14 +236,14 @@ mod tests {
         let probe = store.probe_wait().await.unwrap_err();
         assert_eq!(probe.to_string(), "Memory DB connection error: ConnectionClosed");
 
-        let during = crate::memory::admin::get_memory_core(&store, 1).await.unwrap_err();
+        let during = crate::memory::upkeep::admin::get_memory_core(&store, 1).await.unwrap_err();
         assert_eq!(during.to_string(), "memory backend channel error: connection closed during get_memory_core");
 
         let reader = Reader::new("agent", Reach::Own);
-        let named = crate::memory::language::count_saves_in(&store, Lang::Es, None, &reader).await.unwrap_err();
+        let named = crate::memory::retrieval::language::count_saves_in(&store, Lang::Es, None, &reader).await.unwrap_err();
         assert_eq!(named.to_string(), "memory backend channel error: language count: ConnectionClosed");
 
-        let as_is = crate::memory::registry::rename_project(&store, "p", "name").await.unwrap_err();
+        let as_is = crate::memory::projects::registry::rename_project(&store, "p", "name").await.unwrap_err();
         assert_eq!(as_is.to_string(), "memory backend channel error: ConnectionClosed");
     }
 
@@ -273,7 +273,7 @@ mod tests {
 
     #[test]
     fn store_in_use_names_the_holder_and_its_pid() {
-        use crate::memory::store_lock::{StoreHolder, StoreOwner};
+        use crate::memory::store::store_lock::{StoreHolder, StoreOwner};
         let e = MemoryError::StoreInUse {
             owner: Some(StoreOwner { holder: StoreHolder::Eval, pid: 4242, started_at_ms: 1 }),
         };

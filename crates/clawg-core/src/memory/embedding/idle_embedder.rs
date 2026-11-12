@@ -20,7 +20,7 @@ use async_trait::async_trait;
 use futures::future::BoxFuture;
 use tokio::time::Instant;
 
-use crate::memory::embedder::{EmbedError, EmbedRole, Embedder};
+use crate::memory::embedding::embedder::{EmbedError, EmbedRole, Embedder};
 use crate::metrics::{mib, EventKind, MemoryProbes, Recorder};
 
 /// Loads the model again: the same files and the same load the bootstrap used.
@@ -403,7 +403,7 @@ impl Embedder for IdleEmbedder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::embedder::FakeEmbedder;
+    use crate::memory::embedding::embedder::FakeEmbedder;
     use std::sync::atomic::AtomicUsize;
 
     const IDLE: Duration = Duration::from_secs(600);

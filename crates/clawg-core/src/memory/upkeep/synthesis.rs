@@ -14,12 +14,12 @@
 
 use serde::Serialize;
 
-use crate::memory::error::{ClosedAs, failed_call};
-use crate::memory::listing::{map_memory_row, MemoryAdminRow, SELECT_MEMORY};
-use crate::memory::clock::TimestampMs;
-use crate::memory::search::{reach_predicate, reader_bind, reader_predicate};
-use crate::memory::sharing::Reader;
-use crate::memory::{MemoryError, MemoryStore};
+use crate::memory::store::error::{ClosedAs, failed_call};
+use crate::memory::retrieval::listing::{map_memory_row, MemoryAdminRow, SELECT_MEMORY};
+use crate::memory::domain::clock::TimestampMs;
+use crate::memory::retrieval::search::{reach_predicate, reader_bind, reader_predicate};
+use crate::memory::domain::sharing::Reader;
+use crate::memory::{store::error::MemoryError, store::db::MemoryStore};
 
 /// Pending memories returned when the caller does not say how many.
 pub(crate) const DEFAULT_PENDING_LIMIT: u32 = 30;
@@ -406,12 +406,12 @@ pub async fn existing_memory_ids(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::sharing::Reach;
+    use crate::memory::domain::sharing::Reach;
 
     fn shared(agent: &str) -> Reader {
         Reader::new(agent, Reach::AllBut(Vec::new()))
     }
-    use crate::memory::admin::delete_memory_core;
+    use crate::memory::upkeep::admin::delete_memory_core;
 
     async fn seed(store: &MemoryStore, project: Option<&str>, content: &str, created_at: i64) -> i64 {
         seed_as(store, "a", project, content, created_at).await
@@ -505,8 +505,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_restored_conclusion_covers_its_sources_again() {
-        use crate::memory::admin::restore_memory_core;
-        use crate::memory::embedder::FakeEmbedder;
+        use crate::memory::upkeep::admin::restore_memory_core;
+        use crate::memory::embedding::embedder::FakeEmbedder;
         let store = MemoryStore::new_for_test().await.unwrap();
         let a = seed(&store, Some("p"), "tabs in go", 1).await;
         let b = seed(&store, Some("p"), "tabs in rust", 2).await;
@@ -755,8 +755,8 @@ mod tests {
 
     #[tokio::test]
     async fn restoring_the_source_takes_the_conclusion_off_the_list() {
-        use crate::memory::admin::restore_memory_core;
-        use crate::memory::embedder::FakeEmbedder;
+        use crate::memory::upkeep::admin::restore_memory_core;
+        use crate::memory::embedding::embedder::FakeEmbedder;
         let store = MemoryStore::new_for_test().await.unwrap();
         let a = seed(&store, Some("p"), "tabs in go", 1).await;
         conclude(&store, Some("p"), &[a], 2).await;
@@ -785,7 +785,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_purged_source_leaves_the_conclusion_to_review() {
-        use crate::memory::store_lock::StoreHolder;
+        use crate::memory::store::store_lock::StoreHolder;
         let dir = crate::test_dir::test_dir();
         let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
         let a = seed(&store, Some("p"), "tabs in go", 1).await;
@@ -793,7 +793,7 @@ mod tests {
         store.conn.clone().close().await.unwrap();
         drop(store);
 
-        crate::memory::secrets::purge(dir.path(), a).unwrap();
+        crate::memory::upkeep::secrets::purge(dir.path(), a).unwrap();
         let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
         let found = synthesis_core(&store, in_project("p"), TimestampMs::from_unix_millis(10)).await.unwrap();
 
@@ -827,14 +827,14 @@ mod tests {
 
     #[tokio::test]
     async fn a_purged_source_counts_until_the_first_review() {
-        use crate::memory::store_lock::StoreHolder;
+        use crate::memory::store::store_lock::StoreHolder;
         let dir = crate::test_dir::test_dir();
         let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
         let a = seed(&store, Some("p"), "tabs in go", 1).await;
         conclude(&store, Some("p"), &[a], 2).await;
         store.conn.clone().close().await.unwrap();
         drop(store);
-        crate::memory::secrets::purge(dir.path(), a).unwrap();
+        crate::memory::upkeep::secrets::purge(dir.path(), a).unwrap();
         let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
 
         assert_eq!(conclusions_to_review_count(&store, None, Some("p")).await.unwrap(), 1);

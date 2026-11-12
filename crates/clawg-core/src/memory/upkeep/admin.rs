@@ -6,22 +6,22 @@
 
 use serde::Serialize;
 
-use crate::memory::error::{ClosedAs, failed_call};
-use crate::memory::clock::TimestampMs;
-use crate::memory::chunker::embedding_text;
-use crate::memory::contradiction::{detect_contradiction, excerpt, Candidate};
-use crate::memory::dispute::{add_dispute_in, release_challengers, settle_challengers, settle_row, SUPERSEDE_SQL};
-use crate::memory::relocate::{apply_one_in, plan_one_in, MoveError, MoveReport};
-use crate::memory::revival::{revive_after_delete, revive_after_delete_of_piece, RESTORE_TEXT_INDEX, RESTORE_TOPIC_HOLDER, RESTORE_TWIN};
-use crate::memory::embedder::{EmbedError, EmbedRole, Embedder};
-use crate::memory::search::{reader_bind, reader_predicate};
-use crate::memory::sharing::{Reach, Reader};
-use crate::memory::record::{MemoryType, UnknownMemoryType};
-use crate::memory::tier::retier;
-use crate::memory::topic::Replaced;
-use crate::memory::{MemoryError, MemoryStore};
+use crate::memory::store::error::{ClosedAs, failed_call};
+use crate::memory::domain::clock::TimestampMs;
+use crate::memory::embedding::chunker::embedding_text;
+use crate::memory::revision::contradiction::{detect_contradiction, excerpt, Candidate};
+use crate::memory::revision::dispute::{add_dispute_in, release_challengers, settle_challengers, settle_row, SUPERSEDE_SQL};
+use crate::memory::projects::relocate::{apply_one_in, plan_one_in, MoveError, MoveReport};
+use crate::memory::revision::revival::{revive_after_delete, revive_after_delete_of_piece, RESTORE_TEXT_INDEX, RESTORE_TOPIC_HOLDER, RESTORE_TWIN};
+use crate::memory::embedding::embedder::{EmbedError, EmbedRole, Embedder};
+use crate::memory::retrieval::search::{reader_bind, reader_predicate};
+use crate::memory::domain::sharing::{Reach, Reader};
+use crate::memory::domain::record::{MemoryType, UnknownMemoryType};
+use crate::memory::store::tier::retier;
+use crate::memory::revision::topic::Replaced;
+use crate::memory::{store::error::MemoryError, store::db::MemoryStore};
 
-pub use crate::memory::listing::{
+pub use crate::memory::retrieval::listing::{
     get_memory_core, list_memories_core, memory_stats_core, query_has_tokens, Count, ListParams, MemoryAdminRow, MemoryStats, StatsParams, StatsTotals,
 };
 
@@ -498,7 +498,7 @@ pub async fn restore_memory_core(
         return Err(RestoreError::NotFound(id));
     };
 
-    let kinds: Vec<&'static str> = crate::memory::redact::redact(&content).kinds.iter().map(|k| k.as_str()).collect();
+    let kinds: Vec<&'static str> = crate::memory::domain::redact::redact(&content).kinds.iter().map(|k| k.as_str()).collect();
     if !kinds.is_empty() {
         return Err(RestoreError::HoldsSecret { id, kinds });
     }
@@ -508,7 +508,7 @@ pub async fn restore_memory_core(
         .embed_with_role(&text, EmbedRole::Passage)
         .await
         .map_err(|e| RestoreError::Embed(id, e))?;
-    let unit = crate::memory::vector::to_unit(&vector)
+    let unit = crate::memory::domain::vector::to_unit(&vector)
         .map_err(|e| RestoreError::Embed(id, EmbedError::InferenceFailed(e.to_string())))?;
     let bytes: Vec<u8> = unit.iter().flat_map(|f| f.to_le_bytes()).collect();
     let candidates = restore_candidates(store, id, &unit, &content, reader, project_id, &memory_type).await?;
@@ -584,7 +584,7 @@ pub async fn restore_memory_core(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::sharing::Reach;
+    use crate::memory::domain::sharing::Reach;
 
     /// `agent` as a policy that hides nothing lets it act.
     fn shared(agent: &str) -> Reader {
@@ -1129,14 +1129,14 @@ mod tests {
     // Deleted row is invisible in search_all_memories end-to-end.
     #[tokio::test]
     async fn delete_memory_row_invisible_in_search_end_to_end() {
-        use crate::memory::embedder::{Embedder, FakeEmbedder};
-        use crate::memory::search::{search_all_memories, SearchScope};
+        use crate::memory::embedding::embedder::{Embedder, FakeEmbedder};
+        use crate::memory::retrieval::search::{search_all_memories, SearchScope};
 
         let store = MemoryStore::new_for_test().await.unwrap();
         let embedder = FakeEmbedder::default();
         let content = "content for delete-then-search test";
         let emb = embedder
-            .embed_with_role(content, crate::memory::embedder::EmbedRole::Passage)
+            .embed_with_role(content, crate::memory::embedding::embedder::EmbedRole::Passage)
             .await
             .unwrap();
         let emb_bytes: Vec<u8> = emb.iter().flat_map(|f| f.to_le_bytes()).collect();
@@ -1280,7 +1280,7 @@ mod tests {
 
     // ── restore_memory_core ──────────────────────────────────────────────────
 
-    use crate::memory::embedder::{EmbedError, EmbedRole, Embedder, FakeEmbedder};
+    use crate::memory::embedding::embedder::{EmbedError, EmbedRole, Embedder, FakeEmbedder};
 
     struct BrokenEmbedder;
 
@@ -1309,9 +1309,9 @@ mod tests {
 
     /// A live row as a save leaves it: hash, vector and text index entry.
     async fn save(store: &MemoryStore, agent: &str, content: &str) -> i64 {
-        let unit = crate::memory::vector::to_unit(&passage(content).await).unwrap();
+        let unit = crate::memory::domain::vector::to_unit(&passage(content).await).unwrap();
         let bytes: Vec<u8> = unit.iter().flat_map(|f| f.to_le_bytes()).collect();
-        let hash = crate::memory::dedup::content_hash(content);
+        let hash = crate::memory::store::dedup::content_hash(content);
         let (agent, content) = (agent.to_owned(), content.to_owned());
         store
             .conn
@@ -1419,7 +1419,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_restored_row_is_found_again() {
-        use crate::memory::search::{search_all_memories, SearchScope};
+        use crate::memory::retrieval::search::{search_all_memories, SearchScope};
         let store = MemoryStore::new_for_test().await.unwrap();
         let content = "the build cache lives on the zircon volume";
         let id = save(&store, "a", content).await;
@@ -1585,7 +1585,7 @@ mod tests {
         let id = save(&store, "a", content).await;
         // Marked by hand, as the delete of an older version did: the vector
         // stays, and it is one an earlier model wrote.
-        let earlier_model: Vec<u8> = crate::memory::vector::to_unit(&[0.3; 384])
+        let earlier_model: Vec<u8> = crate::memory::domain::vector::to_unit(&[0.3; 384])
             .unwrap()
             .iter()
             .flat_map(|f| f.to_le_bytes())
@@ -1601,7 +1601,7 @@ mod tests {
 
         restore(&store, id, None).await.unwrap();
 
-        let expected = crate::memory::vector::to_unit(&passage(content).await).unwrap();
+        let expected = crate::memory::domain::vector::to_unit(&passage(content).await).unwrap();
         assert_eq!(stored_vector(&store, id).await, Some(expected), "embedded by the current model, never kept");
     }
 
@@ -1694,7 +1694,7 @@ mod tests {
     }
 
     async fn link_save(store: &MemoryStore, pieces: Vec<(i64, &str)>) {
-        use crate::memory::pieces::StoredPiece;
+        use crate::memory::retrieval::pieces::StoredPiece;
         let pieces = pieces
             .into_iter()
             .map(|(memory_id, context)| StoredPiece { memory_id, context: context.to_owned() })
@@ -1710,15 +1710,15 @@ mod tests {
         let third = save(&store, "a", "the third piece of a long save").await;
         link_save(&store, vec![(first, ""), (second, "Notes on clawg-ledger."), (third, "Notes on clawg-ledger.")]).await;
         delete(&store, second).await;
-        let gap = crate::memory::read_save_core(&store, first, None).await.unwrap().unwrap();
+        let gap = crate::memory::retrieval::pieces::read_save_core(&store, first, None).await.unwrap().unwrap();
         assert_eq!(gap.missing, vec![2]);
 
         restore(&store, second, Some(&shared("a"))).await.unwrap();
 
-        let behind = crate::memory::chunker::embedding_text("Notes on clawg-ledger.", "the second piece of a long save");
-        let expected = crate::memory::vector::to_unit(&passage(&behind).await).unwrap();
+        let behind = crate::memory::embedding::chunker::embedding_text("Notes on clawg-ledger.", "the second piece of a long save");
+        let expected = crate::memory::domain::vector::to_unit(&passage(&behind).await).unwrap();
         assert_eq!(stored_vector(&store, second).await, Some(expected));
-        let whole = crate::memory::read_save_core(&store, first, None).await.unwrap().unwrap();
+        let whole = crate::memory::retrieval::pieces::read_save_core(&store, first, None).await.unwrap().unwrap();
         assert!(whole.missing.is_empty(), "{whole:?}");
         assert_eq!(whole.ids, vec![Some(first), Some(second), Some(third)]);
     }
@@ -1837,7 +1837,7 @@ mod tests {
 
     #[tokio::test]
     async fn deleting_the_current_revision_revives_the_one_it_replaced() {
-        use crate::memory::search::{search_all_memories, SearchScope};
+        use crate::memory::retrieval::search::{search_all_memories, SearchScope};
         let store = MemoryStore::new_for_test().await.unwrap();
         let content = "Storage engine is SQLite\nchosen for the basalt file";
         let v1 = keyed(&store, "a", content, "storage/engine").await;
@@ -2126,7 +2126,7 @@ mod tests {
     /// created at `created_at`.
     async fn save_placed(store: &MemoryStore, content: &str, memory_type: &str, vector: Vec<f32>, created_at: i64) -> i64 {
         let bytes: Vec<u8> = vector.iter().flat_map(|f| f.to_le_bytes()).collect();
-        let hash = crate::memory::dedup::content_hash(content);
+        let hash = crate::memory::store::dedup::content_hash(content);
         let (content, memory_type) = (content.to_owned(), memory_type.to_owned());
         store
             .conn
@@ -2240,7 +2240,7 @@ mod tests {
     /// code shapes it.
     async fn seed_deleted_by_previous_version(store: &MemoryStore, content: &str, vector: &[f32]) -> i64 {
         let bytes: Vec<u8> = vector.iter().flat_map(|f| f.to_le_bytes()).collect();
-        let hash = crate::memory::dedup::content_hash(content);
+        let hash = crate::memory::store::dedup::content_hash(content);
         let content = content.to_owned();
         store
             .conn
@@ -2265,14 +2265,14 @@ mod tests {
 
     #[tokio::test]
     async fn rows_deleted_by_the_previous_version_can_be_restored() {
-        use crate::memory::search::{search_all_memories, SearchScope};
+        use crate::memory::retrieval::search::{search_all_memories, SearchScope};
         let store = MemoryStore::new_for_test().await.unwrap();
         let alone = "the release notes live in the obsidian vault";
         let head = "Notes on clawg-ledger. The first piece";
         let piece = "the second piece mentions the quartz bucket";
         let alone_id = seed_deleted_by_previous_version(&store, alone, &passage(alone).await).await;
         let head_id = save(&store, "a", head).await;
-        let behind = crate::memory::chunker::embedding_text("Notes on clawg-ledger.", piece).into_owned();
+        let behind = crate::memory::embedding::chunker::embedding_text("Notes on clawg-ledger.", piece).into_owned();
         let piece_id = seed_deleted_by_previous_version(&store, piece, &passage(&behind).await).await;
         link_save(&store, vec![(head_id, ""), (piece_id, "Notes on clawg-ledger.")]).await;
         assert!(text_matches(&store, "obsidian").await.is_empty());

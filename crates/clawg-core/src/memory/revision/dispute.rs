@@ -16,14 +16,14 @@
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
-use crate::memory::error::{ClosedAs, failed_call};
-use crate::memory::clock::TimestampMs;
-use crate::memory::provenance::mark;
-use crate::memory::redact::redact;
-use crate::memory::search::{memory_project_predicate, project_bind, reader_bind, reader_predicate};
-use crate::memory::sharing::Reader;
-use crate::memory::record::MemoryType;
-use crate::memory::{MemoryError, MemoryStore};
+use crate::memory::store::error::{ClosedAs, failed_call};
+use crate::memory::domain::clock::TimestampMs;
+use crate::memory::domain::provenance::mark;
+use crate::memory::domain::redact::redact;
+use crate::memory::retrieval::search::{memory_project_predicate, project_bind, reader_bind, reader_predicate};
+use crate::memory::domain::sharing::Reader;
+use crate::memory::domain::record::MemoryType;
+use crate::memory::{store::error::MemoryError, store::db::MemoryStore};
 
 /// How a dispute between two rows is closed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -570,14 +570,14 @@ pub async fn open_pairs(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::sharing::Reach;
-    use crate::memory::admin::{list_memories_core, ListParams};
-    use crate::memory::pieces::StoredPiece;
+    use crate::memory::domain::sharing::Reach;
+    use crate::memory::upkeep::admin::{list_memories_core, ListParams};
+    use crate::memory::retrieval::pieces::StoredPiece;
 
     fn reader(agent: &str) -> Reader {
         Reader::new(agent, Reach::AllBut(Vec::new()))
     }
-    use crate::memory::search::{search_all_memories, SearchScope};
+    use crate::memory::retrieval::search::{search_all_memories, SearchScope};
 
     fn pair_row(id: i64, status: &str, superseded_by: Option<i64>, disputes: &[i64]) -> PairRow {
         PairRow { id, status: status.into(), superseded_by, disputes: disputes.to_vec(), memory_type: "semantic_fact".into() }
@@ -633,7 +633,7 @@ mod tests {
     // ── against the store ───────────────────────────────────────────────────
 
     fn basis(i: usize) -> Vec<f32> {
-        let mut v = vec![0.0_f32; crate::memory::vector::EMBEDDING_DIM];
+        let mut v = vec![0.0_f32; crate::memory::domain::vector::EMBEDDING_DIM];
         v[i] = 1.0;
         v
     }

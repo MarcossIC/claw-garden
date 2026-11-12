@@ -2,7 +2,7 @@
 //! `search.rs` and `prompt_builder.rs` log what these return, so the side
 //! effect stays at the call site.
 
-use crate::memory::search::RankedHit;
+use crate::memory::retrieval::search::RankedHit;
 
 /// Counts hits by tier and renders `"t1:{n1},t2:{n2},t3:{n3}"`.
 ///
@@ -65,7 +65,7 @@ pub(crate) fn format_channel_attribution(dense: usize, lexical_only: usize) -> S
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::clock::TimestampMs;
+    use crate::memory::domain::clock::TimestampMs;
 
     // ── format_tier_distribution ─────────────────────────
 

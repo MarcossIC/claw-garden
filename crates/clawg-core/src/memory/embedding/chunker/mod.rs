@@ -86,8 +86,8 @@ const _: () = assert!(CHUNK_OVERLAP_TOKENS < CHUNK_MAX_TOKENS);
 // this assert immediately, instead of surfacing later as a quietly
 // truncated embedding.
 const _: () = assert!(
-    CHUNK_MAX_TOKENS + crate::memory::embedder::SPECIAL_TOKEN_RESERVE
-        <= crate::memory::embedder::EMBED_MAX_TOKENS
+    CHUNK_MAX_TOKENS + crate::memory::embedding::embedder::SPECIAL_TOKEN_RESERVE
+        <= crate::memory::embedding::embedder::EMBED_MAX_TOKENS
 );
 
 /// Which chunker the worker dispatches to for this event.
@@ -160,7 +160,7 @@ mod tests {
     // stay here as a cap-respecting smoke test wired through the real constants.
     #[test]
     fn token_split_respects_cap() {
-        use crate::memory::chunker::token_splitter::TokenSplitter;
+        use crate::memory::embedding::chunker::token_splitter::TokenSplitter;
         let splitter = TokenSplitter::fallback();
         let long_text = "a".repeat(10_000);
         let max_bytes = CHUNK_MAX_TOKENS * 4; // 1920
@@ -178,7 +178,7 @@ mod tests {
 
     #[test]
     fn token_split_short_input_single_segment() {
-        use crate::memory::chunker::token_splitter::TokenSplitter;
+        use crate::memory::embedding::chunker::token_splitter::TokenSplitter;
         let splitter = TokenSplitter::fallback();
         let segments = splitter.split("hello world", CHUNK_MAX_TOKENS, CHUNK_OVERLAP_TOKENS);
         assert_eq!(segments.len(), 1, "short input should produce exactly 1 segment");

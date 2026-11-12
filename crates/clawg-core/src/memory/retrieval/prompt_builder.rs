@@ -4,18 +4,18 @@ use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use crate::memory::error::{ClosedAs, failed_call};
-use crate::memory::pieces::read_save_core;
-use crate::memory::provenance::{mark, preference_mark};
+use crate::memory::store::error::{ClosedAs, failed_call};
+use crate::memory::retrieval::pieces::read_save_core;
+use crate::memory::domain::provenance::{mark, preference_mark};
 use crate::preferences::Lang;
 use crate::memory::{
-    access::AccessTracker,
-    clock::TimestampMs,
-    embedder::{EmbedError, EmbedRole, Embedder},
-    search::{memory_project_predicate, project_bind, search_all_memories, PiecePosition, RankedHit, SearchScope},
-    sharing::{Reach, Reader},
-    workspace::{EmittedIds, EmittedRow, WorkspaceManager},
-    MemoryError, MemoryStore,
+    retrieval::access::AccessTracker,
+    domain::clock::TimestampMs,
+    embedding::embedder::{EmbedError, EmbedRole, Embedder},
+    retrieval::search::{memory_project_predicate, project_bind, search_all_memories, PiecePosition, RankedHit, SearchScope},
+    domain::sharing::{Reach, Reader},
+    retrieval::workspace::{EmittedIds, EmittedRow, WorkspaceManager},
+    store::error::MemoryError, store::db::MemoryStore,
 };
 
 // ---------------------------------------------------------------------------
@@ -274,7 +274,7 @@ pub async fn build_memory_prompt(
     // search.rs's `log::debug!`) — this is the criterion's capturable signal.
     log::info!(
         "{}",
-        crate::memory::search_log::format_tier1_coverage(
+        crate::memory::retrieval::search_log::format_tier1_coverage(
             !workspace_content.render().is_empty(),
             hits.len()
         )
@@ -1205,7 +1205,7 @@ impl PromptWorkspace {
 /// Each entry of the AUTO section is matched, by its exact text, to a row
 /// `emitted` reports; two rows with the same line take the entries in order.
 fn workspace_for_prompt(raw: &str, emitted: &EmittedIds) -> PromptWorkspace {
-    use crate::memory::workspace::{AUTO_END, AUTO_START, USER_END, USER_START};
+    use crate::memory::retrieval::workspace::{AUTO_END, AUTO_START, USER_END, USER_START};
 
     let Some(auto_start) = raw.find(AUTO_START) else {
         return PromptWorkspace { before: raw.to_string(), auto: None, after: String::new() };
@@ -1330,7 +1330,7 @@ async fn fetch_active_conflicts(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::{clock::TimestampMs, db::MemoryStore, embedder::{EmbedError, Embedder}};
+    use crate::memory::{domain::clock::TimestampMs, store::db::MemoryStore, embedding::embedder::{EmbedError, Embedder}};
 
     /// Records every `(role, text)` pair handed to `embed_with_role`.
     struct RecordingEmbedder {
@@ -1543,7 +1543,7 @@ mod tests {
     #[test]
     fn format_hit_line_names_the_piece_of_a_long_save() {
         let mut hit = hit_at_2023_11_14(58, "semantic_fact", "the retry budget was set");
-        hit.piece = Some(crate::memory::search::PiecePosition { piece: 2, pieces: 4 });
+        hit.piece = Some(crate::memory::retrieval::search::PiecePosition { piece: 2, pieces: 4 });
         assert_eq!(format_hit_line(&hit, "agent-1"), "[2023-11-14 #58 semantic_fact piece=2/4] the retry budget was set");
     }
 
@@ -1551,7 +1551,7 @@ mod tests {
     fn a_preference_hit_line_shows_its_origin() {
         let mut hit = hit_at_2023_11_14(59, "user_preference", "tabs");
         hit.origin = Some("inferred");
-        hit.piece = Some(crate::memory::search::PiecePosition { piece: 1, pieces: 2 });
+        hit.piece = Some(crate::memory::retrieval::search::PiecePosition { piece: 1, pieces: 2 });
         hit.agent_id = Some("cursor".into());
         assert_eq!(format_hit_line(&hit, "agent-1"), "[2023-11-14 #59 user_preference inferred piece=1/2 by cursor] tabs");
 
@@ -2356,7 +2356,7 @@ mod tests {
     // build_memory_prompt accepts Option<&AccessTracker> as its last parameter.
     #[tokio::test]
     async fn build_memory_prompt_accepts_none_access_tracker() {
-        use crate::memory::access::AccessTracker;
+        use crate::memory::retrieval::access::AccessTracker;
         let store = MemoryStore::new_for_test().await.unwrap();
         let tmp = crate::test_dir::test_dir();
         let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
@@ -2542,7 +2542,7 @@ mod tests {
 
     #[tokio::test]
     async fn three_hits_split_into_recent_and_longterm_blocks() {
-        use crate::memory::embedder::FakeEmbedder;
+        use crate::memory::embedding::embedder::FakeEmbedder;
 
         let store = MemoryStore::new_for_test().await.unwrap();
         let tmp = crate::test_dir::test_dir();
@@ -2641,7 +2641,7 @@ mod tests {
     /// clamps to 0 — every row then ties at score 0 and the ranking under
     /// test becomes arbitrary.
     fn unit_bytes(v: &[f32]) -> Vec<u8> {
-        crate::memory::search::serialize_f32_query_pub(&crate::memory::vector::to_unit(v).unwrap())
+        crate::memory::retrieval::search::serialize_f32_query_pub(&crate::memory::domain::vector::to_unit(v).unwrap())
     }
 
     /// Seeds one `memory` row with a vector, at the exact tier/importance the
@@ -2921,7 +2921,7 @@ mod tests {
     /// and through that one only.
     #[tokio::test]
     async fn a_tier1_row_below_the_workspace_bar_arrives_through_exactly_one_channel() {
-        use crate::memory::embedder::FakeEmbedder;
+        use crate::memory::embedding::embedder::FakeEmbedder;
 
         let store = MemoryStore::new_for_test().await.unwrap();
         let tmp = crate::test_dir::test_dir();
@@ -2953,7 +2953,7 @@ mod tests {
     /// the query channel.
     #[tokio::test]
     async fn dedup_does_not_shrink_the_retrieval_budget() {
-        use crate::memory::embedder::FakeEmbedder;
+        use crate::memory::embedding::embedder::FakeEmbedder;
 
         let store = MemoryStore::new_for_test().await.unwrap();
         let tmp = crate::test_dir::test_dir();
@@ -3379,7 +3379,7 @@ mod tests {
 
     #[tokio::test]
     async fn e2e_full_4_block_output() {
-        use crate::memory::embedder::FakeEmbedder;
+        use crate::memory::embedding::embedder::FakeEmbedder;
 
         let store = MemoryStore::new_for_test().await.unwrap();
         let tmp = crate::test_dir::test_dir();
@@ -3796,8 +3796,8 @@ mod tests {
         let second = seed_dated(&store, "agent-1", None, "closing piece of a long save", 1).await;
         store
             .link_pieces(vec![
-                crate::memory::pieces::StoredPiece { memory_id: first, context: String::new() },
-                crate::memory::pieces::StoredPiece { memory_id: second, context: "opening".into() },
+                crate::memory::retrieval::pieces::StoredPiece { memory_id: first, context: String::new() },
+                crate::memory::retrieval::pieces::StoredPiece { memory_id: second, context: "opening".into() },
             ])
             .await
             .unwrap();
@@ -3835,7 +3835,7 @@ mod tests {
         let linked = ids
             .iter()
             .enumerate()
-            .map(|(i, &memory_id)| crate::memory::pieces::StoredPiece {
+            .map(|(i, &memory_id)| crate::memory::retrieval::pieces::StoredPiece {
                 memory_id,
                 context: if i == 0 { String::new() } else { label.to_string() },
             })
@@ -4012,8 +4012,8 @@ mod tests {
             .unwrap();
         store
             .link_pieces(vec![
-                crate::memory::pieces::StoredPiece { memory_id: opening, context: String::new() },
-                crate::memory::pieces::StoredPiece { memory_id: closing, context: "Goal".into() },
+                crate::memory::retrieval::pieces::StoredPiece { memory_id: opening, context: String::new() },
+                crate::memory::retrieval::pieces::StoredPiece { memory_id: closing, context: "Goal".into() },
             ])
             .await
             .unwrap();

@@ -9,7 +9,7 @@
 //! `memory.db`" is the invariant, and it has to be enforced where the file is
 //! opened. An earlier lock lived in the daemon's startup, which excluded a
 //! daemon from a daemon and left every other host as a convention; taking it in
-//! [`MemoryStore::open`](crate::memory::MemoryStore::open) covers every host
+//! [`MemoryStore::open`](crate::memory::store::db::MemoryStore::open) covers every host
 //! (the daemon, an evaluation run) with one mechanism.
 //!
 //! # First holder wins
@@ -41,7 +41,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::memory::error::MemoryError;
+use crate::memory::store::error::MemoryError;
 use crate::paths::{store_lock_file, store_owner_file};
 
 /// Which kind of host holds (or is asking for) the store.

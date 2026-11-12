@@ -10,9 +10,9 @@ use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension};
 
-use crate::memory::backup::{open_for_probe, probe, ProbeState, SchemaPlan, StoreProbe};
-use crate::memory::db::StoredContract;
-use crate::memory::merge::MAX_MERGE_HOPS;
+use crate::memory::store::backup::{open_for_probe, probe, ProbeState, SchemaPlan, StoreProbe};
+use crate::memory::store::db::StoredContract;
+use crate::memory::projects::merge::MAX_MERGE_HOPS;
 
 /// What [`inspect`] found.
 #[derive(Debug, Clone, PartialEq)]
@@ -289,7 +289,7 @@ pub fn inspect(base_dir: &Path) -> Inspection {
     if !readable {
         return Inspection { schema, facts: None };
     }
-    crate::memory::db::ensure_vec0_registered();
+    crate::memory::store::db::ensure_vec0_registered();
     match open_for_probe(&base_dir.join("memory.db")).and_then(|c| read_facts(&c)) {
         Ok(facts) => Inspection { schema, facts: Some(facts) },
         Err(e) => {
@@ -335,7 +335,7 @@ fn claude_code_imports(c: &Connection) -> rusqlite::Result<Vec<String>> {
     let mut stmt = c.prepare(
         "SELECT DISTINCT created_by_ref FROM memory WHERE source = 'import' AND created_by_ref LIKE ?1 ORDER BY created_by_ref",
     )?;
-    let prefix = format!("{}:%", crate::memory::provenance::CLAUDE_CODE);
+    let prefix = format!("{}:%", crate::memory::domain::provenance::CLAUDE_CODE);
     let rows = stmt.query_map([prefix], |r| r.get(0))?;
     rows.collect()
 }
@@ -600,9 +600,9 @@ fn lonely_disputes(c: &Connection) -> rusqlite::Result<Vec<i64>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::db::seed_on_disk;
-    use crate::memory::store_lock::StoreHolder;
-    use crate::memory::MemoryStore;
+    use crate::memory::store::db::seed_on_disk;
+    use crate::memory::store::store_lock::StoreHolder;
+    use crate::memory::store::db::MemoryStore;
 
     /// A row with what each rule reads; every other column takes a default.
     struct Row {

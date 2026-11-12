@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::memory::events::MemoryEvent;
+use crate::memory::domain::events::MemoryEvent;
 
 /// Name of the spill file inside the data directory.
 pub const SPILL_FILE: &str = "ingest-pending.jsonl";
@@ -108,7 +108,7 @@ pub(crate) fn parse_lines(text: &str) -> (Vec<MemoryEvent>, Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::events::MemorySource;
+    use crate::memory::domain::events::MemorySource;
     use crate::models::chat::Role;
 
     fn event(content: &str) -> MemoryEvent {

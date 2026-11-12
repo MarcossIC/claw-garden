@@ -1,21 +1,21 @@
 //! Maintenance job — periodic inactivity-based tier demotion.
 //!
-//! Wires [`crate::memory::tier::demote_inactive`] (pure, previously unused)
+//! Wires [`crate::memory::store::tier::demote_inactive`] (pure, previously unused)
 //! into a bulk `UPDATE` against `memory` ONLY, on a timer (`maintenance`
 //! module).
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::memory::error::{ClosedAs, failed_call};
-use crate::memory::chunker::embedding_text;
-use crate::memory::clock::TimestampMs;
-use crate::memory::db::{EmbeddingIdentity, MemoryStore};
-use crate::memory::dispute::settle_disputed;
-use crate::memory::embedder::{EmbedRole, Embedder};
-use crate::memory::revival::revive_hidden;
-use crate::memory::vector::to_unit;
-use crate::memory::MemoryError;
+use crate::memory::store::error::{ClosedAs, failed_call};
+use crate::memory::embedding::chunker::embedding_text;
+use crate::memory::domain::clock::TimestampMs;
+use crate::memory::store::db::{EmbeddingIdentity, MemoryStore};
+use crate::memory::revision::dispute::settle_disputed;
+use crate::memory::embedding::embedder::{EmbedRole, Embedder};
+use crate::memory::revision::revival::revive_hidden;
+use crate::memory::domain::vector::to_unit;
+use crate::memory::store::error::MemoryError;
 use crate::metrics::EventKind;
 use serde::Serialize;
 
@@ -162,7 +162,7 @@ async fn classify_languages(store: &MemoryStore) -> usize {
         };
         let langs: Vec<(i64, &'static str)> = batch
             .iter()
-            .map(|(id, content)| (*id, crate::memory::language::column_value(crate::memory::language::detect(content))))
+            .map(|(id, content)| (*id, crate::memory::retrieval::language::column_value(crate::memory::retrieval::language::detect(content))))
             .collect();
         let written = store
             .conn
@@ -439,7 +439,7 @@ pub struct ReembedReport {
 }
 
 /// Backfill for the vectors of `memory`. The only automatic caller is the
-/// pooling upgrade in [`crate::memory::bootstrap::verify_or_reembed`], a
+/// pooling upgrade in [`crate::memory::upkeep::bootstrap::verify_or_reembed`], a
 /// mismatch this binary itself introduced and can name exactly; any other
 /// mismatch stays the embedding contract's loud, safe stop (an empty cell,
 /// an `error` event), because re-inferring the whole store whenever a config
@@ -665,7 +665,7 @@ async fn write_embedding_contract(
     store
         .conn
         .call(move |c| -> rusqlite::Result<()> {
-            let created_at = crate::memory::clock::TimestampMs::now();
+            let created_at = crate::memory::domain::clock::TimestampMs::now();
             c.execute(
                 "INSERT INTO embedding_contract \
                  (id, model_id, dim, metric, normalized, query_prefix, passage_prefix, created_at) \
@@ -707,9 +707,9 @@ fn deserialize_f32_vec(bytes: &[u8]) -> Vec<f32> {
 
 #[cfg(test)]
 mod tests {
-    use crate::memory::clock::TimestampMs;
-    use crate::memory::db::MemoryStore;
-    use crate::memory::embedder::{EmbedRole, Embedder};
+    use crate::memory::domain::clock::TimestampMs;
+    use crate::memory::store::db::MemoryStore;
+    use crate::memory::embedding::embedder::{EmbedRole, Embedder};
 
     // ── Test helpers ──────────────────────────────────────────────────────
 
@@ -1305,7 +1305,7 @@ mod tests {
             &self,
             text: &str,
             role: EmbedRole,
-        ) -> Result<Vec<f32>, crate::memory::embedder::EmbedError> {
+        ) -> Result<Vec<f32>, crate::memory::embedding::embedder::EmbedError> {
             self.calls.lock().unwrap().push((role, text.to_string()));
             Ok(vec![1.0f32; 384])
         }
@@ -1337,10 +1337,10 @@ mod tests {
             &self,
             text: &str,
             _role: EmbedRole,
-        ) -> Result<Vec<f32>, crate::memory::embedder::EmbedError> {
+        ) -> Result<Vec<f32>, crate::memory::embedding::embedder::EmbedError> {
             let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
             if n == self.fail_on_call {
-                return Err(crate::memory::embedder::EmbedError::InferenceFailed(
+                return Err(crate::memory::embedding::embedder::EmbedError::InferenceFailed(
                     "simulated failure".into(),
                 ));
             }
@@ -1364,7 +1364,7 @@ mod tests {
     async fn reembed_normalize_leaves_contract_row_byte_identical() {
         let store = MemoryStore::new_for_test().await.unwrap();
         store
-            .ensure_embedding_contract(crate::memory::db::EmbeddingIdentity {
+            .ensure_embedding_contract(crate::memory::store::db::EmbeddingIdentity {
                 model_id: "multilingual-e5-small".into(),
                 dim: 384,
                 query_prefix: "query: ".into(),
@@ -1407,9 +1407,9 @@ mod tests {
         let absorbed = seed_reembed_memory(&store, "a row an earlier save held", vec![0.3; 384]).await;
         store
             .link_pieces(vec![
-                crate::memory::pieces::StoredPiece { memory_id: first, context: String::new() },
-                crate::memory::pieces::StoredPiece { memory_id: second, context: "Notes on clawg-ledger.".into() },
-                crate::memory::pieces::StoredPiece { memory_id: absorbed, context: String::new() },
+                crate::memory::retrieval::pieces::StoredPiece { memory_id: first, context: String::new() },
+                crate::memory::retrieval::pieces::StoredPiece { memory_id: second, context: "Notes on clawg-ledger.".into() },
+                crate::memory::retrieval::pieces::StoredPiece { memory_id: absorbed, context: String::new() },
             ])
             .await
             .unwrap();
@@ -1487,7 +1487,7 @@ mod tests {
         store.conn.call(|c| c.execute("PRAGMA query_only = ON", [])).await.unwrap();
 
         let embedder: std::sync::Arc<dyn Embedder> =
-            std::sync::Arc::new(crate::memory::embedder::FakeEmbedder::default());
+            std::sync::Arc::new(crate::memory::embedding::embedder::FakeEmbedder::default());
         let plan = super::ReInferPlan::new(embedder);
         let report = super::reembed_all(&store, super::ReembedMode::ReInfer(plan)).await;
 
@@ -1503,7 +1503,7 @@ mod tests {
         seed_reembed_memory(&store, "one row is enough", vec![1.0; 384]).await;
 
         let embedder: std::sync::Arc<dyn Embedder> =
-            std::sync::Arc::new(crate::memory::embedder::FakeEmbedder::default());
+            std::sync::Arc::new(crate::memory::embedding::embedder::FakeEmbedder::default());
         let plan = super::ReInferPlan::new(embedder);
         let report = super::reembed_all(&store, super::ReembedMode::ReInfer(plan)).await;
 
@@ -1522,7 +1522,7 @@ mod tests {
     async fn reembed_reinfer_partial_failure_leaves_old_contract_row_untouched() {
         let store = MemoryStore::new_for_test().await.unwrap();
         store
-            .ensure_embedding_contract(crate::memory::db::EmbeddingIdentity {
+            .ensure_embedding_contract(crate::memory::store::db::EmbeddingIdentity {
                 model_id: "old-model".into(),
                 dim: 384,
                 query_prefix: "".into(),
@@ -1577,12 +1577,12 @@ mod tests {
         let id = seed_reembed_memory(&store, "stable content", vec![1.0; 384]).await;
 
         let embedder1: std::sync::Arc<dyn Embedder> =
-            std::sync::Arc::new(crate::memory::embedder::FakeEmbedder::default());
+            std::sync::Arc::new(crate::memory::embedding::embedder::FakeEmbedder::default());
         super::reembed_all(&store, super::ReembedMode::ReInfer(super::ReInferPlan::new(embedder1))).await;
         let first = read_vector_bytes(&store, "memory_vectors", id).await;
 
         let embedder2: std::sync::Arc<dyn Embedder> =
-            std::sync::Arc::new(crate::memory::embedder::FakeEmbedder::default());
+            std::sync::Arc::new(crate::memory::embedding::embedder::FakeEmbedder::default());
         super::reembed_all(&store, super::ReembedMode::ReInfer(super::ReInferPlan::new(embedder2))).await;
         let second = read_vector_bytes(&store, "memory_vectors", id).await;
 

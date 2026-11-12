@@ -153,7 +153,7 @@ pub struct OneSession {
 
 fn local_date(at_ms: i64, utc_offset_s: i64) -> String {
     let local_ms = at_ms + utc_offset_s * 1000;
-    let (y, m, d) = crate::memory::backup::civil_from_days(local_ms.div_euclid(86_400_000));
+    let (y, m, d) = crate::memory::store::backup::civil_from_days(local_ms.div_euclid(86_400_000));
     format!("{y:04}-{m:02}-{d:02}")
 }
 

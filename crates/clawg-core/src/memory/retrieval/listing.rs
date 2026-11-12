@@ -6,10 +6,10 @@
 
 use serde::Serialize;
 
-use crate::memory::error::{ClosedAs, failed_call};
-use crate::memory::search::{reach_predicate, reader_bind, viewer_match_expression};
-use crate::memory::sharing::Reader;
-use crate::memory::{MemoryError, MemoryStore};
+use crate::memory::store::error::{ClosedAs, failed_call};
+use crate::memory::retrieval::search::{reach_predicate, reader_bind, viewer_match_expression};
+use crate::memory::domain::sharing::Reader;
+use crate::memory::{store::error::MemoryError, store::db::MemoryStore};
 
 // ---------------------------------------------------------------------------
 // list_memories — the rows of `memory`, filtered and paged in SQL. `summary`
@@ -438,8 +438,8 @@ pub async fn memory_stats_core(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::admin::delete_memory_core;
-    use crate::memory::sharing::Reach;
+    use crate::memory::upkeep::admin::delete_memory_core;
+    use crate::memory::domain::sharing::Reach;
 
     /// `agent` as a policy that hides nothing lets it act.
     fn shared(agent: &str) -> Reader {

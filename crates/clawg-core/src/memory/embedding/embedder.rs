@@ -14,9 +14,9 @@ use ort::session::{builder::{GraphOptimizationLevel, SessionBuilder}, Session};
 use ort::value::Tensor;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::memory::db::EmbeddingIdentity;
-use crate::memory::model_download::TokenizerFiles;
-use crate::memory::vector::EMBEDDING_DIM;
+use crate::memory::store::db::EmbeddingIdentity;
+use crate::memory::embedding::model_download::TokenizerFiles;
+use crate::memory::domain::vector::EMBEDDING_DIM;
 use crate::metrics::{Recorder, Unit};
 use tokenizers::{Encoding, Tokenizer};
 
@@ -102,7 +102,7 @@ pub trait Embedder: Send + Sync {
 
     /// Whether the model is in memory now, so the next call needs no load.
     /// Only an embedder that can let its model go (see
-    /// [`IdleEmbedder`](crate::memory::idle_embedder::IdleEmbedder)) ever
+    /// [`IdleEmbedder`](crate::memory::embedding::idle_embedder::IdleEmbedder)) ever
     /// answers `false`.
     fn resident(&self) -> bool {
         true
@@ -994,10 +994,10 @@ mod tests {
         let onnx = minimal_onnx();
         let path = dir.path().join("model.onnx");
         std::fs::write(&path, &onnx).unwrap();
-        let sha = crate::memory::model_download::sha256_hex(&onnx);
-        let lock = crate::memory::model_download::CacheLock::new();
+        let sha = crate::memory::embedding::model_download::sha256_hex(&onnx);
+        let lock = crate::memory::embedding::model_download::CacheLock::new();
 
-        let view = crate::memory::model_download::verified_onnx(&path, &sha, lock.read_now()).expect("the model verifies");
+        let view = crate::memory::embedding::model_download::verified_onnx(&path, &sha, lock.read_now()).expect("the model verifies");
         let session = build_session(&view).expect("the session is built from the view");
         assert_eq!(session.inputs().iter().map(|i| i.name()).collect::<Vec<_>>(), ["x"]);
         assert_eq!(session.outputs().iter().map(|o| o.name()).collect::<Vec<_>>(), ["y"]);
@@ -1683,7 +1683,7 @@ mod tests {
     /// side.
     #[test]
     fn the_embedding_contract_is_pinned() {
-        use crate::memory::model_download as md;
+        use crate::memory::embedding::model_download as md;
         let ask = "does E5_MODEL_ID have to change, so that stored vectors are embedded again?";
 
         assert_eq!(E5_MODEL_ID, "multilingual-e5-small/mean", "{ask}");
@@ -1691,7 +1691,7 @@ mod tests {
         assert_eq!(E5_QUERY_PREFIX, "query: ", "{ask}");
         assert_eq!(E5_PASSAGE_PREFIX, "query: ", "{ask}");
         assert_eq!(EMBED_MAX_TOKENS, 512, "{ask}");
-        assert_eq!(crate::memory::vector::EMBEDDING_DIM, 384, "{ask}");
+        assert_eq!(crate::memory::domain::vector::EMBEDDING_DIM, 384, "{ask}");
         assert_eq!(
             md::MODEL_SHA256,
             "ca456c06b3a9505ddfd9131408916dd79290368331e7d76bb621f1cba6bc8665",

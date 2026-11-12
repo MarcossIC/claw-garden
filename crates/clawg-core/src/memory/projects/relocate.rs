@@ -17,14 +17,14 @@ use std::path::Path;
 use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
-use crate::memory::error::{ClosedAs, failed_call};
-use crate::memory::backup::Reason;
-use crate::memory::clock::TimestampMs;
-use crate::memory::merge::canonical_in;
-use crate::memory::project_delete::{deleted_in, deleted_message};
-use crate::memory::search::{reader_predicate, viewer_match_expression};
-use crate::memory::record::MemoryType;
-use crate::memory::{MemoryError, MemoryStore};
+use crate::memory::store::error::{ClosedAs, failed_call};
+use crate::memory::store::backup::Reason;
+use crate::memory::domain::clock::TimestampMs;
+use crate::memory::projects::merge::canonical_in;
+use crate::memory::projects::project_delete::{deleted_in, deleted_message};
+use crate::memory::retrieval::search::{reader_predicate, viewer_match_expression};
+use crate::memory::domain::record::MemoryType;
+use crate::memory::{store::error::MemoryError, store::db::MemoryStore};
 
 /// Why a unit stays where it is. Nothing of it is written.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
@@ -974,12 +974,12 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::memory::admin::{delete_memory_core, restore_memory_core};
-    use crate::memory::embedder::{EmbedRole, Embedder, FakeEmbedder};
-    use crate::memory::events::{MemoryEvent, MemorySource};
-    use crate::memory::search::{search_all_memories, SearchScope};
-    use crate::memory::sharing::{Reach, Reader};
-    use crate::memory::worker::save_for_test;
+    use crate::memory::upkeep::admin::{delete_memory_core, restore_memory_core};
+    use crate::memory::embedding::embedder::{EmbedRole, Embedder, FakeEmbedder};
+    use crate::memory::domain::events::{MemoryEvent, MemorySource};
+    use crate::memory::retrieval::search::{search_all_memories, SearchScope};
+    use crate::memory::domain::sharing::{Reach, Reader};
+    use crate::memory::ingest::worker::save_for_test;
     use crate::models::chat::Role;
 
     const A: &str = "repo-aaaa";
@@ -1410,7 +1410,7 @@ mod tests {
         let blind = Reader::new("agent-a", Reach::AllBut(vec!["agent-b".into()]));
         let sees = Reader::new("agent-a", Reach::AllBut(Vec::new()));
         let plan = |reader: Reader| {
-            let reach = crate::memory::search::reader_bind(Some(&reader));
+            let reach = crate::memory::retrieval::search::reader_bind(Some(&reader));
             store.conn.call(move |c| -> Result<MoveReport, MoveError> { plan_one_in(c, id, Some(B), reach.as_deref()) })
         };
 
@@ -1430,7 +1430,7 @@ mod tests {
             .await
             .unwrap();
         let reader = Reader::new("agent-a", Reach::AllBut(vec!["agent-b".into()]));
-        let reach = crate::memory::search::reader_bind(Some(&reader));
+        let reach = crate::memory::retrieval::search::reader_bind(Some(&reader));
         let first = pieces[0];
 
         let report = store
@@ -1525,8 +1525,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_session_summary_moved_into_a_project_is_its_last_session() {
-        use crate::memory::prompt_builder::{build_memory_prompt, QueryTexts, DEFAULT_BUDGET};
-        use crate::memory::workspace::{EmittedIds, WorkspaceManager};
+        use crate::memory::retrieval::prompt_builder::{build_memory_prompt, QueryTexts, DEFAULT_BUDGET};
+        use crate::memory::retrieval::workspace::{EmittedIds, WorkspaceManager};
         let store = store().await;
         let id = save_one(
             &store,
@@ -1562,7 +1562,7 @@ mod tests {
 
     #[tokio::test]
     async fn moving_a_superseded_source_does_not_make_its_conclusions_reappear_for_review() {
-        use crate::memory::synthesis::conclusions_to_review_count;
+        use crate::memory::upkeep::synthesis::conclusions_to_review_count;
         let store = store().await;
         let source = save_one(&store, fact("the cache is per process", Some(A))).await;
         let winner = save_one(&store, fact("the cache is shared", Some(A))).await;

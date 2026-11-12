@@ -14,21 +14,21 @@ use tokio::sync::mpsc::Receiver;
 use tokio::sync::{oneshot, watch};
 use tokio::time::Instant;
 
-use crate::memory::chunker::{
+use crate::memory::embedding::chunker::{
     embedding_text, select_chunker, ChatChunker, Chunk, ChunkerKind, SaveSplit,
 };
-use crate::memory::outbox::{resume_positions, Claimed, NotedPiece, OutboxNote};
-use crate::memory::contradiction::{Candidate, SaveKey};
-use crate::memory::pieces::StoredPiece;
-use crate::memory::embedder::{EmbedError, EmbedRole, Embedder};
-use crate::memory::events::{MemoryEvent, MemorySource};
-use crate::memory::provenance::{is_stated, seal};
-use crate::memory::redact::{redact, SecretKind};
-use crate::memory::sharing::{self, Reader};
-use crate::memory::store_insert::{deliberate_importance, NewMemoryRecord, Repeat, Stored as Insert};
-use crate::memory::topic::{inherit, unkeyed_revision, Replaced, Revision, TopicScope};
-use crate::memory::clock::TimestampMs;
-use crate::memory::MemoryStore;
+use crate::memory::ingest::outbox::{resume_positions, Claimed, NotedPiece, OutboxNote};
+use crate::memory::revision::contradiction::{Candidate, SaveKey};
+use crate::memory::retrieval::pieces::StoredPiece;
+use crate::memory::embedding::embedder::{EmbedError, EmbedRole, Embedder};
+use crate::memory::domain::events::{MemoryEvent, MemorySource};
+use crate::memory::domain::provenance::{is_stated, seal};
+use crate::memory::domain::redact::{redact, SecretKind};
+use crate::memory::domain::sharing::{self, Reader};
+use crate::memory::ingest::store_insert::{deliberate_importance, NewMemoryRecord, Repeat, Stored as Insert};
+use crate::memory::revision::topic::{inherit, unkeyed_revision, Replaced, Revision, TopicScope};
+use crate::memory::domain::clock::TimestampMs;
+use crate::memory::store::db::MemoryStore;
 use crate::metrics::{Recorder, Unit};
 
 /// What happened to one chunk that reached the store.
@@ -171,7 +171,7 @@ fn collapse_duplicate_chunks(chunks: Vec<Chunk>) -> Vec<PendingChunk> {
     let mut out: Vec<PendingChunk> = Vec::with_capacity(chunks.len());
     let mut by_hash: HashMap<String, usize> = HashMap::with_capacity(chunks.len());
     for chunk in chunks {
-        let content_hash = crate::memory::dedup::content_hash(&chunk.text);
+        let content_hash = crate::memory::store::dedup::content_hash(&chunk.text);
         match by_hash.get(&content_hash) {
             Some(&idx) => out[idx].multiplicity += 1,
             None => {
@@ -667,7 +667,7 @@ fn note_for(
 #[cfg(test)]
 pub(crate) async fn save_for_test(store: &Arc<MemoryStore>, evt: &MemoryEvent) -> IngestReport {
     let cell: OnceCell<Arc<dyn Embedder>> = OnceCell::new();
-    cell.set(Arc::new(crate::memory::embedder::FakeEmbedder::default())).ok();
+    cell.set(Arc::new(crate::memory::embedding::embedder::FakeEmbedder::default())).ok();
     let mut absorbed = 0;
     process_event(evt, store, &Arc::new(cell), &Arc::new(ChatChunker::with_fallback()), &mut absorbed).await
 }
@@ -794,7 +794,7 @@ fn record_outcome(metrics: &Recorder, report: &IngestReport, has_row: bool, acce
 /// here is the one every later step of the save reads.
 async fn follow_merge(store: &MemoryStore, evt: &MemoryEvent) -> Option<MemoryEvent> {
     let project = evt.project_id.as_deref()?;
-    match crate::memory::merge::canonical(store, project).await {
+    match crate::memory::projects::merge::canonical(store, project).await {
         Ok(live) if live != project => Some(MemoryEvent { project_id: Some(live), ..evt.clone() }),
         Ok(_) => None,
         Err(e) => {
@@ -1081,7 +1081,7 @@ async fn store_pieces(to: &PieceStore<'_>, absorbed: &mut u64, gated: &mut Gated
         // KNN, and its result (which existing rows this chunk is close to)
         // must be attached to the record before it is written, not after.
         let mut record = NewMemoryRecord::from_event_and_chunk(evt, &chunk);
-        record.candidates = crate::memory::contradiction::detect_contradiction(
+        record.candidates = crate::memory::revision::contradiction::detect_contradiction(
             store, &vec, &chunk.text, saver, evt.project_id.as_deref(), record.memory_type, &siblings,
         )
         .await
@@ -1192,9 +1192,9 @@ where
 mod tests {
     use std::sync::Arc;
     use super::*;
-    use crate::memory::MemoryStore;
-    use crate::memory::embedder::{EmbedError, Embedder, FakeEmbedder};
-    use crate::memory::events::MemorySource;
+    use crate::memory::store::db::MemoryStore;
+    use crate::memory::embedding::embedder::{EmbedError, Embedder, FakeEmbedder};
+    use crate::memory::domain::events::MemorySource;
     use crate::models::chat::Role;
     use tokio::sync::mpsc::Sender;
     use tokio::task::JoinHandle;
@@ -1289,7 +1289,7 @@ mod tests {
         assert_eq!(absorbed, 1);
         assert!(gated.noted.is_empty(), "nothing is noted without a row");
 
-        let beta = crate::memory::dedup::content_hash("beta");
+        let beta = crate::memory::store::dedup::content_hash("beta");
         let progress = vec![NotedPiece { position: 1, hash: beta, id: 77, inserted: true, context: "head".into() }];
         let track = Track { row: 1, progress, accepted: TimestampMs::now() };
         let gated = gate_pieces(&evt, &saver, &store, &mut absorbed, Some(&track), chunks(&["alpha", "beta"])).await;
@@ -1305,7 +1305,7 @@ mod tests {
         let recording = RecordingEmbedder { calls: calls.clone() };
         let pending = |text: &str| PendingChunk {
             chunk: Chunk { text: text.to_string() },
-            content_hash: crate::memory::dedup::content_hash(text),
+            content_hash: crate::memory::store::dedup::content_hash(text),
             multiplicity: 1,
         };
         let survivors = vec![(0, pending("first")), (2, pending("third"))];
@@ -1359,7 +1359,7 @@ mod tests {
                 .enumerate()
                 .map(|(position, text)| {
                     let chunk = Chunk { text: text.to_string() };
-                    let content_hash = crate::memory::dedup::content_hash(text);
+                    let content_hash = crate::memory::store::dedup::content_hash(text);
                     (position, PendingChunk { chunk, content_hash, multiplicity: 1 })
                 })
                 .collect(),
@@ -1963,7 +1963,7 @@ mod tests {
             timestamp_ms: 0,
             is_error: None,
         };
-        let result = crate::memory::events::MemoryEvent::from_message(
+        let result = crate::memory::domain::events::MemoryEvent::from_message(
             "agent".to_string(),
             None,
             &msg,
@@ -1983,7 +1983,7 @@ mod tests {
             timestamp_ms: 0,
             is_error: None,
         };
-        let result = crate::memory::events::MemoryEvent::from_message(
+        let result = crate::memory::domain::events::MemoryEvent::from_message(
             "agent".to_string(),
             None,
             &msg,
@@ -1994,7 +1994,7 @@ mod tests {
         // Also verify non-empty assistant content DOES produce an event
         msg.content = "actual response".to_string();
         msg.tool_calls = None;
-        let result2 = crate::memory::events::MemoryEvent::from_message(
+        let result2 = crate::memory::domain::events::MemoryEvent::from_message(
             "agent".to_string(),
             None,
             &msg,
@@ -2505,12 +2505,12 @@ mod tests {
         let older = only_id(&save_placed(&store, turned(2, 0.2), &fact_in("the build uses cargo", Some("p-1"))).await);
         let new = only_id(&save_placed(&store, turned(1, 0.0), &fact_in("the build uses make", Some("p-1"))).await);
 
-        crate::memory::dispute::judge_pair(&store, new, older, crate::memory::dispute::Verdict::Supersedes, None, false, None)
+        crate::memory::revision::dispute::judge_pair(&store, new, older, crate::memory::revision::dispute::Verdict::Supersedes, None, false, None)
             .await
             .unwrap();
         assert_eq!(warned_pairs(&store).await, vec![(new, older)], "after a verdict");
 
-        crate::memory::admin::delete_memory_core(&store, new, None)
+        crate::memory::upkeep::admin::delete_memory_core(&store, new, None)
             .await
             .unwrap();
         assert_eq!(warned_pairs(&store).await, vec![(new, older)], "after a delete");
@@ -2570,7 +2570,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_pair_a_long_save_names_is_judged_through_its_first_piece() {
-        use crate::memory::dispute::{judge_pair, Verdict};
+        use crate::memory::revision::dispute::{judge_pair, Verdict};
 
         let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
         let older = PlacedEmbedder { vectors: vec![turned(2, 0.2)] };
@@ -3024,8 +3024,8 @@ mod tests {
         };
         let id = process_with(embedder(), &store, &preference(false, None, 1)).await.memories[0].id;
         let tmp = crate::test_dir::test_dir();
-        let wm = crate::memory::workspace::WorkspaceManager::new(tmp.path().join("workspaces"));
-        let reach = crate::memory::sharing::Reach::Own;
+        let wm = crate::memory::retrieval::workspace::WorkspaceManager::new(tmp.path().join("workspaces"));
+        let reach = crate::memory::domain::sharing::Reach::Own;
         let before = wm.regenerate_auto_section("agent-test", None, &reach, &store).await.unwrap();
         assert!(!before.contains(id), "inferred, and at importance 5");
 
@@ -3307,11 +3307,11 @@ mod tests {
 
     // ── Shared fixture: write two real messages, read them back ────────────
 
-    use crate::memory::prompt_builder::{
+    use crate::memory::retrieval::prompt_builder::{
         build_memory_prompt, QueryTexts, DEFAULT_BUDGET, SEP_LONGTERM_TEST, SEP_RECENT_TEST,
     };
-    use crate::memory::search::{search_all_memories, RankedHit, SearchScope};
-    use crate::memory::workspace::WorkspaceManager;
+    use crate::memory::retrieval::search::{search_all_memories, RankedHit, SearchScope};
+    use crate::memory::retrieval::workspace::WorkspaceManager;
     use crate::models::chat::{current_time_millis, ChatMessage};
 
     /// State shared by the two gates below: one fresh message and one a month
@@ -3385,8 +3385,8 @@ mod tests {
         let prompt = build_memory_prompt(
             crate::preferences::Lang::En,
             &store, &wm, Some(embedder.clone() as Arc<dyn Embedder>),
-            AGENT, None, &crate::memory::sharing::Reach::Own, QueryTexts::single_shot(&fresh.content),
-            &crate::memory::workspace::EmittedIds::default(), None, DEFAULT_BUDGET,
+            AGENT, None, &crate::memory::domain::sharing::Reach::Own, QueryTexts::single_shot(&fresh.content),
+            &crate::memory::retrieval::workspace::EmittedIds::default(), None, DEFAULT_BUDGET,
         )
         .await
         .unwrap().text;
@@ -3822,7 +3822,7 @@ mod tests {
         use tokenizers::models::wordlevel::WordLevel;
         use tokenizers::pre_tokenizers::whitespace::Whitespace;
 
-        let target = crate::memory::model_download::tokenizer_path(base_dir);
+        let target = crate::memory::embedding::model_download::tokenizer_path(base_dir);
         std::fs::create_dir_all(target.parent().unwrap()).unwrap();
         let vocab_path = target.parent().unwrap().join("vocab.json");
         std::fs::write(&vocab_path, r#"{"[UNK]":0,"hello":1,"world":2}"#).unwrap();
@@ -3850,7 +3850,7 @@ mod tests {
         write_minimal_tokenizer_fixture(&base_dir);
 
         let cell: Arc<OnceCell<Arc<tokenizers::Tokenizer>>> = Arc::new(OnceCell::new());
-        let chunker = resolve_tokenizer_and_chunker(&base_dir, &cell, crate::memory::model_download::load_tokenizer);
+        let chunker = resolve_tokenizer_and_chunker(&base_dir, &cell, crate::memory::embedding::model_download::load_tokenizer);
 
         let cell_tok = cell.get().expect("cell must be filled when tokenizer.json is present");
         let cell_ptr: *const tokenizers::Tokenizer = Arc::as_ptr(cell_tok);
@@ -3879,7 +3879,7 @@ mod tests {
         assert!(cell.get().is_none(), "nothing on disk yet");
 
         write_minimal_tokenizer_fixture(&base_dir);
-        let tokenizer = crate::memory::model_download::load_tokenizer(&base_dir).expect("the fixture loads");
+        let tokenizer = crate::memory::embedding::model_download::load_tokenizer(&base_dir).expect("the fixture loads");
         cell.set(tokenizer).ok();
 
         let chunks = chunker.chunk("hello world", 1);
@@ -3892,7 +3892,7 @@ mod tests {
     fn resolve_tokenizer_and_chunker_leaves_the_cell_empty_when_the_file_is_absent() {
         let base_dir = unique_temp_dir("resolve-tok-absent");
         let cell: Arc<OnceCell<Arc<tokenizers::Tokenizer>>> = Arc::new(OnceCell::new());
-        let chunker = resolve_tokenizer_and_chunker(&base_dir, &cell, crate::memory::model_download::load_tokenizer);
+        let chunker = resolve_tokenizer_and_chunker(&base_dir, &cell, crate::memory::embedding::model_download::load_tokenizer);
 
         assert!(cell.get().is_none(), "no tokenizer.json on disk must leave the cell empty");
         assert!(chunker.tokenizer_ptr().is_none(), "the chunker must be running the byte fallback");
@@ -3908,7 +3908,7 @@ mod tests {
         let parses = std::cell::Cell::new(0u32);
         let cell: Arc<OnceCell<Arc<tokenizers::Tokenizer>>> = Arc::new(OnceCell::new());
         let chunker = resolve_tokenizer_and_chunker(&base_dir, &cell, |dir| {
-            crate::memory::model_download::load_verified_tokenizer_with(dir, |bytes| {
+            crate::memory::embedding::model_download::load_verified_tokenizer_with(dir, |bytes| {
                 parses.set(parses.get() + 1);
                 tokenizers::Tokenizer::from_bytes(bytes).ok()
             })
@@ -3951,7 +3951,7 @@ mod tests {
     async fn record(store: &MemoryStore, content: &str) -> i64 {
         let evt = make_event(Role::User, content, None, 1);
         match store.outbox_record(uuid::Uuid::new_v4().to_string(), evt).await.unwrap() {
-            crate::memory::outbox::Recorded::New { row } => row,
+            crate::memory::ingest::outbox::Recorded::New { row } => row,
             other => panic!("expected a new row, got {other:?}"),
         }
     }
@@ -4183,7 +4183,7 @@ mod tests {
 
     async fn record_event(store: &MemoryStore, evt: MemoryEvent) -> i64 {
         match store.outbox_record(uuid::Uuid::new_v4().to_string(), evt).await.unwrap() {
-            crate::memory::outbox::Recorded::New { row } => row,
+            crate::memory::ingest::outbox::Recorded::New { row } => row,
             other => panic!("expected a new row, got {other:?}"),
         }
     }
@@ -4494,12 +4494,12 @@ mod tests {
         assert_eq!(revision_state(&store, new).await, ("active".into(), None, Some("storage/engine".into())));
         assert_eq!(live_with_key(&store, "storage/engine").await, vec![new]);
         let vector = FakeEmbedder::default().embed_with_role(old_text, EmbedRole::Passage).await.unwrap();
-        let hits = crate::memory::search::search_all_memories(
+        let hits = crate::memory::retrieval::search::search_all_memories(
             &store,
             &vector,
             Some("SQLite"),
             "agent-test",
-            crate::memory::search::SearchScope::all_default(),
+            crate::memory::retrieval::search::SearchScope::all_default(),
             10,
         )
         .await
@@ -4533,12 +4533,12 @@ mod tests {
         let plain_id = only_id(&save(&store, &explicit("Deploys happen on fridays", "architectural_decision")).await);
 
         let vector = FakeEmbedder::default().embed_with_role(text, EmbedRole::Passage).await.unwrap();
-        let hits = crate::memory::search::search_all_memories(
+        let hits = crate::memory::retrieval::search::search_all_memories(
             &store,
             &vector,
             Some("SQLite"),
             "agent-test",
-            crate::memory::search::SearchScope::all_default(),
+            crate::memory::retrieval::search::SearchScope::all_default(),
             10,
         )
         .await
@@ -4753,9 +4753,9 @@ mod tests {
     #[tokio::test]
     async fn a_key_leaves_a_hidden_authors_holder() {
         let dir = crate::test_dir::test_dir();
-        let mut policy = crate::memory::sharing::SharingPolicy::default();
+        let mut policy = crate::memory::domain::sharing::SharingPolicy::default();
         policy.hide("agent-other", "agent-test");
-        crate::memory::sharing::save(dir.path(), &policy).unwrap();
+        crate::memory::domain::sharing::save(dir.path(), &policy).unwrap();
         let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
         let old = only_id(&save(&store, &keyed("Storage engine is SQLite", "storage/engine")).await);
 
@@ -4854,7 +4854,7 @@ mod tests {
             .await
             .unwrap()
         {
-            crate::memory::outbox::Recorded::New { row } => row,
+            crate::memory::ingest::outbox::Recorded::New { row } => row,
             other => panic!("expected a new row, got {other:?}"),
         };
 

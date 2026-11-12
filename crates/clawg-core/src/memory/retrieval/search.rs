@@ -4,14 +4,14 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-use crate::memory::error::{ClosedAs, failed_call};
-use crate::memory::clock::TimestampMs;
-use crate::memory::pieces::SaveLink;
-use crate::memory::provenance::preference_mark;
-use crate::memory::score::{score as compute_score, RawHit, ScoringConfig};
-use crate::memory::sharing::{Reach, Reader};
-use crate::memory::vector::to_unit;
-use crate::memory::{MemoryError, MemoryStore};
+use crate::memory::store::error::{ClosedAs, failed_call};
+use crate::memory::domain::clock::TimestampMs;
+use crate::memory::retrieval::pieces::SaveLink;
+use crate::memory::domain::provenance::preference_mark;
+use crate::memory::retrieval::score::{score as compute_score, RawHit, ScoringConfig};
+use crate::memory::domain::sharing::{Reach, Reader};
+use crate::memory::domain::vector::to_unit;
+use crate::memory::{store::error::MemoryError, store::db::MemoryStore};
 use crate::metrics::{Recorder, Unit};
 
 /// Pool sizes for one search. `None` means "skip this arm entirely".
@@ -101,7 +101,7 @@ pub(crate) fn reader_bind(reader: Option<&Reader>) -> Option<String> {
 /// every row when it bound NULL.
 macro_rules! reader_predicate {
     ($author:literal, $param:literal) => {
-        concat!("(", $param, " IS NULL OR ", $crate::memory::search::reach_predicate!($author, $param), ")")
+        concat!("(", $param, " IS NULL OR ", $crate::memory::retrieval::search::reach_predicate!($author, $param), ")")
     };
 }
 pub(crate) use reader_predicate;
@@ -533,7 +533,7 @@ async fn knn_one(
             // were linked.
             let links_of = |raw: &[RawHit]| {
                 let ids: Vec<i64> = raw.iter().map(|r| r.id).collect();
-                crate::memory::pieces::read_links(c, &ids).unwrap_or_else(|e| {
+                crate::memory::retrieval::pieces::read_links(c, &ids).unwrap_or_else(|e| {
                     log::warn!("knn: reading save links failed, the pool counts rows: {e}");
                     HashMap::new()
                 })
@@ -606,7 +606,7 @@ async fn knn_one(
 /// switched off contributes 0 on both sides — it asked for nothing and got
 /// nothing, which is not a survival rate of zero.
 fn format_pool_line(scope: &SearchScope, mem: &KnnOutcome) -> String {
-    crate::memory::search_log::format_pool_survival(scope.memory.unwrap_or(0), mem.hits.len(), mem.retried())
+    crate::memory::retrieval::search_log::format_pool_survival(scope.memory.unwrap_or(0), mem.hits.len(), mem.retried())
 }
 
 // ── lexical (FTS5) candidate channel ──
@@ -1274,7 +1274,7 @@ async fn search_all_memories_inner(
     // than being reassembled at the log call.
     let pool_survival = format_pool_line(&scope, &mem);
     let channel_attribution =
-        crate::memory::search_log::format_channel_attribution(mem.hits.len(), lexical_only);
+        crate::memory::retrieval::search_log::format_channel_attribution(mem.hits.len(), lexical_only);
     let telemetry = format!("{pool_survival} {channel_attribution}");
     let memory_pool = MemoryPool::of(scope.memory, &mem);
 
@@ -1322,7 +1322,7 @@ async fn search_all_memories_inner(
         all.len(),
         telemetry,
         k_final,
-        crate::memory::search_log::format_tier_distribution(&all),
+        crate::memory::retrieval::search_log::format_tier_distribution(&all),
         store.knn_latency().snapshot(),
     );
 
@@ -1382,8 +1382,8 @@ pub(crate) async fn search_all_memories_with_scoring(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::db::MemoryStore;
-    use crate::memory::embedder::{EmbedRole, Embedder};
+    use crate::memory::store::db::MemoryStore;
+    use crate::memory::embedding::embedder::{EmbedRole, Embedder};
     use rusqlite::params;
 
     /// The bind every agent-filtered query takes, for an agent with no grants.
@@ -2009,7 +2009,7 @@ mod tests {
 
     #[tokio::test]
     async fn integration_5_rows_fake_embedder_top3_sorted() {
-        use crate::memory::embedder::FakeEmbedder;
+        use crate::memory::embedding::embedder::FakeEmbedder;
         let store = MemoryStore::new_for_test().await.unwrap();
         let agent = "agent-integration";
 
@@ -4034,7 +4034,7 @@ mod tests {
         assert_eq!(ids_before.len(), 1, "test setup: the row must be lexically reachable before deletion");
         let id = ids_before[0];
 
-        crate::memory::admin::delete_memory_core(
+        crate::memory::upkeep::admin::delete_memory_core(
             &store,
             id, None,
         )
@@ -4079,7 +4079,7 @@ mod tests {
         )
         .await;
 
-        crate::memory::admin::delete_memory_core(
+        crate::memory::upkeep::admin::delete_memory_core(
             &store,
             id, None,
         )
@@ -4140,7 +4140,7 @@ mod tests {
         .await
         .unwrap();
 
-        let expected = crate::memory::search_log::format_channel_attribution(20, 1);
+        let expected = crate::memory::retrieval::search_log::format_channel_attribution(20, 1);
         assert!(
             telemetry.contains(&expected),
             "the wired telemetry line must contain exactly what the formatter renders for (dense=20, lex_only=1): {telemetry}"
@@ -4549,7 +4549,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_exclusion_does_not_work_backwards() {
-        use crate::memory::sharing::SharingPolicy;
+        use crate::memory::domain::sharing::SharingPolicy;
         let store = MemoryStore::new_for_test().await.unwrap();
         let mine = insert_memory_row(&store, "a", "fila de a", "semantic_fact", 3, 5.0, "active", serialize_embedding(&axis(0))).await;
         let yours = insert_memory_row(&store, "b", "fila de b", "semantic_fact", 3, 5.0, "active", serialize_embedding(&axis(0))).await;
@@ -4782,7 +4782,7 @@ mod tests {
         store
             .link_pieces(
                 ids.iter()
-                    .map(|&memory_id| crate::memory::pieces::StoredPiece { memory_id, context: String::new() })
+                    .map(|&memory_id| crate::memory::retrieval::pieces::StoredPiece { memory_id, context: String::new() })
                     .collect(),
             )
             .await
@@ -5081,7 +5081,7 @@ mod tests {
             .link_pieces(
                 pieces
                     .iter()
-                    .map(|&memory_id| crate::memory::pieces::StoredPiece { memory_id, context: String::new() })
+                    .map(|&memory_id| crate::memory::retrieval::pieces::StoredPiece { memory_id, context: String::new() })
                     .collect(),
             )
             .await

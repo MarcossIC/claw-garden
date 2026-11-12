@@ -15,20 +15,20 @@ use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::memory::backup::Reason;
-use crate::memory::clock::TimestampMs;
-use crate::memory::chunker::embedding_text;
-use crate::memory::dispute::{release_challengers, settle_challengers, settle_row};
-use crate::memory::embedder::{EmbedError, EmbedRole, Embedder};
-use crate::memory::inspect::{answered_pairs, duplicates, folder_prints, registry, Has, RegistryRow};
-use crate::memory::merge::{canonical_in, retrying, Retried};
+use crate::memory::store::backup::Reason;
+use crate::memory::domain::clock::TimestampMs;
+use crate::memory::embedding::chunker::embedding_text;
+use crate::memory::revision::dispute::{release_challengers, settle_challengers, settle_row};
+use crate::memory::embedding::embedder::{EmbedError, EmbedRole, Embedder};
+use crate::memory::projects::inspect::{answered_pairs, duplicates, folder_prints, registry, Has, RegistryRow};
+use crate::memory::projects::merge::{canonical_in, retrying, Retried};
 use crate::memory::project_docs::drop_root_index_in;
-use crate::memory::redact::redact;
-use crate::memory::revival::{RESTORE_TEXT_INDEX, RESTORE_TOPIC_HOLDER, RESTORE_TWIN};
-use crate::memory::subfolder::{leading_to_in, SubfolderOf};
-use crate::memory::vector::to_unit;
-use crate::memory::workspace::WorkspaceManager;
-use crate::memory::{MemoryError, MemoryStore};
+use crate::memory::domain::redact::redact;
+use crate::memory::revision::revival::{RESTORE_TEXT_INDEX, RESTORE_TOPIC_HOLDER, RESTORE_TWIN};
+use crate::memory::projects::subfolder::{leading_to_in, SubfolderOf};
+use crate::memory::domain::vector::to_unit;
+use crate::memory::retrieval::workspace::WorkspaceManager;
+use crate::memory::{store::error::MemoryError, store::db::MemoryStore};
 
 /// What every refusal of a deleted project says: it is deleted, and, when the
 /// journal has an open delete for it, which one and how to undo it.
@@ -892,7 +892,7 @@ pub async fn undo_delete_core(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::MemoryStore;
+    use crate::memory::store::db::MemoryStore;
 
     const GONE: &str = "app-aaaa";
 
@@ -989,9 +989,9 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
-    use crate::memory::events::{MemoryEvent, MemorySource};
-    use crate::memory::worker::save_for_test;
-    use crate::memory::workspace::WorkspaceManager;
+    use crate::memory::domain::events::{MemoryEvent, MemorySource};
+    use crate::memory::ingest::worker::save_for_test;
+    use crate::memory::retrieval::workspace::WorkspaceManager;
     use crate::models::chat::Role;
 
     const A: &str = "app-aaaa";
@@ -1700,7 +1700,7 @@ mod tests {
 
     // ── undoing ─────────────────────────────────────────────────────────
 
-    use crate::memory::embedder::{Embedder, FakeEmbedder};
+    use crate::memory::embedding::embedder::{Embedder, FakeEmbedder};
 
     impl Fixture {
         async fn undo(&self, delete_id: i64, dry_run: bool, embedder: Option<&dyn Embedder>) -> Result<DeleteReport, DeleteError> {

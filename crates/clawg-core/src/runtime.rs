@@ -24,24 +24,24 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
-use crate::memory::access::AccessTracker;
+use crate::memory::retrieval::access::AccessTracker;
 use crate::memory::portability::RunningImports;
-use crate::memory::StorageError;
-use crate::memory::backup::Reason;
-use crate::memory::bootstrap::EmbedderStatus;
-use crate::memory::chunker::chat::ChatChunker;
-use crate::memory::embedder::Embedder;
-use crate::memory::events::MemoryEvent;
-use crate::memory::store_lock::StoreHolder;
-use crate::memory::maintenance::{run_maintenance_loop, MAINTENANCE_PERIOD, STARTUP_DELAY};
-use crate::memory::admin::delete_memory_core;
-use crate::memory::outbox::{OutboxActionError, OutboxState, Recorded};
-use crate::memory::redact::{redact, SecretKind};
+use crate::memory::store::error::StorageError;
+use crate::memory::store::backup::Reason;
+use crate::memory::upkeep::bootstrap::EmbedderStatus;
+use crate::memory::embedding::chunker::chat::ChatChunker;
+use crate::memory::embedding::embedder::Embedder;
+use crate::memory::domain::events::MemoryEvent;
+use crate::memory::store::store_lock::StoreHolder;
+use crate::memory::upkeep::maintenance::{run_maintenance_loop, MAINTENANCE_PERIOD, STARTUP_DELAY};
+use crate::memory::upkeep::admin::delete_memory_core;
+use crate::memory::ingest::outbox::{OutboxActionError, OutboxState, Recorded};
+use crate::memory::domain::redact::{redact, SecretKind};
 use crate::memory::project_docs::DocIndex;
-use crate::memory::spill;
-use crate::memory::worker::{memory_worker, resolve_tokenizer_and_chunker, IngestReport, IngestRequest, Replay};
-use crate::memory::workspace::WorkspaceManager;
-use crate::memory::{MemoryError, MemoryStore};
+use crate::memory::ingest::spill;
+use crate::memory::ingest::worker::{memory_worker, resolve_tokenizer_and_chunker, IngestReport, IngestRequest, Replay};
+use crate::memory::retrieval::workspace::WorkspaceManager;
+use crate::memory::{store::error::MemoryError, store::db::MemoryStore};
 use crate::metrics::Recorder;
 
 /// How many saves the ingest queue holds before a producer is refused.
@@ -240,7 +240,7 @@ impl MemoryRuntime {
             self.tokenizer.clone(),
             rx,
             drain,
-            crate::memory::model_download::load_verified_tokenizer,
+            crate::memory::embedding::model_download::load_verified_tokenizer,
         )
     }
 
@@ -425,7 +425,7 @@ impl MemoryRuntime {
         base_dir: PathBuf,
         capacity: usize,
     ) -> (Self, Receiver<IngestRequest>) {
-        use crate::memory::embedder::FakeEmbedder;
+        use crate::memory::embedding::embedder::FakeEmbedder;
 
         let store = Arc::new(MemoryStore::new_for_test().await.expect("in-memory test store"));
         let (memory_tx, memory_rx) = tokio::sync::mpsc::channel(capacity);
@@ -573,8 +573,8 @@ const _: fn() = || {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::events::{MemoryEvent, MemorySource};
-    use crate::memory::worker::{ChunkOutcome, IngestReport};
+    use crate::memory::domain::events::{MemoryEvent, MemorySource};
+    use crate::memory::ingest::worker::{ChunkOutcome, IngestReport};
     use tokio::sync::mpsc::error::TrySendError;
     use crate::models::chat::Role;
 
@@ -887,7 +887,7 @@ mod tests {
             tokenizer,
             rx,
             watch::channel(None).1,
-            crate::memory::model_download::load_verified_tokenizer,
+            crate::memory::embedding::model_download::load_verified_tokenizer,
         ));
         memory_tx.try_send(chat_event("through the free function").into()).expect("send");
         drop(memory_tx);

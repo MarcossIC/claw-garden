@@ -11,15 +11,15 @@
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 
-use crate::memory::error::{ClosedAs, failed_call};
-use crate::memory::clock::TimestampMs;
+use crate::memory::store::error::{ClosedAs, failed_call};
+use crate::memory::domain::clock::TimestampMs;
 use crate::metrics::EventKind;
-use crate::memory::error::MemoryError;
-use crate::memory::events::MemoryEvent;
-use crate::memory::pieces::{link_in, StoredPiece};
-use crate::memory::redact::redact;
-use crate::memory::topic::{mark_warned_in, revise_in, Replaced, Revision};
-use crate::memory::MemoryStore;
+use crate::memory::store::error::MemoryError;
+use crate::memory::domain::events::MemoryEvent;
+use crate::memory::retrieval::pieces::{link_in, StoredPiece};
+use crate::memory::domain::redact::redact;
+use crate::memory::revision::topic::{mark_warned_in, revise_in, Replaced, Revision};
+use crate::memory::store::db::MemoryStore;
 
 /// How many times a row is taken before it is given up as failed. A save that
 /// failed once fails the same way with the same text; the retries are for a
@@ -588,7 +588,7 @@ impl MemoryStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::events::MemorySource;
+    use crate::memory::domain::events::MemorySource;
     use crate::models::chat::Role;
 
     fn event(agent: &str, content: &str) -> MemoryEvent {
@@ -664,7 +664,7 @@ mod tests {
     #[tokio::test]
     async fn recording_a_row_leaves_the_store_on_normal() {
         let dir = crate::test_dir::test_dir();
-        let store = MemoryStore::open(dir.path(), crate::memory::store_lock::StoreHolder::Eval).await.unwrap();
+        let store = MemoryStore::open(dir.path(), crate::memory::store::store_lock::StoreHolder::Eval).await.unwrap();
         new_row(&store, "op-1", "a save").await;
         store.outbox_import(vec![event("a", "an old one")]).await.unwrap();
         assert_eq!(store.conn.call(|c| Ok::<_, rusqlite::Error>(synchronous(c))).await.unwrap(), 1);

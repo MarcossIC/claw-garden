@@ -20,16 +20,16 @@ use std::time::Duration;
 use once_cell::sync::OnceCell;
 use tokio::sync::watch;
 
-use crate::memory::backup::{self, Reason};
-use crate::memory::db::{ContractStatus, EmbeddingIdentity, StoredContract};
-use crate::memory::embedder::{E5Embedder, Embedder, E5_MODEL_ID, LEGACY_CLS_MODEL_ID};
-use crate::memory::idle_embedder::{IdleEmbedder, LoadWatch, ReloadFn};
-use crate::memory::maintenance::{reembed_all, ReInferPlan, ReembedMode};
-use crate::memory::model_download::{
+use crate::memory::store::backup::{self, Reason};
+use crate::memory::store::db::{ContractStatus, EmbeddingIdentity, StoredContract};
+use crate::memory::embedding::embedder::{E5Embedder, Embedder, E5_MODEL_ID, LEGACY_CLS_MODEL_ID};
+use crate::memory::embedding::idle_embedder::{IdleEmbedder, LoadWatch, ReloadFn};
+use crate::memory::upkeep::maintenance::{reembed_all, ReInferPlan, ReembedMode};
+use crate::memory::embedding::model_download::{
     ensure_model, load_cached_model, parse_verified_tokenizer, CacheLock, DownloadError, DownloadProgress, ModelFiles,
     TokenizerFiles,
 };
-use crate::memory::MemoryStore;
+use crate::memory::store::db::MemoryStore;
 use crate::metrics::{EventKind, Recorder, Unit};
 use crate::models::chat::StreamEvent;
 
@@ -197,8 +197,8 @@ pub(crate) type EnsureModelFn = Arc<
         ) -> futures::future::BoxFuture<
             'static,
             Result<
-                crate::memory::model_download::ModelFiles,
-                crate::memory::model_download::DownloadError,
+                crate::memory::embedding::model_download::ModelFiles,
+                crate::memory::embedding::model_download::DownloadError,
             >,
         > + Send
         + Sync,
@@ -215,7 +215,7 @@ pub(crate) type CachedModelFn = Arc<
 /// Type alias for the injectable model-load seam (replaces
 /// [`E5Embedder::from_parts`] in tests).
 pub(crate) type LoadEmbedderFn = Arc<
-    dyn Fn(crate::memory::model_download::ModelFiles) -> Result<Arc<dyn Embedder>, String>
+    dyn Fn(crate::memory::embedding::model_download::ModelFiles) -> Result<Arc<dyn Embedder>, String>
         + Send
         + Sync,
 >;
@@ -410,7 +410,7 @@ fn record_load(metrics: &Recorder, phase: &'static str, took: std::time::Duratio
 /// once and never returns from the load, holding its blocking thread. It lets a test run the real binary without
 /// the 470 MB model; a release build never reads it.
 ///
-/// [`FakeEmbedder`]: crate::memory::embedder::FakeEmbedder
+/// [`FakeEmbedder`]: crate::memory::embedding::embedder::FakeEmbedder
 #[cfg(any(test, feature = "testing"))]
 pub(crate) const TEST_EMBEDDER_VAR: &str = "CLAWG_TEST_EMBEDDER";
 
@@ -455,9 +455,9 @@ impl TestEmbedder {
         let ensure: EnsureModelFn = match self {
             Self::Fake | Self::Blocked => Arc::new(|_base_dir, _progress| {
                 Box::pin(async {
-                    Ok(crate::memory::model_download::ModelFiles {
-                        onnx: crate::memory::model_download::OnnxFile::in_memory(Vec::new()),
-                        tokenizer: crate::memory::model_download::TokenizerFiles {
+                    Ok(crate::memory::embedding::model_download::ModelFiles {
+                        onnx: crate::memory::embedding::model_download::OnnxFile::in_memory(Vec::new()),
+                        tokenizer: crate::memory::embedding::model_download::TokenizerFiles {
                             tokenizer_file: Vec::new(),
                             config_file: Vec::new(),
                             special_tokens_map_file: Vec::new(),
@@ -476,8 +476,8 @@ impl TestEmbedder {
                 }
             }),
             Self::Fake | Self::Stalled => Arc::new(move |_files| {
-                tokenizer.get_or_init(crate::memory::chunker::word_tokenizer);
-                Ok(Arc::new(crate::memory::embedder::FakeEmbedder::default()) as Arc<dyn Embedder>)
+                tokenizer.get_or_init(crate::memory::embedding::chunker::word_tokenizer);
+                Ok(Arc::new(crate::memory::embedding::embedder::FakeEmbedder::default()) as Arc<dyn Embedder>)
             }),
         };
         let cached: CachedModelFn = {
@@ -527,8 +527,8 @@ pub fn serve_deps(
 #[cfg(feature = "testing")]
 pub fn serving_contract() -> EmbeddingIdentity {
     match TestEmbedder::parse(std::env::var(TEST_EMBEDDER_VAR).ok().as_deref()) {
-        Ok(Some(_)) => EmbeddingIdentity::of(&crate::memory::embedder::FakeEmbedder::default()),
-        _ => crate::memory::embedder::expected_contract(),
+        Ok(Some(_)) => EmbeddingIdentity::of(&crate::memory::embedding::embedder::FakeEmbedder::default()),
+        _ => crate::memory::embedding::embedder::expected_contract(),
     }
 }
 
@@ -536,7 +536,7 @@ pub fn serving_contract() -> EmbeddingIdentity {
 /// model: always the production embedder's.
 #[cfg(not(feature = "testing"))]
 pub fn serving_contract() -> EmbeddingIdentity {
-    crate::memory::embedder::expected_contract()
+    crate::memory::embedding::embedder::expected_contract()
 }
 
 /// `load`, with every embedder it builds wrapped in an [`IdleEmbedder`] that
@@ -777,7 +777,7 @@ pub(crate) async fn run_embedder_bootstrap(
                             // worker.rs and prompt_builder.rs already treat an
                             // empty cell as "memory disabled", so this needs no
                             // new degraded-mode logic of its own.
-                            let diffs = crate::memory::db::differing_fields(&stored, &actual);
+                            let diffs = crate::memory::store::db::differing_fields(&stored, &actual);
                             log::warn!(
                                 "embedding contract mismatch ({}); memory reads/writes are \
                                  disabled until this is resolved",
@@ -1001,9 +1001,9 @@ mod tests {
     // path, contract mismatch, AND the forwarder→sink pipeline) can be
     // asserted in-process without a host runtime.
 
-    use crate::memory::embedder::FakeEmbedder;
-    use crate::memory::model_download::{DownloadError, ModelFiles, OnnxFile};
-    use crate::memory::model_download::TokenizerFiles;
+    use crate::memory::embedding::embedder::FakeEmbedder;
+    use crate::memory::embedding::model_download::{DownloadError, ModelFiles, OnnxFile};
+    use crate::memory::embedding::model_download::TokenizerFiles;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
@@ -1044,7 +1044,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_load_records_how_long_it_verified_and_built_and_a_failure_records_nothing() {
-        use crate::memory::embedder::FakeEmbedder;
+        use crate::memory::embedding::embedder::FakeEmbedder;
         use crate::metrics::SeriesKey;
         let metrics = Arc::new(Recorder::default());
         let counts = |metrics: &Recorder| {
@@ -1153,7 +1153,7 @@ mod tests {
 
         tokio::time::sleep(Duration::from_secs(1200)).await;
         assert!(!embedder.resident());
-        embedder.embed_with_role("again", crate::memory::embedder::EmbedRole::Query).await.expect("reload");
+        embedder.embed_with_role("again", crate::memory::embedding::embedder::EmbedRole::Query).await.expect("reload");
         assert!(embedder.resident());
         assert_eq!((cached_calls.load(Ordering::SeqCst), load_calls.load(Ordering::SeqCst)), (1, 2));
     }
@@ -1166,9 +1166,9 @@ mod tests {
             async fn embed_with_role(
                 &self,
                 _: &str,
-                _: crate::memory::embedder::EmbedRole,
-            ) -> Result<Vec<f32>, crate::memory::embedder::EmbedError> {
-                Err(crate::memory::embedder::EmbedError::WorkerGone)
+                _: crate::memory::embedding::embedder::EmbedRole,
+            ) -> Result<Vec<f32>, crate::memory::embedding::embedder::EmbedError> {
+                Err(crate::memory::embedding::embedder::EmbedError::WorkerGone)
             }
             fn dimensions(&self) -> usize {
                 384
@@ -1208,7 +1208,7 @@ mod tests {
         let embedder = wrapped(empty_model_files()).expect("first load");
         tokio::time::sleep(Duration::from_secs(24 * 3600)).await;
         assert!(embedder.resident(), "never let go");
-        embedder.embed_with_role("a text", crate::memory::embedder::EmbedRole::Query).await.expect("recovered");
+        embedder.embed_with_role("a text", crate::memory::embedding::embedder::EmbedRole::Query).await.expect("recovered");
         assert_eq!(loads.load(Ordering::SeqCst), 2);
     }
 
@@ -1266,11 +1266,11 @@ mod tests {
         for _ in 0..2 {
             let answer = tokio::time::timeout(
                 Duration::from_secs(1),
-                embedder.embed_with_role("a text", crate::memory::embedder::EmbedRole::Query),
+                embedder.embed_with_role("a text", crate::memory::embedding::embedder::EmbedRole::Query),
             )
             .await
             .expect("the call answered without waiting for the download");
-            assert!(matches!(answer, Err(crate::memory::embedder::EmbedError::NotReady)), "{answer:?}");
+            assert!(matches!(answer, Err(crate::memory::embedding::embedder::EmbedError::NotReady)), "{answer:?}");
         }
         tokio::task::yield_now().await;
         assert_eq!(downloads.load(Ordering::SeqCst), 1, "one repair at a time");
@@ -1281,7 +1281,7 @@ mod tests {
         }
         tokio::time::sleep(Duration::from_millis(1)).await;
         embedder
-            .embed_with_role("a text", crate::memory::embedder::EmbedRole::Query)
+            .embed_with_role("a text", crate::memory::embedding::embedder::EmbedRole::Query)
             .await
             .expect("the repaired cache loads");
         assert!(embedder.resident());
@@ -1328,8 +1328,8 @@ mod tests {
         assert!(!embedder.resident());
 
         for _ in 0..2 {
-            let answer = embedder.embed_with_role("a text", crate::memory::embedder::EmbedRole::Query).await;
-            assert!(matches!(answer, Err(crate::memory::embedder::EmbedError::NotReady)), "{answer:?}");
+            let answer = embedder.embed_with_role("a text", crate::memory::embedding::embedder::EmbedRole::Query).await;
+            assert!(matches!(answer, Err(crate::memory::embedding::embedder::EmbedError::NotReady)), "{answer:?}");
         }
         tokio::task::yield_now().await;
         assert_eq!(downloads.load(Ordering::SeqCst), 0, "a file another program holds is not downloaded again");
@@ -1375,7 +1375,7 @@ mod tests {
             let load = model_loader(cell.clone(), counting_parse(parses.clone()), recording_build(seen.clone()));
             let worker = || {
                 let parses = parses.clone();
-                crate::memory::worker::resolve_tokenizer_and_chunker(
+                crate::memory::ingest::worker::resolve_tokenizer_and_chunker(
                     std::path::Path::new("unused"),
                     &cell,
                     move |_dir| {
@@ -1429,7 +1429,7 @@ mod tests {
 
         tokio::time::sleep(Duration::from_secs(1200)).await;
         assert!(!embedder.resident());
-        embedder.embed_with_role("again", crate::memory::embedder::EmbedRole::Query).await.expect("reload");
+        embedder.embed_with_role("again", crate::memory::embedding::embedder::EmbedRole::Query).await.expect("reload");
 
         assert!(embedder.resident());
         assert_eq!(parses.load(Ordering::SeqCst), 1, "the reload built a session and parsed nothing");
@@ -1725,7 +1725,7 @@ mod tests {
         let verify: ContractVerifyFn = Arc::new(|_embedder| {
             Box::pin(async move {
                 Ok(ContractStatus::Mismatch {
-                    stored: crate::memory::db::StoredContract {
+                    stored: crate::memory::store::db::StoredContract {
                         model_id: "multilingual-e5-small".into(),
                         dim: 384,
                         query_prefix: "".into(),
@@ -1802,7 +1802,7 @@ mod tests {
         let verify: ContractVerifyFn = Arc::new(|_embedder| {
             Box::pin(async move {
                 Ok(ContractStatus::Mismatch {
-                    stored: crate::memory::db::StoredContract {
+                    stored: crate::memory::store::db::StoredContract {
                         model_id: "fake-embedder".into(),
                         dim: 384,
                         query_prefix: "query: ".into(),
@@ -1981,7 +1981,7 @@ mod tests {
         Arc::new(|_embedder| {
             Box::pin(async move {
                 Ok(ContractStatus::Mismatch {
-                    stored: crate::memory::db::StoredContract {
+                    stored: crate::memory::store::db::StoredContract {
                         model_id: "multilingual-e5-small".into(),
                         dim: 384,
                         query_prefix: "".into(),
@@ -2213,8 +2213,8 @@ mod tests {
 
     // ---------- pooling upgrade ----------
 
-    fn contract(model_id: &str, dim: i64, prefix: &str) -> crate::memory::db::StoredContract {
-        crate::memory::db::StoredContract {
+    fn contract(model_id: &str, dim: i64, prefix: &str) -> crate::memory::store::db::StoredContract {
+        crate::memory::store::db::StoredContract {
             model_id: model_id.into(),
             dim,
             query_prefix: prefix.into(),
@@ -2253,8 +2253,8 @@ mod tests {
         async fn embed_with_role(
             &self,
             text: &str,
-            role: crate::memory::embedder::EmbedRole,
-        ) -> Result<Vec<f32>, crate::memory::embedder::EmbedError> {
+            role: crate::memory::embedding::embedder::EmbedRole,
+        ) -> Result<Vec<f32>, crate::memory::embedding::embedder::EmbedError> {
             self.0.embed_with_role(text, role).await
         }
         fn dimensions(&self) -> usize {

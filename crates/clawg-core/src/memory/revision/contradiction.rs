@@ -10,13 +10,13 @@
 
 use std::collections::HashMap;
 
-use crate::memory::search::{identifier_tokens, search_all_memories, SearchScope};
-use crate::memory::sharing::Reader;
-use crate::memory::record::MemoryType;
-use crate::memory::MemoryStore;
+use crate::memory::retrieval::search::{identifier_tokens, search_all_memories, SearchScope};
+use crate::memory::domain::sharing::Reader;
+use crate::memory::domain::record::MemoryType;
+use crate::memory::store::db::MemoryStore;
 
 #[cfg(test)]
-use crate::memory::vector::to_unit;
+use crate::memory::domain::vector::to_unit;
 
 /// L2 distance below which two embeddings are close enough to be a candidate
 /// contradiction.
@@ -247,8 +247,8 @@ pub(crate) async fn detect_contradiction(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::db::MemoryStore;
-    use crate::memory::sharing::Reach;
+    use crate::memory::store::db::MemoryStore;
+    use crate::memory::domain::sharing::Reach;
 
     // ── shared test helpers ──────────────────────────────────────────────────
 
@@ -782,9 +782,9 @@ mod tests {
     /// `[NEAR_DUPLICATE_FLOOR, CONTRADICTION_THRESHOLD)`.
     #[tokio::test]
     async fn user_preference_contradiction_detected_at_in_band_distance() {
-        use crate::memory::embedder::{EmbedRole, Embedder, FakeEmbedder};
-        use crate::memory::events::MemorySource;
-        use crate::memory::store_insert::{CreatedByType, NewMemoryRecord};
+        use crate::memory::embedding::embedder::{EmbedRole, Embedder, FakeEmbedder};
+        use crate::memory::domain::events::MemorySource;
+        use crate::memory::ingest::store_insert::{CreatedByType, NewMemoryRecord};
 
         let store = MemoryStore::new_for_test().await.unwrap();
         let embedder = FakeEmbedder::default();

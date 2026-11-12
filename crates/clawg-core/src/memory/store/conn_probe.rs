@@ -5,8 +5,8 @@ use std::time::{Duration, Instant};
 
 use rusqlite::ffi;
 
-use crate::memory::db::MemoryStore;
-use crate::memory::error::MemoryError;
+use crate::memory::store::db::MemoryStore;
+use crate::memory::store::error::MemoryError;
 
 /// What `sqlite3_db_status` says of the connection. The four counters count
 /// from the reading before, since each reading restarts them; the two sizes

@@ -19,7 +19,7 @@ use refinery::embed_migrations;
 // file's own directory is not watched, so editing only that file is not enough.
 embed_migrations!("migrations");
 
-// Re-export so callers can write `crate::memory::migrations::runner()`.
+// Re-export so callers can write `crate::memory::store::migrations::runner()`.
 pub use migrations::runner;
 
 use refinery_core::traits::sync::{Query, Transaction};
@@ -197,11 +197,11 @@ mod tests {
 
     use std::path::Path;
 
-    use crate::memory::admin::restore_memory_core;
-    use crate::memory::db::{ensure_vec0_registered, seed_on_disk, MemoryStore};
-    use crate::memory::embedder::{EmbedRole, Embedder, FakeEmbedder};
-    use crate::memory::search::{search_all_memories, SearchScope};
-    use crate::memory::store_lock::StoreHolder;
+    use crate::memory::upkeep::admin::restore_memory_core;
+    use crate::memory::store::db::{ensure_vec0_registered, seed_on_disk, MemoryStore};
+    use crate::memory::embedding::embedder::{EmbedRole, Embedder, FakeEmbedder};
+    use crate::memory::retrieval::search::{search_all_memories, SearchScope};
+    use crate::memory::store::store_lock::StoreHolder;
     use crate::test_dir::{test_dir, TestDir};
 
     /// The last schema with the two tables. Fixed, not "the latest minus
@@ -212,7 +212,7 @@ mod tests {
 
     async fn unit_bytes(text: &str) -> Vec<u8> {
         let v = FakeEmbedder::default().embed_with_role(text, EmbedRole::Passage).await.unwrap();
-        crate::memory::vector::to_unit(&v).unwrap().iter().flat_map(|f| f.to_le_bytes()).collect()
+        crate::memory::domain::vector::to_unit(&v).unwrap().iter().flat_map(|f| f.to_le_bytes()).collect()
     }
 
     /// A store at [`BEFORE`] with `seed` written into it, closed. It holds
@@ -500,7 +500,7 @@ mod tests {
         let hashes: Vec<(String, Option<String>)> =
             query(dir.path(), "SELECT content, content_hash FROM memory WHERE id >= 8 ORDER BY id", |r| Ok((r.get(0)?, r.get(1)?)));
         for (content, hash) in hashes {
-            assert_eq!(hash, Some(crate::memory::dedup::content_hash(&content)), "{content:?}");
+            assert_eq!(hash, Some(crate::memory::store::dedup::content_hash(&content)), "{content:?}");
         }
 
         let vectors: Vec<(i64, Vec<u8>)> =
@@ -539,7 +539,7 @@ mod tests {
         close(MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap()).await;
 
         assert_eq!(moved_rows(dir.path()).len(), 6, "every row moved");
-        let found = crate::memory::inspect::inspect(dir.path());
+        let found = crate::memory::projects::inspect::inspect(dir.path());
         let facts = found.facts.expect("a migrated store is read");
         assert!(facts.invariants.is_empty(), "{:?}", facts.invariants);
     }
@@ -562,7 +562,7 @@ mod tests {
         let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
         let backups = dir.path().join("backups");
 
-        let report = crate::memory::project_delete::undo_delete_core(&store, Some(&FakeEmbedder::default()), &backups, 1, false)
+        let report = crate::memory::projects::project_delete::undo_delete_core(&store, Some(&FakeEmbedder::default()), &backups, 1, false)
             .await
             .unwrap();
 
@@ -600,9 +600,9 @@ mod tests {
         )
         .await;
         let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
-        let workspaces = crate::memory::workspace::WorkspaceManager::new(dir.path().join("workspaces"));
+        let workspaces = crate::memory::retrieval::workspace::WorkspaceManager::new(dir.path().join("workspaces"));
 
-        let report = crate::memory::merge::undo_merge_core(&store, &workspaces, &dir.path().join("backups"), 1, false).await.unwrap();
+        let report = crate::memory::projects::merge::undo_merge_core(&store, &workspaces, &dir.path().join("backups"), 1, false).await.unwrap();
 
         assert_eq!(report.memories, 2, "{report:?}");
         close(store).await;
@@ -632,7 +632,7 @@ mod tests {
         assert_eq!((restored.id, restored.status.as_str()), (8, "active"));
         assert!(found(&store, TRAJECTORY).await.contains(&8));
         close(store).await;
-        crate::memory::secrets::purge(dir.path(), 9).unwrap();
+        crate::memory::upkeep::secrets::purge(dir.path(), 9).unwrap();
         let left: Vec<i64> = query(
             dir.path(),
             "SELECT id FROM memory WHERE id >= 8 UNION ALL SELECT rowid FROM memory_vectors WHERE rowid >= 8 ORDER BY 1",

@@ -8,8 +8,8 @@
 //! backwards. [`retier`] is the one other way down, and only on request: a
 //! correction takes away the tier the corrected field was giving.
 
-use crate::memory::error::{ClosedAs, failed_call};
-use crate::memory::MemoryError;
+use crate::memory::store::error::{ClosedAs, failed_call};
+use crate::memory::store::error::MemoryError;
 
 // ---------------------------------------------------------------------------
 // Pure-Rust functions (no SQL, fully unit-testable)
@@ -357,7 +357,7 @@ mod tests {
     #[tokio::test]
     async fn register_tier_udf_makes_compute_tier_callable_via_sql() {
         // Uses new_for_test() which calls register_tier_udf internally.
-        let store = crate::memory::db::MemoryStore::new_for_test().await.unwrap();
+        let store = crate::memory::store::db::MemoryStore::new_for_test().await.unwrap();
         let v: i64 = store
             .conn
             .call(|c| {
@@ -374,7 +374,7 @@ mod tests {
 
     #[tokio::test]
     async fn register_tier_udf_initial_insert_user_preference_returns_1() {
-        let store = crate::memory::db::MemoryStore::new_for_test().await.unwrap();
+        let store = crate::memory::store::db::MemoryStore::new_for_test().await.unwrap();
         let v: i64 = store
             .conn
             .call(|c| {
@@ -394,7 +394,7 @@ mod tests {
     #[tokio::test]
     async fn register_demote_udf_makes_demote_tier_callable_via_sql() {
         // Uses new_for_test() which calls register_demote_udf internally.
-        let store = crate::memory::db::MemoryStore::new_for_test().await.unwrap();
+        let store = crate::memory::store::db::MemoryStore::new_for_test().await.unwrap();
         let v: i64 = store
             .conn
             .call(|c| {

@@ -7,8 +7,8 @@
 //! differently, backfilled rows land in a different hash space than newly
 //! written ones and dedup silently stops matching history.
 
-use crate::memory::error::{ClosedAs, failed_call};
-use crate::memory::MemoryError;
+use crate::memory::store::error::{ClosedAs, failed_call};
+use crate::memory::store::error::MemoryError;
 use unicode_normalization::UnicodeNormalization;
 
 /// Trim, then NFC-normalize, then SHA-256 — trim BEFORE compose, deliberately:
@@ -100,7 +100,7 @@ mod tests {
 
     // ── SQL UDF equals the Rust function, on the same input ────────────────
 
-    async fn sql_content_hash(store: &crate::memory::db::MemoryStore, text: &str) -> String {
+    async fn sql_content_hash(store: &crate::memory::store::db::MemoryStore, text: &str) -> String {
         let text = text.to_string();
         store
             .conn
@@ -111,14 +111,14 @@ mod tests {
 
     #[tokio::test]
     async fn sql_udf_matches_rust_content_hash() {
-        let store = crate::memory::db::MemoryStore::new_for_test().await.unwrap();
+        let store = crate::memory::store::db::MemoryStore::new_for_test().await.unwrap();
         let plain = "hello world";
         assert_eq!(sql_content_hash(&store, plain).await, content_hash(plain));
     }
 
     #[tokio::test]
     async fn sql_udf_matches_rust_content_hash_on_nfd_input() {
-        let store = crate::memory::db::MemoryStore::new_for_test().await.unwrap();
+        let store = crate::memory::store::db::MemoryStore::new_for_test().await.unwrap();
         let nfd = "cafe\u{301}";
         assert_eq!(sql_content_hash(&store, nfd).await, content_hash(nfd));
         // And it must equal the NFC form's hash too, transitively.
@@ -134,7 +134,7 @@ mod tests {
     /// padded string through both.
     #[tokio::test]
     async fn sql_udf_matches_rust_content_hash_on_whitespace_padded_input() {
-        let store = crate::memory::db::MemoryStore::new_for_test().await.unwrap();
+        let store = crate::memory::store::db::MemoryStore::new_for_test().await.unwrap();
         let padded = "  hello world  \n";
         assert_eq!(sql_content_hash(&store, padded).await, content_hash(padded));
         // And it must equal the trimmed form's hash too, transitively.
@@ -151,7 +151,7 @@ mod tests {
     #[tokio::test]
     async fn backfilled_row_becomes_lookup_visible() {
         use rusqlite::OptionalExtension;
-        let store = crate::memory::db::MemoryStore::new_for_test().await.unwrap();
+        let store = crate::memory::store::db::MemoryStore::new_for_test().await.unwrap();
 
         // `new_for_test()` already runs V6, so simulate legacy data: raw-insert
         // a row, then force content_hash back to NULL as if it predated V6.
