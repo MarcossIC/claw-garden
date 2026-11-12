@@ -2,7 +2,7 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| 1 y 2 | M, operativo, sin código del producto | — | ensayo hecho ([verify.md](verify.md)); el corte espera la aprobación del piloto |
+| 1 y 2 | M, operativo, sin código del producto | — | ensayo y corte hechos ([verify.md](verify.md)); el corte fue el 2026-11-08, antes del piloto |
 
 **Tesis:** el historial entró a prod una sola vez, el 2026-10-24, con el release 0.62.0. Repetir esa importación sirve para dos cosas que hoy nadie sabe: si el trabajo de rendimiento funcionó en una importación real de punta a punta con un binario release, y dónde va lo que quedó sin proyecto. Se ensaya primero en el perfil `dev`, sobre una copia del store de prod, y recién después de aprobar el piloto se hace en prod.
 
@@ -48,7 +48,7 @@ En el ensayo fueron al proyecto de espera 735 notas sin señal o con señales qu
 ## Pasos
 
 1. **Ensayo, en `dev`:** hecho. Clasificó, deshizo e importó sobre una copia de prod, midió y dejó `dev` con su contenido. Prod sólo recibió un `clawg backup`.
-2. **Corte, en prod:** con el piloto aprobado, un `clawg backup`, un export nuevo, clasificar las notas que el mapa no conoce, `clawg projects create`, el `--dry-run` con el mapa, `clawg import --undo 1`, la importación con el mapa, colocar con `clawg projects move --id` las filas retenidas que el mapa ubica, y la verificación.
+2. **Corte, en prod:** hecho el 2026-11-08, antes del piloto y no con el piloto aprobado como decía este paso ([verify.md](verify.md#el-corte-en-prod)). Era: un `clawg backup`, un export nuevo, clasificar las notas que el mapa no conoce, `clawg projects create`, el `--dry-run` con el mapa, `clawg import --undo 1`, la importación con el mapa, colocar con `clawg projects move --id` las filas retenidas que el mapa ubica, y la verificación.
 
 **Antes del corte:** cada snapshot automático puede empujar afuera otro, porque se conservan 5 más el último de cada motivo (`AUTO_KEEP`, `crates/clawg-core/src/memory/backup.rs`). En el ensayo eso costó 4 snapshots viejos de `dev`. En prod caerían 4, incluido el `pre-import` de la primera importación si se hacen los 5 `projects move` ([verify.md](verify.md)). Los `manual` no se podan.
 
@@ -63,12 +63,14 @@ En el ensayo fueron al proyecto de espera 735 notas sin señal o con señales qu
 
 Necesita el store real, el export y las transcripciones de los clientes, un binario release y la misma máquina de la línea base.
 
-## Decisiones abiertas
+## Decisiones
 
-- [ ] Aprobar el piloto y hacer el corte.
-- [ ] Si alcanza con que 684 notas se ubiquen sólo por las rutas: unas 25 quedarían mal, hasta unas 69 en el límite inferior medido.
-- [ ] Si se aceptan las 27 notas que quedan sin fila activa porque otra de su proyecto comparte su clave de tema.
-- [ ] Si se copia aparte algún snapshot automático de prod antes de que el corte lo empuje afuera.
-- [ ] Nombre y alcance del proyecto de espera.
-- [ ] Si las filas siguen bajo el autor `migrated`. Por omisión sí: el workspace pide importancia 8 o más y tier 1, así que cambiar el autor aporta poco.
-- [ ] Qué hacer con los archivos de la memoria nativa de Claude Code que `clawg doctor` cuenta sin importar: se decide con su `--dry-run`, en el corte.
+Cómo quedó cada una en el corte ([verify.md](verify.md#el-corte-en-prod)):
+
+- [x] Aprobar el piloto y hacer el corte. El corte se hizo antes del piloto.
+- [x] Si alcanza con que 684 notas se ubiquen sólo por las rutas: unas 25 quedarían mal, hasta unas 69 en el límite inferior medido. Se aceptó. En el corte fueron 751, porque la clave de tema salió de las señales.
+- [ ] Si se aceptan las 27 notas que quedan sin fila activa porque otra de su proyecto comparte su clave de tema. No se decidió aparte: el corte no las volvió a contar.
+- [x] Si se copia aparte algún snapshot automático de prod antes de que el corte lo empuje afuera. Se copiaron los 6, y la copia se borró después de la revisión.
+- [x] Nombre y alcance del proyecto de espera. `historial-sin-ubicar`, sin carpeta, para lo que no tiene señal y para las notas de proyectos de origen sin carpeta.
+- [x] Si las filas siguen bajo el autor `migrated`. Siguen.
+- [ ] Qué hacer con los archivos de la memoria nativa de Claude Code que `clawg doctor` cuenta sin importar. No se decidió en este corte: quedó en el paso de «Corte» de [ROADMAP.md](../../ROADMAP.md) que mira el `--dry-run` de `clawg import --from claude-code`.
