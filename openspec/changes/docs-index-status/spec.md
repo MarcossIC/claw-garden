@@ -112,7 +112,7 @@ Cada entrada:
 - WHEN se pide `/health`
 - THEN `docs_index` es una lista vacía
 
-**Tests:** `health_names_the_project_whose_refresh_runs_and_how_far_it_is`, `health_shows_a_running_refresh_without_the_connection`, `health_says_when_a_refresh_ended_and_what_it_did`, `health_keeps_the_cause_of_a_failed_refresh` y `health_lists_no_docs_index_before_any_refresh` (`crates/clawg-cli/tests/api.rs`).
+**Tests:** `an_index_status_serializes_what_health_shows` (`mod.rs`); `health_names_the_project_whose_refresh_runs_and_how_far_it_is`, `health_shows_a_running_refresh_without_the_connection`, `health_says_when_a_refresh_ended_and_what_it_did`, `health_keeps_the_cause_of_a_failed_refresh` y `health_lists_no_docs_index_before_any_refresh` (`crates/clawg-cli/tests/api.rs`).
 
 ## IS4. Una línea de log cuando el refresco conoce su plan
 
@@ -133,7 +133,7 @@ Las dos líneas del final (`indexed the docs of …` y `docs refresh of …: don
 
 ## IS5. `clawg status` muestra `docs_index`
 
-El bloque `health` de `clawg status` MUST llevar `docs_index` como lo manda el daemon. Contra un daemon que no lo manda, MUST leer su `/health` sin fallar y mostrar una lista vacía.
+El bloque `health` de `clawg status` MUST llevar `docs_index` como lo manda el daemon. Contra un daemon que no lo manda, MUST leer su `/health` sin fallar y mostrar una lista vacía. El cliente MUST pasar cada entrada como llegó, sin interpretarla: una entrada con una forma que no conoce no le impide leer `/health`.
 
 #### Escenario: después de un refresco
 - GIVEN un daemon que indexó una carpeta registrada
