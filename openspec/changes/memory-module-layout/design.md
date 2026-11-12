@@ -80,10 +80,10 @@ Diez carpetas. La columna «Puede nombrar» es la tabla que fija el test ([D7](#
 - Los otros crates escriben `clawg_core::memory::` 264 veces, en 44 archivos. Pasar las carpetas a la raíz cambia todas, y con ellas `crates/clawg-cli/src/daemon/api.rs`, que otro cambio abierto edita.
 - Separar en crates queda fuera. Si se hace, es el momento de decidir los nombres de primer nivel.
 
-**Las rutas públicas.** Las carpetas son módulos privados de `memory`, y `memory/mod.rs` reexporta, una por línea, los módulos que hoy son `pub mod`:
+**Las rutas públicas.** Las carpetas son módulos del crate (`pub(crate) mod`): otro crate no las alcanza, y `crates/clawg-core/src/runtime.rs` y `eval_api.rs`, que están fuera de `memory`, sí. `memory/mod.rs` reexporta, una por línea, los módulos que hoy son `pub mod`:
 
 ```rust
-mod store;
+pub(crate) mod store;
 pub use store::backup;
 pub use store::db;
 pub use store::db::MemoryStore;
@@ -172,17 +172,17 @@ En `crates/clawg-cli/tests/conventions.rs`, con las funciones que ya tiene (`rus
 cargo test -p clawg-cli --test conventions the_memory_modules_cycle_only_where_listed
 ```
 
-Sobre `develop` imprime un grupo de 34 módulos, de 52. Al terminar tienen que quedar los cinco listados:
+Sobre `develop` imprime un grupo de 34 módulos, de 52. Al terminar quedan cinco, de 7, 5, 4, 2 y 2 módulos, de 54 (los 52 más `listing` y `search_log`):
 
 | Grupo | Motivo |
 |---|---|
-| `store`: `backup`, `db`, `dedup`, `error`, `store_lock`, `tier` | `MemoryError` lleva `BackupError` y `StoreOwner`, y los módulos que los definen, y los que registran funciones de SQL en la conexión, fallan con `MemoryError` |
-| `retrieval`: `listing`, `pieces`, `search` | un hit lleva el lugar de su pieza en el save (`pieces.rs:14`), y un save se lee entero desde la fila de su cabeza (`pieces.rs:12`, `search.rs:9`) |
+| `store`: `backup`, `db`, `dedup`, `error`, `latency`, `store_lock`, `tier` | `MemoryError` lleva `BackupError` y `StoreOwner`, y los módulos que los definen, y los que registran funciones de SQL en la conexión, fallan con `MemoryError`. El store guarda la latencia de su búsqueda vectorial (`db.rs:11`), que se mide sobre el store |
+| `retrieval`: `listing`, `pieces`, `search`, `search_log` | un hit lleva el lugar de su pieza en el save (`pieces.rs:14`), un save se lee entero desde la fila de su cabeza (`pieces.rs:12`, `search.rs:9`), y las líneas de log de una búsqueda cuentan sus hits (`RankedHit`) |
 | `retrieval`: `prompt_builder`, `workspace` | `workspace.md` se escribe con la sangría del prompt (`workspace.rs`, `indent_continuations`), y el prompt lo lee |
 | `projects`: `inspect`, `merge`, `project_delete`, `relocate`, `subfolder` | un merge, un movimiento y un borrado de proyecto corren los pasos de los otros dentro de una transacción (las funciones `_in`) |
 | `projects`: `project`, `registry` | registrar una carpeta lee los nombres del registro, y el registro reconoce un id de proyecto por su forma (`is_project_id`) |
 
-Si al aplicar la cuenta da otros grupos, la lista se corrige con lo que dé y `verify.md` lo dice.
+La lista es la que dio la cuenta al aplicar. Antes de aplicar, este diseño esperaba los mismos cinco grupos sin `latency` ni `search_log`; [`verify.md`](verify.md#lo-que-se-resolvió-distinto-de-lo-escrito) dice por qué entraron.
 
 **Descartado:** contar con una herramienta aparte (`cargo-modules`, un script). El test ya está donde viven estas reglas, corre en el CI y no agrega una dependencia.
 
@@ -192,7 +192,7 @@ Un commit por carpeta. Cada uno:
 
 1. mueve los archivos con `git mv`, sin tocar su contenido;
 2. crea `<carpeta>/mod.rs`, que declara los módulos con la visibilidad y el `cfg` que tenían en `memory/mod.rs`;
-3. en `memory/mod.rs`, cambia cada `pub mod x;` por `pub use <carpeta>::x;` y cada `pub(crate) mod x;` por `pub(crate) use <carpeta>::x;`.
+3. en `memory/mod.rs`, declara la carpeta y cambia cada `pub mod x;` por `pub use <carpeta>::x;` y cada `pub(crate) mod x;` por `pub(crate) use <carpeta>::x;`.
 
 Con el paso 3, toda ruta `crate::memory::x` del núcleo sigue resolviendo, así que el commit compila y pasa los tests sin editar lo movido. Se puede hacer así porque ningún fuente de `memory` nombra a un hermano con `super::`: los 15 `super::` de producción son de un archivo a otro del mismo módulo (`chunker/chat.rs:18-19`, `portability/translate.rs:24-26`, …).
 

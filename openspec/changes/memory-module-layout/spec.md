@@ -78,7 +78,7 @@ La regla MUST imprimir, cuando falla, cada grupo que encontró con su tamaño, p
 #### Escenario: al terminar
 - GIVEN el árbol con las carpetas
 - WHEN corre la regla
-- THEN encuentra los cinco grupos de [D7](design.md#d7-la-regla-y-cómo-se-cuenta-el-ciclo), de 6, 5, 3, 2 y 2 módulos
+- THEN encuentra los cinco grupos de [D7](design.md#d7-la-regla-y-cómo-se-cuenta-el-ciclo), de 7, 5, 4, 2 y 2 módulos
 
 **Tests:** `the_memory_modules_cycle_only_where_listed` y el puro `cycles_groups_the_nodes_that_reach_each_other` (`conventions.rs`).
 
@@ -91,7 +91,7 @@ La regla MUST imprimir, cuando falla, cada grupo que encontró con su tamaño, p
 - Ningún fuente de `crates/clawg-cli/src` ni de `crates/clawg-eval/src` MUST cambiar.
 
 #### Escenario
-- GIVEN una raíz con `pub mod portability;`, `mod store;`, `pub use store::db;` y `pub use store::db::MemoryStore;`
+- GIVEN una raíz con `pub mod portability;`, `pub(crate) mod store;`, `pub use store::db;` y `pub use store::db::MemoryStore;`
 - WHEN se leen sus módulos públicos
 - THEN son `portability` y `db`
 

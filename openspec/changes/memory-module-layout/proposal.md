@@ -68,7 +68,7 @@ Ninguno. No cambia el esquema, ningún identificador guardado ni ningún archivo
 - **Los dos tests en rojo** (`conventions.rs`), que hoy fallan:
   - `a_memory_folder_names_only_the_folders_its_row_allows` nombra los 50 módulos que no están en una carpeta de la tabla.
   - `the_memory_modules_cycle_only_where_listed` imprime el ciclo de 34 módulos.
-- **El ciclo baja de un grupo de 34 a cinco grupos, de 6, 5, 3, 2 y 2 módulos,** cada uno dentro de una carpeta y escrito con su motivo en `MEMORY_CYCLES`. Entre carpetas no queda ninguno.
+- **El ciclo baja de un grupo de 34 a cinco grupos, de 7, 5, 4, 2 y 2 módulos,** cada uno dentro de una carpeta y escrito con su motivo en `MEMORY_CYCLES`. Entre carpetas no queda ninguno.
 - **La suite pasa sin cambiar lo que comprueba.** Ninguna aserción cambia. Los tests de una respuesta (`crates/clawg-cli/tests/api.rs`, `binary.rs`) y los dos contratos del agente pasan sin editarse y sin `CLAWG_BLESS`.
 - **Los movimientos son puros:** cada commit de movimiento muestra sus archivos como renombrados al 100 %.
 - **No hay métrica de `rag-eval`:** el cambio no toca la recuperación. Lo que sí puede moverse es `rag-eval --docs`, que compara rutas: queda como pendiente en local en `verify.md`.
