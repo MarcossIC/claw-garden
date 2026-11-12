@@ -29,7 +29,6 @@ pub mod chunker;
 pub(crate) mod conn_probe;
 pub mod db;
 pub mod embedder;
-pub mod events;
 pub mod idle_embedder;
 pub mod store_insert;
 pub mod store_lock;
@@ -45,15 +44,11 @@ pub(crate) mod pieces;
 pub mod project;
 pub mod project_delete;
 pub mod project_docs;
-pub mod provenance;
 pub(crate) mod model_download;
-pub(crate) mod record;
-pub mod redact;
 pub mod registry;
 pub mod relocate;
 pub mod inspect;
 pub mod secrets;
-pub mod sharing;
 pub mod subfolder;
 
 pub use contradiction::Candidate;
@@ -74,7 +69,6 @@ pub use search::{search_all_memories, PiecePosition, RankedHit, SearchScope};
 /// search would count its pool under test and not in a release.
 pub use search::MemoryPool;
 
-pub mod clock;
 pub(crate) mod latency;
 pub(crate) mod access;
 pub(crate) mod score;
@@ -90,7 +84,6 @@ pub mod spill;
 pub(crate) mod maintenance;
 #[cfg(any(test, feature = "eval"))]
 pub(crate) mod query_context;
-pub mod vector;
 pub mod admin;
 pub mod dispute;
 pub mod synthesis;
@@ -98,3 +91,12 @@ pub mod topic;
 pub(crate) mod revival;
 #[cfg(test)]
 mod crowding;
+
+mod domain;
+pub use domain::clock;
+pub use domain::events;
+pub use domain::provenance;
+pub(crate) use domain::record;
+pub use domain::redact;
+pub use domain::sharing;
+pub use domain::vector;
