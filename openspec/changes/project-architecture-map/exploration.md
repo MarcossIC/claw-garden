@@ -12,7 +12,7 @@
 2. **Los datos para dibujar no existen.** El índice guarda pasajes sin relaciones, y el troceador descarta nombres, imports y referencias (puntos 1 y 2 de 125).
 3. **El análisis de arquitectura ya se hizo a mano en este repositorio, tres veces:**
    - [memory-module-layout](../memory-module-layout/exploration.md): 32 de 51 módulos en un solo ciclo, y dependencias invertidas;
-   - [store-boundary](../store-boundary/exploration.md): 44 de 51 módulos `pub`, que le esconden código muerto al compilador;
+   - [store-boundary](../archive/2026-11-12-store-boundary/exploration.md): 44 de 51 módulos `pub`, que le esconden código muerto al compilador;
    - [core-use-cases](../core-use-cases/exploration.md): `daemon/api.rs` con más de 3.000 líneas y handlers que deciden reglas de dominio.
 
    Son el tipo de hallazgo que un mapa podría dar sin rearmarlo cada vez.
