@@ -112,11 +112,11 @@ fn no_production_code_names_the_retired_tables() {
 }
 
 /// A failed call on the store's connection is worded in one place,
-/// `memory/error.rs`, so no other code of the core matches on the connection's
+/// `memory/store/error.rs`, so no other code of the core matches on the connection's
 /// error.
 #[test]
 fn no_memory_code_translates_a_connection_error_by_hand() {
-    const TRANSLATES: &str = "clawg-core/src/memory/error.rs";
+    const TRANSLATES: &str = "clawg-core/src/memory/store/error.rs";
     let crates = Path::new(env!("CARGO_MANIFEST_DIR")).parent().expect("the crates directory");
     let mut files = Vec::new();
     rust_files(&crates.join("clawg-core/src"), &mut files);

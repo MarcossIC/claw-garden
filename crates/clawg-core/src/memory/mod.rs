@@ -23,21 +23,15 @@
 //! [`MemoryRecord::disputed_against_ids`] parses it into `Vec<i64>`, returning
 //! `None` for NULL or malformed JSON rather than panicking.
 
-pub mod backup;
 pub mod bootstrap;
 pub mod chunker;
-pub(crate) mod conn_probe;
-pub mod db;
 pub mod embedder;
 pub mod idle_embedder;
 pub mod store_insert;
-pub mod store_lock;
 pub mod worker;
-pub(crate) mod error;
 pub mod identity;
 pub mod language;
 pub mod merge;
-pub(crate) mod migrations;
 pub mod outbox;
 pub mod portability;
 pub(crate) mod pieces;
@@ -69,11 +63,8 @@ pub use search::{search_all_memories, PiecePosition, RankedHit, SearchScope};
 /// search would count its pool under test and not in a release.
 pub use search::MemoryPool;
 
-pub(crate) mod latency;
 pub(crate) mod access;
 pub(crate) mod score;
-pub(crate) mod tier;
-pub(crate) mod dedup;
 pub(crate) mod search;
 pub(crate) mod listing;
 pub(crate) mod search_log;
@@ -100,3 +91,13 @@ pub(crate) use domain::record;
 pub use domain::redact;
 pub use domain::sharing;
 pub use domain::vector;
+
+mod store;
+pub use store::backup;
+pub use store::db;
+pub(crate) use store::dedup;
+pub(crate) use store::error;
+pub(crate) use store::latency;
+pub(crate) use store::migrations;
+pub use store::store_lock;
+pub(crate) use store::tier;
