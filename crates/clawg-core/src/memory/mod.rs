@@ -88,6 +88,7 @@ pub use projects::relocate;
 pub use projects::subfolder;
 
 pub use ingest::outbox;
+pub use ingest::save;
 pub use ingest::spill;
 pub use ingest::store_insert;
 pub use ingest::worker;
