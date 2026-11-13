@@ -1413,7 +1413,7 @@ Un `call` fallido sobre la conexión MUST traducirse con las conversiones de `cr
 
 ### SB9. La superficie de `memory` es la que usan los otros crates
 
-- Cada `pub mod` de `crates/clawg-core/src/memory/upkeep/mod.rs` MUST estar nombrado por otro crate, en una ruta `clawg_core::memory::<módulo>` o en un grupo `clawg_core::memory::{…}`. Los demás MUST ser `pub(crate)`.
+- Cada módulo que muestra `crates/clawg-core/src/memory/mod.rs` MUST estar nombrado por otro crate, en una ruta `clawg_core::memory::<módulo>` o en un grupo `clawg_core::memory::{…}`. Los muestra con un `pub mod <módulo>;` (`portability`, `project_docs`) o con un `pub use <carpeta>::<módulo>;` de una carpeta que la raíz declara `pub(crate) mod` ([`specs/quality`](../quality/spec.md), ML5). Los demás MUST ser `pub(crate)`.
 - Dentro de un módulo `pub`, un ítem MUST ser `pub` sólo si otro crate lo usa, o si está en la firma de algo que otro crate usa; las dos gemelas de plataforma que tienen una definición por sistema (`keep_one_malloc_arena`, `sync_dir`) siguen `pub` en ambas.
 - Un ítem que sólo usan los tests de otro crate MUST compilarse sólo con `cfg(any(test, feature = "testing"))`.
 - Un ítem que sólo usa `eval_api` MUST compilarse sólo con `cfg(feature = "eval")`, o con `cfg(any(test, feature = "eval"))` si también lo usan los tests del núcleo; `query_context` es uno de ellos, entero.

@@ -174,7 +174,7 @@ Un commit por carpeta, en el orden de la tabla, como dice [D8](design.md#d8-cóm
   cargo clippy -p clawg-cli -- -D warnings
   ```
 
-- [ ] El CI del PR, que corre también Windows y compila el código `cfg(windows)`.
+- [x] El CI del PR, que corre también Windows y compila el código `cfg(windows)`.
 - [x] Las comprobaciones de [D10](design.md#d10-cómo-se-comprueba-que-nada-cambia).
 - [x] `verify.md`: la suite y los clippy, los dos tests en rojo antes y después, la cuenta del ciclo, las comprobaciones de D10, lo que se resolvió distinto de lo escrito, y lo pendiente en local. Por lo menos: `rag-eval --real --docs` con el golden, mirando que ninguna pregunta se mueva por una ruta esperada.
 - [x] `state.yaml`.

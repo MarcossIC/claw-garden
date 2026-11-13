@@ -1,6 +1,6 @@
 # memory-module-layout — Verificación
 
-**Resultado:** aplicado y verificado en Linux. La suite entera y los dos clippy pasan sobre el último commit de código. Los dos tests que nacieron en rojo pasan. Ningún test de una respuesta ni de los contratos del agente se editó. Queda el CI de Windows y lo que se lista en [«Pendiente»](#pendiente).
+**Resultado:** aplicado y verificado en Linux, en el CI de Linux y Windows, y en Windows en local ([«En Windows, en local»](#en-windows-en-local)). La suite entera y los dos clippy pasan sobre el último commit de código. Los dos tests que nacieron en rojo pasan. Ningún test de una respuesta ni de los contratos del agente se editó. Queda lo que pide el modelo real, en [«Pendiente»](#pendiente).
 
 ## Qué se corrió
 
@@ -89,9 +89,9 @@ Los cinco grupos y su motivo están en `MEMORY_CYCLES` y en la tabla de D7:
 
 ## Pendiente
 
-**El CI del PR**, que corre el job de Windows: compila el código `cfg(windows)` de los tres crates, que Linux no compila, y corre la suite con finales de línea CRLF. Las reglas nuevas leen fuentes y `mod.rs`, y `declared_for_tests_only` y `production_code` parten las líneas con `str::lines`, que quita el `\r`.
+El CI del PR y la corrida en Windows ya se hicieron: están en [«El CI»](#el-ci) y en [«En Windows, en local»](#en-windows-en-local).
 
-**En local**, lo que ni Linux ni el CI comprueban:
+Queda lo que ni Linux ni el CI comprueban, porque pide el modelo real:
 
 - **`rag-eval --real --docs`**, que necesita el modelo real. El índice mide docs y código juntos, y la ruta de cada archivo de `memory` cambió, así que hay que ver que ninguna pregunta se mueva por una ruta esperada:
 
@@ -110,6 +110,31 @@ Los cinco grupos y su motivo están en `MEMORY_CYCLES` y en la tabla de D7:
   cargo test -p clawg-core --lib -- --ignored
   ```
 
-- **En Windows**, con `--target-dir target-test`: la suite y los dos clippy, si se quiere antes que el CI.
+Y, fuera de este cambio, pasar las rutas de `project_docs` a la forma con carpeta cuando entre el otro cambio que edita `project_docs/mod.rs` ([D3](design.md#d3-project_docs-es-un-dominio-aparte-y-queda-donde-está)); con eso salen la excepción `NAMES_THROUGH_THE_ROOT` y las dos reexportaciones de más de `memory/mod.rs`.
 
-Fuera de estas tareas quedan archivar, las specs principales, `openspec/README.md`, `openspec/ROADMAP.md`, la subida de versión, y pasar las rutas de `project_docs` a la forma con carpeta cuando entre el otro cambio que edita `project_docs/mod.rs` ([D3](design.md#d3-project_docs-es-un-dominio-aparte-y-queda-donde-está)).
+## El CI
+
+El CI del PR corrió sobre su último commit. El job `test (ubuntu-latest)` y el job `test (windows-latest)` pasaron. El de Windows compila el código `cfg(windows)` de los tres crates, que Linux no compila, y corre la suite con finales de línea CRLF: las reglas nuevas leen fuentes y `mod.rs`, y `declared_for_tests_only` y `production_code` parten las líneas con `str::lines`, que quita el `\r`.
+
+## En Windows, en local
+
+Se corrió el 2026-11-13 en Windows 11, sobre `develop` con este cambio y con la primera parte de core-use-cases, que agregó el módulo `ingest/save`. El build es debug, en `target-test`, limpiado antes de compilar con `cargo clean --workspace --target-dir target-test`, con el modelo falso y sin ningún perfil de datos.
+
+| Comando | Resultado |
+|---|---|
+| `cargo test --workspace --target-dir target-test` | pasa, sin ningún fallo |
+| `cargo clippy --workspace --all-targets --target-dir target-test -- -D warnings` | sin hallazgos |
+| `cargo clippy -p clawg-cli --target-dir target-test -- -D warnings` | sin hallazgos |
+
+La búsqueda de [«Las citas»](#las-citas) se repitió sobre las specs ya consolidadas y no imprime nada.
+
+## Al archivar (2026-11-13)
+
+- **Los ids cambian al consolidar.** R1 a R7 chocan con los ids de [`specs/quality`](../../../specs/quality/spec.md), así que R1 a R5 pasan a ML1 a ML5, en «Las carpetas de `memory`». R6 («Ninguna firma, tipo ni conducta cambia») es de conservación y no se consolida. R7 («Las citas siguen llevando al código») tampoco: fue un barrido de una vez, sin un test que lo sostenga, y queda en este archivo con su comando. Este archivo conserva los ids R.
+- **Sale en 0.87.0.**
+- **Los escenarios «hoy» no se consolidan.** Los de R1 y R4 describen el código de antes del cambio (50 módulos sueltos, un grupo de 34). ML1 y ML4 llevan en su lugar un escenario que vale sobre el árbol de ahora.
+- **La lista de módulos de ML1 es la de hoy,** con `ingest/save`, que agregó core-use-cases después de este cambio. La regla pasó sin editarse: un módulo nuevo dentro de una carpeta no la toca mientras nombre sólo lo que su fila permite. ML1 lo dice.
+- **Diferencias entre la spec del cambio y el código:** las de [«Lo que se resolvió distinto de lo escrito»](#lo-que-se-resolvió-distinto-de-lo-escrito). R5 pedía que las carpetas no se alcanzaran desde otro crate, y son `pub(crate) mod`, no privadas; ML5 dice lo que hace el código. ML4 lista los cinco grupos como quedaron, con `latency` y `search_log`.
+- **SB9 de [`specs/storage`](../../../specs/storage/spec.md)** decía «cada `pub mod` de `crates/clawg-core/src/memory/upkeep/mod.rs`»: el barrido de citas de este cambio había llevado `memory/mod.rs` a una carpeta, como si `mod` fuera un módulo. Vuelve a nombrar la raíz, y dice las dos formas en que la raíz muestra un módulo.
+- **Citas:** las de ML1 a ML5 se tomaron de `crates/clawg-cli/tests/conventions.rs` de hoy. En la sección que ya estaba, las tres de R7 de `specs/quality` (`tests_leaving_a_store_open` y sus dos tests) apuntaban a líneas que ya no son las suyas y se corrigieron. Las `ruta:línea` de `proposal.md`, `design.md` y `exploration.md` describen el código de antes de este cambio y no se corrigieron.
+- **De «Pendiente»** se corrió lo de Windows. Lo que pide el modelo real no se corrió: `rag-eval --real` lee el modelo de un perfil de datos.

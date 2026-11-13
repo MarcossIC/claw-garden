@@ -11,7 +11,7 @@
 1. **Ninguna salida es gráfica.** Los comandos imprimen texto o JSON ([commands.md](../../../docs/reference/commands.md)), y en `crates/` no hay nada que escriba HTML: las dos apariciones son cuerpos de error de prueba (`crates/clawg-cli/src/client.rs:2152`, `:2269`).
 2. **Los datos para dibujar no existen.** El índice guarda pasajes sin relaciones, y el troceador descarta nombres, imports y referencias (puntos 1 y 2 de 125).
 3. **El análisis de arquitectura ya se hizo a mano en este repositorio, tres veces:**
-   - [memory-module-layout](../memory-module-layout/exploration.md): 32 de 51 módulos en un solo ciclo, y dependencias invertidas;
+   - [memory-module-layout](../archive/2026-11-13-memory-module-layout/exploration.md): 32 de 51 módulos en un solo ciclo, y dependencias invertidas;
    - [store-boundary](../archive/2026-11-12-store-boundary/exploration.md): 44 de 51 módulos `pub`, que le esconden código muerto al compilador;
    - [core-use-cases](../core-use-cases/exploration.md): `daemon/api.rs` con más de 3.000 líneas y handlers que deciden reglas de dominio.
 

@@ -1,12 +1,13 @@
 # quality — Especificación
 
-Fuente de verdad de las redes de tests que vigilan lo que el modelo ve del servidor MCP, la convención de no esconder código muerto y la de no dejar un store abierto en un test de integración, de cómo se organiza por dentro el despacho de los comandos de `clawg`, y de dónde están documentados esos chequeos. Ninguno cambia el comportamiento de un comando, una ruta o una herramienta. Lo que hace cada herramienta está en [`specs/mcp`](../mcp/spec.md), y lo que dice cada comando, en la spec de su dominio.
+Fuente de verdad de las redes de tests que vigilan lo que el modelo ve del servidor MCP, la convención de no esconder código muerto y la de no dejar un store abierto en un test de integración, de cómo se organiza por dentro el despacho de los comandos de `clawg`, de en qué carpetas vive el código de `clawg_core::memory` y qué carpeta puede nombrar a cuál, y de dónde están documentados esos chequeos. Ninguno cambia el comportamiento de un comando, una ruta o una herramienta. Lo que hace cada herramienta está en [`specs/mcp`](../mcp/spec.md), y lo que dice cada comando, en la spec de su dominio.
 
 **Origen:**
 - [quality-guards](../../changes/archive/2026-10-15-quality-guards/proposal.md), archivado el 2026-10-15. Los ids de requisito son los de esa spec. R5 (borrar el código sin llamador que escondían los `allow`) fue un arreglo de una vez y no queda como requisito: lo que impide que vuelva es R4 y el comando de `clippy` de R6. R3 (que la línea `MCP tools` de `.claude/CLAUDE.md` nombrara las herramientas registradas) se quitó: ningún test lee un archivo de instrucciones para agentes (R6).
 - [agent-language](../../changes/archive/2026-10-23-agent-language/proposal.md), archivado el 2026-10-23 (sólo el contrato de una sesión en español en R1 y R2; qué lee esa sesión está en [`specs/mcp`](../mcp/spec.md), AL2 a AL4).
 - [clippy-enforced](../../changes/archive/2026-11-03-clippy-enforced/proposal.md), archivado el 2026-11-03, cuyo código salió en 0.73.0 (CE1, CE3 y CE4 en R6: qué lints de clippy rigen, cómo se anota una excepción y qué dicen los docs; CE2 está en [`specs/install`](../install/spec.md), «CI»).
 - [cli-dispatch](../../changes/archive/2026-11-04-cli-dispatch/proposal.md), archivado el 2026-11-04, sale en 0.75.0 (CD1 a CD4). No cambió ningún comando: el binario de antes y el de después dieron la misma salida, el mismo stderr y el mismo código en 244 casos, y `crates/clawg-cli/tests/binary.rs` pasó sin editarse ([verify](../../changes/archive/2026-11-04-cli-dispatch/verify.md#el-binario-de-antes-y-el-de-después)).
+- [memory-module-layout](../../changes/archive/2026-11-13-memory-module-layout/proposal.md), archivado el 2026-11-13, sale en 0.87.0 (ML1 a ML5, en «Las carpetas de `memory`»). Sus R1 a R5 son ML1 a ML5 acá, para no chocar con los ids de esta spec. R6, que ninguna firma, tipo ni respuesta cambia, es de conservación y no se consolida. R7, que las citas de las specs, de `docs/reference` y del golden de docs nombren archivos que existen, fue un barrido de una vez ([verify](../../changes/archive/2026-11-13-memory-module-layout/verify.md#las-citas)). El motivo del reparto y de cada grupo en círculo está en su [diseño](../../changes/archive/2026-11-13-memory-module-layout/design.md#d1-el-reparto).
 
 ## Definiciones
 
@@ -15,6 +16,12 @@ Fuente de verdad de las redes de tests que vigilan lo que el modelo ve del servi
 - **Lo común:** lo que un comando necesita antes de hacer lo suyo y que comparte con otros: su perfil, su directorio de datos, su idioma y, si lo necesita, el daemon corriendo.
 - **Función del comando:** la función de su módulo en `clawg_cli` a la que `dispatch` le pasa lo común y los argumentos del comando, y que devuelve lo que se imprime o el error.
 - **Frase compuesta:** un texto que clawg arma para la persona, en el idioma del comando ([`specs/preferences`](../preferences/spec.md)): la que enmarca un fallo, una negativa o un informe.
+- **`memory`:** `crates/clawg-core/src/memory/`.
+- **Carpeta:** un directorio de `memory` que es una fila de la tabla `MEMORY_FOLDERS` (`crates/clawg-cli/tests/conventions.rs:309`).
+- **Módulo:** una entrada de una carpeta: un `.rs`, o un directorio con sus fuentes. `project_docs` y `portability` son un módulo cada una (`ONE_MODULE_FOLDERS`, `conventions.rs:323`).
+- **Código de producción** de un fuente: sus líneas antes del primer `#[cfg(test)]` seguido de `mod <nombre> {`, sin las líneas de comentario (`production_code`, `conventions.rs:449`). Un fuente que su `mod.rs` declara bajo `#[cfg(test)]` no tiene (`declared_for_tests_only`).
+- **Dependencia:** un módulo depende de otro cuando su código de producción lo nombra con una ruta que empieza en `crate::memory::` o en un `super::` (`memory_dependencies`, `conventions.rs:594`). Un grupo `{…}` da una ruta por elemento, un nombre que la raíz reexporta se sigue hasta su módulo, y una ruta al propio módulo no cuenta.
+- **Otro crate:** `clawg-cli`, `clawg-eval` o un test de integración de `crates/*/tests/`.
 
 ## R1. El contrato del agente está fijado
 
@@ -112,7 +119,7 @@ Reconocer el atributo en una línea MUST ser una función pura (`hides_dead_code
 
 Un test bajo `crates/*/tests` que abre un runtime con `MemoryRuntime::open` MUST llamar a `MemoryRuntime::close` antes de terminar. Soltar un runtime sólo le avisa al hilo de su conexión, y en Windows un archivo abierto no se puede borrar: `tempfile` se rinde sin error, el store queda en el temporal del sistema y ningún test falla. Un test de integración no alcanza `crate::test_dir`, que en `src/` detecta este caso. El test de esta convención MUST fallar con la ruta, relativa a `crates/`, y el nombre de cada test que no cierra.
 
-Reconocerlo MUST ser una función pura (`tests_leaving_a_store_open`, `crates/clawg-cli/tests/conventions.rs:1018`). Lee el texto de cada test: un `.close().await` alcanza, así que un test con dos runtimes puede dejar uno abierto.
+Reconocerlo MUST ser una función pura (`tests_leaving_a_store_open`, `crates/clawg-cli/tests/conventions.rs:1668`). Lee el texto de cada test: un `.close().await` alcanza, así que un test con dos runtimes puede dejar uno abierto.
 
 #### Escenario: un test que abre en disco y no cierra
 - GIVEN un test con `MemoryRuntime::open` y sin `.close().await`
@@ -124,7 +131,7 @@ Reconocerlo MUST ser una función pura (`tests_leaving_a_store_open`, `crates/cl
 - WHEN corre la convención
 - THEN no cuenta
 
-**Test:** `an_integration_test_closes_the_store_it_opens_on_disk` (`conventions.rs:1057`) y el puro `tests_leaving_a_store_open_names_each_test_without_a_close` (`conventions.rs:1029`).
+**Test:** `an_integration_test_closes_the_store_it_opens_on_disk` (`conventions.rs:1707`) y el puro `tests_leaving_a_store_open_names_each_test_without_a_close` (`conventions.rs:1679`).
 
 ## CD1. Un error llega a `main` con su tipo y su texto
 
@@ -194,3 +201,117 @@ Un comando que hace algo además de resolver lo común, llamar una función y mo
 `export` MUST leer el idioma después de resolver el proyecto, y `secrets` sin `--mask-reasons`, después de leer el store: `language_in` escribe en stderr una línea por un `preferences.json` inválido, y leerlo antes de un paso que puede fallar sumaría esa línea donde no sale.
 
 **Test:** los de la tabla.
+
+## Las carpetas de `memory`
+
+El árbol de `memory` dice qué hace el sistema, y dos reglas de `crates/clawg-cli/tests/conventions.rs` fijan hacia dónde puede depender cada parte. Leen los fuentes como texto: no compilan nada ni agregan una dependencia. Las dos cuentan una dependencia de la misma forma, la de «Definiciones».
+
+### ML1. Cada módulo vive en una carpeta
+
+`memory` MUST contener sólo su `mod.rs` y las diez carpetas de la tabla de ML2. Un fuente o un directorio suelto junto a ellas MUST hacer fallar la regla, que lo nombra, y también una carpeta de la tabla que no existe.
+
+| Carpeta | Módulos |
+|---|---|
+| `domain` | `clock`, `events`, `provenance`, `record`, `redact`, `sharing`, `vector` |
+| `store` | `backup`, `conn_probe`, `db`, `dedup`, `error`, `latency`, `migrations`, `store_lock`, `tier` |
+| `embedding` | `chunker/`, `embedder`, `idle_embedder`, `model_download` |
+| `retrieval` | `access`, `language`, `listing`, `pieces`, `prompt_builder`, `query_context`, `score`, `search`, `search_log`, `workspace`, y `crowding`, que sólo se compila para los tests |
+| `revision` | `contradiction`, `dispute`, `revival`, `topic` |
+| `project_docs` | la carpeta es el módulo |
+| `projects` | `identity`, `inspect`, `merge`, `project`, `project_delete`, `registry`, `relocate`, `subfolder` |
+| `ingest` | `outbox`, `save`, `spill`, `store_insert`, `worker` |
+| `upkeep` | `admin`, `bootstrap`, `maintenance`, `secrets`, `synthesis` |
+| `portability` | la carpeta es el módulo |
+
+La regla fija las carpetas, no la lista de módulos de cada una: un módulo nuevo entra en la carpeta de lo que hace, y lo que comprueba la regla es que su código nombre sólo lo que la fila de esa carpeta permite.
+
+#### Escenario: un fuente suelto
+- GIVEN un fuente `extra.rs` suelto en `memory`, junto a las carpetas
+- WHEN corre la regla
+- THEN falla y nombra `extra`
+
+**Test:** `a_memory_folder_names_only_the_folders_its_row_allows` (`conventions.rs:627`).
+
+### ML2. Una carpeta nombra sólo las que su fila permite
+
+El código de producción de una carpeta MUST depender sólo de módulos de su carpeta y de las carpetas de su fila (`MEMORY_FOLDERS`, `conventions.rs:309`):
+
+| Carpeta | Puede nombrar |
+|---|---|
+| `domain` | ninguna |
+| `store` | `domain` |
+| `embedding` | `domain`, `store` |
+| `retrieval` | `domain`, `store`, `embedding` |
+| `revision` | `domain`, `store`, `retrieval` |
+| `project_docs` | `domain`, `store`, `embedding`, `retrieval` |
+| `projects` | `domain`, `store`, `embedding`, `retrieval`, `revision`, `project_docs` |
+| `ingest` | `domain`, `store`, `embedding`, `retrieval`, `revision`, `projects` |
+| `upkeep` | `domain`, `store`, `embedding`, `retrieval`, `revision`, `project_docs`, `projects` |
+| `portability` | `domain`, `store`, `embedding`, `retrieval`, `revision`, `projects`, `ingest`, `upkeep` |
+
+- Una fila MUST nombrar sólo filas escritas más arriba, así la tabla no tiene ciclos y ningún par de carpetas depende una de la otra.
+- Cada par de la tabla MUST usarse: una fila que permite una carpeta que su código no nombra hace fallar la regla. Una fila que permite más de lo que el código hace dejaría pasar una dependencia nueva sin que nadie la decida.
+- Una ruta `crate::memory::…` del código de producción MUST llevar a un módulo.
+- La regla MUST fallar con `archivo:línea` y el módulo nombrado de cada hallazgo.
+
+Una dependencia nueva entre carpetas se decide editando la fila, en el mismo cambio que la agrega.
+
+#### Escenario: una dependencia hacia arriba
+- GIVEN un fuente de `store` cuyo código de producción escribe `crate::memory::retrieval::search::RankedHit`
+- WHEN corre la regla
+- THEN falla y nombra ese archivo, esa línea y `retrieval/search`
+
+#### Escenario: el código de tests no cuenta
+- GIVEN un fuente de `retrieval` que nombra `crate::memory::upkeep::admin` sólo dentro de su `#[cfg(test)] mod tests`
+- WHEN corre la regla
+- THEN pasa
+
+**Tests:** `a_memory_folder_names_only_the_folders_its_row_allows`, y los puros `leading_paths_opens_groups_under_what_leads_to_them` (`conventions.rs:436`), `memory_paths_reads_absolute_and_relative_paths` (`:494`) y `module_named_follows_a_folder_a_module_and_a_reexport` (`:547`).
+
+### ML3. Dentro del núcleo, la ruta nombra la carpeta
+
+El código de producción de `memory` MUST nombrar un módulo de `memory` por su carpeta: `crate::memory::<carpeta>::<módulo>`. Una ruta que llegue a un módulo por un nombre que la raíz reexporta (`crate::memory::db`, `crate::memory::MemoryStore`) MUST hacer fallar la regla: con dos formas de escribir cada ruta, la que no nombra la carpeta esconde hacia dónde va la dependencia.
+
+La excepción es `project_docs`, listada en `NAMES_THROUGH_THE_ROOT` (`conventions.rs:327`): sus fuentes siguen nombrando por la raíz, y sus dependencias se cuentan igual. Para que esas rutas resuelvan, `memory/mod.rs` conserva dos reexportaciones `pub(crate)` que nada más usa: `retrieval::search` y, bajo `cfg(test)`, `embedding::model_download`. Cuando los fuentes de `project_docs` pasen a la forma con carpeta, salen la excepción y las dos reexportaciones.
+
+El código del núcleo que está fuera de `memory` (`crates/clawg-core/src/runtime.rs`, `eval_api.rs`) alcanza las carpetas, que son `pub(crate) mod`, y la regla no lo lee.
+
+**Test:** `a_memory_folder_names_only_the_folders_its_row_allows`.
+
+### ML4. Los módulos dependen en círculo sólo donde está escrito
+
+Los grupos de más de un módulo en los que cada uno depende de los demás, directa o indirectamente, MUST ser exactamente los de `MEMORY_CYCLES` (`conventions.rs:331`), cada uno con su motivo. Por ML2, cada grupo queda dentro de una sola carpeta:
+
+| Grupo | Motivo |
+|---|---|
+| `store`: `backup`, `db`, `dedup`, `error`, `latency`, `store_lock`, `tier` | `MemoryError` lleva `BackupError` y `StoreOwner`, y los módulos que los definen, y los que registran funciones de SQL en la conexión, fallan con `MemoryError`. El store guarda la latencia de su búsqueda vectorial, que se mide sobre el store |
+| `retrieval`: `listing`, `pieces`, `search`, `search_log` | un hit lleva el lugar de su pieza en el save, un save se lee entero desde la fila de su cabeza, y las líneas de log de una búsqueda cuentan sus hits |
+| `retrieval`: `prompt_builder`, `workspace` | `workspace.md` se escribe con la sangría del prompt, y el prompt lo lee |
+| `projects`: `inspect`, `merge`, `project_delete`, `relocate`, `subfolder` | un merge, un movimiento y un borrado de proyecto corren los pasos de los otros dentro de una transacción |
+| `projects`: `project`, `registry` | registrar una carpeta lee los nombres del registro, y el registro reconoce un id de proyecto por su forma |
+
+La regla MUST fallar tanto por un grupo que no está listado como por uno listado que ya no existe, y MUST imprimir cada grupo que encontró con su tamaño y la cantidad de módulos de `memory`, para que la cuenta se pueda leer de ahí:
+
+```bash
+cargo test -p clawg-cli --test conventions the_memory_modules_cycle_only_where_listed
+```
+
+#### Escenario: un ciclo nuevo
+- GIVEN un fuente de `domain/record` que pasa a nombrar `crate::memory::domain::provenance`, que ya lo nombra a él
+- WHEN corre la regla
+- THEN falla e imprime los cinco grupos listados y uno más, de 2 módulos, con `domain/provenance` y `domain/record`
+
+**Tests:** `the_memory_modules_cycle_only_where_listed` (`conventions.rs:707`) y el puro `cycles_groups_the_nodes_that_reach_each_other` (`:698`).
+
+### ML5. Los otros crates nombran un módulo sin su carpeta
+
+- Las carpetas MUST ser `pub(crate) mod` en `memory/mod.rs`, salvo `portability` y `project_docs`, que son un módulo cada una y siguen `pub mod`. Otro crate MUST NOT alcanzar una carpeta.
+- `memory/mod.rs` MUST reexportar, con una línea `pub use <carpeta>::<módulo>;` cada uno, los módulos de una carpeta que otro crate usa. Así `clawg_core::memory::<módulo>` resuelve sin nombrar la carpeta, y mover un módulo de carpeta no cambia ningún fuente de `clawg-cli` ni de `clawg-eval`.
+- La lista de los módulos que la raíz muestra MUST leerse de esas líneas y de los `pub mod` (`public_memory_modules`, `conventions.rs:286`). Qué módulos puede mostrar lo dice SB9 de [`specs/storage`](../storage/spec.md): los que otro crate nombra.
+
+#### Escenario
+- GIVEN una raíz con `pub mod portability;`, `pub(crate) mod store;`, `pub use store::db;` y `pub use store::db::MemoryStore;`
+- WHEN se leen sus módulos públicos
+- THEN son `portability` y `db`
+
+**Tests:** `every_public_memory_module_is_named_outside_core` (`conventions.rs:264`) y el puro `public_memory_modules_reads_declarations_and_reexports` (`:301`); además, que los otros crates compilan.

@@ -64,7 +64,7 @@ La reimportación del historial ya se hizo, el 2026-11-08 y antes del piloto ([h
 
 ## Después del corte (no bloquean)
 
-**Arquitectura, en este orden, porque cada paso abarata el siguiente:** store-boundary, ya hecho (archivado el 2026-11-12, sale en 0.84.0), y la cadena sigue con memory-module-layout, core-use-cases, domain-types, storage-read-side, storage-write-side, y después search-index-ports y storage-ports, que tienen puerta: sin un candidato o una pregunta concreta, cierran sin código.
+**Arquitectura, en este orden, porque cada paso abarata el siguiente:** store-boundary (archivado el 2026-11-12, sale en 0.84.0) y memory-module-layout (archivado el 2026-11-13, sale en 0.87.0), ya hechos, y la cadena sigue con core-use-cases, que tiene aplicada la primera de sus cuatro partes, domain-types, storage-read-side, storage-write-side, y después search-index-ports y storage-ports, que tienen puerta: sin un candidato o una pregunta concreta, cierran sin código.
 
 **Modelo y memoria del proceso:** tokenizer-footprint, embedder-bakeoff y model-reembed, que sólo sube si un modelo candidato pasa su umbral.
 

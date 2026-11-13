@@ -1,6 +1,6 @@
 # memory-module-layout — Especificación
 
-Son requisitos sobre [`specs/quality`](../../specs/quality/spec.md), que es donde viven las convenciones que el compilador no comprueba, y se consolidan al archivar. Lo que no se nombra acá sigue como está.
+Son requisitos sobre [`specs/quality`](../../../specs/quality/spec.md), que es donde viven las convenciones que el compilador no comprueba, y se consolidan al archivar. Lo que no se nombra acá sigue como está.
 
 Términos:
 
