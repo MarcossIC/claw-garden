@@ -62,5 +62,5 @@ Ninguno. El evento que se guarda en `ingest_outbox` sigue igual: `MemoryEvent::m
 - **Tests en rojo en core, sin router ni HTTP** ([spec](spec.md)): los de `memory/ingest/save.rs` no compilan antes del cambio (el módulo no existe), y los de `admit` en `runtime.rs` tampoco (el método no existe).
 - **Caracterización primero:** `each_refused_save_keeps_its_status_and_body` (`mod tests` de `crates/clawg-cli/src/daemon/api.rs`) fija el estado y el cuerpo entero de cada rechazo de un save, pasa sobre el código de `develop` y sigue pasando sin tocarse ([R7](spec.md#r7-lo-que-ve-un-cliente-no-cambia)).
 - **La suite pasa sin editar ningún test de respuestas:** `crates/clawg-cli/tests/api.rs` y los tests de `crates/clawg-cli/src/mcp/` no cambian, y los dos contratos del agente pasan sin `CLAWG_BLESS`.
-- **`save_memory` no decide ninguna regla:** no nombra `MemoryType`, `EmbedderStatus`, `existing_memory_ids`, `replaced_memory_ids` ni `live_project`. `verify.md` lo registra con su largo antes y después.
+- **`save_memory` no decide ninguna regla:** no nombra `EmbedderStatus`, `existing_memory_ids`, `replaced_memory_ids` ni `live_project`, y de `MemoryType` sólo usa `as_str` para la etiqueta de la métrica de la sesión. `verify.md` lo registra con su largo antes y después.
 - **No hay métrica de `rag-eval`:** el cambio no toca la recuperación.
