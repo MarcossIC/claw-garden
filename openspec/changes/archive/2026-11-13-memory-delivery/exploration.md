@@ -2,7 +2,7 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| entrega y medición (1, 2): qué memoria le llega al agente, por qué canal y cuánto contexto cuesta | M–L, por pasos y con puerta: el paso 1 es del arnés y no toca el producto | [agent-eval](../agent-eval/proposal.md) (96), del que toma el arnés y el piloto pago; se coordina con [claude-code-plugin](../claude-code-plugin/exploration.md) (120), que espera esta medición para decidir el bloque del protocolo, y con [memory-anchors](../memory-anchors/exploration.md) (98), que avisa cuando una memoria nombra algo que ya no existe | exploración cerrada; el paso 1 sigue en la [propuesta](proposal.md) |
+| entrega y medición (1, 2): qué memoria le llega al agente, por qué canal y cuánto contexto cuesta | M–L, por pasos y con puerta: el paso 1 es del arnés y no toca el producto | [agent-eval](../../agent-eval/proposal.md) (96), del que toma el arnés y el piloto pago; se coordina con [claude-code-plugin](../../claude-code-plugin/exploration.md) (120), que espera esta medición para decidir el bloque del protocolo, y con [memory-anchors](../../memory-anchors/exploration.md) (98), que avisa cuando una memoria nombra algo que ya no existe | archivado el 2026-11-13: el paso 1 está en la [propuesta](proposal.md), y la campaña no dio ganador, así que los pasos 2 y 3 no se construyen ([verify](verify.md#la-campaña-2026-11-11)) |
 
 **Tesis.** En el piloto pago de agent-eval, la memoria nativa de Claude Code resolvió las tres tareas K (6 de 6) y clawg ninguna (0 de 6). clawg no buscó mal: su memoria nunca llegó al agente. El canal que empuja, el hook de arranque, sólo toma filas que las memorias sembradas no cumplían, y el agente no tiró de ella buscando. Mientras tanto clawg paga unos 4.400 tokens fijos por sesión. Este cambio decide qué le llega al agente, por cuál de los canales que el cliente ya tiene y con cuánto contexto, midiéndolo con brazos de agent-eval, y construye en el producto sólo lo que gane. La meta es superar a la memoria nativa con menos contexto, no igualarla.
 
@@ -55,11 +55,11 @@ Medido sin sesiones pagas, sobre una copia del store de una corrida `a3` con las
 | S | la decisión vieja | 0,17 |
 | C | la decisión vigente y la vieja | 0,35 y 0,14 |
 
-El puntaje es absoluto: el coseno reescalado contra un piso del corpus, por la antigüedad, la importancia y el estado (`crates/clawg-core/src/memory/score.rs`). Una regla que vale para todo el código se parece al prompt de una tarea lo mismo que una memoria cualquiera. Un umbral alto en `user-prompt-submit`, la idea de las «Ideas evaluadas» del [README](../../README.md), no inyectaría nada en las K. Sin umbral, en el store del piloto, de una a tres memorias por proyecto, inyectaría todo, y eso no se sostiene en un store real.
+El puntaje es absoluto: el coseno reescalado contra un piso del corpus, por la antigüedad, la importancia y el estado (`crates/clawg-core/src/memory/score.rs`). Una regla que vale para todo el código se parece al prompt de una tarea lo mismo que una memoria cualquiera. Un umbral alto en `user-prompt-submit`, la idea de las «Ideas evaluadas» del [README](../../../README.md), no inyectaría nada en las K. Sin umbral, en el store del piloto, de una a tres memorias por proyecto, inyectaría todo, y eso no se sostiene en un store real.
 
 ## Los canales que el cliente ya tiene
 
-Leídos en https://code.claude.com/docs/en/memory y https://code.claude.com/docs/en/hooks el 2026-11-11, y en https://code.claude.com/docs/en/mcp según las fuentes de la [exploración de agent-eval](../agent-eval/exploration.md#fuentes), leída el 2026-10-31:
+Leídos en https://code.claude.com/docs/en/memory y https://code.claude.com/docs/en/hooks el 2026-11-11, y en https://code.claude.com/docs/en/mcp según las fuentes de la [exploración de agent-eval](../../agent-eval/exploration.md#fuentes), leída el 2026-10-31:
 
 | Canal | Cuándo entra | Lo usa clawg |
 |---|---|---|

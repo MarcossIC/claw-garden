@@ -31,5 +31,5 @@ Strict TDD: en cada tarea con conducta nueva el test va primero y falla, por la 
 
 ## Después de este paso
 
-- [ ] La guía de la campaña, fuera de git como la del piloto: `a4`, `a3`, `l0`, `l1` y `l2` sobre las seis tareas, dos corridas, con tope de gasto. La primera sesión de `l2` confirma que el cliente lee `.claude/rules/` en `-p` y avisa `InstructionsLoaded`.
-- [ ] Aplicar la regla de decisión de la [exploración](exploration.md#el-experimento) y proponer el paso 2 con el ganador.
+- [x] La guía de la campaña, fuera de git como la del piloto: `a4`, `a3`, `l0`, `l1` y `l2` sobre las seis tareas, dos corridas, con tope de gasto. La primera sesión de `l2` confirmó que el cliente lee `.claude/rules/` en `-p` y avisa `InstructionsLoaded`.
+- [x] Aplicar la regla de decisión de la [exploración](exploration.md#el-experimento): ningún brazo la cumple, así que no hay ganador con el que proponer el paso 2 ([verify](verify.md#la-campaña-2026-11-11)).

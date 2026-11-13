@@ -1,6 +1,6 @@
 # memory-delivery — Especificación (paso 1)
 
-Amplía el arnés de [agent-eval](../agent-eval/spec.md); ninguna spec del producto cambia. Origen: [proposal](proposal.md). Los tests corren con la suite, sin modelo real, red ni `claude`, y no dejan nada en el temporal.
+Amplía el arnés de [agent-eval](../../agent-eval/spec.md); ninguna spec del producto cambia. Origen: [proposal](proposal.md). Los tests corren con la suite, sin modelo real, red ni `claude`, y no dejan nada en el temporal.
 
 ## MD1. Una memoria que dijo la persona
 

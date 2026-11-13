@@ -2,7 +2,7 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| 1 (guardar barato: lo que clawg le cuesta a cada sesión que guarda) | S (textos del puente y del protocolo; sin esquema ni rutas nuevas) | — ; se coordina con [topic-key-warning](../../topic-key-warning/proposal.md) (68), que agrega otra línea a la misma respuesta, y con [memory-delivery](../../memory-delivery/proposal.md) (127), que mide brazos sin el bloque del protocolo | exploración |
+| 1 (guardar barato: lo que clawg le cuesta a cada sesión que guarda) | S (textos del puente y del protocolo; sin esquema ni rutas nuevas) | — ; se coordina con [topic-key-warning](../../topic-key-warning/proposal.md) (68), que agrega otra línea a la misma respuesta, y con [memory-delivery](../2026-11-13-memory-delivery/proposal.md) (127), que mide brazos sin el bloque del protocolo | exploración |
 
 **Tesis.** Después de cada save con memorias cercanas, el agente gasta un pedido entero al modelo en juzgar cada par, y casi siempre contesta `compatible`, un veredicto que no cambia nada de lo que se recupera. La idea de partida era pedir el juicio sólo cuando el par parece un reemplazo. Los datos dicen que el detector no puede saberlo: ni la distancia, ni el tipo, ni la posición en la lista separan los reemplazos del resto. Quien sí puede es el agente, que ya lee la lista. Lo que ahorra es dejar de pedirle el veredicto `compatible` y pedirle la llamada sólo cuando el save reemplaza una memoria.
 

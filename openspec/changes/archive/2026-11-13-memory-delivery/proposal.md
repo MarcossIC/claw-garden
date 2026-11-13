@@ -2,7 +2,7 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| entrega y medición (1, 2) | M: esta propuesta cubre el paso 1, que es sólo del arnés; los pasos 2 y 3 se proponen con el resultado de la campaña | [agent-eval](../agent-eval/proposal.md) (96), del que toma el arnés | propuesta |
+| entrega y medición (1, 2) | M: esta propuesta cubre el paso 1, que es sólo del arnés; los pasos 2 y 3 se proponen con el resultado de la campaña | [agent-eval](../../agent-eval/proposal.md) (96), del que toma el arnés | archivado el 2026-11-13, sale en 0.86.0; el paso 1 está hecho y la campaña no dio ganador ([verify](verify.md)) |
 
 ## Problema
 

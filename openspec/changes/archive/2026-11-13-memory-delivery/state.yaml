@@ -1,0 +1,16 @@
+change: memory-delivery
+objective: "entrega y medición (1, 2)"
+depends_on: [agent-eval]
+phase: archived
+release: "0.86.0"  # el arnés siembra reglas, lo que dijo la persona y ruido, suma los brazos l0, l1 y l2 y cuenta lo que llegó al contexto fuera del stream; la campaña no dio ganador y los pasos 2 y 3 no se construyen (verify.md)
+artifacts:
+  exploration: done
+  proposal: done  # cubre el paso 1, que es sólo del arnés
+  spec: done  # MD1 a MD7
+  design: skipped  # las decisiones están en la propuesta
+  tasks: done
+  apply: done
+  verify: done  # la suite y clippy pasan en Windows y el CI de Linux y Windows pasa; la campaña paga corrió y ningún brazo cumple la regla de decisión (verify.md)
+  archive: done  # MD1 a MD7 en specs/eval; ninguna spec del producto cambia
+updated: 2026-11-13
+main_spec: openspec/specs/eval/spec.md
