@@ -342,7 +342,7 @@ pub async fn conclusions_to_review_count(
 /// The ids among `ids` that name a `memory` row not deleted but superseded,
 /// ascending, each with the row that replaced it. A row out of `reader`'s
 /// reach is left out, as in [`existing_memory_ids`].
-pub async fn replaced_memory_ids(
+pub(crate) async fn replaced_memory_ids(
     store: &MemoryStore,
     ids: &[i64],
     reader: Option<&Reader>,
@@ -375,7 +375,7 @@ pub async fn replaced_memory_ids(
 /// The ids among `ids` that name a `memory` row not deleted, ascending. A row
 /// out of `reader`'s reach counts as missing, like an id that is not there, so
 /// a refusal never confirms a row the policy hides.
-pub async fn existing_memory_ids(
+pub(crate) async fn existing_memory_ids(
     store: &MemoryStore,
     ids: &[i64],
     reader: Option<&Reader>,

@@ -41,7 +41,6 @@ use clawg_core::memory::project_docs::{self, DocHit, DocIndexError, RefreshGuard
 use clawg_core::memory::worker::{
     ChunkOutcome, IngestFailure, IngestReport, SavedChunk,
 };
-use clawg_core::memory::events::{MemoryEvent, MemorySource};
 use clawg_core::memory::clock::TimestampMs;
 use clawg_core::memory::language::{count_saves_in, count_saves_in_projects};
 use clawg_core::memory::portability::timing::{Step, Timing};
@@ -64,18 +63,17 @@ use clawg_core::memory::prompt_builder::{
     build_memory_prompt, build_session_prompt, PromptBlock, QueryTexts, Retrieval, DEFAULT_BUDGET, MAX_BUDGET,
 };
 use clawg_core::memory::sharing::{self, Reach, Reader};
-use clawg_core::memory::topic::validate_topic_key;
 use clawg_core::memory::synthesis::{
-    conclusions_to_review_count, existing_memory_ids, replaced_memory_ids, synthesis_core, unreviewed_count, ConclusionReview, LostSource,
+    conclusions_to_review_count, synthesis_core, unreviewed_count, ConclusionReview, LostSource,
     Synthesis, SynthesisParams,
 };
 use clawg_core::memory::{read_save_core, search_all_memories, RankedHit, SaveText, SearchScope};
 use clawg_core::metrics::{EventKind, Recorder, Unit};
-use clawg_core::models::chat::Role;
 use clawg_core::paths::Profile;
 use clawg_core::preferences::Lang;
 use clawg_core::memory::outbox::{OutboxActionError, OutboxState, OutboxSummary};
 use clawg_core::memory::redact::SecretKind;
+use clawg_core::memory::save::{check_operation_id, NewSave, SaveInput, SaveRejected};
 use clawg_core::memory::store_insert::MemoryType;
 use clawg_core::metrics::sessions::{label, Activity, HookEvent, Who, CLIENTS, END_REASONS, OTHER, SOURCES, UNSPECIFIED};
 use clawg_core::runtime::{AcceptError, Accepted, MemoryRuntime};
@@ -322,42 +320,6 @@ pub fn clamp_search_limit(requested: Option<usize>) -> usize {
 /// Rejects instead of clamping, unlike the limit: a ratio above 1 would cut
 /// every hit past the minimum, and an answer that short would read as "the
 /// store has nothing else" when the caller only mistyped a number.
-/// Most sources one save may name. A conclusion rests on a handful of
-/// memories; a list longer than this is a client passing a listing through,
-/// and every id costs a lookup before the save is queued.
-pub const MAX_SOURCES: usize = 50;
-
-/// The sources a save names, each once and ascending, or why they are refused.
-fn distinct_sources(ids: &[i64]) -> Result<Vec<i64>, ApiError> {
-    let mut ids = ids.to_vec();
-    ids.sort_unstable();
-    ids.dedup();
-    if ids.len() > MAX_SOURCES {
-        return Err(ApiError::bad_request(format!(
-            "derived_from names {} memories; at most {MAX_SOURCES} are accepted",
-            ids.len()
-        )));
-    }
-    Ok(ids)
-}
-
-/// The requested sources that are not among the ones that exist, in order.
-fn missing_sources(requested: &[i64], existing: &[i64]) -> Vec<i64> {
-    requested.iter().copied().filter(|id| !existing.contains(id)).collect()
-}
-
-/// `5 (by 9), 7` for replaced sources, each with what replaced it when known.
-fn replaced_list(replaced: &[(i64, Option<i64>)]) -> String {
-    replaced
-        .iter()
-        .map(|(id, by)| match by {
-            Some(by) => format!("{id} (by {by})"),
-            None => id.to_string(),
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
 fn check_budget(budget: Option<usize>) -> Result<usize, ApiError> {
     match budget {
         Some(0) => Err(ApiError::bad_request("budget must be at least 1 byte")),
@@ -402,6 +364,22 @@ pub struct SaveRequest {
     /// memories saved under the same key in the same project.
     #[serde(default)]
     pub topic_key: Option<String>,
+}
+
+impl From<SaveRequest> for SaveInput {
+    fn from(body: SaveRequest) -> Self {
+        Self {
+            content: body.content,
+            agent_id: body.agent_id,
+            project_id: body.project_id,
+            memory_type: body.memory_type,
+            importance: body.importance,
+            derived_from: body.derived_from,
+            user_stated: body.user_stated,
+            operation_id: body.operation_id,
+            topic_key: body.topic_key,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -690,45 +668,8 @@ pub struct RelatedMemory {
     pub excerpt: String,
 }
 
-/// Most bytes a save's `content` may hold. Every piece of a long save
-/// rewrites its outbox row with the progress so far, so the bytes a save
-/// writes grow with the square of its length; this keeps the worst case near
-/// 230 pieces and under 10 MB, and still takes the longest note an imported
-/// history was measured to hold (45 372 characters).
-pub const MAX_CONTENT_BYTES: usize = 64 * 1024;
-
-/// A save's `content`, or why it is refused: empty, or over
-/// [`MAX_CONTENT_BYTES`] as received. Refused rather than cut, since a cut
-/// save would store a text the caller never wrote.
-fn check_content(content: &str) -> Result<(), ApiError> {
-    if content.trim().is_empty() {
-        return Err(ApiError::bad_request("content must not be empty"));
-    }
-    if content.len() > MAX_CONTENT_BYTES {
-        return Err(ApiError::bad_request(format!(
-            "content is {} bytes; at most {MAX_CONTENT_BYTES} are accepted: split it into several saves, one fact each",
-            content.len()
-        )));
-    }
-    Ok(())
-}
-
-/// Longest `operation_id` a caller may send.
-pub const MAX_OPERATION_ID_LEN: usize = 128;
-
-/// A caller's operation id, or why it is refused: one to
-/// [`MAX_OPERATION_ID_LEN`] visible ASCII characters, so it prints and
-/// compares the same everywhere it is shown.
-fn check_operation_id(id: Option<String>) -> Result<Option<String>, ApiError> {
-    match id {
-        Some(id) if id.is_empty() || id.len() > MAX_OPERATION_ID_LEN || !id.bytes().all(|b| b.is_ascii_graphic()) => {
-            Err(ApiError::bad_request(format!(
-                "operation_id must be 1 to {MAX_OPERATION_ID_LEN} visible ASCII characters"
-            )))
-        }
-        id => Ok(id),
-    }
-}
+/// The tests of the daemon and of the bridge name it from here.
+pub use clawg_core::memory::save::MAX_CONTENT_BYTES;
 
 /// A row a save wrote or reinforced. `kind` is always `"memory"`, spelled out
 /// so the triple is exactly what `DELETE /v1/memories/{kind}/{id}` takes.
@@ -1421,84 +1362,16 @@ async fn save_memory(
     State(app): State<Arc<AppCtx>>,
     Json(body): Json<SaveRequest>,
 ) -> ApiResult<(StatusCode, Json<SaveBody>)> {
-    check_content(&body.content)?;
-    // Refused here, as `PATCH` refuses it: the worker would store it as
-    // `semantic_fact` long after the caller was told the save was accepted.
-    if let Some(raw) = body.memory_type.as_deref() {
-        raw.parse::<MemoryType>().map_err(|e| ApiError::bad_request(e.to_string()))?;
-    }
-    let operation_id = check_operation_id(body.operation_id)?;
-    if let Some(key) = body.topic_key.as_deref() {
-        validate_topic_key(key).map_err(|e| ApiError::bad_request(e.to_string()))?;
-    }
-    let topic_key = body.topic_key.clone();
-    // Checked here rather than by the worker: once queued, a save can only be
-    // reported as failed long after the caller was told it was accepted.
-    let derived_from = distinct_sources(&body.derived_from)?;
-    // A conclusion is the agent's even when its sources are the user's words;
-    // storing it as the agent's after this declaration would hide the refusal.
-    if body.user_stated && !derived_from.is_empty() {
-        return Err(ApiError::bad_request(
-            "user_stated cannot go with derived_from: a conclusion is drawn by the agent, not stated by the user",
-        ));
-    }
-    if !derived_from.is_empty() {
-        let saver = reader(&app, &body.agent_id);
-        let existing = existing_memory_ids(&app.runtime.store, &derived_from, Some(&saver))
-            .await
-            .map_err(ApiError::internal)?;
-        let missing = missing_sources(&derived_from, &existing);
-        if !missing.is_empty() {
-            let ids = missing.iter().map(i64::to_string).collect::<Vec<_>>().join(", ");
-            return Err(ApiError::bad_request(format!(
-                "derived_from names memories that do not exist or were deleted: {ids}"
-            )));
-        }
-        let replaced = replaced_memory_ids(&app.runtime.store, &derived_from, Some(&saver))
-            .await
-            .map_err(ApiError::internal)?;
-        if !replaced.is_empty() {
-            return Err(ApiError::bad_request(format!(
-                "derived_from names memories that were replaced: {}; draw the conclusion from the current ones",
-                replaced_list(&replaced)
-            )));
-        }
-    }
-    // Refused before it is queued: with no embedder coming, a queued save
-    // would sit in memory until the daemon stops and then be lost.
-    let wait = match app.runtime.embedder_status() {
-        EmbedderStatus::Failed { error, retryable } => {
-            return Err(ApiError::embedder_failed(error, retryable));
-        }
-        EmbedderStatus::Loading => false,
-        EmbedderStatus::Ready => true,
-    };
-
-    let project_id = live_project(&app, body.project_id).await?;
+    let save = NewSave::parse(body.into()).map_err(save_refused)?;
+    let admitted = app.runtime.admit(save).await.map_err(save_refused)?;
     // Read now, not by the worker: a replay after a restart must keep the
     // session the save was accepted in.
-    let session_id = app.sessions.current(&body.agent_id, project_id.as_deref());
+    let session_id = app.sessions.current(admitted.agent_id(), admitted.project_id());
     let saved_in = session_id.clone();
-    let saved_as = body.memory_type.as_deref().and_then(|raw| raw.parse::<MemoryType>().ok()).map_or(UNSPECIFIED, MemoryType::as_str);
-    let event = MemoryEvent {
-        agent_id: body.agent_id,
-        project_id,
-        // Not read for an explicit save: `provenance::seal` decides who
-        // stated it.
-        role: Role::User,
-        content: body.content,
-        // Only `Role::Tool` messages carry an error flag.
-        is_error: None,
-        // The one source that honours the caller's `memory_type`/`importance`.
-        source: MemorySource::Explicit,
-        timestamp_ms: now_ms(),
-        memory_type: body.memory_type,
-        importance: body.importance,
-        derived_from,
-        topic_key: body.topic_key,
-        user_stated: body.user_stated,
-        session_id,
-    };
+    let saved_as = admitted.memory_type().map_or(UNSPECIFIED, MemoryType::as_str);
+    let topic_key = admitted.topic_key().map(str::to_owned);
+    let wait = admitted.waits();
+    let (event, operation_id) = admitted.into_event(session_id, now_ms());
 
     let (reply, report) = if wait {
         let (tx, rx) = oneshot::channel();
@@ -1549,6 +1422,25 @@ async fn save_memory(
         }
     }
     save_response(confirmation, operation_id, &masked).map(|(status, body)| (status, Json(SaveBody { topic_key, ..body })))
+}
+
+/// The answer to a save the core refused: a mistake of the caller is a
+/// `400` with the refusal's text, an embedder that will not load a `503`
+/// that says whether to retry, and a failing store a `500`.
+fn save_refused(e: SaveRejected) -> ApiError {
+    match e {
+        SaveRejected::EmbedderFailed { error, retryable } => ApiError::embedder_failed(error, retryable),
+        SaveRejected::Store(e) => ApiError::internal(e),
+        refused @ (SaveRejected::EmptyContent
+        | SaveRejected::ContentTooLong { .. }
+        | SaveRejected::UnknownType(_)
+        | SaveRejected::OperationId(_)
+        | SaveRejected::TopicKey(_)
+        | SaveRejected::TooManySources { .. }
+        | SaveRejected::StatedConclusion
+        | SaveRejected::MissingSources(_)
+        | SaveRejected::ReplacedSources(_)) => ApiError::bad_request(refused.to_string()),
+    }
 }
 
 /// A model that was let go for being idle and could not load again is not
@@ -2086,7 +1978,8 @@ fn outbox_error(e: OutboxActionError) -> ApiError {
 
 /// The operation id of an outbox request, checked as a save checks it.
 fn requested_operation(body: &OutboxRequest) -> ApiResult<String> {
-    Ok(check_operation_id(Some(body.operation_id.clone()))?.unwrap_or_default())
+    let id = check_operation_id(Some(body.operation_id.clone())).map_err(|e| ApiError::bad_request(e.to_string()))?;
+    Ok(id.unwrap_or_default())
 }
 
 async fn retry_outbox(State(app): State<Arc<AppCtx>>, Json(body): Json<OutboxRequest>) -> ApiResult<Json<RetriedBody>> {
@@ -3934,51 +3827,6 @@ mod tests {
     }
 
     #[test]
-    fn sources_are_counted_once_and_sorted() {
-        assert_eq!(distinct_sources(&[9, 3, 9, 1]).unwrap(), vec![1, 3, 9]);
-        assert_eq!(distinct_sources(&[]).unwrap(), Vec::<i64>::new());
-    }
-
-    #[test]
-    fn content_is_checked_in_bytes() {
-        assert!(check_content(&"x".repeat(MAX_CONTENT_BYTES)).is_ok());
-        assert!(check_content(&"ñ".repeat(MAX_CONTENT_BYTES / 2)).is_ok());
-        let over = check_content(&"ñ".repeat(MAX_CONTENT_BYTES / 2 + 1)).unwrap_err();
-        assert_eq!(over.status, StatusCode::BAD_REQUEST);
-        assert_eq!(
-            over.message,
-            format!(
-                "content is {} bytes; at most {MAX_CONTENT_BYTES} are accepted: split it into several saves, one fact each",
-                MAX_CONTENT_BYTES + 2
-            )
-        );
-        for empty in ["", "  \n "] {
-            assert_eq!(check_content(empty).unwrap_err().message, "content must not be empty");
-        }
-    }
-
-    #[test]
-    fn too_many_sources_are_refused() {
-        let at_cap: Vec<i64> = (0..MAX_SOURCES as i64).collect();
-        assert!(distinct_sources(&at_cap).is_ok());
-        let repeated: Vec<i64> = at_cap.iter().chain(at_cap.iter()).copied().collect();
-        assert!(distinct_sources(&repeated).is_ok(), "the cap counts distinct ids");
-        let over: Vec<i64> = (0..=MAX_SOURCES as i64).collect();
-        assert_eq!(distinct_sources(&over).unwrap_err().status, StatusCode::BAD_REQUEST);
-    }
-
-    #[test]
-    fn replaced_sources_name_what_replaced_them() {
-        assert_eq!(replaced_list(&[(5, Some(9)), (7, None)]), "5 (by 9), 7");
-    }
-
-    #[test]
-    fn missing_sources_are_the_ones_that_were_not_found() {
-        assert_eq!(missing_sources(&[1, 2, 3, 999], &[1, 3]), vec![2, 999]);
-        assert!(missing_sources(&[1, 3], &[1, 3]).is_empty());
-    }
-
-    #[test]
     fn save_response_covers_every_worker_answer() {
         let saved = save_response(Confirmation::Reported(IngestReport {
             memories: vec![chunk(57, ChunkOutcome::Inserted), chunk(12, ChunkOutcome::Reinforced)],
@@ -4031,17 +3879,6 @@ mod tests {
         assert_eq!(retrying.reason, Some("retrying"));
         assert_eq!(retrying.detail.as_deref(), Some("the embedder is not available"));
         assert_eq!(retrying.memories, None);
-    }
-
-    #[test]
-    fn operation_ids_are_checked() {
-        assert_eq!(check_operation_id(None).unwrap(), None);
-        assert_eq!(check_operation_id(Some("hook-42.a_b".into())).unwrap(), Some("hook-42.a_b".into()));
-        let longest = "x".repeat(MAX_OPERATION_ID_LEN);
-        assert_eq!(check_operation_id(Some(longest.clone())).unwrap(), Some(longest));
-        for bad in ["".to_string(), "x".repeat(MAX_OPERATION_ID_LEN + 1), "has space".into(), "acción".into()] {
-            assert_eq!(check_operation_id(Some(bad.clone())).unwrap_err().status, StatusCode::BAD_REQUEST, "{bad:?}");
-        }
     }
 
     #[test]

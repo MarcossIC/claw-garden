@@ -36,6 +36,10 @@ use crate::memory::store::store_lock::StoreHolder;
 use crate::memory::upkeep::maintenance::{run_maintenance_loop, MAINTENANCE_PERIOD, STARTUP_DELAY};
 use crate::memory::upkeep::admin::delete_memory_core;
 use crate::memory::ingest::outbox::{OutboxActionError, OutboxState, Recorded};
+use crate::memory::ingest::save::{missing_sources, Admitted, NewSave, SaveRejected};
+use crate::memory::domain::sharing;
+use crate::memory::projects::merge::canonical;
+use crate::memory::upkeep::synthesis::{existing_memory_ids, replaced_memory_ids};
 use crate::memory::domain::redact::{redact, SecretKind};
 use crate::memory::project_docs::DocIndex;
 use crate::memory::ingest::spill;
@@ -242,6 +246,36 @@ impl MemoryRuntime {
             drain,
             crate::memory::embedding::model_download::load_verified_tokenizer,
         )
+    }
+
+    /// Holds a deliberate save to the rules that read the store and the
+    /// embedder, in this order, before it is accepted: the sources of a
+    /// conclusion are live rows its agent reaches and not replaced ones, and
+    /// an embedder that failed takes no save, since with none coming a queued
+    /// save would wait until the process stops. The save then goes to the
+    /// live project its own was merged into.
+    pub async fn admit(&self, mut save: NewSave) -> Result<Admitted, SaveRejected> {
+        if !save.derived_from.is_empty() {
+            let saver = sharing::reader_in(&self.base_dir, &save.agent_id);
+            let existing = existing_memory_ids(&self.store, &save.derived_from, Some(&saver)).await?;
+            let missing = missing_sources(&save.derived_from, &existing);
+            if !missing.is_empty() {
+                return Err(SaveRejected::MissingSources(missing));
+            }
+            let replaced = replaced_memory_ids(&self.store, &save.derived_from, Some(&saver)).await?;
+            if !replaced.is_empty() {
+                return Err(SaveRejected::ReplacedSources(replaced));
+            }
+        }
+        let waits = match self.embedder_status() {
+            EmbedderStatus::Failed { error, retryable } => return Err(SaveRejected::EmbedderFailed { error, retryable }),
+            EmbedderStatus::Loading => false,
+            EmbedderStatus::Ready => true,
+        };
+        if let Some(project) = save.project_id.take() {
+            save.project_id = Some(canonical(&self.store, &project).await?);
+        }
+        Ok(Admitted { save, waits })
     }
 
     /// Takes a save: masks its secrets, records it in the outbox under
@@ -1032,5 +1066,183 @@ mod tests {
     #[test]
     fn the_production_ingest_queue_holds_1024_saves() {
         assert_eq!(INGEST_QUEUE_CAPACITY, 1024);
+    }
+
+    mod admit {
+        use super::*;
+        use crate::memory::domain::record::MemoryType;
+        use crate::memory::ingest::save::{NewSave, SaveInput, SaveRejected};
+
+        fn save(f: impl FnOnce(&mut SaveInput)) -> NewSave {
+            let mut input = SaveInput { content: "a conclusion".into(), agent_id: "a".into(), ..SaveInput::default() };
+            f(&mut input);
+            NewSave::parse(input).expect("a save of the right format")
+        }
+
+        fn from(sources: &[i64]) -> NewSave {
+            save(|s| s.derived_from = sources.to_vec())
+        }
+
+        async fn seed(rt: &MemoryRuntime, agent: &'static str) -> i64 {
+            rt.store
+                .conn
+                .call(move |c| {
+                    c.execute(
+                        "INSERT INTO memory (scope, agent_id, content, memory_type, source, created_at, created_by_type, \
+                         created_by_ref, last_modified_at, last_accessed_at, importance, tier, status) \
+                         VALUES ('agent', ?1, 'a source', 'semantic_fact', 'explicit', 1, 'agent', ?1, 1, 1, 5.0, 3, 'active')",
+                        [agent],
+                    )?;
+                    Ok::<_, rusqlite::Error>(c.last_insert_rowid())
+                })
+                .await
+                .expect("seed a row")
+        }
+
+        async fn run(rt: &MemoryRuntime, sql: String) {
+            rt.store.conn.call(move |c| c.execute_batch(&sql)).await.expect("update the rows");
+        }
+
+        #[tokio::test]
+        async fn a_conclusion_from_missing_or_hidden_sources_is_refused() {
+            let tmp = tmp_base();
+            let (rt, _rx) = MemoryRuntime::new_for_test(tmp.path().to_path_buf()).await;
+            let kept = seed(&rt, "a").await;
+            let deleted = seed(&rt, "a").await;
+            let theirs = seed(&rt, "b").await;
+            run(&rt, format!("UPDATE memory SET deleted_at = 2 WHERE id = {deleted}")).await;
+
+            assert!(rt.admit(from(&[kept, theirs])).await.is_ok(), "both reach a before the policy hides b");
+            std::fs::write(tmp.path().join("sharing.json"), r#"{"version":1,"hides":{"a":["b"]}}"#).expect("write the policy");
+            let refused = rt.admit(from(&[999_999, theirs, kept, deleted])).await.expect_err("refused");
+            assert!(matches!(&refused, SaveRejected::MissingSources(ids) if *ids == vec![deleted, theirs, 999_999]), "{refused:?}");
+            assert_eq!(
+                refused.to_string(),
+                format!("derived_from names memories that do not exist or were deleted: {deleted}, {theirs}, 999999")
+            );
+            let admitted = rt.admit(from(&[kept])).await.expect("a live source of its own");
+            assert_eq!(admitted.agent_id(), "a");
+            rt.close().await.expect("the store closes");
+        }
+
+        #[tokio::test]
+        async fn a_conclusion_from_a_replaced_source_is_refused() {
+            let tmp = tmp_base();
+            let (rt, _rx) = MemoryRuntime::new_for_test(tmp.path().to_path_buf()).await;
+            let kept = seed(&rt, "a").await;
+            let old = seed(&rt, "a").await;
+            let new = seed(&rt, "a").await;
+            let deleted = seed(&rt, "a").await;
+            run(&rt, format!("UPDATE memory SET status = 'superseded', superseded_by = {new} WHERE id = {old}; UPDATE memory SET deleted_at = 2 WHERE id = {deleted}")).await;
+
+            let refused = rt.admit(from(&[kept, old])).await.expect_err("refused");
+            assert!(matches!(&refused, SaveRejected::ReplacedSources(pairs) if *pairs == vec![(old, Some(new))]), "{refused:?}");
+            assert_eq!(
+                refused.to_string(),
+                format!("derived_from names memories that were replaced: {old} (by {new}); draw the conclusion from the current ones")
+            );
+            let refused = rt.admit(from(&[old, deleted])).await.expect_err("refused");
+            assert!(matches!(&refused, SaveRejected::MissingSources(ids) if *ids == vec![deleted]), "a missing source first: {refused:?}");
+            rt.close().await.expect("the store closes");
+        }
+
+        #[tokio::test]
+        async fn a_store_that_fails_refuses_the_save_with_its_error() {
+            let tmp = tmp_base();
+            let (rt, _rx) = MemoryRuntime::new_for_test(tmp.path().to_path_buf()).await;
+            rt.close().await.expect("the store closes");
+
+            let refused = rt.admit(from(&[1])).await.expect_err("the sources cannot be read");
+            assert!(matches!(refused, SaveRejected::Store(_)), "{refused:?}");
+            assert_eq!(refused.to_string(), "memory backend channel error: source lookup: ConnectionClosed");
+            let refused = rt.admit(save(|s| s.project_id = Some("app".into()))).await.expect_err("the project cannot be read");
+            assert_eq!(refused.to_string(), "Memory DB connection error: ConnectionClosed");
+            assert!(rt.admit(save(|_| {})).await.is_ok(), "a save with no source and no project reads nothing");
+        }
+
+        #[tokio::test]
+        async fn a_save_is_refused_while_the_embedder_failed() {
+            let tmp = tmp_base();
+            let (rt, _rx) = MemoryRuntime::new_for_test(tmp.path().to_path_buf()).await;
+            rt.embedder_status.send_replace(EmbedderStatus::Failed { error: "disk full".into(), retryable: true });
+
+            let refused = rt.admit(save(|_| {})).await.expect_err("no embedder is coming");
+            assert!(
+                matches!(&refused, SaveRejected::EmbedderFailed { error, retryable: true } if error == "disk full"),
+                "{refused:?}"
+            );
+            let refused = rt.admit(from(&[999_999])).await.expect_err("refused");
+            assert!(matches!(refused, SaveRejected::MissingSources(_)), "the sources before the embedder: {refused:?}");
+            rt.close().await.expect("the store closes");
+        }
+
+        #[tokio::test]
+        async fn a_save_waits_only_for_a_ready_embedder() {
+            let tmp = tmp_base();
+            let (rt, _rx) = MemoryRuntime::new_for_test(tmp.path().to_path_buf()).await;
+            assert!(rt.admit(save(|_| {})).await.expect("ready").waits());
+            rt.embedder_status.send_replace(EmbedderStatus::Loading);
+            assert!(!rt.admit(save(|_| {})).await.expect("loading").waits());
+            rt.close().await.expect("the store closes");
+        }
+
+        #[tokio::test]
+        async fn a_save_of_a_merged_project_goes_to_its_target() {
+            let tmp = tmp_base();
+            let (rt, _rx) = MemoryRuntime::new_for_test(tmp.path().to_path_buf()).await;
+            run(
+                &rt,
+                "INSERT INTO project (id, name, born, reviewed, created_at, merged_into) VALUES ('web', 'web', 'root', 0, 1, NULL); \
+                 INSERT INTO project (id, name, born, reviewed, created_at, merged_into) VALUES ('app', 'app', 'root', 0, 1, 'web');"
+                    .into(),
+            )
+            .await;
+
+            let admitted = rt.admit(save(|s| s.project_id = Some("app".into()))).await.expect("admitted");
+            assert_eq!(admitted.project_id(), Some("web"));
+            assert_eq!(rt.admit(save(|_| {})).await.expect("admitted").project_id(), None);
+            rt.close().await.expect("the store closes");
+        }
+
+        #[tokio::test]
+        async fn an_admitted_save_becomes_the_event_the_daemon_queued() {
+            let tmp = tmp_base();
+            let (rt, _rx) = MemoryRuntime::new_for_test(tmp.path().to_path_buf()).await;
+            let source = seed(&rt, "a").await;
+            let admitted = rt
+                .admit(save(|s| {
+                    s.content = "the user indents with tabs".into();
+                    s.project_id = Some("p".into());
+                    s.memory_type = Some("user_preference".into());
+                    s.importance = Some(8.0);
+                    s.derived_from = vec![source, source];
+                    s.operation_id = Some("op-1".into());
+                    s.topic_key = Some("style/indent".into());
+                }))
+                .await
+                .expect("admitted");
+            assert_eq!(admitted.memory_type(), Some(MemoryType::UserPreference));
+            assert_eq!(admitted.topic_key(), Some("style/indent"));
+
+            let (event, operation_id) = admitted.into_event(Some("s-1".into()), 42);
+            assert_eq!(operation_id.as_deref(), Some("op-1"));
+            assert_eq!(event.agent_id, "a");
+            assert_eq!(event.project_id.as_deref(), Some("p"));
+            assert_eq!(event.role, Role::User);
+            assert_eq!(event.content, "the user indents with tabs");
+            assert_eq!(event.is_error, None);
+            assert_eq!(event.source, MemorySource::Explicit);
+            assert_eq!(event.timestamp_ms, 42);
+            assert_eq!(event.memory_type.as_deref(), Some("user_preference"));
+            assert_eq!(event.importance, Some(8.0));
+            assert_eq!(event.derived_from, vec![source]);
+            assert_eq!(event.topic_key.as_deref(), Some("style/indent"));
+            assert!(!event.user_stated);
+            assert_eq!(event.session_id.as_deref(), Some("s-1"));
+
+            let (event, operation_id) = rt.admit(save(|s| s.user_stated = true)).await.expect("admitted").into_event(None, 7);
+            assert_eq!((event.memory_type, event.user_stated, event.session_id, operation_id), (None, true, None, None));
+            rt.close().await.expect("the store closes");
+        }
     }
 }
