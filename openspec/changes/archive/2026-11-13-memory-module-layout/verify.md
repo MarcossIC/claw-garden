@@ -91,19 +91,20 @@ Los cinco grupos y su motivo están en `MEMORY_CYCLES` y en la tabla de D7:
 
 El CI del PR y la corrida en Windows ya se hicieron: están en [«El CI»](#el-ci) y en [«En Windows, en local»](#en-windows-en-local).
 
+**`rag-eval --real --docs`** se corrió después de archivar, en Windows, con el modelo real y sobre el commit del bump a 0.87.0. El índice mide docs y código juntos, y la ruta de cada archivo de `memory` cambió, así que había que ver que ninguna pregunta se moviera por una ruta esperada:
+
+```bash
+cargo run -p clawg-eval --bin rag-eval -- --real --docs --tag memory-module-layout
+```
+
+```bash
+cargo run -p clawg-eval --bin rag-eval -- --diff docs/eval/results/2026-11-01-real-docs-a2-step-3.json docs/eval/results/2026-11-13-real-docs-memory-module-layout.json
+```
+
+La base es el último resultado `real-docs` que había, del 2026-11-01: la diferencia junta todo lo que cambió en docs y código desde entonces, no sólo este cambio, y los dos conjuntos de preguntas no son el mismo, así que se comparan las 40 que hicieron los dos. En las 20 de código, donde están las 11 que esperan un fuente de `memory`, ninguna pierde su acierto en `hit@1`, `hit@3` ni `hit@5`; una entra en los tres primeros (c04, que espera `memory/projects/identity.rs`) y `mrr@10` se mueve en una para cada lado. En las 20 de docs, una sale de los tres primeros (d01) y `hit@5` no se mueve. El veredicto de la métrica primaria es «no distinguible», con un caso para cada lado. Ninguna pregunta se movió por una ruta esperada.
+
 Queda lo que ni Linux ni el CI comprueban, porque pide el modelo real:
 
-- **`rag-eval --real --docs`**, que necesita el modelo real. El índice mide docs y código juntos, y la ruta de cada archivo de `memory` cambió, así que hay que ver que ninguna pregunta se mueva por una ruta esperada:
-
-  ```bash
-  cargo run -p clawg-eval --bin rag-eval -- --real --docs --tag memory-module-layout
-  ```
-
-  ```bash
-  cargo run -p clawg-eval --bin rag-eval -- --diff <el último {fecha}-real-docs.json de develop> <el archivo nuevo>
-  ```
-
-  Las 11 preguntas cuya respuesta esperada es un fuente de `memory` (las de `crates/clawg-eval/golden/project-docs.json` que nombran `crates/clawg-core/src/memory/`, con 13 rutas entre todas) son las que más pueden moverse. Si una pierde su acierto, hay que mirar si fue por la ruta (el breadcrumb de un pasaje de código lleva la ruta) y anotarlo acá.
 - **Los tests con el modelo real** de `project_docs` y de la importación, que están `#[ignore]` y piden `CLAWG_E5_MODEL_DIR`. Este cambio no toca su código; correrlos confirma que las rutas de sus `use` siguen llevando al mismo lugar:
 
   ```bash
@@ -137,4 +138,4 @@ La búsqueda de [«Las citas»](#las-citas) se repitió sobre las specs ya conso
 - **Diferencias entre la spec del cambio y el código:** las de [«Lo que se resolvió distinto de lo escrito»](#lo-que-se-resolvió-distinto-de-lo-escrito). R5 pedía que las carpetas no se alcanzaran desde otro crate, y son `pub(crate) mod`, no privadas; ML5 dice lo que hace el código. ML4 lista los cinco grupos como quedaron, con `latency` y `search_log`.
 - **SB9 de [`specs/storage`](../../../specs/storage/spec.md)** decía «cada `pub mod` de `crates/clawg-core/src/memory/upkeep/mod.rs`»: el barrido de citas de este cambio había llevado `memory/mod.rs` a una carpeta, como si `mod` fuera un módulo. Vuelve a nombrar la raíz, y dice las dos formas en que la raíz muestra un módulo.
 - **Citas:** las de ML1 a ML5 se tomaron de `crates/clawg-cli/tests/conventions.rs` de hoy. En la sección que ya estaba, las tres de R7 de `specs/quality` (`tests_leaving_a_store_open` y sus dos tests) apuntaban a líneas que ya no son las suyas y se corrigieron. Las `ruta:línea` de `proposal.md`, `design.md` y `exploration.md` describen el código de antes de este cambio y no se corrigieron.
-- **De «Pendiente»** se corrió lo de Windows. Lo que pide el modelo real no se corrió: `rag-eval --real` lee el modelo de un perfil de datos.
+- **De «Pendiente»** se corrió lo de Windows y, después de archivar, `rag-eval --real --docs`. Los tests `#[ignore]` con el modelo real no se corrieron.
