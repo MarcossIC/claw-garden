@@ -7,8 +7,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::memory::store_insert::MemoryType;
-use crate::memory::topic::validate_topic_key;
+use crate::memory::domain::record::MemoryType;
+use crate::memory::revision::topic::validate_topic_key;
 
 /// The `format` every header names.
 pub const FORMAT: &str = "clawg-memories";

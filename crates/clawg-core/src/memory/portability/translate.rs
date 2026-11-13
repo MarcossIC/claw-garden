@@ -14,12 +14,12 @@ use std::ops::Range;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::memory::chunker::ChatChunker;
-use crate::memory::dedup::content_hash;
-use crate::memory::redact::redact;
-use crate::memory::store_insert::MemoryType;
-use crate::memory::tier::compute_tier;
-use crate::memory::topic::{validate_topic_key, MAX_TOPIC_KEY_LEN};
+use crate::memory::embedding::chunker::ChatChunker;
+use crate::memory::store::dedup::content_hash;
+use crate::memory::domain::redact::redact;
+use crate::memory::domain::record::MemoryType;
+use crate::memory::store::tier::compute_tier;
+use crate::memory::revision::topic::{validate_topic_key, MAX_TOPIC_KEY_LEN};
 
 use super::claude_code;
 use super::foreign::{ForeignExport, ForeignNote, ForeignRelation, NoteKind, When};
@@ -801,7 +801,7 @@ pub(crate) mod tests {
     use std::path::Path;
 
     use super::*;
-    use crate::memory::identity::derive_project_id;
+    use crate::memory::projects::identity::derive_project_id;
 
     /// 2025-01-01 10:00:00 UTC.
     pub(crate) const T0: i64 = 1_735_725_600_000;
@@ -1022,7 +1022,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_long_note_is_not_cut_inside_a_word() {
-        use crate::memory::chunker::token_splitter::tests::{assert_cut_at_word_boundaries, subword_tokenizer, subword_words};
+        use crate::memory::embedding::chunker::token_splitter::tests::{assert_cut_at_word_boundaries, subword_tokenizer, subword_words};
         let content = subword_words(480).join(" ");
         let chunker = ChatChunker::with_tokenizer(subword_tokenizer());
         let t = translate(&export(vec![note("engram:long", "Notes", &content)]), &options(&[]), &chunker, NOW);

@@ -9,7 +9,7 @@ Fuente de verdad de cómo la suite prueba el binario `clawg` mismo: el build de 
 - **Feature `testing`:** la feature de clawg-core que compila los sustitutos de prueba (`crates/clawg-core/Cargo.toml:25`).
 - **Build de test:** un binario compilado con `testing`. Es el que cargo arma para los tests de integración de clawg-cli (`CARGO_BIN_EXE_clawg`, `crates/clawg-cli/tests/binary.rs:26`), porque clawg-cli enciende la feature en sus `[dev-dependencies]` (`crates/clawg-cli/Cargo.toml:73`). `cargo build --release` no compila las dev-dependencies, así que el binario que se entrega no la tiene. Efecto aceptado: después de un `cargo test`, `target/debug/clawg` es un build de test. Sólo lee las variables si están puestas, y como build debug ya está limitado al perfil dev.
 - **Home de prueba:** el valor no vacío de `CLAWG_TEST_HOME` (`TEST_HOME_VAR`, `crates/clawg-core/src/paths.rs:169`).
-- **Embedder de prueba:** el valor de `CLAWG_TEST_EMBEDDER` (`TEST_EMBEDDER_VAR`, `crates/clawg-core/src/memory/bootstrap.rs:313`), `fake`, `stalled` o `blocked` (`TestEmbedder`, `bootstrap.rs:318`).
+- **Embedder de prueba:** el valor de `CLAWG_TEST_EMBEDDER` (`TEST_EMBEDDER_VAR`, `crates/clawg-core/src/memory/upkeep/bootstrap.rs:313`), `fake`, `stalled` o `blocked` (`TestEmbedder`, `bootstrap.rs:318`).
 
 ## El home de prueba
 

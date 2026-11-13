@@ -1,6 +1,6 @@
 # eval — Especificación
 
-Fuente de verdad del comportamiento actual de la evaluación de recuperación: el generador sintético de `golden-mine synth`, la etiqueta de subconjunto y el idioma de la consulta en el golden set, sus casos sin respuesta y de versión nueva, el reporte de `rag-eval` (por subconjunto, por pareja de idiomas consulta–fila, aciertos estrictos y parciales con intervalo, partición calibración/prueba), la comparación de dos corridas con `--diff` y su corte por pareja, el brazo sólo léxico, los intrusos del audit, el barrido de contradicciones, `conflict-eval` (el detector de contradicciones entero, sobre pares etiquetados y un flujo de saves), `revision-eval` (qué cambia la clave de tema, sobre cadenas de versiones y sobre el export de un store real), `rag-eval --docs` (la medición del índice de la documentación y el código de un proyecto, [`specs/project-docs`](../project-docs/spec.md), sin los docs que citan sus preguntas, con su archivo de resultados y su `--diff`, y lo que cuesta ese índice: su memoria de vectores, los tokens, el reparto por área y el bloque `index` del archivo de resultados), `rag-eval --background` (medir sobre la copia de un snapshot real, con casos que citan su save por origen y nombran su proyecto), el banco de rendimiento del daemon y `perf-bench diff`, y la baseline medida.
+Fuente de verdad del comportamiento actual de la evaluación de recuperación: el generador sintético de `golden-mine synth`, la etiqueta de subconjunto y el idioma de la consulta en el golden set, sus casos sin respuesta y de versión nueva, el reporte de `rag-eval` (por subconjunto, por pareja de idiomas consulta–fila, aciertos estrictos y parciales con intervalo, partición calibración/prueba), la comparación de dos corridas con `--diff` y su corte por pareja, el brazo sólo léxico, los intrusos del audit, el barrido de contradicciones, `conflict-eval` (el detector de contradicciones entero, sobre pares etiquetados y un flujo de saves), `revision-eval` (qué cambia la clave de tema, sobre cadenas de versiones y sobre el export de un store real), `rag-eval --docs` (la medición del índice de la documentación y el código de un proyecto, [`specs/project-docs`](../project-docs/spec.md), sin los docs que citan sus preguntas, con su archivo de resultados y su `--diff`, y lo que cuesta ese índice: su memoria de vectores, los tokens, el reparto por área y el bloque `index` del archivo de resultados), `rag-eval --background` (medir sobre la copia de un snapshot real, con casos que citan su save por origen y nombran su proyecto), el banco de rendimiento del daemon y `perf-bench diff`, la baseline medida, y de `agent-eval` lo que mide la entrega de reglas (la siembra de reglas, de lo que dijo la persona y del ruido, los brazos `l0`, `l1` y `l2`, el registro de instrucciones y los tokens del primer pedido).
 
 **Origen:**
 - [eval-golden-expansion](../../changes/archive/2026-10-12-eval-golden-expansion/proposal.md), archivado el 2026-10-12.
@@ -19,6 +19,7 @@ Fuente de verdad del comportamiento actual de la evaluación de recuperación: e
 - [docs-search-quality](../../changes/archive/2026-10-31-docs-search-quality/proposal.md), archivado el 2026-10-31, que sale en 0.71.0 (sólo DQ1 a DQ5: los docs que citan una pregunta fuera del corpus medido, el golden inválido, el archivo de resultados de docs, su `--diff` y el golden de 40, en «`rag-eval --docs`: medir el índice de documentación», y la calidad en «Índice de docs», en la baseline). Sus pasos 2 a 4 (una expresión léxica propia de docs, los identificadores partidos y un prefijo de pasaje para docs) no entraron: los que se midieron no pasaron su puerta, y los léxicos que faltan no se pueden medir con este golden ([verify](../../changes/archive/2026-10-31-docs-search-quality/verify.md)).
 - [docs-index-speed](../../changes/archive/2026-11-01-docs-index-speed/proposal.md), archivado el 2026-11-01, que sale en 0.73.0 (sólo IS3 e IS15: `padded_sorted_queue` y el aviso de relleno, en IC6 de «`rag-eval --docs`: medir el índice de documentación», y lo medido en «Índice de docs», en la baseline). El orden y la cola con que el refresco embebe (IS1, IS2 e IS7 a IS14) están en [`specs/project-docs`](../project-docs/spec.md), «La cola del refresco».
 - [retire-legacy-kinds](../../changes/archive/2026-11-07-retire-legacy-kinds/proposal.md), archivado el 2026-11-07, que sale en 0.79.0 (RL10, al final de esta spec). Los requisitos de ese cambio se numeran R1 a R10 allí y RL1 a RL10 acá, para no chocar con los ids de cada spec.
+- [memory-delivery](../../changes/archive/2026-11-13-memory-delivery/proposal.md), archivado el 2026-11-13, que sale en 0.86.0 (MD1 a MD7, en «`agent-eval`: las reglas, el ruido y los brazos de entrega», al final de esta spec). Sólo entró su paso 1, que es del arnés: la campaña que corrió con él no dio ganador, así que nada cambió en el producto ([verify](../../changes/archive/2026-11-13-memory-delivery/verify.md#la-campaña-2026-11-11)).
 
 ## Definiciones
 
@@ -459,7 +460,7 @@ El flag MUST NOT aceptarse sin `--diff`: es un error de uso, que sale con 1. Si 
 rag-eval (--fake | --real) --lexical-only [--tag <slug>]
 ```
 
-`--lexical-only` MUST ordenar cada caso por el canal léxico solo: la misma consulta FTS5 y el mismo orden `bm25` que la búsqueda completa (`lexical_candidates`, `crates/clawg-core/src/memory/search.rs:785`), con la consulta tal cual, sin vectores ni puntaje, y hasta 10 filas (`EvalStore::lexical_search`, `crates/clawg-core/src/eval_api.rs:347`). Si FTS falla, el caso queda sin filas, sin aviso.
+`--lexical-only` MUST ordenar cada caso por el canal léxico solo: la misma consulta FTS5 y el mismo orden `bm25` que la búsqueda completa (`lexical_candidates`, `crates/clawg-core/src/memory/retrieval/search.rs:785`), con la consulta tal cual, sin vectores ni puntaje, y hasta 10 filas (`EvalStore::lexical_search`, `crates/clawg-core/src/eval_api.rs:347`). Si FTS falla, el caso queda sin filas, sin aviso.
 
 El resultado MUST llevar el tag `lexical-only` (`LEXICAL_ONLY_SLUG`, `main.rs:46`), y con `--tag X`, `X-lexical-only`, en un archivo que `--diff` compara con cualquier otro. `similarity` se sigue calculando. El flag MUST NOT combinarse con `--agent-view`, `--follow-up`, `--docs`, los barridos ni `--fts-tokenizer` (`cli.rs:407-417`). Con `--audit` sí se puede.
 
@@ -580,7 +581,7 @@ revision-eval store --labels FILE [--tag SLUG]
 
 ### El set de cadenas
 
-`crates/clawg-eval/data/revision-chains.json` es `{"version": 1, "chains": [...]}`. Cada cadena lleva `id`, `lang` (`es` o `en`), `memory_type`, `topic_key`, `query` y `versions` (2 o 3). Cada versión lleva `content`, `value` (el texto que la distingue de las otras de su cadena) y, salvo la primera, `change`: `value` cambia el valor con la misma redacción, `rewrite` lo reescribe y `extend` suma alcance o motivo. El parseo (`parse_set`, `set.rs:83`) MUST usar `deny_unknown_fields`, MUST validar la clave como un save (`validate_topic_key`, `crates/clawg-core/src/memory/topic.rs:33`) y MUST rechazar, nombrando la cadena por `id`, una `query` que contiene el `value` de alguna versión de su cadena: así ninguna versión gana por una palabra que sólo ella tiene.
+`crates/clawg-eval/data/revision-chains.json` es `{"version": 1, "chains": [...]}`. Cada cadena lleva `id`, `lang` (`es` o `en`), `memory_type`, `topic_key`, `query` y `versions` (2 o 3). Cada versión lleva `content`, `value` (el texto que la distingue de las otras de su cadena) y, salvo la primera, `change`: `value` cambia el valor con la misma redacción, `rewrite` lo reescribe y `extend` suma alcance o motivo. El parseo (`parse_set`, `set.rs:83`) MUST usar `deny_unknown_fields`, MUST validar la clave como un save (`validate_topic_key`, `crates/clawg-core/src/memory/revision/topic.rs:33`) y MUST rechazar, nombrando la cadena por `id`, una `query` que contiene el `value` de alguna versión de su cadena: así ninguna versión gana por una palabra que sólo ella tiene.
 
 El parseo MUST rechazar un set que no llega a estos mínimos, con un error que nombra la clase que falta y cuánto:
 
@@ -601,7 +602,7 @@ Cada corrida registra la `version` del set y su sha256, que se toma con finales 
 - `keyed_bare` y `keyed_unindexed` guardan como el brazo con clave. Antes de consultar, `keyed_bare` les quita a las filas `superseded` el vector (`drop_superseded_vectors`, `eval_api.rs:738`). `keyed_unindexed` les quita también el texto de `memory_fts` (`drop_superseded_text`, `eval_api.rs:768`), con la sentencia `'delete'` de los triggers de `V8__memory_fts.sql`.
 - El control guarda sólo la última versión de cada cadena, con su clave y en la ronda en que la guarda el brazo con clave.
 
-Con `--background FILE`, cada brazo guarda primero, por el worker, la historia de un store real: los saves de un `clawg export` que una reproducción deja como estaban (sin los borrados ni los reemplazados por veredicto), en el orden en que se hicieron, bajo el agente y el proyecto del brazo, con el tipo y la importancia que tenían y con su clave detrás de `bg/` (`background`, `store.rs`). Así ningún save del fondo revisa una cadena: ninguna clave del set empieza así. Una clave a la que el prefijo no le entra se deja afuera y se cuenta. El export MUST estar en un directorio `revision-eval-*` hijo directo del temporal del sistema; si no está, la corrida se rechaza sin crear ni borrar nada. Ese directorio se borra al terminar, salga bien o mal (`run_with_background`, `run.rs`). El reporte cuenta qué tuvo el fondo (`background`, y `background_saves` por brazo), sin texto ni claves. `save` valida tipo y clave antes de encolar, y devuelve lo que el worker informa del save (`IngestReport`, `crates/clawg-core/src/memory/worker.rs:82`): sus filas, las candidatas del detector y las filas reemplazadas. `EvalIngest::send` (`eval_api.rs:589`) sigue guardando sin proyecto ni clave para `rag-eval --agent-view` y `conflict-eval`.
+Con `--background FILE`, cada brazo guarda primero, por el worker, la historia de un store real: los saves de un `clawg export` que una reproducción deja como estaban (sin los borrados ni los reemplazados por veredicto), en el orden en que se hicieron, bajo el agente y el proyecto del brazo, con el tipo y la importancia que tenían y con su clave detrás de `bg/` (`background`, `store.rs`). Así ningún save del fondo revisa una cadena: ninguna clave del set empieza así. Una clave a la que el prefijo no le entra se deja afuera y se cuenta. El export MUST estar en un directorio `revision-eval-*` hijo directo del temporal del sistema; si no está, la corrida se rechaza sin crear ni borrar nada. Ese directorio se borra al terminar, salga bien o mal (`run_with_background`, `run.rs`). El reporte cuenta qué tuvo el fondo (`background`, y `background_saves` por brazo), sin texto ni claves. `save` valida tipo y clave antes de encolar, y devuelve lo que el worker informa del save (`IngestReport`, `crates/clawg-core/src/memory/ingest/worker.rs:82`): sus filas, las candidatas del detector y las filas reemplazadas. `EvalIngest::send` (`eval_api.rs:589`) sigue guardando sin proyecto ni clave para `rag-eval --agent-view` y `conflict-eval`.
 
 En el brazo sin clave, cada transición MUST quedar en exactamente una clase (`classify`, `chains.rs:195`), mirando la versión nueva contra la anterior:
 
@@ -611,7 +612,7 @@ En el brazo sin clave, cada transición MUST quedar en exactamente una clase (`c
 | `pending` | hay entre ambas un par `pending` |
 | `no_mark` | no hay par, por una de cuatro razones: `not_claim_bearing` (el tipo no afirma, `is_claim_type`, `eval_api.rs:799`), `out_of_pool` (alguna distancia dentro de la banda), `below_floor` (alguna menor que `NEAR_DUPLICATE_FLOOR`) o `above_threshold` (todas en `CONTRADICTION_THRESHOLD` o más), en ese orden |
 
-El par se lee del store (`conflict_pairs`, `eval_api.rs:670`), con cualquier fila de cada versión. Las distancias salen de `row_distances` (`eval_api.rs:698`, `vec_distance_l2` sobre `memory_vectors`, la misma distancia del KNN). Se miden entre las filas de la nueva que la anterior no tiene, que son con las que el detector probó, y las filas propias de la anterior (`compared_rows`, `chains.rs:110`). Una versión larga que repite casi todo el texto de la anterior guarda cada pedazo sin cambios como una sola fila que los dos saves tienen, y esa fila es de la versión más nueva que la tiene (`own_rows`, `chains.rs:95`). Si la nueva tiene todas las filas de la anterior, la transición es `below_floor`. Las constantes de la banda son las del detector, reexportadas y no copiadas (`eval_api.rs:805-806`; `crates/clawg-core/src/memory/contradiction.rs:45` y `:37`). `out_of_pool` se deduce por descarte, sin recalcular el pool del detector (`CANDIDATE_POOL`, `contradiction.rs:58`).
+El par se lee del store (`conflict_pairs`, `eval_api.rs:670`), con cualquier fila de cada versión. Las distancias salen de `row_distances` (`eval_api.rs:698`, `vec_distance_l2` sobre `memory_vectors`, la misma distancia del KNN). Se miden entre las filas de la nueva que la anterior no tiene, que son con las que el detector probó, y las filas propias de la anterior (`compared_rows`, `chains.rs:110`). Una versión larga que repite casi todo el texto de la anterior guarda cada pedazo sin cambios como una sola fila que los dos saves tienen, y esa fila es de la versión más nueva que la tiene (`own_rows`, `chains.rs:95`). Si la nueva tiene todas las filas de la anterior, la transición es `below_floor`. Las constantes de la banda son las del detector, reexportadas y no copiadas (`eval_api.rs:805-806`; `crates/clawg-core/src/memory/revision/contradiction.rs:45` y `:37`). `out_of_pool` se deduce por descarte, sin recalcular el pool del detector (`CANDIDATE_POOL`, `contradiction.rs:58`).
 
 Una versión está viva si alguna de sus filas propias está `active` o `disputed` (`is_live`, `chains.rs:115`). Las cuatro razones MUST sumar el total de `no_mark`, y las tres clases, el de transiciones. El reporte (`m1`, `chains.rs:462`) da conteo, tasa e intervalo de Wilson al 95 % (z = 1,96, `stats.rs:12`) por clase y razón, y los mismos cortes por `change`, `lang` y tipo. Da además `above`, las transiciones en que la vieja aparece arriba de la nueva, y `unmarked_or_above`, las que son `no_mark` o `above`, contadas una vez.
 
@@ -642,7 +643,7 @@ Con el tokenizador de las líneas de base (`EvalTokenCounter::real`, `eval_api.r
 4. el costo fijo de la clave en cada sesión: los tokens de su descripción en el schema de `save_memory` y los de su párrafo de `protocol.md`, leídos de `agent_contract.json` y de `protocol.md` compilados en el binario (`fixed_cost`, `cost.rs:169`);
 5. los tokens de una línea de aviso de referencia, fijada antes de medir (`WARNING_LINE`, `cost.rs:24`). Su costo por save lo da `store`. Es la línea en inglés: un test la compara con la que da el puente sin preferencia (`topic_key_warning(Lang::En, 123)`, `crates/clawg-cli/src/mcp/tools.rs:373`). La que el puente da en una sesión en español ([`specs/mcp`](../mcp/spec.md), AL4) no se midió en tokens.
 
-La reescritura vive en la herramienta: en producción, `recall_context` no muestra la clave (`format_hit_line`, `crates/clawg-core/src/memory/prompt_builder.rs:763`).
+La reescritura vive en la herramienta: en producción, `recall_context` no muestra la clave (`format_hit_line`, `crates/clawg-core/src/memory/retrieval/prompt_builder.rs:763`).
 
 **Tests:** `the_rewrite_adds_the_key_only_to_keyed_hits`, `the_byte_delta_is_the_sum_of_the_added_keys`, `a_prompt_over_budget_after_the_rewrite_is_counted`, `m4_reports_the_fixed_cost_of_the_key_from_the_contract_and_the_protocol`, `the_key_of_a_search_hit_shows_for_the_save_project_of_its_row` y `m4_sums_the_queries_and_prices_the_warning_line` (`cost.rs`); `the_rewrite_finds_every_keyed_header_of_a_real_prompt` y `the_production_context_still_omits_the_key` (`run.rs`), los dos sobre prompts del router en proceso.
 
@@ -781,7 +782,7 @@ Lo que sigue es lo que cuesta ese indexado y cómo no pagar dos veces el mismo v
 
 ### IC3. La clave de la memoria de vectores
 
-`rag-eval --real --docs` MUST identificar cada vector guardado por una clave: el SHA-256 de, en este orden, `model_id`, `dimensions`, el prefijo de consulta y el de pasaje (`E5_QUERY_PREFIX` y `E5_PASSAGE_PREFIX`, `crates/clawg-core/src/memory/embedder.rs:120` y `:141`), el SHA-256 del `model.onnx` (`MODEL_SHA256`, `crates/clawg-core/src/memory/model_download.rs:63`), el rol, el texto exacto con su prefijo y la marca de la máquina: sistema, arquitectura, AVX2, AVX-512F y FMA, los campos de `EvalCpu` (`crates/clawg-core/src/eval_api.rs:637`), y los hilos con que se arma la sesión (`session_threads`, `embedder.rs:530`, que usa `session_builder`, `:541`: otro número de hilos cambia cómo ONNX Runtime reparte y suma el trabajo, y puede mover los últimos bits). Cada componente de texto entra a la clave detrás de su largo, de modo que no se confunda con el vecino (`hash_contract`, `crates/clawg-core/src/eval_api/vector_memo.rs:48`; `memo_key`, `:70`). Si cambia cualquiera, la clave cambia y el vector guardado MUST NOT usarse (`from_memo = 0` para ese texto). La clave es pura: no lee disco ni reloj.
+`rag-eval --real --docs` MUST identificar cada vector guardado por una clave: el SHA-256 de, en este orden, `model_id`, `dimensions`, el prefijo de consulta y el de pasaje (`E5_QUERY_PREFIX` y `E5_PASSAGE_PREFIX`, `crates/clawg-core/src/memory/embedding/embedder.rs:120` y `:141`), el SHA-256 del `model.onnx` (`MODEL_SHA256`, `crates/clawg-core/src/memory/embedding/model_download.rs:63`), el rol, el texto exacto con su prefijo y la marca de la máquina: sistema, arquitectura, AVX2, AVX-512F y FMA, los campos de `EvalCpu` (`crates/clawg-core/src/eval_api.rs:637`), y los hilos con que se arma la sesión (`session_threads`, `embedder.rs:543`, que usa `session_builder`, `:554`: otro número de hilos cambia cómo ONNX Runtime reparte y suma el trabajo, y puede mover los últimos bits). Cada componente de texto entra a la clave detrás de su largo, de modo que no se confunda con el vecino (`hash_contract`, `crates/clawg-core/src/eval_api/vector_memo.rs:48`; `memo_key`, `:70`). Si cambia cualquiera, la clave cambia y el vector guardado MUST NOT usarse (`from_memo = 0` para ese texto). La clave es pura: no lee disco ni reloj.
 
 Una máquina distinta nunca usa los vectores de otra, porque ahí los últimos bits cambian (documentado en `EvalCpu`, `eval_api.rs:632-636`): no hay tolerancia.
 
@@ -906,14 +907,14 @@ Una memoria truncada, con una cabecera que no es la esperada, de una versión qu
 
 ### IC6. Los tokens
 
-`rag-eval --real --docs` MUST contar los tokens del corpus que indexó, después de indexar, y el archivo de resultados MUST llevarlos en `index.tokens`. Se cuentan sobre el texto de cada pasaje escrito, con el prefijo de pasaje y como lo embebe el modelo: tokenizado y recortado a la ventana de 512 (`window_encodings`, `crates/clawg-core/src/memory/embedder.rs:249`; el conteo, `lengths_by_doc`, `eval_api.rs:1415`, y `EvalDocIndex::passage_lengths`, `:1478`). Los campos son (`Tokens`, `crates/clawg-eval/src/bin/rag-eval/index_cost.rs:103`):
+`rag-eval --real --docs` MUST contar los tokens del corpus que indexó, después de indexar, y el archivo de resultados MUST llevarlos en `index.tokens`. Se cuentan sobre el texto de cada pasaje escrito, con el prefijo de pasaje y como lo embebe el modelo: tokenizado y recortado a la ventana de 512 (`window_encodings`, `crates/clawg-core/src/memory/embedding/embedder.rs:262`; el conteo, `lengths_by_doc`, `eval_api.rs:1415`, y `EvalDocIndex::passage_lengths`, `:1478`). Los campos son (`Tokens`, `crates/clawg-eval/src/bin/rag-eval/index_cost.rs:103`):
 
 | Campo | Qué es |
 |---|---|
 | `real` | La suma de los tokens de cada pasaje dentro de la ventana, sin relleno |
-| `padded` | Por doc, en tandas de `EMBED_BATCH` (`embedder.rs:185`) y en el orden del doc, filas × el más largo de la tanda, sumado: lo que corría el modelo cuando el refresco embebía doc por doc y sin ordenar, el contrafactual (`padded`, `index_cost.rs:90`) |
-| `padded_ran` | La suma de `embedder.batch_tokens` con `role=passage` de la corrida (`embedder.rs:538`): lo que corrió de verdad |
-| `padded_sorted_in_doc` | El cálculo de `padded` con los pasajes de cada doc ordenados de más tokens a menos, los empates en el orden del doc, como `longest_first` (`crates/clawg-core/src/memory/embedder.rs:189`, que `eval_api.rs:1092` reexporta), el orden con que una importación embebe sus filas (`import.rs:2529`) y con que el refresco embebía un doc de más de una tanda antes de la cola (`padded_sorted`, `index_cost.rs:96`) |
+| `padded` | Por doc, en tandas de `EMBED_BATCH` (`embedder.rs:198`) y en el orden del doc, filas × el más largo de la tanda, sumado: lo que corría el modelo cuando el refresco embebía doc por doc y sin ordenar, el contrafactual (`padded`, `index_cost.rs:90`) |
+| `padded_ran` | La suma de `embedder.batch_tokens` con `role=passage` de la corrida (`embedder.rs:551`): lo que corrió de verdad |
+| `padded_sorted_in_doc` | El cálculo de `padded` con los pasajes de cada doc ordenados de más tokens a menos, los empates en el orden del doc, como `longest_first` (`crates/clawg-core/src/memory/embedding/embedder.rs:202`, que `eval_api.rs:1092` reexporta), el orden con que una importación embebe sus filas (`import.rs:2529`) y con que el refresco embebía un doc de más de una tanda antes de la cola (`padded_sorted`, `index_cost.rs:96`) |
 | `padded_sorted_queue` | El cálculo de `padded` con los pasajes de cada grupo de docs que comparten una llamada del refresco ordenados de más tokens a menos, los empates en el orden del plan, y sumado. Los grupos los da `queue_groups` (`eval_api.rs:1207`), que delega en la cola de producción con su tope ([`specs/project-docs`](../project-docs/spec.md), «La cola del refresco»), así que es el relleno de las tandas que corre el modelo sin memoria (`Tokens::new`, `index_cost.rs:129`) |
 | `padded_sorted_all` | El mismo cálculo con todos los pasajes de la corrida en ese orden, los empates en el orden de la corrida, cortados en tandas de `EMBED_BATCH` |
 | `count_seconds` | Cuánto llevó contar, tokenizando como el embedder: la estimación de lo que cuesta tokenizar dentro de `embed` |
@@ -1029,7 +1030,7 @@ Una corrida en la que ningún pasaje salió de la memoria (`from_memo = 0`: con 
 El archivo de `rag-eval --real --docs` (`DocsResults`, `crates/clawg-eval/src/bin/rag-eval/docs.rs:323`) MUST llevar un bloque `index` (`IndexBlock`, `index_cost.rs:295`) con:
 
 - `build`: `debug` o `release` (`cfg!(debug_assertions)`);
-- `machine`: `os`, `arch`, `avx2`, `avx512f`, `fma` y `threads`, los hilos de la sesión (`session_threads`, `embedder.rs:530`);
+- `machine`: `os`, `arch`, `avx2`, `avx512f`, `fma` y `threads`, los hilos de la sesión (`session_threads`, `embedder.rs:543`);
 - `phases`: `scan`, `read`, `mask`, `split`, `lookup`, `embed` y `write`, en segundos, sumados sobre el refresco (IC1);
 - `memo`: `used` (si se leyó una memoria utilizable), `from_memo` (pasajes que salieron de ella), `embedded` (pasajes que se embebieron; `from_memo + embedded` es `corpus.passages`) y `seconds` (lo que llevó leer y escribir la memoria, **fuera** de `index_seconds`);
 - `tokens` (IC6) y `by_area` (IC7).
@@ -1458,3 +1459,71 @@ Medido el 2026-10-31 en Linux x86_64 con 4 hilos, en un build debug con el embed
 `rag-eval` MUST pedir sólo el pool de `memory` y el léxico, y `k_pool` MUST NOT registrar `episodic` ni `procedural`. `rag-eval --diff` contra la línea base de `openspec/config.yaml` MUST NOT mover ningún caso ([`specs/retrieval`](../retrieval/spec.md), RL4).
 
 **Test:** `k_pool_mirrors_the_production_lexical_budget` y los de `report.rs`, ajustados.
+
+## `agent-eval`: las reglas, el ruido y los brazos de entrega
+
+`agent-eval` mide sesiones de un agente, una tarea bajo un brazo. La base del arnés (las tareas, los brazos `a0` a `a4` y `b`, el plan de una corrida, el stream, el puntaje y la rúbrica) es AE1 a AE6, en la spec de [agent-eval](../../changes/agent-eval/spec.md), que todavía no está archivado. Lo de esta sección se suma a esa base y no toca el producto. Sus tests corren con la suite, sin modelo real, red ni `claude`, y no dejan nada en el temporal; están en `crates/clawg-eval/src/bin/agent-eval/` y en `crates/clawg-eval/tests/agent_eval.rs`.
+
+Lo que se midió con estos brazos, una campaña paga de 60 sesiones en la que ninguno cumplió la regla de decisión, está en el [verify](../../changes/archive/2026-11-13-memory-delivery/verify.md#la-campaña-2026-11-11) del cambio. Una campaña que repita `a4` lee antes lo que ese verify dice del orden de su `MEMORY.md`.
+
+### MD1. Una memoria que dijo la persona
+
+Una memoria sembrada MAY llevar `user_stated: true`. El export MUST sembrarla con `created_by_type = 'user'`, como guarda `save_memory` una memoria explícita que dijo la persona, y sin el campo MUST sembrarla con `'agent'`, como hasta ahora. Un `run.json` anterior, sin el campo, MUST seguir leyéndose.
+
+##### Escenario: la preferencia de K1
+- GIVEN una tarea cuya preferencia lleva `user_stated: true`
+- WHEN se exporta la siembra
+- THEN su fila dice `created_by_type` `user` y las demás `agent`
+
+**Tests:** `a_seeded_memory_the_person_stated_is_the_persons` (`seed.rs`); `a_task_reads_with_its_defaults` (`task.rs`).
+
+### MD2. Las reglas y el ruido
+
+Una memoria sembrada MAY llevar `rule`: `{}` es una regla de toda sesión y `{"paths": [...]}` una regla de los archivos que esos globs nombran, relativos al directorio de trabajo. Un glob vacío o que sale del directorio de trabajo MUST rechazar la tarea nombrando por qué. `data/agent-tasks/noise.json`, cuando existe, MUST ser una lista de memorias sembradas, cada una válida como las de una tarea y cada una con `rule`; un trazador de cualquier tarea en una de ellas MUST rechazarse, en `agent-eval tasks` y en cada corrida, nombrando la tarea, el trazador y la memoria. Un directorio de datos sin el archivo no tiene ruido. `agent-eval tasks` MUST listar cuántas reglas tiene el ruido.
+
+##### Escenario: un ruido que da el hecho
+- GIVEN un ruido con una memoria que contiene `48213`, el trazador de una tarea
+- WHEN se cargan las tareas y el ruido
+- THEN la carga falla nombrando la tarea, `48213` y la memoria
+
+**Tests:** `a_rule_reads_with_or_without_paths`, `a_rule_path_must_stay_inside`, `the_noise_is_rules_that_hold_no_tracer`, `a_data_directory_without_noise_has_none` (`task.rs`); `the_example_tasks_are_valid_and_leak_no_tracer` (`tests/agent_eval.rs`).
+
+### MD3. Lo que siembra cada brazo
+
+Todo brazo con memoria MUST sembrar el ruido junto a las memorias de la tarea, en un solo orden, de la más nueva a la más vieja y, a igual edad, el ruido antes que la tarea: en el export, en el `MEMORY.md` de `a4` y en las reglas de `l1` y `l2`. `a0` MUST seguir sin siembra ni memoria nativa. Una tarea sin memorias MUST sembrar el ruido.
+
+**Tests:** `the_seed_goes_from_the_newest_memory_to_the_oldest` (`seed.rs`); `every_arm_with_memory_seeds_the_noise_with_the_task` (`arm.rs`); `a_replayed_session_with_clawg_finds_the_fact_and_succeeds` (`tests/agent_eval.rs`).
+
+### MD4. Los brazos `l0`, `l1` y `l2`
+
+`l0` MUST ser `a3` sin el `CLAUDE.md` del protocolo: el mismo servidor, los mismos hooks de `setup` y la misma siembra. `l1` MUST ser `l0` más un hook `SessionStart` que corre `agent-eval hook-context FILE` sobre un archivo del directorio de la corrida con las reglas sembradas. `l2` MUST ser `l1` con cada regla que tiene globs en un archivo de `.claude/rules/clawg/` del directorio de trabajo, con esos globs en su `paths:`, y fuera del texto del arranque; las reglas de los mismos globs MUST compartir archivo. Una regla MUST escribirse en una línea con su antigüedad en días, el título y el cuerpo de la memoria unidos con ` — `, bajo una cabecera que dice que una regla vieja puede estar desactualizada, en el idioma de la corrida (inglés salvo `--lang es`). Sin reglas que entregar, `l1` y `l2` MUST no agregar el hook ni el archivo. `agent-eval hook-context FILE` MUST imprimir el texto de FILE como el `additionalContext` de `SessionStart`.
+
+##### Escenario: una regla por archivo
+- GIVEN una tarea con una regla de `**/*.md` y otra de toda sesión
+- WHEN se planea bajo `l2`
+- THEN `.claude/rules/clawg/` tiene un archivo con `paths:` `"**/*.md"` y esa regla, y el texto del arranque tiene sólo la otra
+
+**Tests:** `a_rule_is_one_line_with_its_age`, `the_startup_holds_every_rule_or_only_those_without_paths`, `the_rules_by_file_share_a_file_by_their_globs` (`rules.rs`); `the_hook_output_is_the_additional_context_of_session_start` (`hooks.rs`); `l0_is_a3_without_the_protocol`, `l1_adds_the_rules_at_startup_through_a_hook_of_the_harness`, `l2_moves_the_rules_with_globs_to_rules_files`, `l1_without_rules_adds_no_hook` (`arm.rs`); `the_hook_commands_parse` (`main.rs`); `the_harness_hooks_print_the_context_and_log_their_input`, `a_prepared_l2_run_writes_the_rules_of_its_task_by_file` (`tests/agent_eval.rs`).
+
+### MD5. Los archivos de instrucciones que carga el cliente
+
+Todo brazo MUST llevar un hook `InstructionsLoaded` que corre `agent-eval hook-log FILE`, con FILE el `instructions.jsonl` del directorio de la corrida; `hook-log` MUST agregar su entrada a FILE en una línea, y una entrada que no es JSON MUST guardarse como texto sin fallar. En los brazos con `setup` los hooks MUST sumarse a los del `settings.json` que escribe `setup`, sin quitar ninguno. `result.json` MUST llevar, en `session`, cada archivo cargado con su `load_reason`, y un registro ausente MUST leerse como ninguno.
+
+**Tests:** `every_arm_logs_the_instruction_files_the_client_loads` (`arm.rs`); `a_log_line_keeps_the_input_on_one_line`, `the_log_reads_each_loaded_file_and_skips_what_is_not_an_entry` (`hooks.rs`); `score_dir_counts_what_reached_the_context_outside_the_stream` (`run.rs`); `the_harness_hooks_print_the_context_and_log_their_input` (`tests/agent_eval.rs`).
+
+### MD6. Lo que llegó sin pasar por el stream
+
+Un trazador MUST salir `retrieved_but_ignored`, si el agente no lo escribió, cuando está en un texto que llegó al contexto sin pasar por el stream: el `MEMORY.md` que el plan de `a4` escribe, y todo archivo del plan que el registro de instrucciones da por cargado, comparando las rutas sin distinguir separadores ni mayúsculas. Las dos rutas son las de la corrida cuando corrió, así que un directorio de corridas movido después se puntúa igual. Un trazador que el agente escribió MUST seguir `used`.
+
+##### Escenario: la nativa
+- GIVEN una corrida de `a4` cuyo `MEMORY.md` tiene el trazador y un stream que no lo muestra
+- WHEN se puntúa
+- THEN el trazador sale `retrieved_but_ignored`, y bajo `a3` con el mismo stream `never_reached`
+
+**Tests:** `a_tracer_in_what_reached_the_context_counts_as_retrieved` (`score.rs`); `the_native_memory_and_the_loaded_rules_files_are_delivered`, `score_dir_counts_what_reached_the_context_outside_the_stream` (`run.rs`).
+
+### MD7. Los tokens del primer pedido y el reporte
+
+`stream::parse` MUST leer los tokens del primer pedido: la entrada, la caché leída y la caché escrita del `usage` del primer mensaje del asistente del bucle principal; un stream sin ese mensaje MUST dejarlos ausentes. `result.json` MUST llevarlos en `session`. `agent-eval report` MUST sumar a cada fila la mediana de los tokens del primer pedido de las corridas que los dan y la media de los archivos cargados por ruta (`load_reason` `path_glob_match`), y ordenar los brazos `l0`, `l1` y `l2` después de los demás.
+
+**Tests:** `the_first_request_is_the_first_message_of_the_main_loop` (`stream.rs`); `score_dir_counts_what_reached_the_context_outside_the_stream` (`run.rs`); `rows_carry_the_median_first_request_and_the_rules_loaded_by_path` (`report.rs`).

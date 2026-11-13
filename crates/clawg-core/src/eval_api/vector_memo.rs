@@ -18,8 +18,8 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use super::{EvalCpu, EvalEmbedder};
-use crate::memory::embedder::{apply_role_prefix, EmbedError, EmbedRole, Embedder};
-use crate::memory::model_download::MODEL_SHA256;
+use crate::memory::embedding::embedder::{apply_role_prefix, EmbedError, EmbedRole, Embedder};
+use crate::memory::embedding::model_download::MODEL_SHA256;
 use crate::metrics::Recorder;
 
 /// Everything but the text that decides the bits of a vector.
@@ -968,7 +968,7 @@ mod tests {
         let cache = crate::test_dir::test_dir();
         // A batch of passages fills the first limit of the queue, so the
         // first doc is embedded in a call of its own, before the second.
-        let batch = crate::memory::embedder::EMBED_BATCH;
+        let batch = crate::memory::embedding::embedder::EMBED_BATCH;
         write_doc(root.path(), "a.md", batch, &[]);
         write_doc(root.path(), "b.md", 3, &[(1, "BROKEN")]);
         let recording = Recording::faulty(Fault::ShortWhenBroken);

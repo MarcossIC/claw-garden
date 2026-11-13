@@ -9,15 +9,15 @@ use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension};
 
-use crate::memory::backup::{known_migrations, open_for_probe, read_history, schema_plan, BackupError, SchemaPlan};
-use crate::memory::identity::Ground;
+use crate::memory::store::backup::{known_migrations, open_for_probe, read_history, schema_plan, BackupError, SchemaPlan};
+use crate::memory::projects::identity::Ground;
 use crate::memory::portability::format::{
     ConflictLine, DerivationLine, Filter, FolderLine, Header, Line, MemoryLine, PieceLine, ProjectLine, SubfolderLine, FORMAT,
     VERSION,
 };
-use crate::memory::merge::MAX_MERGE_HOPS;
-use crate::memory::registry::project_name;
-use crate::memory::{MemoryError, StorageError};
+use crate::memory::projects::merge::MAX_MERGE_HOPS;
+use crate::memory::projects::registry::project_name;
+use crate::memory::{store::error::MemoryError, store::error::StorageError};
 
 /// Which rows an export takes.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -81,7 +81,7 @@ pub fn export(base_dir: &Path, filter: &ExportFilter, now_ms: i64) -> Result<Exp
     if !path.exists() {
         return Err(MemoryError::from(BackupError::NoStore { path }).into());
     }
-    crate::memory::db::ensure_vec0_registered();
+    crate::memory::store::db::ensure_vec0_registered();
     let c = open_for_probe(&path)?;
     read(&c, filter, now_ms)
 }
@@ -95,12 +95,12 @@ pub fn project_id_of(base_dir: &Path, root: &Path, inside: Option<&Path>, ground
     if !path.exists() {
         return Err(MemoryError::from(BackupError::NoStore { path }).into());
     }
-    crate::memory::db::ensure_vec0_registered();
+    crate::memory::store::db::ensure_vec0_registered();
     let c = open_for_probe(&path)?;
     // The resolver reads `project_path` and `project_remote`; temporary
     // objects lend a store from before them what it has, without writing it.
     match folder_table(&c)? {
-        None => return Ok(crate::memory::identity::derive_project_id(root)),
+        None => return Ok(crate::memory::projects::identity::derive_project_id(root)),
         Some("project") => c.execute_batch(
             "CREATE TEMP VIEW project_path AS SELECT id, root_path, created_at, NULL AS project_id, \
              NULL AS remote, NULL AS root_commit, NULL AS git_stamp FROM main.project",
@@ -123,7 +123,7 @@ pub fn project_id_of(base_dir: &Path, root: &Path, inside: Option<&Path>, ground
             "CREATE TEMP TABLE project_subfolder (parent_id TEXT, subpath TEXT, project_id TEXT, created_at INTEGER)",
         )?;
     }
-    Ok(crate::memory::project::project_id_in(&c, root, inside, ground)?)
+    Ok(crate::memory::projects::project::project_id_in(&c, root, inside, ground)?)
 }
 
 /// The table that holds the store's folders: `project_path` from V27,
@@ -419,11 +419,11 @@ fn columns_of(c: &Connection, table: &str) -> rusqlite::Result<BTreeSet<String>>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::db::seed_on_disk;
-    use crate::memory::identity::{FakeGround, RootCommit};
+    use crate::memory::store::db::seed_on_disk;
+    use crate::memory::projects::identity::{FakeGround, RootCommit};
     use crate::memory::portability::fixtures::{other_project, project, seed, OTHER_ROOT};
     use crate::memory::portability::format::parse;
-    use crate::memory::MemoryStore;
+    use crate::memory::store::db::MemoryStore;
 
     #[test]
     fn a_sqlite_error_of_an_export_keeps_its_text() {
@@ -685,7 +685,7 @@ mod tests {
             assert_eq!(of("/review/app", Some("github.com/acme/app")), "app-1a2b", "{folders}: the project its remote shares");
             assert_eq!(of("/review/app", None), "app-3c4d", "{folders}: its own id without a remote");
             let free = Path::new("/fresh/app");
-            assert_eq!(of("/fresh/app", None), crate::memory::identity::derive_project_id(free), "{folders}");
+            assert_eq!(of("/fresh/app", None), crate::memory::projects::identity::derive_project_id(free), "{folders}");
             let exported = export(dir.path(), &ExportFilter::default(), 0).unwrap();
             let before = ProjectLine { id: "app-1a2b".into(), root_path: Some("/work/app".into()), ..Default::default() };
             let line = match folders {
@@ -859,7 +859,7 @@ mod tests {
         let root = Path::new("/work/app");
         let ground = FakeGround::default();
         ground.put(root, Some("github.com/acme/app"), None, RootCommit::Later);
-        assert_eq!(project_id_of(dir.path(), root, None, &ground).unwrap(), crate::memory::identity::derive_project_id(root));
+        assert_eq!(project_id_of(dir.path(), root, None, &ground).unwrap(), crate::memory::projects::identity::derive_project_id(root));
     }
 
     #[tokio::test]

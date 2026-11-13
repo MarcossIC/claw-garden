@@ -37,19 +37,19 @@ use std::time::Instant;
 use rusqlite::{OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 
-use crate::memory::backup::Reason;
-use crate::memory::chunker::{embedding_text, ChatChunker};
-use crate::memory::clock::TimestampMs;
-use crate::memory::dedup::content_hash;
-use crate::memory::embedder::{longest_first, EmbedError, EmbedRole, Embedder};
-use crate::memory::identity::{Ground, ReadAhead};
-use crate::memory::merge::canonical_in;
-use crate::memory::project::{plan_ids_in, RootPlan};
+use crate::memory::store::backup::Reason;
+use crate::memory::embedding::chunker::{embedding_text, ChatChunker};
+use crate::memory::domain::clock::TimestampMs;
+use crate::memory::store::dedup::content_hash;
+use crate::memory::embedding::embedder::{longest_first, EmbedError, EmbedRole, Embedder};
+use crate::memory::projects::identity::{Ground, ReadAhead};
+use crate::memory::projects::merge::canonical_in;
+use crate::memory::projects::project::{plan_ids_in, RootPlan};
 use crate::memory::portability::projects::{self, file_projects, registry_in, By, FileProject, FolderHere, Placed, Prints, Registry};
-use crate::memory::project_delete::{deleted_in, deleted_message};
-use crate::memory::registry::{find_project, new_project_id, project_name, Named};
-use crate::memory::subfolder::declared_in;
-use crate::memory::language;
+use crate::memory::projects::project_delete::{deleted_in, deleted_message};
+use crate::memory::projects::registry::{find_project, new_project_id, project_name, Named};
+use crate::memory::projects::subfolder::declared_in;
+use crate::memory::retrieval::language;
 use crate::memory::portability::foreign::ForeignExport;
 use crate::memory::portability::control::{ImportControl, StopCause};
 use crate::memory::portability::RunningImports;
@@ -61,9 +61,9 @@ use crate::memory::portability::translate::{
     translate, ForeignReport, LeftOut, MappedProject, MergedNote, NoteRows, TakenKey, TakenProject, TranslateOptions,
     Translated, MIGRATED_AGENT,
 };
-use crate::memory::redact::redact;
-use crate::memory::vector::to_unit;
-use crate::memory::{MemoryError, MemoryStore};
+use crate::memory::domain::redact::redact;
+use crate::memory::domain::vector::to_unit;
+use crate::memory::{store::error::MemoryError, store::db::MemoryStore};
 
 /// The largest file an import reads, in bytes. Every row of it is held in
 /// memory while it is placed, embedded and written.
@@ -2664,13 +2664,13 @@ fn with_foreign(mut report: ImportReport, mut foreign: ForeignReport, notes: &[N
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::memory::admin::{delete_memory_core, restore_memory_core};
-    use crate::memory::db::seed_on_disk;
-    use crate::memory::embedder::FakeEmbedder;
-    use crate::memory::events::{MemoryEvent, MemorySource};
+    use crate::memory::upkeep::admin::{delete_memory_core, restore_memory_core};
+    use crate::memory::store::db::seed_on_disk;
+    use crate::memory::embedding::embedder::FakeEmbedder;
+    use crate::memory::domain::events::{MemoryEvent, MemorySource};
     use crate::memory::portability::export::{read, Export, ExportFilter};
-    use crate::memory::identity::{Disk, FakeGround, RootCommit};
-    use crate::memory::embedder::GatedEmbedder;
+    use crate::memory::projects::identity::{Disk, FakeGround, RootCommit};
+    use crate::memory::embedding::embedder::GatedEmbedder;
     use crate::memory::portability::control::{Counters, StopCause};
     use futures::FutureExt;
     use crate::memory::portability::fixtures::{other_project, project, seed, OTHER_ROOT, ROOT};
@@ -2678,9 +2678,9 @@ pub(crate) mod tests {
     use crate::memory::portability::format::tests::EXAMPLE;
     use crate::memory::portability::translate::tests::{export as foreign_export, note as foreign_note, T0};
     use crate::memory::portability::translate::{rewrite_key, KeyChange, ProjectCount, TakenKey, TakenProject, TypeCount};
-    use crate::memory::relocate::{move_memories_core, MoveFilter};
-    use crate::memory::search::{search_all_memories, SearchScope};
-    use crate::memory::worker::save_for_test;
+    use crate::memory::projects::relocate::{move_memories_core, MoveFilter};
+    use crate::memory::retrieval::search::{search_all_memories, SearchScope};
+    use crate::memory::ingest::worker::save_for_test;
     use crate::models::chat::Role;
 
     pub(crate) const EVERYTHING: ExportFilter = ExportFilter { project_id: None, agent: None, include_deleted: true };
@@ -3127,7 +3127,7 @@ pub(crate) mod tests {
         let elsewhere = "/elsewhere/repo";
         let options = ImportOptions { map_roots: vec![(ROOT.into(), elsewhere.into())], ..Default::default() };
         let (report, _) = run(&dst, &file, options).await;
-        let moved = crate::memory::identity::derive_project_id(Path::new(elsewhere));
+        let moved = crate::memory::projects::identity::derive_project_id(Path::new(elsewhere));
         assert_eq!(report.by_project.get(&moved), Some(&13));
         let roots = dst
             .conn
@@ -3157,7 +3157,7 @@ pub(crate) mod tests {
         let to = went.to.clone().unwrap();
         assert_eq!((went.by, went.created), (Some(By::New), true), "{went:?}");
         assert_eq!(report.by_project.get(&to), Some(&13));
-        let own = crate::memory::identity::candidate_id(Path::new(ROOT), 1);
+        let own = crate::memory::projects::identity::candidate_id(Path::new(ROOT), 1);
         let folder: (String, String) = dst
             .conn
             .call(|c| c.query_row("SELECT id, project_id FROM project_path WHERE root_path = ?1", [ROOT], |r| Ok((r.get(0)?, r.get(1)?))))
@@ -3282,7 +3282,7 @@ pub(crate) mod tests {
     async fn an_import_records_its_folders_as_a_registration_would() {
         let file = seeded_file().await;
         let dst = destination().await;
-        let (old, other) = (crate::memory::identity::derive_project_id(Path::new("/old/repo")), other_project());
+        let (old, other) = (crate::memory::projects::identity::derive_project_id(Path::new("/old/repo")), other_project());
         let (recorded, renamed_from) = (old.clone(), other.clone());
         dst.conn
             .call(move |c| {
@@ -3315,7 +3315,7 @@ pub(crate) mod tests {
 
         let (report, _) = run_on(&dst, &file, ImportOptions::default(), ground).await;
 
-        let renamed = crate::memory::identity::candidate_id(Path::new(OTHER_ROOT), 1);
+        let renamed = crate::memory::projects::identity::candidate_id(Path::new(OTHER_ROOT), 1);
         assert_eq!(report.by_project.get(&old), Some(&13), "the moved checkout keeps its project: {:?}", report.by_project);
         assert_eq!(report.by_project.get(&renamed), Some(&1), "{:?}", report.by_project);
         let s = |v: &str| Some(v.to_string());
@@ -3367,7 +3367,7 @@ pub(crate) mod tests {
     }
 
     impl Ground for Watched {
-        fn checkout(&self, root: &Path) -> crate::memory::identity::Checkout {
+        fn checkout(&self, root: &Path) -> crate::memory::projects::identity::Checkout {
             self.disk.checkout(root)
         }
 
@@ -3516,7 +3516,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_project_contradicted_here_is_another_project() {
         let dst = destination().await;
-        let api = crate::memory::identity::derive_project_id(Path::new("/work/api"));
+        let api = crate::memory::projects::identity::derive_project_id(Path::new("/work/api"));
         let sql: &'static str = Box::leak(
             format!(
                 "INSERT INTO project (id, name, born, reviewed, created_at) VALUES ('{api}', 'api', 'root', 1, 1);
@@ -3555,7 +3555,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn an_export_from_before_names_and_locators_imports_as_before() {
         let dst = destination().await;
-        let id = crate::memory::identity::derive_project_id(Path::new("/work/old"));
+        let id = crate::memory::projects::identity::derive_project_id(Path::new("/work/old"));
         let line = format!(r#"{{"kind":"project","id":"{id}","root_path":"/work/old"}}"#);
         let file = clawg_file(&[&line], &[(1, Some(&id), "A note of an old file")]);
 
@@ -3656,8 +3656,8 @@ pub(crate) mod tests {
         let ground = Arc::new(FakeGround::default());
         ground.put(Path::new("/work/notas"), None, Some("s1"), RootCommit::Known("c1".into()));
         let home = crate::test_dir::test_dir();
-        let workspaces = crate::memory::workspace::WorkspaceManager::new(home.path().join("workspaces"));
-        let reg = crate::memory::project::Registration {
+        let workspaces = crate::memory::retrieval::workspace::WorkspaceManager::new(home.path().join("workspaces"));
+        let reg = crate::memory::projects::project::Registration {
             root: Path::new("/work/notas"),
             checkout: ground.checkout(Path::new("/work/notas")),
             legacy_ids: &[],
@@ -3666,7 +3666,7 @@ pub(crate) mod tests {
             subpath: None,
         };
 
-        let outcome = crate::memory::project::register_project(&dst, &workspaces, home.path(), reg, ground).await.unwrap();
+        let outcome = crate::memory::projects::project::register_project(&dst, &workspaces, home.path(), reg, ground).await.unwrap();
 
         assert_eq!(outcome.project_id, "notas-1a2b", "a move of the checkout the import recorded");
         assert_eq!(count(&dst, "SELECT COUNT(*) FROM project_suggestion").await, 0);
@@ -3718,8 +3718,8 @@ pub(crate) mod tests {
         let ground = Arc::new(FakeGround::default());
         ground.put(Path::new("/work/mono"), Some("github.com/acme/mono"), Some("s1"), RootCommit::Known("c1".into()));
         let home = crate::test_dir::test_dir();
-        let workspaces = crate::memory::workspace::WorkspaceManager::new(home.path().join("workspaces"));
-        let reg = crate::memory::project::Registration {
+        let workspaces = crate::memory::retrieval::workspace::WorkspaceManager::new(home.path().join("workspaces"));
+        let reg = crate::memory::projects::project::Registration {
             root: Path::new("/work/mono"),
             checkout: ground.checkout(Path::new("/work/mono")),
             legacy_ids: &[],
@@ -3727,7 +3727,7 @@ pub(crate) mod tests {
             assigned: true,
             subpath: Some("apps/web/src"),
         };
-        let outcome = crate::memory::project::register_project(&dst, &workspaces, home.path(), reg, ground).await.unwrap();
+        let outcome = crate::memory::projects::project::register_project(&dst, &workspaces, home.path(), reg, ground).await.unwrap();
 
         assert_eq!((outcome.project_id.as_str(), outcome.subproject), ("mono-here", Some(web)));
     }
@@ -4205,7 +4205,7 @@ pub(crate) mod tests {
 
     /// Records `root` as a project here and returns its id.
     async fn register(store: &MemoryStore, root: &'static str) -> String {
-        let id = crate::memory::identity::derive_project_id(Path::new(root));
+        let id = crate::memory::projects::identity::derive_project_id(Path::new(root));
         let recorded = id.clone();
         store
             .conn
@@ -4283,7 +4283,7 @@ pub(crate) mod tests {
     async fn a_key_held_here_supersedes_the_imported_note() {
         let root = "/work/notes";
         let dst = destination().await;
-        let here = crate::memory::identity::derive_project_id(Path::new(root));
+        let here = crate::memory::projects::identity::derive_project_id(Path::new(root));
         let holder = insert_row(&dst, "claude-code", Some(here), "Storage engine: DuckDB", Some("storage/engine"), 5).await;
         let long = ForeignNote {
             project: Some("a".into()),
@@ -4314,7 +4314,7 @@ pub(crate) mod tests {
     async fn a_mapped_root_whose_id_is_taken_gets_its_own() {
         let root = "/work/notes";
         let dst = destination().await;
-        let id = crate::memory::identity::derive_project_id(Path::new(root));
+        let id = crate::memory::projects::identity::derive_project_id(Path::new(root));
         dst.conn
             .call(move |c| c.execute("INSERT INTO project_path (id, root_path, created_at) VALUES (?1, '/not/the/notes', 0)", [id]))
             .await
@@ -4324,7 +4324,7 @@ pub(crate) mod tests {
         let options = ImportOptions { project_map: vec![("a".into(), root.into())], ..Default::default() };
         let (report, _) = run_foreign(&dst, notes, options).await;
 
-        let own = crate::memory::identity::candidate_id(Path::new(root), 1);
+        let own = crate::memory::projects::identity::candidate_id(Path::new(root), 1);
         assert_eq!(report.by_project, BTreeMap::from([(String::new(), 1), (own.clone(), 2)]), "{report:#?}");
         let foreign = report.foreign.clone().unwrap();
         let in_project: Vec<Option<&str>> = foreign.by_source_project.iter().map(|p| p.project_id.as_deref()).collect();
@@ -4413,13 +4413,13 @@ pub(crate) mod tests {
     async fn a_project_map_path_in_a_declared_subfolder_goes_to_its_project() {
         let dst = destination().await;
         let dir = crate::test_dir::test_dir();
-        let root = crate::memory::identity::strip_verbatim(&std::fs::canonicalize(dir.path()).unwrap());
+        let root = crate::memory::projects::identity::strip_verbatim(&std::fs::canonicalize(dir.path()).unwrap());
         let inside = root.join("apps").join("web").join("src");
         std::fs::create_dir_all(root.join(".git")).unwrap();
         std::fs::create_dir_all(&inside).unwrap();
         let home = crate::test_dir::test_dir();
-        let workspaces = crate::memory::workspace::WorkspaceManager::new(home.path().join("workspaces"));
-        let reg = crate::memory::project::Registration {
+        let workspaces = crate::memory::retrieval::workspace::WorkspaceManager::new(home.path().join("workspaces"));
+        let reg = crate::memory::projects::project::Registration {
             root: &root,
             checkout: Disk.checkout(&root),
             legacy_ids: &[],
@@ -4427,7 +4427,7 @@ pub(crate) mod tests {
             assigned: true,
             subpath: None,
         };
-        let repository = crate::memory::project::register_project(&dst, &workspaces, home.path(), reg, Arc::new(Disk)).await.unwrap().project_id;
+        let repository = crate::memory::projects::project::register_project(&dst, &workspaces, home.path(), reg, Arc::new(Disk)).await.unwrap().project_id;
         let repository_id = repository.clone();
         dst.conn
             .call(move |c| {
@@ -4739,7 +4739,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn the_foreign_report_counts_what_the_import_did() {
         let root = "/work/notes";
-        let here = crate::memory::identity::derive_project_id(Path::new(root));
+        let here = crate::memory::projects::identity::derive_project_id(Path::new(root));
         let token = format!("ghp_{}", "aB3".repeat(12));
         let in_a = |n: ForeignNote| ForeignNote { project: Some("a".into()), ..n };
         let notes = vec![
@@ -5266,7 +5266,7 @@ pub(crate) mod tests {
     }
 
     fn word_chunker() -> Arc<ChatChunker> {
-        Arc::new(ChatChunker::with_tokenizer(crate::memory::chunker::word_tokenizer()))
+        Arc::new(ChatChunker::with_tokenizer(crate::memory::embedding::chunker::word_tokenizer()))
     }
 
     /// `count` notes whose texts are `note<i>` and a few more words, of
@@ -5377,7 +5377,7 @@ pub(crate) mod tests {
     fn padding(lens: &[usize]) -> (f64, f64) {
         let (mut sent, mut real, mut sent_sq, mut real_sq) = (0usize, 0usize, 0usize, 0usize);
         for call in lens.chunks(EMBED_BATCH) {
-            for run in call.chunks(crate::memory::embedder::EMBED_BATCH) {
+            for run in call.chunks(crate::memory::embedding::embedder::EMBED_BATCH) {
                 let longest = run.iter().copied().max().unwrap_or(0);
                 sent += run.len() * longest;
                 sent_sq += run.len() * longest * longest;
@@ -5412,12 +5412,12 @@ pub(crate) mod tests {
     #[tokio::test]
     #[ignore = "a measurement: needs CLAWG_E5_MODEL_DIR and CLAWG_IMPORT_EXPORT; run it with `cargo test -p clawg-core --lib -- --ignored the_embedding_phase --nocapture`"]
     async fn the_embedding_phase_of_a_real_export() {
-        use crate::memory::embedder::{
+        use crate::memory::embedding::embedder::{
             apply_role_prefix, check_tokenizer, expected_contract, pad_right, pool_and_normalize, window_encodings, E5Embedder,
         };
-        use crate::memory::model_download::{load_cached_model, load_verified_tokenizer, tokenizer_path};
+        use crate::memory::embedding::model_download::{load_cached_model, load_verified_tokenizer, tokenizer_path};
         use crate::memory::portability::engram;
-        use crate::memory::vector::EMBEDDING_DIM;
+        use crate::memory::domain::vector::EMBEDDING_DIM;
         use std::time::Duration;
 
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -5513,7 +5513,7 @@ pub(crate) mod tests {
         let first: Vec<usize> = (0..sample).collect();
         report_padding(&format!("first {sample} rows"), &first);
 
-        let files = load_cached_model(&base, &crate::memory::model_download::CacheLock::new()).await.unwrap();
+        let files = load_cached_model(&base, &crate::memory::embedding::model_download::CacheLock::new()).await.unwrap();
         let pad_id = check_tokenizer(&tokenizer, &files.tokenizer).unwrap();
         let embedder = E5Embedder::from_parts(&files.onnx, tokenizer.clone(), &files.tokenizer, Arc::default()).unwrap();
         let orders = orders(&first);
@@ -5560,7 +5560,7 @@ pub(crate) mod tests {
         let clock = Instant::now();
         let mut pooling = Duration::ZERO;
         for call in first.chunks(EMBED_BATCH) {
-            for run in call.chunks(crate::memory::embedder::EMBED_BATCH) {
+            for run in call.chunks(crate::memory::embedding::embedder::EMBED_BATCH) {
                 let refs: Vec<&str> = run.iter().map(|&k| prefixed[k].as_str()).collect();
                 let batch = pad_right(&window_encodings(&tokenizer, &refs).unwrap(), pad_id);
                 let hidden = vec![0.5f32; batch.rows * batch.len * EMBEDDING_DIM];

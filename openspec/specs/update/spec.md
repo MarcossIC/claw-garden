@@ -9,10 +9,10 @@ Fuente de verdad del comportamiento actual al corregir una memoria ya guardada: 
 
 - **Cambio:** un pedido con `importance`, `memory_type` o los dos, sobre una fila `(kind, id)`.
 - **Tipo efectivo de una fila:** su `memory_type` en `memory`, la única tabla de filas desde V32 ([`specs/storage`](../storage/spec.md), RL1).
-- **Tier ganado** con una importancia `i` y un tipo efectivo `t`: `compute_tier(3, i, access_count, t)` (`crates/clawg-core/src/memory/tier.rs:22`), el tier que las reglas le dan a la fila sin contar nada más.
+- **Tier ganado** con una importancia `i` y un tipo efectivo `t`: `compute_tier(3, i, access_count, t)` (`crates/clawg-core/src/memory/store/tier.rs:22`), el tier que las reglas le dan a la fila sin contar nada más.
 - **Escala de importancia:** de 0 a 10 inclusive, la misma del save.
-- **Tipos conocidos:** `semantic_fact`, `user_preference`, `architectural_decision`, `session_summary`, `code_block`, `chat_message`, `tool_error` (`MemoryType::ALL`, `crates/clawg-core/src/memory/store_insert.rs:34`).
-- **Fila protegida:** una fila de `memory` cuyo `memory_type` es `user_preference` o `architectural_decision` (`MemoryType::is_protected`, `store_insert.rs:68`), la misma de [`specs/disputes`](../disputes/spec.md). Un tipo guardado que el parser no conoce no es protegido.
+- **Tipos conocidos:** `semantic_fact`, `user_preference`, `architectural_decision`, `session_summary`, `code_block`, `chat_message`, `tool_error` (`MemoryType::ALL`, `crates/clawg-core/src/memory/domain/record.rs:104`).
+- **Fila protegida:** una fila de `memory` cuyo `memory_type` es `user_preference` o `architectural_decision` (`MemoryType::is_protected`, `record.rs:138`), la misma de [`specs/disputes`](../disputes/spec.md). Un tipo guardado que el parser no conoce no es protegido.
 - **Declaración:** `user_answered: true` en el pedido: quien llama dice que el usuario lo pidió. No autentica a nadie y, en un cambio, no se registra: el `PATCH` no guarda razón.
 
 ## R1. Qué cambio es válido
@@ -23,9 +23,9 @@ Un cambio MUST rechazarse, sin tocar la fila, cuando:
 - `importance` no es un número finito dentro de la escala;
 - `memory_type` no es un tipo conocido, con el mismo mensaje que da el save ([`specs/ingest`](../ingest/spec.md), «El tipo de memoria se valida al guardar»: `PatchError::UnknownType` envuelve `UnknownMemoryType`).
 
-La validación es pura: `MemoryPatch::new` (`admin.rs:165`) devuelve `MemoryPatch` o un `PatchError` (`admin.rs:141`, `thiserror`) cuyo mensaje nombra el campo. A diferencia del save, una importancia fuera de escala MUST rechazarse, no recortarse: el save recorta lo que el agente estima al pasar, un cambio es una corrección explícita y recortarla en silencio diría "hecho" sobre un valor que nadie pidió.
+La validación es pura: `MemoryPatch::new` (`admin.rs:103`) devuelve `MemoryPatch` o un `PatchError` (`admin.rs:79`, `thiserror`) cuyo mensaje nombra el campo. A diferencia del save, una importancia fuera de escala MUST rechazarse, no recortarse: el save recorta lo que el agente estima al pasar, un cambio es una corrección explícita y recortarla en silencio diría "hecho" sobre un valor que nadie pidió.
 
-Un cambio de `memory_type` que lleva una fila protegida a un tipo que no lo es MUST rechazarse sin tocar la fila, tampoco la importancia que traiga el mismo cambio, salvo con la declaración. Promover a un tipo protegido, cambiar entre los dos protegidos o cambiar sólo `importance` MUST NOT pedirla. Esta regla depende del tipo guardado, así que no es de `MemoryPatch::new`: `MemoryPatch::answered` (`admin.rs:185`) lleva la declaración, y `update_memory_core` lee el tipo dentro de su transacción y devuelve `UpdateError::NeedsUser` (`admin.rs:192`, `thiserror`; el chequeo, `admin.rs:266-269`), cuyo mensaje nombra la fila y su tipo y pide preguntar al usuario y llamar otra vez con `user_answered`. Sin un camino para que el usuario lo haga solo, la herramienta no puede rechazar el descenso: lo pide declarado.
+Un cambio de `memory_type` que lleva una fila protegida a un tipo que no lo es MUST rechazarse sin tocar la fila, tampoco la importancia que traiga el mismo cambio, salvo con la declaración. Promover a un tipo protegido, cambiar entre los dos protegidos o cambiar sólo `importance` MUST NOT pedirla. Esta regla depende del tipo guardado, así que no es de `MemoryPatch::new`: `MemoryPatch::answered` (`admin.rs:123`) lleva la declaración, y `update_memory_core` lee el tipo dentro de su transacción y devuelve `UpdateError::NeedsUser` (`admin.rs:130`, `thiserror`; el chequeo, `admin.rs:204-207`), cuyo mensaje nombra la fila y su tipo y pide preguntar al usuario y llamar otra vez con `user_answered`. Sin un camino para que el usuario lo haga solo, la herramienta no puede rechazar el descenso: lo pide declarado.
 
 #### Escenario: bajar sin la declaración
 - GIVEN una `user_preference` con `update_count` 0
@@ -42,7 +42,7 @@ Un cambio de `memory_type` que lleva una fila protegida a un tipo que no lo es M
 - WHEN se pide un cambio con `importance = 50`
 - THEN se rechaza con un mensaje que nombra `importance` y la fila sigue con 5
 
-**Test:** `a_change_needs_at_least_one_field`, `importance_outside_the_scale_is_refused`, `an_unknown_memory_type_is_refused`, `only_memory_rows_have_a_type_to_change`, `demoting_a_protected_row_needs_the_answer` y `promoting_or_changing_importance_needs_no_answer` en `crates/clawg-core/src/memory/admin.rs`.
+**Test:** `a_change_needs_at_least_one_field`, `importance_outside_the_scale_is_refused`, `an_unknown_memory_type_is_refused`, `only_memory_rows_have_a_type_to_change`, `demoting_a_protected_row_needs_the_answer` y `promoting_or_changing_importance_needs_no_answer` en `crates/clawg-core/src/memory/upkeep/admin.rs`.
 
 ## R2. Qué tier queda
 
@@ -54,7 +54,7 @@ Con el tier actual `c`, el tier ganado antes del cambio `a` y el tier ganado des
 
 La regla es la función pura `retier` (`tier.rs:115`), separada de `compute_tier`: `compute_tier` sigue siendo sólo de subida, y el decaimiento (`demote_inactive`) sigue siendo la única baja automática. Ésta es la única baja que pide alguien.
 
-El workspace muestra `user_preference` y `architectural_decision` sólo con importancia ≥ 8 **y** tier 1 (`crates/clawg-core/src/memory/workspace.rs:255-292`). Por eso una decisión guardada con 9,5 y bajada a 8,5 sale del workspace por el tier (queda en tier 2), aunque sigue pasando el filtro de importancia.
+El workspace muestra `user_preference` y `architectural_decision` sólo con importancia ≥ 8 **y** tier 1 (`crates/clawg-core/src/memory/retrieval/workspace.rs:255-292`). Por eso una decisión guardada con 9,5 y bajada a 8,5 sale del workspace por el tier (queda en tier 2), aunque sigue pasando el filtro de importancia.
 
 #### Escenario: la importancia era lo que daba el tier
 - GIVEN un `semantic_fact` en tier 1 con importancia 9,5 y `access_count` 1
@@ -86,16 +86,16 @@ El workspace muestra `user_preference` y `architectural_decision` sólo con impo
 - WHEN se sube la importancia a 9, o se cambia el tipo a `user_preference`
 - THEN queda en tier 1
 
-**Test:** `lowering_the_importance_that_gave_tier_1_takes_it_away`, `lowering_to_a_value_that_still_earns_the_tier_keeps_it`, `a_tier_earned_by_access_survives_lowering_the_importance`, `a_lost_tier_falls_only_to_what_the_rest_still_earns`, `a_type_that_gave_tier_1_takes_it_with_it`, `a_tier_the_rules_never_gave_survives_any_change`, `a_tier_lost_to_inactivity_is_not_given_back_by_lowering` y `raising_still_promotes` en `crates/clawg-core/src/memory/tier.rs`.
+**Test:** `lowering_the_importance_that_gave_tier_1_takes_it_away`, `lowering_to_a_value_that_still_earns_the_tier_keeps_it`, `a_tier_earned_by_access_survives_lowering_the_importance`, `a_lost_tier_falls_only_to_what_the_rest_still_earns`, `a_type_that_gave_tier_1_takes_it_with_it`, `a_tier_the_rules_never_gave_survives_any_change`, `a_tier_lost_to_inactivity_is_not_given_back_by_lowering` y `raising_still_promotes` en `crates/clawg-core/src/memory/store/tier.rs`.
 
 ## R3. Qué escribe un cambio
 
-Un cambio válido sobre una fila viva (`deleted_at IS NULL`) MUST, en una sola transacción (`update_memory_core`, `admin.rs:233`):
+Un cambio válido sobre una fila viva (`deleted_at IS NULL`) MUST, en una sola transacción (`update_memory_core`, `admin.rs:171`):
 
 - escribir los campos pedidos y dejar igual los que no;
 - escribir el tier de R2;
 - poner `last_modified_at` en ahora y sumar 1 a `update_count`;
-- devolver la fila como quedó (`UpdatedRow`, `admin.rs:204`): `id`, `kind`, `importance`, `memory_type` (sólo en `memory`) y `tier`.
+- devolver la fila como quedó (`UpdatedRow`, `admin.rs:142`): `id`, `kind`, `importance`, `memory_type` (sólo en `memory`) y `tier`.
 
 MUST NOT cambiar `status`, `access_count`, `last_accessed_at`, `superseded_by`, las disputas, la procedencia, el contenido ni el vector.
 

@@ -1,0 +1,16 @@
+change: verdict-on-replace
+objective: "1"
+depends_on: []
+phase: archived
+release: "0.85.0"  # la respuesta del save y la de restore piden resolve_conflict sólo para un reemplazo, el protocolo y las descripciones dicen lo mismo, y memory_status cuenta sólo los pares que esperan a la persona (verify.md)
+artifacts:
+  exploration: done
+  proposal: done
+  spec: done
+  design: skipped  # ninguna decisión de arquitectura: son textos del puente
+  tasks: done
+  apply: done
+  verify: done  # la suite y clippy pasan en Windows y el CI de Linux y Windows pasa; queda la medición con uso real (verify.md, «Pendiente en prod»)
+  archive: done  # R1 es VR1 en specs/disputes; R2 a R5 son VR2 a VR5 en specs/mcp; P4 de specs/provenance pierde la marca en memory_status; R6 no se consolida
+updated: 2026-11-12
+main_spec: openspec/specs/disputes/spec.md, openspec/specs/mcp/spec.md, openspec/specs/provenance/spec.md

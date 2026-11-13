@@ -90,12 +90,12 @@ pub fn report(metric: &str, rows: Rows, runs: &[RunRow], labels: &[(String, Stri
         let local_ms = start_ms + run.map_or(0, |r| r.utc_offset_s * 1000);
         match by {
             By::Day => {
-                let (y, m, d) = crate::memory::backup::civil_from_days(local_ms.div_euclid(86_400_000));
+                let (y, m, d) = crate::memory::store::backup::civil_from_days(local_ms.div_euclid(86_400_000));
                 (0, format!("{y:04}-{m:02}-{d:02}"))
             }
             By::Hour => (0, format!("{:02}", local_ms.rem_euclid(86_400_000) / 3_600_000)),
             By::Minute => {
-                let (y, m, d) = crate::memory::backup::civil_from_days(local_ms.div_euclid(86_400_000));
+                let (y, m, d) = crate::memory::store::backup::civil_from_days(local_ms.div_euclid(86_400_000));
                 let minute = local_ms.rem_euclid(86_400_000) / 60_000;
                 (0, format!("{y:04}-{m:02}-{d:02} {:02}:{:02}", minute / 60, minute % 60))
             }

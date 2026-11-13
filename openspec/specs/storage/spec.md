@@ -40,17 +40,17 @@ Fuente de verdad del comportamiento actual del almacenamiento: el outbox donde q
 - **Fallo pasajero:** `IngestFailure::EmbedderUnavailable`: el modelo no está, o su recarga no pudo hacerse.
 - **Apagado ordenado:** el que empieza con Ctrl-C, con SIGTERM (Unix) o con `POST /v1/shutdown`. Un SIGKILL, o en Windows el fin del proceso, no es un apagado ordenado.
 - **Plazo de drenaje (`DRAIN_DEADLINE`, `crates/clawg-core/src/runtime.rs:56`):** el tiempo máximo que el apagado dedica a ingerir lo encolado.
-- **Volcado viejo:** el archivo `<data>/ingest-pending.jsonl` (`SPILL_FILE`, `crates/clawg-core/src/memory/spill.rs:11`), un `MemoryEvent` en JSON por línea, que las versiones anteriores al outbox escribían en un apagado ordenado. Ninguna versión actual lo escribe.
+- **Volcado viejo:** el archivo `<data>/ingest-pending.jsonl` (`SPILL_FILE`, `crates/clawg-core/src/memory/ingest/spill.rs:11`), un `MemoryEvent` en JSON por línea, que las versiones anteriores al outbox escribían en un apagado ordenado. Ninguna versión actual lo escribe.
 - **Directorio de backups:** `<data>/backups/` (`backups_dir`, `crates/clawg-core/src/paths.rs`).
 - **Snapshot:** una copia completa y autónoma de `memory.db` hecha con `VACUUM INTO`. Incluye lo commiteado en el WAL y no tiene archivo WAL propio.
-- **Motivo** de un snapshot (`Reason`, `crates/clawg-core/src/memory/backup.rs:129`): `pre-migration`, `pre-restore` y `pre-reembed` son **automáticos**; `manual` es el de `clawg backup`.
+- **Motivo** de un snapshot (`Reason`, `crates/clawg-core/src/memory/store/backup.rs:129`): `pre-migration`, `pre-restore` y `pre-reembed` son **automáticos**; `manual` es el de `clawg backup`.
 - **Plan de esquema** (`SchemaPlan`, `backup.rs:73`): la comparación entre el historial de `refinery_schema_history` y las migraciones embebidas en el binario. `Fresh` (sin historial), `UpToDate`, `Pending { from, to }` (un prefijo; faltan de `from + 1` a `to`), `Newer { db, binary }` (una versión aplicada mayor que la última del binario) o `Diverged { version }` (otro nombre o checksum, o un hueco).
 
 ## Apagado sin pérdida
 
 ### Un save aceptado está en el outbox hasta que termina
 
-Un save que termina de guardarse MUST NOT dejar su fila. Cada pieza que el worker inserta o refuerza MUST anotar su posición en el progreso de la fila en la misma transacción que la escribe (`apply_note`, `crates/clawg-core/src/memory/outbox.rs:118`, llamado desde `insert_noting` y `reinforce_noting`). El vínculo de `memory_piece` ([`specs/pieces`](../pieces/spec.md)) y el borrado de la fila MUST ir en una transacción (`outbox_finish`, `outbox.rs:459`, que usa `link_in`, `crates/clawg-core/src/memory/pieces.rs:228`). Las copias repetidas dentro del mismo save se refuerzan después de anotar su posición y sin nota: un kill en ese punto pierde a lo sumo un refuerzo, nunca agrega uno.
+Un save que termina de guardarse MUST NOT dejar su fila. Cada pieza que el worker inserta o refuerza MUST anotar su posición en el progreso de la fila en la misma transacción que la escribe (`apply_note`, `crates/clawg-core/src/memory/ingest/outbox.rs:118`, llamado desde `insert_noting` y `reinforce_noting`). El vínculo de `memory_piece` ([`specs/pieces`](../pieces/spec.md)) y el borrado de la fila MUST ir en una transacción (`outbox_finish`, `outbox.rs:459`, que usa `link_in`, `crates/clawg-core/src/memory/retrieval/pieces.rs:225`). Las copias repetidas dentro del mismo save se refuerzan después de anotar su posición y sin nota: un kill en ese punto pierde a lo sumo un refuerzo, nunca agrega uno.
 
 #### Escenario
 - GIVEN un daemon con el embedder listo
@@ -151,7 +151,7 @@ Una fila de la lectura de arranque que se reintenta retiene también la copia qu
 
 En un apagado ordenado, cada save aceptado MUST terminar en uno de dos lugares: guardado en la base (o absorbido por el gate de dedup), o en el outbox para el próximo arranque. El apagado MUST seguir drenando hasta `DRAIN_DEADLINE`, MUST NOT escribir `ingest-pending.jsonl` y MUST NOT descartar un save: lo que el worker no empezó queda en su fila.
 
-La decisión de seguir drenando o dejar la cola es pura (`drain_step`, `crates/clawg-core/src/memory/worker.rs:239`; su variante `DrainStep::Spill` conserva el nombre de cuando el apagado volcaba a un archivo). `MemoryRuntime::shutdown` (`crates/clawg-core/src/runtime.rs:317`) espera al worker, y el daemon la llama antes de borrar su estado (`crates/clawg-cli/src/daemon/serve.rs:290`). Sólo un evento encolado sin fila (los caminos en proceso de tests y evaluación) puede quedar sin ingerir, y el apagado lo registra con un warn (`runtime.rs:345`).
+La decisión de seguir drenando o dejar la cola es pura (`drain_step`, `crates/clawg-core/src/memory/ingest/worker.rs:239`; su variante `DrainStep::Spill` conserva el nombre de cuando el apagado volcaba a un archivo). `MemoryRuntime::shutdown` (`crates/clawg-core/src/runtime.rs:317`) espera al worker, y el daemon la llama antes de borrar su estado (`crates/clawg-cli/src/daemon/serve.rs:290`). Sólo un evento encolado sin fila (los caminos en proceso de tests y evaluación) puede quedar sin ingerir, y el apagado lo registra con un warn (`runtime.rs:345`).
 
 Un save con fila que está en curso MUST mirar el plazo antes de insertar cada pedazo, salvo el primero que inserta cada toma (`pause_due`, `worker.rs:250`, pura, leída en `ingest_pieces`), porque el drenaje puede empezar después de tomarlo. Vencido, MUST detenerse con el progreso ya anotado (`IngestReport::paused`), MUST devolver el intento sin cambiar `last_error` (`outbox_pause`, `outbox.rs:371`), MUST NOT contestar al que espera (que ve `202 unconfirmed`) y MUST terminar como con un evento sin empezar; el próximo arranque retoma el save. La primera inserción de cada toma no se pausa: así una toma no tira entero el embed que pagó, un save de un solo pedazo termina, y un save largo avanza en cada arranque. Un evento sin fila termina siempre: retomarlo duplicaría lo guardado.
 
@@ -201,7 +201,7 @@ Si no se puede leer el outbox, el worker lo registra y sigue con el canal: esas 
 
 ### El volcado de una versión anterior
 
-Una versión anterior al outbox escribía en un apagado ordenado los eventos sin ingerir en `ingest-pending.jsonl`. El volcado MUST seguir importándose al arrancar (arriba), con los mismos criterios de siempre: una línea que no se puede parsear MUST NOT bloquear las demás; se registra con un warn y se mueve a `<data>/ingest-pending.rejected.jsonl` (`REJECTED_FILE`, `crates/clawg-core/src/memory/spill.rs:15`), que nada borra. Si no se puede guardar en ese archivo, el volcado MUST NOT borrarse (`Spilled::file`, `spill.rs:23`), porque es la única copia de esas líneas; las líneas válidas ya están en el outbox, así que el próximo arranque las importa otra vez y el dedup las absorbe. El contenido de cada evento importado MUST enmascararse antes de entrar al outbox. `parse_lines` (`spill.rs:96`) es pura y `load` (`spill.rs:49`) lee el archivo y aparta lo ilegible; un evento escrito antes de `derived_from` MUST leerse con `derived_from` vacío ([`specs/synthesis`](../synthesis/spec.md)).
+Una versión anterior al outbox escribía en un apagado ordenado los eventos sin ingerir en `ingest-pending.jsonl`. El volcado MUST seguir importándose al arrancar (arriba), con los mismos criterios de siempre: una línea que no se puede parsear MUST NOT bloquear las demás; se registra con un warn y se mueve a `<data>/ingest-pending.rejected.jsonl` (`REJECTED_FILE`, `crates/clawg-core/src/memory/ingest/spill.rs:15`), que nada borra. Si no se puede guardar en ese archivo, el volcado MUST NOT borrarse (`Spilled::file`, `spill.rs:23`), porque es la única copia de esas líneas; las líneas válidas ya están en el outbox, así que el próximo arranque las importa otra vez y el dedup las absorbe. El contenido de cada evento importado MUST enmascararse antes de entrar al outbox. `parse_lines` (`spill.rs:96`) es pura y `load` (`spill.rs:49`) lee el archivo y aparta lo ilegible; un evento escrito antes de `derived_from` MUST leerse con `derived_from` vacío ([`specs/synthesis`](../synthesis/spec.md)).
 
 #### Escenario: volcado viejo
 - GIVEN un `ingest-pending.jsonl` con dos eventos válidos (uno con un secreto) y una línea truncada
@@ -212,7 +212,7 @@ Una versión anterior al outbox escribía en un apagado ordenado los eventos sin
 
 ### Flush final del `AccessTracker`
 
-En un apagado ordenado, el tracker MUST escribir el buffer pendiente antes de terminar, y el apagado MUST esperar a que termine (`AccessTracker::shutdown`, `crates/clawg-core/src/memory/access.rs:134`). Lo mismo vale cuando se sueltan todos los `Sender`.
+En un apagado ordenado, el tracker MUST escribir el buffer pendiente antes de terminar, y el apagado MUST esperar a que termine (`AccessTracker::shutdown`, `crates/clawg-core/src/memory/retrieval/access.rs:134`). Lo mismo vale cuando se sueltan todos los `Sender`.
 
 #### Escenario
 - GIVEN un hit registrado con `record` hace menos de 30 s
@@ -266,7 +266,7 @@ Un apagado ordenado tiene cuatro fases, más una con un trabajo de importación 
 | El save en curso, el flush de accesos, el fin del mantenimiento y el checkpoint | `AFTER_DRAIN`, 7 s después del plazo de drenaje (`crates/clawg-core/src/runtime.rs`) | `shutdown_by` | se aborta el mantenimiento, se registra un warn y no se hace el checkpoint: el save en curso queda en su fila y el WAL se repite al abrir |
 | Las tareas bloqueantes que el proceso espera, una carga del modelo incluida | `RUNTIME_TEARDOWN`, 2 s | `shutdown_timeout` en `main.rs`, sólo para `clawg serve` | se abandonan y el proceso sale |
 
-En operación normal, sin señal, ninguna petición tiene tope por esto: un backup largo no se corta. Una petición cortada se ve como conexión cerrada; un save ya tiene su fila, y un snapshot sólo toma su nombre final al terminar (`snapshot_into`, `crates/clawg-core/src/memory/backup.rs:313-321`). `AFTER_DRAIN` cubre los 5 s que el checkpoint puede esperar en el busy handler de rusqlite si otro proceso tiene una lectura en curso.
+En operación normal, sin señal, ninguna petición tiene tope por esto: un backup largo no se corta. Una petición cortada se ve como conexión cerrada; un save ya tiene su fila, y un snapshot sólo toma su nombre final al terminar (`snapshot_into`, `crates/clawg-core/src/memory/store/backup.rs:313-321`). `AFTER_DRAIN` cubre los 5 s que el checkpoint puede esperar en el busy handler de rusqlite si otro proceso tiene una lectura en curso.
 
 #### Escenario: una petición que no termina
 - GIVEN un servidor con una petición en vuelo que no termina
@@ -333,7 +333,7 @@ La resolución es una función pura que recibe el home (`data_dir_in`, `paths.rs
 
 ### Migraciones atómicas
 
-Las migraciones pendientes de un arranque MUST aplicarse en una sola transacción junto con sus filas de historial (`configured`, `crates/clawg-core/src/memory/db.rs:417`, con `set_grouped(true)`). Si una falla, la base MUST quedar como estaba antes del arranque.
+Las migraciones pendientes de un arranque MUST aplicarse en una sola transacción junto con sus filas de historial (`configured`, `crates/clawg-core/src/memory/store/db.rs:403`, con `set_grouped(true)`). Si una falla, la base MUST quedar como estaba antes del arranque.
 
 #### Escenario: fallo a mitad
 - GIVEN una base vacía y la lista V1–V8 más una V9 cuyo SQL falla
@@ -349,7 +349,7 @@ Las migraciones pendientes de un arranque MUST aplicarse en una sola transacció
 
 ### Checksums fijados
 
-Los checksums de las migraciones publicadas (hoy V1–V32) MUST coincidir con una lista fija en el código (`PINNED`, `crates/clawg-core/src/memory/migrations.rs:44`). Cambiar una migración publicada MUST romper un test. Una migración nueva agrega su fila a la lista en el mismo commit.
+Los checksums de las migraciones publicadas (hoy V1–V32) MUST coincidir con una lista fija en el código (`PINNED`, `crates/clawg-core/src/memory/store/migrations.rs:44`). Cambiar una migración publicada MUST romper un test. Una migración nueva agrega su fila a la lista en el mismo commit.
 
 **Test:** `published_migration_checksums_are_pinned` (`migrations.rs`).
 
@@ -394,7 +394,7 @@ Una base en V16 MUST abrir con V17 con cada fila igual, salvo `supersede_cause`,
 - WHEN se abre con la versión nueva
 - THEN la revisión queda `revision`, los dos veredictos `verdict`, la revisión deshecha `verdict`, y las demás filas sin causa ni `revived_from`
 
-**Tests:** `a_database_from_before_revivals_opens_with_its_supersede_causes` (`crates/clawg-core/src/memory/db.rs:1175`), que siembra V16 con SQL directo; el checksum de V17 en `published_migration_checksums_are_pinned` (`migrations.rs`). Que `clawg update` aplique V17 sobre una base en V16 con revisiones y veredictos, y que el daemon nuevo actúe según esas causas, está en [`specs/self-update`](../self-update/spec.md), S10, «Escenario: migración pendiente sobre filas sin causa de reemplazo».
+**Tests:** `a_database_from_before_revivals_opens_with_its_supersede_causes` (`crates/clawg-core/src/memory/store/db.rs:1161`), que siembra V16 con SQL directo; el checksum de V17 en `published_migration_checksums_are_pinned` (`migrations.rs`). Que `clawg update` aplique V17 sobre una base en V16 con revisiones y veredictos, y que el daemon nuevo actúe según esas causas, está en [`specs/self-update`](../self-update/spec.md), S10, «Escenario: migración pendiente sobre filas sin causa de reemplazo».
 
 #### Vuelta atrás de V17
 
@@ -402,11 +402,11 @@ Un binario anterior a V17 MUST NOT abrir una base en V17: la rechaza sin tocarla
 
 #### Bases de la versión anterior con borrados de la vigente
 
-Una base escrita por una versión anterior a V17 puede tener una versión reemplazada por una fila borrada, de la misma clave, porque el borrado de la vigente no la revivía. La migración escribe `revision` en esa fila (su reemplazante tiene la clave), y no la revive: el primer paso de mantenimiento la trae de vuelta, `STARTUP_DELAY` después de arrancar el daemon (`crates/clawg-core/src/memory/maintenance.rs:25`). Esto se acepta como está diseñado: el efecto queda sólo en el log del daemon (`maintenance: brought back N rows ...`), `clawg update` no lo informa, y restaurar la fila borrada la vuelve a reemplazar. Ver [`specs/restore`](../restore/spec.md), «Filas de una versión anterior a V17».
+Una base escrita por una versión anterior a V17 puede tener una versión reemplazada por una fila borrada, de la misma clave, porque el borrado de la vigente no la revivía. La migración escribe `revision` en esa fila (su reemplazante tiene la clave), y no la revive: el primer paso de mantenimiento la trae de vuelta, `STARTUP_DELAY` después de arrancar el daemon (`crates/clawg-core/src/memory/upkeep/maintenance.rs:25`). Esto se acepta como está diseñado: el efecto queda sólo en el log del daemon (`maintenance: brought back N rows ...`), `clawg update` no lo informa, y restaurar la fila borrada la vuelve a reemplazar. Ver [`specs/restore`](../restore/spec.md), «Filas de una versión anterior a V17».
 
 ### Una base en V17 abre con los índices de las sentencias de sesión
 
-V18 (`crates/clawg-core/migrations/V18__session_indexes.sql`) sólo toca índices de `memory`: crea `idx_memory_session_summary` sobre `(project_id, created_at DESC)` para los `session_summary` no borrados, que lee LAST SESSION, e `idx_memory_agent_created` sobre `(agent_id, created_at DESC)` para las filas no borradas, que lee RECENT ([`specs/retrieval`](../retrieval/spec.md), «Las sentencias de sesión leen por índice»), y reconstruye `idx_memory_dedup` como `(agent_id, COALESCE(project_id, ''), content_hash, created_at)` con el mismo predicado parcial. El índice del agente entrega las filas de `agent_id = ?` por `created_at`, y sin el sello en el de dedup el planificador lo elegía para las búsquedas de dedup (`ORDER BY created_at ASC LIMIT 1`): cada guardado habría recorrido las filas vivas del agente. Con el sello, esas búsquedas (`REINFORCE_LOOKUP_SQL`, `crates/clawg-core/src/memory/store_insert.rs:300`; `TWIN_SQL` del import; `RESTORE_TWIN` del undelete) llegan por el índice de dedup sin ordenar. Ningún predicado nombra `status`: un índice parcial sólo sirve a una sentencia cuyo `WHERE` implica el del índice, y eso ataría el índice al texto de los estados. V20 le cambia las columnas a `idx_memory_dedup` y V25 le quita el predicado (abajo).
+V18 (`crates/clawg-core/migrations/V18__session_indexes.sql`) sólo toca índices de `memory`: crea `idx_memory_session_summary` sobre `(project_id, created_at DESC)` para los `session_summary` no borrados, que lee LAST SESSION, e `idx_memory_agent_created` sobre `(agent_id, created_at DESC)` para las filas no borradas, que lee RECENT ([`specs/retrieval`](../retrieval/spec.md), «Las sentencias de sesión leen por índice»), y reconstruye `idx_memory_dedup` como `(agent_id, COALESCE(project_id, ''), content_hash, created_at)` con el mismo predicado parcial. El índice del agente entrega las filas de `agent_id = ?` por `created_at`, y sin el sello en el de dedup el planificador lo elegía para las búsquedas de dedup (`ORDER BY created_at ASC LIMIT 1`): cada guardado habría recorrido las filas vivas del agente. Con el sello, esas búsquedas (`REINFORCE_LOOKUP_SQL`, `crates/clawg-core/src/memory/ingest/store_insert.rs:191`; `TWIN_SQL` del import; `RESTORE_TWIN` del undelete) llegan por el índice de dedup sin ordenar. Ningún predicado nombra `status`: un índice parcial sólo sirve a una sentencia cuyo `WHERE` implica el del índice, y eso ataría el índice al texto de los estados. V20 le cambia las columnas a `idx_memory_dedup` y V25 le quita el predicado (abajo).
 
 Una base en V17 MUST abrir con V18 con cada fila igual y con los tres índices. La migración MUST NOT cambiar ninguna fila.
 
@@ -420,7 +420,7 @@ Una base en V17 MUST abrir con V18 con cada fila igual y con los tres índices. 
 - WHEN se pide el plan de `REINFORCE_LOOKUP_SQL`
 - THEN nombra `idx_memory_dedup` y ninguna línea nombra `TEMP B-TREE`
 
-**Tests:** `a_store_from_before_the_session_indexes_keeps_its_rows_and_gains_them` (`crates/clawg-core/src/memory/db.rs:1343`), que abre con `MemoryStore::open`, así que pasa también por el snapshot `pre-migration`; `reinforce_lookup_uses_dedup_index` (`store_insert.rs:2165`); el checksum de V18 en `published_migration_checksums_are_pinned` (`migrations.rs`).
+**Tests:** `a_store_from_before_the_session_indexes_keeps_its_rows_and_gains_them` (`crates/clawg-core/src/memory/store/db.rs:1329`), que abre con `MemoryStore::open`, así que pasa también por el snapshot `pre-migration`; `reinforce_lookup_uses_dedup_index` (`store_insert.rs:2165`); el checksum de V18 en `published_migration_checksums_are_pinned` (`migrations.rs`).
 
 #### Vuelta atrás de V18
 
@@ -428,7 +428,7 @@ Un binario anterior a V18 MUST NOT abrir una base en V18: la rechaza sin tocarla
 
 ### Una base en V19 abre con los índices por proyecto
 
-V20 (`crates/clawg-core/migrations/V20__project_scoped_indexes.sql`) sólo toca índices de `memory`: reconstruye `idx_memory_dedup` como `(COALESCE(project_id, ''), content_hash, created_at)` e `idx_memory_topic` como `(COALESCE(project_id, ''), topic_key)`, con los mismos predicados parciales. La dedup y la clave de tema comparan un save con su proyecto, de cualquier autor ([`specs/ingest`](../ingest/spec.md)), y ninguna búsqueda trae ya una igualdad sobre `agent_id`, con la que empezaban los dos. El autor queda como filtro residual del alcance del que guarda (`reach_predicate!`): el índice lleva a las filas del proyecto con ese hash o esa clave, que son pocas. Usan el de dedup `REINFORCE_LOOKUP_SQL` (refuerzo y `insert_unless_twin`), `RESTORE_TWIN` y `TWIN_SQL` del import; el de la clave, `SCOPE_ROWS_SQL` (`crates/clawg-core/src/memory/topic.rs`), `RESTORE_TOPIC_HOLDER`, `KEY_HELD_SQL` y `TOPIC_HOLDERS_SQL`. V25 le quita el predicado a `idx_memory_dedup` y le deja estas columnas; `idx_memory_topic` sigue parcial.
+V20 (`crates/clawg-core/migrations/V20__project_scoped_indexes.sql`) sólo toca índices de `memory`: reconstruye `idx_memory_dedup` como `(COALESCE(project_id, ''), content_hash, created_at)` e `idx_memory_topic` como `(COALESCE(project_id, ''), topic_key)`, con los mismos predicados parciales. La dedup y la clave de tema comparan un save con su proyecto, de cualquier autor ([`specs/ingest`](../ingest/spec.md)), y ninguna búsqueda trae ya una igualdad sobre `agent_id`, con la que empezaban los dos. El autor queda como filtro residual del alcance del que guarda (`reach_predicate!`): el índice lleva a las filas del proyecto con ese hash o esa clave, que son pocas. Usan el de dedup `REINFORCE_LOOKUP_SQL` (refuerzo y `insert_unless_twin`), `RESTORE_TWIN` y `TWIN_SQL` del import; el de la clave, `SCOPE_ROWS_SQL` (`crates/clawg-core/src/memory/revision/topic.rs`), `RESTORE_TOPIC_HOLDER`, `KEY_HELD_SQL` y `TOPIC_HOLDERS_SQL`. V25 le quita el predicado a `idx_memory_dedup` y le deja estas columnas; `idx_memory_topic` sigue parcial.
 
 Una base en V19 MUST abrir con V20 con cada fila igual, con `synthesis_review` igual y con los dos índices nuevos. La migración MUST NOT cambiar ninguna fila. Lo que las reglas por agente dejaban convivir (dos titulares de una clave o dos filas con un mismo texto en un proyecto, de agentes distintos) sigue vivo y alcanzable: el doctor lo marca ([`specs/doctor`](../doctor/spec.md)) y el próximo save con esa clave reemplaza a los dos.
 
@@ -442,7 +442,7 @@ Una base en V19 MUST abrir con V20 con cada fila igual, con `synthesis_review` i
 - WHEN se pide el plan de `REINFORCE_LOOKUP_SQL` y el de `SCOPE_ROWS_SQL`
 - THEN nombran `idx_memory_dedup` (sin `TEMP B-TREE`) e `idx_memory_topic`
 
-**Tests:** `a_store_from_before_project_scoped_rules_keeps_its_rows` (`crates/clawg-core/src/memory/db.rs`), que abre con `MemoryStore::open`; `reinforce_lookup_uses_dedup_index` (`store_insert.rs`); `the_scope_lookup_uses_the_topic_index` (`topic.rs`); `a_keyed_save_replaces_every_holder_of_its_project` (`worker.rs`); el checksum de V20 en `published_migration_checksums_are_pinned` (`migrations.rs`).
+**Tests:** `a_store_from_before_project_scoped_rules_keeps_its_rows` (`crates/clawg-core/src/memory/store/db.rs`), que abre con `MemoryStore::open`; `reinforce_lookup_uses_dedup_index` (`store_insert.rs`); `the_scope_lookup_uses_the_topic_index` (`topic.rs`); `a_keyed_save_replaces_every_holder_of_its_project` (`worker.rs`); el checksum de V20 en `published_migration_checksums_are_pinned` (`migrations.rs`).
 
 #### Vuelta atrás de V20
 
@@ -462,7 +462,7 @@ Una base en V24 MUST abrir con V25 con cada fila tal como estaba, después de la
 - AND una consulta `INDEXED BY idx_memory_dedup` encuentra la fila borrada por su proyecto, su hash y su fecha
 - AND en `backups` hay una copia `pre-migration`
 
-**Tests:** `a_store_from_before_the_unfiltered_dedup_index_keeps_its_rows` (`crates/clawg-core/src/memory/db.rs`), que abre con `MemoryStore::open`; el checksum de V25 en `published_migration_checksums_are_pinned` (`migrations.rs`); `a_v8_database_opens_unchanged_under_grouped_migrations`, `idempotent_migrations_second_open` y `e2e_store_smoke` (`db.rs`), que cuentan todas las migraciones.
+**Tests:** `a_store_from_before_the_unfiltered_dedup_index_keeps_its_rows` (`crates/clawg-core/src/memory/store/db.rs`), que abre con `MemoryStore::open`; el checksum de V25 en `published_migration_checksums_are_pinned` (`migrations.rs`); `a_v8_database_opens_unchanged_under_grouped_migrations`, `idempotent_migrations_second_open` y `e2e_store_smoke` (`db.rs`), que cuentan todas las migraciones.
 
 #### Vuelta atrás de V25
 
@@ -470,7 +470,7 @@ Un binario anterior a V25 MUST NOT abrir una base en V25: la rechaza sin tocarla
 
 ### IL3. Las búsquedas del texto vivo y de la clave no cambian de índice
 
-`REINFORCE_LOOKUP_SQL` (`crates/clawg-core/src/memory/store_insert.rs`) MUST seguir llegando por `idx_memory_dedup` sin ninguna línea `TEMP B-TREE`. `SCOPE_ROWS_SQL` (`crates/clawg-core/src/memory/topic.rs`) y `TOPIC_HOLDERS_SQL` del import MUST seguir llegando por `idx_memory_topic`, aunque `idx_memory_dedup`, ya sin predicado, también sirva a cualquier consulta con una igualdad sobre `COALESCE(project_id, '')`. Las entradas de filas borradas que ahora tiene el índice se descartan como filtro residual: ninguna de estas consultas MUST devolver otra fila que la que devolvía con el índice parcial.
+`REINFORCE_LOOKUP_SQL` (`crates/clawg-core/src/memory/ingest/store_insert.rs`) MUST seguir llegando por `idx_memory_dedup` sin ninguna línea `TEMP B-TREE`. `SCOPE_ROWS_SQL` (`crates/clawg-core/src/memory/revision/topic.rs`) y `TOPIC_HOLDERS_SQL` del import MUST seguir llegando por `idx_memory_topic`, aunque `idx_memory_dedup`, ya sin predicado, también sirva a cualquier consulta con una igualdad sobre `COALESCE(project_id, '')`. Las entradas de filas borradas que ahora tiene el índice se descartan como filtro residual: ninguna de estas consultas MUST devolver otra fila que la que devolvía con el índice parcial.
 
 #### Escenario
 - GIVEN un store migrado
@@ -481,7 +481,7 @@ Un binario anterior a V25 MUST NOT abrir una base en V25: la rechaza sin tocarla
 
 ### Verificación del esquema antes de migrar
 
-La decisión es pura (`schema_plan`, `backup.rs:93`). `MemoryStore::open` MUST calcularla antes de cualquier pragma y antes del runner (`check_schema`, `crates/clawg-core/src/memory/db.rs:432`, llamada en `db.rs:200`). Con `Newer` o `Diverged`, `open` MUST devolver `MemoryError::SchemaNewer` o `MemoryError::SchemaDiverged` (`crates/clawg-core/src/memory/error.rs:58` y `:64`) y MUST NOT escribir nada en `memory.db`. Los mensajes MUST decir las versiones, que nada cambió, y qué hacer: instalar la versión que la escribió o `clawg restore` de un backup anterior.
+La decisión es pura (`schema_plan`, `backup.rs:93`). `MemoryStore::open` MUST calcularla antes de cualquier pragma y antes del runner (`check_schema`, `crates/clawg-core/src/memory/store/db.rs:418`, llamada en `db.rs:186`). Con `Newer` o `Diverged`, `open` MUST devolver `MemoryError::SchemaNewer` o `MemoryError::SchemaDiverged` (`crates/clawg-core/src/memory/store/error.rs:58` y `:64`) y MUST NOT escribir nada en `memory.db`. Los mensajes MUST decir las versiones, que nada cambió, y qué hacer: instalar la versión que la escribió o `clawg restore` de un backup anterior.
 
 #### Escenario: base más nueva
 - GIVEN una base en la última versión del binario, N (hoy V32), con una fila N + 1 agregada en `refinery_schema_history`
@@ -496,7 +496,7 @@ La decisión es pura (`schema_plan`, `backup.rs:93`). `MemoryStore::open` MUST c
 
 ### Snapshot antes de migrar
 
-Con plan `Pending`, `open` MUST hacer un snapshot `pre-migration` antes de aplicar la primera migración pendiente (`db.rs:234`). Si falla, MUST devolver `MemoryError::Backup` y MUST NOT migrar. Con `Fresh` y `UpToDate` MUST NOT hacer snapshot.
+Con plan `Pending`, `open` MUST hacer un snapshot `pre-migration` antes de aplicar la primera migración pendiente (`db.rs:220`). Si falla, MUST devolver `MemoryError::Backup` y MUST NOT migrar. Con `Fresh` y `UpToDate` MUST NOT hacer snapshot.
 
 #### Escenario
 - GIVEN una base migrada hasta V7, con filas
@@ -509,7 +509,7 @@ Con plan `Pending`, `open` MUST hacer un snapshot `pre-migration` antes de aplic
 
 ### El modelo se carga con pooling mean
 
-`E5Embedder` (`crates/clawg-core/src/memory/embedder.rs:410`) MUST embeber con pooling mean, el del entrenamiento de multilingual-e5-small: la media de los estados ocultos sobre la máscara de atención y después L2 (`pool_and_normalize`, `embedder.rs:290`). Con el token CLS, todos los pasajes de un corpus quedaban a 0,90–0,91 de coseno de cualquier pregunta. La inferencia la arma clawg sobre ONNX Runtime; las reglas de la ventana, el relleno y la salida están en «Los mismos vectores que fastembed», abajo.
+`E5Embedder` (`crates/clawg-core/src/memory/embedding/embedder.rs:423`) MUST embeber con pooling mean, el del entrenamiento de multilingual-e5-small: la media de los estados ocultos sobre la máscara de atención y después L2 (`pool_and_normalize`, `embedder.rs:303`). Con el token CLS, todos los pasajes de un corpus quedaban a 0,90–0,91 de coseno de cualquier pregunta. La inferencia la arma clawg sobre ONNX Runtime; las reglas de la ventana, el relleno y la salida están en «Los mismos vectores que fastembed», abajo.
 
 El id del modelo en el contrato de embedding MUST ser `multilingual-e5-small/mean` (`E5_MODEL_ID`, `embedder.rs:135`). El id anterior, `multilingual-e5-small` (`LEGACY_CLS_MODEL_ID`, `embedder.rs:141`), nombra los vectores CLS: el archivo del modelo es el mismo, el espacio no. El contrato no tiene una columna de pooling; el id es lo que distingue espacios, y el índice de documentación de los proyectos, que guarda el `model_id` de cada doc, se reindexa solo cuando cambia ([`specs/project-docs`](../project-docs/spec.md)).
 
@@ -517,7 +517,7 @@ El id del modelo en el contrato de embedding MUST ser `multilingual-e5-small/mea
 
 ### RM4. El contrato de embedding lo fija un test
 
-Un test MUST fijar juntos `E5_MODEL_ID` (`embedder.rs:135`), los dos prefijos (`"query: "` en ambos, `embedder.rs:109` y `:130`), `EMBED_MAX_TOKENS` (`embedder.rs:166`), `EMBEDDING_DIM` (`crates/clawg-core/src/memory/vector.rs:8`), el pooling que el id nombra (el sufijo `/mean` y los bits de `pool_and_normalize`, `embedder.rs:290`, sobre una entrada fija) y los SHA-256 fijados del modelo y del tokenizer (`MODEL_SHA256`, `TOKENIZER_JSON_SHA256` y los demás, `model_download.rs:63-71`). Cuando cambia cualquiera, el test MUST fallar con un mensaje que pregunta si `E5_MODEL_ID` tiene que subir.
+Un test MUST fijar juntos `E5_MODEL_ID` (`embedder.rs:135`), los dos prefijos (`"query: "` en ambos, `embedder.rs:109` y `:130`), `EMBED_MAX_TOKENS` (`embedder.rs:179`), `EMBEDDING_DIM` (`crates/clawg-core/src/memory/domain/vector.rs:8`), el pooling que el id nombra (el sufijo `/mean` y los bits de `pool_and_normalize`, `embedder.rs:303`, sobre una entrada fija) y los SHA-256 fijados del modelo y del tokenizer (`MODEL_SHA256`, `TOKENIZER_JSON_SHA256` y los demás, `model_download.rs:63-71`). Cuando cambia cualquiera, el test MUST fallar con un mensaje que pregunta si `E5_MODEL_ID` tiene que subir.
 
 #### Escenario: un prefijo cambia
 - GIVEN el contrato fijado por el test
@@ -528,10 +528,10 @@ Un test MUST fijar juntos `E5_MODEL_ID` (`embedder.rs:135`), los dos prefijos (`
 
 ### Re-embebido de un store CLS al arrancar
 
-Al arrancar, después de cargar el modelo y dentro del bootstrap del embedder, el daemon verifica el contrato (`verify_or_reembed`, `crates/clawg-core/src/memory/bootstrap.rs:550`, cableado por `contract_verifier`, `bootstrap.rs:259`, en `production_deps`, `bootstrap.rs:289`, que `serve_deps`, `bootstrap.rs:414`, entrega al daemon en `crates/clawg-cli/src/daemon/serve.rs:133`). Si el contrato guardado tiene `LEGACY_CLS_MODEL_ID` y el embedder cargado tiene `E5_MODEL_ID`, con la misma dimensión y los mismos prefijos (`is_pooling_upgrade`, `bootstrap.rs:536`, pura), MUST:
+Al arrancar, después de cargar el modelo y dentro del bootstrap del embedder, el daemon verifica el contrato (`verify_or_reembed`, `crates/clawg-core/src/memory/upkeep/bootstrap.rs:550`, cableado por `contract_verifier`, `bootstrap.rs:259`, en `production_deps`, `bootstrap.rs:289`, que `serve_deps`, `bootstrap.rs:414`, entrega al daemon en `crates/clawg-cli/src/daemon/serve.rs:133`). Si el contrato guardado tiene `LEGACY_CLS_MODEL_ID` y el embedder cargado tiene `E5_MODEL_ID`, con la misma dimensión y los mismos prefijos (`is_pooling_upgrade`, `bootstrap.rs:536`, pura), MUST:
 
 1. escribir un snapshot `pre-reembed` en `<data>/backups`; si falla, no re-embebe, y el intento termina como un fallo de verificación, que se reintenta con la espera de siempre ([`specs/ingest`](../ingest/spec.md), «Reintento del bootstrap»);
-2. re-embeber `memory` con el embedder cargado (`reembed_all` en modo `ReInfer`, `crates/clawg-core/src/memory/maintenance.rs:507`; desde V32 es la única tabla, RL4);
+2. re-embeber `memory` con el embedder cargado (`reembed_all` en modo `ReInfer`, `crates/clawg-core/src/memory/upkeep/maintenance.rs:507`; desde V32 es la única tabla, RL4);
 3. habilitar la memoria sólo si el re-embebido terminó sin fallas, que es cuando `reembed_all` escribe el contrato nuevo. Si no, el contrato queda como estaba, la memoria sigue deshabilitada y el estado es el de un contrato que no coincide: ese bootstrap no se reintenta, pero el próximo arranque vuelve a empezar, y las filas ya hechas dan los mismos bytes.
 
 Mientras el snapshot y el re-embebido corren, el estado del embedder MUST ser `loading`: el bootstrap publica `loading` antes de empezar y `ready` sólo cuando el embedder entró a su celda. Un save de ese lapso espera en la cola como con cualquier carga ([`specs/ingest`](../ingest/spec.md), «Embedder cargando»).
@@ -553,11 +553,11 @@ Cualquier otro contrato que no coincide (otro modelo, otra dimensión, otros pre
 - WHEN arranca con el embedder mean
 - THEN no hay snapshot ni re-embebido
 
-**Tests:** `only_the_cls_vectors_of_the_same_model_are_a_pooling_upgrade`, `cls_vectors_are_snapshotted_then_reembedded_by_mean`, `any_other_mismatch_is_left_as_it_is` y `a_store_that_matches_is_not_touched` en `crates/clawg-core/src/memory/bootstrap.rs`; el nombre `pre-reembed` en `snapshot_names_sort_in_time_order` (`backup.rs`). La regla de que el contrato se escribe al final está en los tests de `reembed_all` de `maintenance.rs`.
+**Tests:** `only_the_cls_vectors_of_the_same_model_are_a_pooling_upgrade`, `cls_vectors_are_snapshotted_then_reembedded_by_mean`, `any_other_mismatch_is_left_as_it_is` y `a_store_that_matches_is_not_touched` en `crates/clawg-core/src/memory/upkeep/bootstrap.rs`; el nombre `pre-reembed` en `snapshot_names_sort_in_time_order` (`backup.rs`). La regla de que el contrato se escribe al final está en los tests de `reembed_all` de `maintenance.rs`.
 
 ## Descarga del modelo
 
-El daemon consigue el modelo con `ensure_model` (`crates/clawg-core/src/memory/model_download.rs:472`): en el primer arranque lo baja y en los siguientes lo lee de la caché. Es la única entrada de producción: arma un `ModelSource` (`:446`) con el origen, el oráculo de disco, la espera entre intentos, los plazos y el manifiesto, y llama a `ensure_model_from` (`:499`), la que un test usa con su propio `ModelSource`. La caché se lee y se verifica en un solo lugar, `read_verified` (`:605`).
+El daemon consigue el modelo con `ensure_model` (`crates/clawg-core/src/memory/embedding/model_download.rs:472`): en el primer arranque lo baja y en los siguientes lo lee de la caché. Es la única entrada de producción: arma un `ModelSource` (`:446`) con el origen, el oráculo de disco, la espera entre intentos, los plazos y el manifiesto, y llama a `ensure_model_from` (`:499`), la que un test usa con su propio `ModelSource`. La caché se lee y se verifica en un solo lugar, `read_verified` (`:605`).
 
 **Definiciones:**
 - **Caché:** los cinco archivos del modelo en `<data>/models/multilingual-e5-small/`, cada uno con el SHA-256 fijado en `ALL_FILES` (`model_download.rs:92`).
@@ -631,7 +631,7 @@ Leer y hashear la caché MUST correr en una tarea bloqueante (`check_cache_off_r
 
 ### RM2. La carga y la reparación no se pisan
 
-La reparación corre en el mismo proceso que la carga (`repair_in_background`, `crates/clawg-core/src/memory/bootstrap.rs:505`, que corre `ensure` bajo una marca `AtomicBool`), y ningún comando de `clawg-cli` escribe en `<data>/models/`. Un candado del proceso (`CacheLock`, `model_download.rs:315`) MUST cubrir la carga desde que abre el archivo hasta que vuelve `commit_from_memory`, y la reparación MUST tomarlo antes de renombrar `.partial` sobre `model.onnx`, así que espera a que la carga suelte el archivo.
+La reparación corre en el mismo proceso que la carga (`repair_in_background`, `crates/clawg-core/src/memory/upkeep/bootstrap.rs:505`, que corre `ensure` bajo una marca `AtomicBool`), y ningún comando de `clawg-cli` escribe en `<data>/models/`. Un candado del proceso (`CacheLock`, `model_download.rs:315`) MUST cubrir la carga desde que abre el archivo hasta que vuelve `commit_from_memory`, y la reparación MUST tomarlo antes de renombrar `.partial` sobre `model.onnx`, así que espera a que la carga suelte el archivo.
 
 - Si la apertura de la carga falla por compartir (errores 5, 32 o 33 de Windows, por ejemplo un antivirus), MUST reintentarse con esperas crecientes que suman unos 2 s (`OPEN_RETRY_WAITS_MS`, `model_download.rs:746`).
 - Si sigue fallando, el pedido MUST contestar que el modelo no está listo, con una línea en el log. MUST NOT lanzar una reparación ni una descarga, MUST NOT contar el archivo como faltante en el arranque (`needs_repair`, `bootstrap.rs:500`, e `is_sharing_conflict`, `model_download.rs:752`) y MUST NOT volver a leer el ONNX a un `Vec`.
@@ -667,13 +667,13 @@ Sin la variable, vacía o con sólo espacios, el origen MUST ser `https://huggin
 
 ## Ciclo de vida del embedder
 
-El daemon envuelve el modelo en un `IdleEmbedder` (`crates/clawg-core/src/memory/idle_embedder.rs:267`), que lo suelta tras un tiempo sin uso y lo vuelve a cargar cuando una llamada necesita un vector, y que recarga también un modelo cuyo hilo de inferencia murió. Lo envuelve siempre, también con `CLAWG_EMBEDDER_IDLE_MINUTES=0`. Lo arma `unloading_when_idle` (`crates/clawg-core/src/memory/bootstrap.rs:452`), con la lectura de la caché para recargar, la descarga para repararla y la sonda de memoria del daemon, cableado en `crates/clawg-cli/src/daemon/serve.rs:147`.
+El daemon envuelve el modelo en un `IdleEmbedder` (`crates/clawg-core/src/memory/embedding/idle_embedder.rs:267`), que lo suelta tras un tiempo sin uso y lo vuelve a cargar cuando una llamada necesita un vector, y que recarga también un modelo cuyo hilo de inferencia murió. Lo envuelve siempre, también con `CLAWG_EMBEDDER_IDLE_MINUTES=0`. Lo arma `unloading_when_idle` (`crates/clawg-core/src/memory/upkeep/bootstrap.rs:452`), con la lectura de la caché para recargar, la descarga para repararla y la sonda de memoria del daemon, cableado en `crates/clawg-cli/src/daemon/serve.rs:147`.
 
 **Definiciones:**
 - **Tiempo de ocio:** los minutos de `CLAWG_EMBEDDER_IDLE_MINUTES` (`IDLE_MINUTES_VAR`, `idle_embedder.rs:32`), 10 si falta o está vacía.
 - **Residente:** el modelo está en memoria y una llamada no necesita cargarlo.
 - **Uso:** una llamada de embedding, desde que pide el modelo (incluida su carga) hasta que vuelve.
-- **Hilo muerto:** una llamada al modelo devuelve `EmbedError::WorkerGone` (`crates/clawg-core/src/memory/embedder.rs:204`): el hilo `embedder-worker`, dueño de la sesión, terminó o soltó la petición sin contestarla.
+- **Hilo muerto:** una llamada al modelo devuelve `EmbedError::WorkerGone` (`crates/clawg-core/src/memory/embedding/embedder.rs:217`): el hilo `embedder-worker`, dueño de la sesión, terminó o soltó la petición sin contestarla.
 - **Línea de base:** la memoria privada del mismo build con el embedder falso (`CLAWG_TEST_EMBEDDER=fake`) y sólo `tokenizer.json` en su directorio de datos.
 
 ### Soltar el modelo ocioso
@@ -694,7 +694,7 @@ El daemon MUST soltar el modelo cuando pasó el tiempo de ocio desde el último 
 
 ### Recargar a demanda, una sola vez
 
-Una llamada con el modelo suelto MUST cargarlo con la misma carga del arranque sobre los archivos de la caché, leídos y verificados otra vez (`cached` y `load`, en `unloading_when_idle`; `load_cached_model`, `crates/clawg-core/src/memory/model_download.rs:631`), y MUST devolver el mismo vector que antes de soltarlo. Una recarga MUST NOT tocar la red. Una recarga MUST NOT volver a parsear el tokenizer («Un solo tokenizer por proceso»). Las llamadas que llegan durante una carga MUST compartirla. `model_id`, `dimensions` y los prefijos MUST NOT cargar el modelo.
+Una llamada con el modelo suelto MUST cargarlo con la misma carga del arranque sobre los archivos de la caché, leídos y verificados otra vez (`cached` y `load`, en `unloading_when_idle`; `load_cached_model`, `crates/clawg-core/src/memory/embedding/model_download.rs:631`), y MUST devolver el mismo vector que antes de soltarlo. Una recarga MUST NOT tocar la red. Una recarga MUST NOT volver a parsear el tokenizer («Un solo tokenizer por proceso»). Las llamadas que llegan durante una carga MUST compartirla. `model_id`, `dimensions` y los prefijos MUST NOT cargar el modelo.
 
 #### Escenario: varias llamadas, una carga
 - GIVEN el modelo suelto
@@ -705,7 +705,7 @@ Una llamada con el modelo suelto MUST cargarlo con la misma carga del arranque s
 
 ### Una recarga que falla no deja nada roto
 
-Una recarga cuya caché no pasa (falta un archivo, no se lee o tiene otro SHA-256; `DownloadError::NotCached`, `crates/clawg-core/src/memory/model_download.rs:417`) MUST responder «no listo» (`EmbedError::NotReady`) sin esperar ninguna descarga, y MUST lanzar una reparación: `ensure` en una tarea del runtime, fuera del cerrojo del modelo, salvo que ya haya una en curso, así que hay a lo sumo una a la vez (`repair_in_background`, `bootstrap.rs:505`). La reparación no carga el modelo: la llamada siguiente que encuentre la caché reparada MUST cargarla. Una reparación que falla MUST dejarlo en el log, y la llamada siguiente MAY lanzar otra. Cualquier otra recarga que falla MUST responder «no listo» igual, y la llamada siguiente MUST intentar otra vez. Una recarga que trae otro `model_id` u otra dimensión MUST rechazarse igual: los vectores nuevos no pueden caer en otro espacio que los guardados. El estado del embedder MUST NOT pasar a `failed` por una recarga ni por una reparación.
+Una recarga cuya caché no pasa (falta un archivo, no se lee o tiene otro SHA-256; `DownloadError::NotCached`, `crates/clawg-core/src/memory/embedding/model_download.rs:417`) MUST responder «no listo» (`EmbedError::NotReady`) sin esperar ninguna descarga, y MUST lanzar una reparación: `ensure` en una tarea del runtime, fuera del cerrojo del modelo, salvo que ya haya una en curso, así que hay a lo sumo una a la vez (`repair_in_background`, `bootstrap.rs:505`). La reparación no carga el modelo: la llamada siguiente que encuentre la caché reparada MUST cargarla. Una reparación que falla MUST dejarlo en el log, y la llamada siguiente MAY lanzar otra. Cualquier otra recarga que falla MUST responder «no listo» igual, y la llamada siguiente MUST intentar otra vez. Una recarga que trae otro `model_id` u otra dimensión MUST rechazarse igual: los vectores nuevos no pueden caer en otro espacio que los guardados. El estado del embedder MUST NOT pasar a `failed` por una recarga ni por una reparación.
 
 El cerrojo del modelo queda tomado lo que tarda leer y hashear la caché, nunca lo que tarda la red. La lectura de una recarga MUST empezar por los archivos chicos (los tres de configuración, después `tokenizer.json` y al final el ONNX, `FileKind::read_cost`) y MUST cortar en el primero que no pasa (`Reading::UntilOneFails`, `model_download.rs:674`, en `load_cached_from`, `:635`), así que un archivo chico dañado da el «no listo» sin hashear el ONNX, y `NotCached` nombra sólo ese archivo; la reparación vuelve a leer todo. El arranque MUST leer los cinco (`Reading::Whole`), porque baja cada uno que no pasa. Cuando la recarga leía los cinco, medido el 2026-10-19 con el modelo real en un build debug en Windows, las dos búsquedas del escenario respondían en 8,7 y 9,2 s, lo que una recarga buena tarda en leer y verificar la caché (9,5 s).
 
@@ -725,7 +725,7 @@ El cerrojo del modelo queda tomado lo que tarda leer y hashear la caché, nunca 
 
 ### Un pánico en la inferencia contesta y suelta la sesión
 
-Cuando la inferencia de una petición entra en pánico, el hilo de inferencia (`serve_requests`, `crates/clawg-core/src/memory/embedder.rs:608`, con `catch_unwind`) MUST contestar esa petición con `EmbedError::InferenceFailed`, cuyo texto MUST decir `inference panicked` y la causa del pánico, MUST dejarlo en el log y MUST terminar, soltando la sesión. MUST NOT inferir otra petición con esa sesión. Las peticiones que esperaban en la cola MUST recibir `WorkerGone`. El hilo MUST NOT inferir una petición cuyo llamante ya soltó la respuesta cuando la toma; puede inferir una que se suelta durante la inferencia, a lo sumo un lote por llamante.
+Cuando la inferencia de una petición entra en pánico, el hilo de inferencia (`serve_requests`, `crates/clawg-core/src/memory/embedding/embedder.rs:621`, con `catch_unwind`) MUST contestar esa petición con `EmbedError::InferenceFailed`, cuyo texto MUST decir `inference panicked` y la causa del pánico, MUST dejarlo en el log y MUST terminar, soltando la sesión. MUST NOT inferir otra petición con esa sesión. Las peticiones que esperaban en la cola MUST recibir `WorkerGone`. El hilo MUST NOT inferir una petición cuyo llamante ya soltó la respuesta cuando la toma; puede inferir una que se suelta durante la inferencia, a lo sumo un lote por llamante.
 
 No se conoce un camino que haga entrar en pánico a la inferencia (ver [embedder-recovery](../../changes/archive/2026-10-19-embedder-recovery/exploration.md)): este requisito y el siguiente cubren un fallo posible, no uno observado. La llamada que entró en pánico ve el error: un `500` en búsqueda y `recall_context`, y en el ingest un save `failed` con `embed failed: inference panicked: …`.
 
@@ -791,7 +791,7 @@ Buscar, guardar, restaurar y `recall_context` con el modelo suelto MUST esperar 
 
 ### RM3. Cada carga dice quién la pidió y cuánto costó
 
-Cuando `IdleEmbedder` vuelve a cargar el modelo MUST dejar en el log una línea de `info` con la duración, quién la pidió y, si el daemon le dio una sonda de memoria, la memoria privada antes y después (`load_line`, `crates/clawg-core/src/memory/idle_embedder.rs:87`):
+Cuando `IdleEmbedder` vuelve a cargar el modelo MUST dejar en el log una línea de `info` con la duración, quién la pidió y, si el daemon le dio una sonda de memoria, la memoria privada antes y después (`load_line`, `crates/clawg-core/src/memory/embedding/idle_embedder.rs:87`):
 
 ```
 embedding model loaded again in 9234 ms for a wake; private memory 284.0 MiB before, 740.0 MiB after
@@ -843,8 +843,8 @@ embedding model loaded again in 1102 ms for a call that embeds; private memory 3
 Con el modelo suelto, la memoria privada del daemon MUST quedar cerca de la línea de base. En 10 recargas seguidas, la mediana MUST NOT superar la línea de base en más de 64 MB, y la mediana de las recargas 6 a 10 MUST NOT superar la de las recargas 1 a 5 en más de 16 MB. Vale en Windows y en Linux.
 
 En Linux con glibc, dos cosas lo hacen posible:
-- El hilo dueño de la sesión MUST devolver al sistema las páginas libres al soltarla (`return_freed_memory`, `embedder.rs:645`, un `malloc_trim(0)` después de `drop(inference.session)`).
-- `clawg serve` MUST dejar todos sus hilos en una sola arena de `malloc` (`keep_one_malloc_arena`, `embedder.rs:668`, `mallopt(M_ARENA_MAX, 1)`), fijada en `main` antes de construir el runtime de tokio (`crates/clawg-cli/src/main.rs:42-46`), porque glibc le asigna la arena a un hilo en su primera asignación. Los demás comandos no la fijan (`Command::loads_the_model`, `crates/clawg-cli/src/cli.rs:176`, pura). Cada carga arma, usa y suelta la sesión en hilos nuevos para ella; con las arenas por hilo de glibc, cada recarga podía estrenar otra arena, y cada una retenía de 6 a 24 MB después del trim.
+- El hilo dueño de la sesión MUST devolver al sistema las páginas libres al soltarla (`return_freed_memory`, `embedder.rs:658`, un `malloc_trim(0)` después de `drop(inference.session)`).
+- `clawg serve` MUST dejar todos sus hilos en una sola arena de `malloc` (`keep_one_malloc_arena`, `embedder.rs:681`, `mallopt(M_ARENA_MAX, 1)`), fijada en `main` antes de construir el runtime de tokio (`crates/clawg-cli/src/main.rs:42-46`), porque glibc le asigna la arena a un hilo en su primera asignación. Los demás comandos no la fijan (`Command::loads_the_model`, `crates/clawg-cli/src/cli.rs:176`, pura). Cada carga arma, usa y suelta la sesión en hilos nuevos para ella; con las arenas por hilo de glibc, cada recarga podía estrenar otra arena, y cada una retenía de 6 a 24 MB después del trim.
 
 #### Escenario: diez recargas
 - GIVEN `CLAWG_EMBEDDER_IDLE_MINUTES=1` y la línea de base medida en el mismo build
@@ -860,7 +860,7 @@ En Linux con glibc, dos cosas lo hacen posible:
 
 ### Un solo tokenizer por proceso
 
-El daemon MUST parsear `tokenizer.json` a lo sumo una vez por proceso, y sólo de bytes cuyo SHA-256 verificó. El chunker, el índice de docs y el embedder MUST compartir esa copia, la celda `MemoryRuntime::tokenizer` (`crates/clawg-core/src/runtime.rs:143`). La llenan `resolve_tokenizer_and_chunker` (`crates/clawg-core/src/memory/worker.rs:1011`), con `load_verified_tokenizer` (`crates/clawg-core/src/memory/model_download.rs:155`), y `model_loader` (`bootstrap.rs:237`); cada parse deja la línea `tokenizer.json parsed` (`model_download.rs:165` y `:196`). Una recarga MUST NOT volver a parsearlo. El embedder MUST NOT cambiar la configuración del tokenizer compartido. El chunker del worker MUST leer la celda en cada save (`ChatChunker::from_cell`, `crates/clawg-core/src/memory/chunker/chat.rs:64`): una celda que se llena después de construirlo cambia su troceo sin reiniciar, y un mismo save se corta entero con un solo splitter.
+El daemon MUST parsear `tokenizer.json` a lo sumo una vez por proceso, y sólo de bytes cuyo SHA-256 verificó. El chunker, el índice de docs y el embedder MUST compartir esa copia, la celda `MemoryRuntime::tokenizer` (`crates/clawg-core/src/runtime.rs:143`). La llenan `resolve_tokenizer_and_chunker` (`crates/clawg-core/src/memory/ingest/worker.rs:1011`), con `load_verified_tokenizer` (`crates/clawg-core/src/memory/embedding/model_download.rs:155`), y `model_loader` (`bootstrap.rs:237`); cada parse deja la línea `tokenizer.json parsed` (`model_download.rs:165` y `:196`). Una recarga MUST NOT volver a parsearlo. El embedder MUST NOT cambiar la configuración del tokenizer compartido. El chunker del worker MUST leer la celda en cada save (`ChatChunker::from_cell`, `crates/clawg-core/src/memory/embedding/chunker/chat.rs:64`): una celda que se llena después de construirlo cambia su troceo sin reiniciar, y un mismo save se corta entero con un solo splitter.
 
 #### Escenario: arranque con el modelo en disco, en cualquier orden
 - GIVEN el modelo en disco
@@ -886,9 +886,9 @@ El daemon MUST parsear `tokenizer.json` a lo sumo una vez por proceso, y sólo d
 
 ### Los mismos vectores que fastembed
 
-Para el mismo texto y el mismo rol, el embedder MUST devolver los mismos bits que devolvió fastembed 5.13.4 en una CPU y un sistema operativo como los que generaron la referencia. ONNX Runtime elige sus kernels según la CPU y viene compilado aparte para cada sistema, así que en otra CPU o en otro sistema la diferencia máxima por componente MUST NOT pasar de 1e-6. Eso exige una ventana de `EMBED_MAX_TOKENS` (`embedder.rs:166`) que cuenta `<s>` y `</s>` (`window_encodings`, `embedder.rs:229`), relleno hasta el texto más largo del pedido con `pad_token_id` (`pad_right`, `embedder.rs:248`), `token_type_ids` cuando el modelo los pide, pooling por media sobre la máscara y L2. La carga (`from_parts`, `embedder.rs:572`) MUST rechazar (`LoadFailed`) un tokenizer con truncación o relleno propios, un token de `special_tokens_map.json` que el tokenizer no trata como especial, un `model_max_length` menor que `EMBED_MAX_TOKENS` (`check_tokenizer`, `embedder.rs:348`) y un modelo sin salida elegible (`pick_output`, `embedder.rs:273`). La sesión usa el proveedor de CPU sin arena y optimización de grafo nivel 3 (`session_builder`, `embedder.rs:583`).
+Para el mismo texto y el mismo rol, el embedder MUST devolver los mismos bits que devolvió fastembed 5.13.4 en una CPU y un sistema operativo como los que generaron la referencia. ONNX Runtime elige sus kernels según la CPU y viene compilado aparte para cada sistema, así que en otra CPU o en otro sistema la diferencia máxima por componente MUST NOT pasar de 1e-6. Eso exige una ventana de `EMBED_MAX_TOKENS` (`embedder.rs:179`) que cuenta `<s>` y `</s>` (`window_encodings`, `embedder.rs:242`), relleno hasta el texto más largo del pedido con `pad_token_id` (`pad_right`, `embedder.rs:261`), `token_type_ids` cuando el modelo los pide, pooling por media sobre la máscara y L2. La carga (`from_parts`, `embedder.rs:585`) MUST rechazar (`LoadFailed`) un tokenizer con truncación o relleno propios, un token de `special_tokens_map.json` que el tokenizer no trata como especial, un `model_max_length` menor que `EMBED_MAX_TOKENS` (`check_tokenizer`, `embedder.rs:361`) y un modelo sin salida elegible (`pick_output`, `embedder.rs:286`). La sesión usa el proveedor de CPU sin arena y optimización de grafo nivel 3 (`session_builder`, `embedder.rs:596`).
 
-La sesión de ONNX Runtime MUST usar tantos hilos intra-op como informa `std::thread::available_parallelism()` (`session_threads`, `embedder.rs:570`). Si esa llamada falla, la sesión MUST armarse con `FALLBACK_SESSION_THREADS` = 2 (`embedder.rs:562`) y el daemon SHOULD registrar un `warn` con la causa. Una falla de esa llamada MUST NOT impedir la carga del modelo. La decisión es pura (`threads_from`, `embedder.rs:565`): no lee el sistema. Los binarios de evaluación (`EvalMemo::open` y el bloque `index` de `rag-eval --docs`) MUST usar el mismo número, y MUST NOT fallar ni dejar de usar la memoria de vectores porque falte el dato.
+La sesión de ONNX Runtime MUST usar tantos hilos intra-op como informa `std::thread::available_parallelism()` (`session_threads`, `embedder.rs:583`). Si esa llamada falla, la sesión MUST armarse con `FALLBACK_SESSION_THREADS` = 2 (`embedder.rs:575`) y el daemon SHOULD registrar un `warn` con la causa. Una falla de esa llamada MUST NOT impedir la carga del modelo. La decisión es pura (`threads_from`, `embedder.rs:578`): no lee el sistema. Los binarios de evaluación (`EvalMemo::open` y el bloque `index` de `rag-eval --docs`) MUST usar el mismo número, y MUST NOT fallar ni dejar de usar la memoria de vectores porque falte el dato.
 
 #### Escenario: un texto largo conserva `</s>`
 - GIVEN un texto de más de `EMBED_MAX_TOKENS` tokens
@@ -961,8 +961,8 @@ Después de cada snapshot automático, el directorio de backups MUST conservar l
 
 `clawg backup [--profile P]` (`crates/clawg-cli/src/main.rs:140`) MUST producir un snapshot `manual` e imprimir su ruta.
 
-- Con el daemon andando, MUST pedirlo por `POST /v1/backup` (con el token; `crates/clawg-cli/src/daemon/api.rs:1934`, ruta en `:1046`), que lo hace en una conexión propia y corta, dentro de `spawn_blocking`, para que el `VACUUM INTO` no deje esperando detrás a cada llamada de la conexión del daemon (`MemoryStore::snapshot`, `crates/clawg-core/src/memory/db.rs:294`), y responde `{"path": "..."}`. El store en memoria de las pruebas, sin archivo, copia por su propia conexión.
-- Sin daemon, MUST tomar el lock del store con el titular `Maintenance` (`crates/clawg-core/src/memory/store_lock.rs:59`), copiar sin migrar y soltar el lock (`backup_offline`, `backup.rs:339`).
+- Con el daemon andando, MUST pedirlo por `POST /v1/backup` (con el token; `crates/clawg-cli/src/daemon/api.rs:1934`, ruta en `:1046`), que lo hace en una conexión propia y corta, dentro de `spawn_blocking`, para que el `VACUUM INTO` no deje esperando detrás a cada llamada de la conexión del daemon (`MemoryStore::snapshot`, `crates/clawg-core/src/memory/store/db.rs:280`), y responde `{"path": "..."}`. El store en memoria de las pruebas, sin archivo, copia por su propia conexión.
+- Sin daemon, MUST tomar el lock del store con el titular `Maintenance` (`crates/clawg-core/src/memory/store/store_lock.rs:59`), copiar sin migrar y soltar el lock (`backup_offline`, `backup.rs:339`).
 - Sin `memory.db`, MUST decir que no hay base, sin crear el directorio de datos.
 
 **Tests:** `backup_endpoint_writes_a_manual_snapshot` (`crates/clawg-cli/tests/api.rs`), `backup_takes_only_a_profile` (`cli.rs`), `an_offline_backup_copies_without_migrating`, `an_offline_backup_refuses_a_held_store` y `an_offline_backup_of_nothing_says_so` (`backup.rs`).
@@ -1072,7 +1072,7 @@ Un `clawg serve` lanzado a mano escribe donde lo redirija quien lo lanza, sin ro
 
 ### Escritura atómica de `workspace.md`
 
-`regenerate_auto_section` (`crates/clawg-core/src/memory/workspace.rs:108`) MUST escribir a un archivo temporal en el mismo directorio y hacer `rename` sobre `workspace.md` (`write_atomically`, `workspace.rs:482`). Si la escritura falla, `workspace.md` MUST quedar con su contenido anterior, sección USER incluida, y MUST NOT quedar ningún temporal.
+`regenerate_auto_section` (`crates/clawg-core/src/memory/retrieval/workspace.rs:108`) MUST escribir a un archivo temporal en el mismo directorio y hacer `rename` sobre `workspace.md` (`write_atomically`, `workspace.rs:482`). Si la escritura falla, `workspace.md` MUST quedar con su contenido anterior, sección USER incluida, y MUST NOT quedar ningún temporal.
 
 #### Escenario
 - GIVEN un `workspace.md` con una sección USER escrita a mano
@@ -1098,7 +1098,7 @@ V23 MUST agregar a `memory` la columna nullable `origin_project`, un índice par
 - WHEN se abre con este clawg
 - THEN cada fila tiene las mismas columnas que antes, `origin_project` es NULL y los dos índices existen
 
-**Test:** `a_database_from_the_previous_version_opens_with_no_origin_project` (`crates/clawg-core/src/memory/db.rs`); `published_migration_checksums_are_pinned` (`crates/clawg-core/src/memory/migrations.rs`).
+**Test:** `a_database_from_the_previous_version_opens_with_no_origin_project` (`crates/clawg-core/src/memory/store/db.rs`); `published_migration_checksums_are_pinned` (`crates/clawg-core/src/memory/store/migrations.rs`).
 
 #### Vuelta atrás de V23
 
@@ -1130,7 +1130,7 @@ Una base en V25 MUST abrir con V26 con cada fila de `memory` como estaba y las c
 - WHEN se abre con `MemoryStore::open`
 - THEN la fila tiene las mismas columnas que antes y las cuatro tablas del diario están vacías
 
-**Tests:** `a_store_from_before_the_import_journal_keeps_its_rows` (`crates/clawg-core/src/memory/db.rs`); la fila 26 de `published_migration_checksums_are_pinned` (`migrations.rs`); `snapshot_names_parse_back_to_their_reason` (`backup.rs`).
+**Tests:** `a_store_from_before_the_import_journal_keeps_its_rows` (`crates/clawg-core/src/memory/store/db.rs`); la fila 26 de `published_migration_checksums_are_pinned` (`migrations.rs`); `snapshot_names_parse_back_to_their_reason` (`backup.rs`).
 
 #### Vuelta atrás de V26
 
@@ -1156,7 +1156,7 @@ MUST NOT cambiar ninguna fila de `memory`, `episodic_trajectory`, `procedural_sk
 - AND cada id con filas o con remoto tiene un proyecto `migrated`, revisado y con el nombre de su id, y el id que sólo nombran los registros no tiene ninguno
 - AND `project_path.remote` está lleno sólo en las carpetas con un único remoto atado
 
-**Tests:** `a_database_from_the_previous_version_opens_with_a_project_for_every_id_in_use` (`crates/clawg-core/src/memory/db.rs`); la fila 27 de `published_migration_checksums_are_pinned` (`migrations.rs`).
+**Tests:** `a_database_from_the_previous_version_opens_with_a_project_for_every_id_in_use` (`crates/clawg-core/src/memory/store/db.rs`); la fila 27 de `published_migration_checksums_are_pinned` (`migrations.rs`).
 
 #### Vuelta atrás de V27
 
@@ -1179,7 +1179,7 @@ MUST NOT cambiar ninguna fila. Las filas de `memory` de una unión van en `memor
 - WHEN se abre con este clawg
 - THEN hay una copia `pre-migration`, ninguna fila cambió, ningún proyecto tiene `merged_into` y los dos diarios están vacíos
 
-**Tests:** `a_database_from_the_previous_version_opens_with_every_project_live` (`crates/clawg-core/src/memory/db.rs`); la fila 28 de `published_migration_checksums_are_pinned` (`migrations.rs`).
+**Tests:** `a_database_from_the_previous_version_opens_with_every_project_live` (`crates/clawg-core/src/memory/store/db.rs`); la fila 28 de `published_migration_checksums_are_pinned` (`migrations.rs`).
 
 #### Vuelta atrás de V28
 
@@ -1205,7 +1205,7 @@ La fila de un proyecto borrado no se borra: sus filas borradas siguen bajo su id
 - THEN hay una copia `pre-migration`, ninguna fila cambió y ningún proyecto tiene `deleted_at`
 - AND un save bajo un id que `project` no conoce lo adopta como antes
 
-**Tests:** `a_database_from_the_previous_version_opens_with_no_project_deleted` (`crates/clawg-core/src/memory/db.rs`, sembrado con `seed_on_disk(dir, Some(28))`); la fila 29 de `published_migration_checksums_are_pinned` (`migrations.rs`); los de los disparadores en `project_delete.rs`.
+**Tests:** `a_database_from_the_previous_version_opens_with_no_project_deleted` (`crates/clawg-core/src/memory/store/db.rs`, sembrado con `seed_on_disk(dir, Some(28))`); la fila 29 de `published_migration_checksums_are_pinned` (`migrations.rs`); los de los disparadores en `project_delete.rs`.
 
 #### Vuelta atrás de V29
 
@@ -1222,7 +1222,7 @@ V30 (`crates/clawg-core/migrations/V30__project_subfolder.sql`) MUST crear `proj
 - WHEN se abre con este clawg
 - THEN hay una copia `pre-migration`, ninguna fila cambió y `project_subfolder` existe y está vacía
 
-**Tests:** `a_database_from_the_previous_version_opens_with_no_subfolder_declared` (`crates/clawg-core/src/memory/db.rs`, sembrado con `seed_on_disk(dir, Some(29))`); la fila 30 de `published_migration_checksums_are_pinned` (`migrations.rs`).
+**Tests:** `a_database_from_the_previous_version_opens_with_no_subfolder_declared` (`crates/clawg-core/src/memory/store/db.rs`, sembrado con `seed_on_disk(dir, Some(29))`); la fila 30 de `published_migration_checksums_are_pinned` (`migrations.rs`).
 
 #### Vuelta atrás de V30
 
@@ -1240,7 +1240,7 @@ V31 (`crates/clawg-core/migrations/V31__import_registry.sql`) MUST crear `memory
 - THEN hay una copia `pre-migration`, ninguna fila cambió, `memory_import_registry` existe y está vacía, e `idx_memory_created_at` existe
 - AND `clawg import --undo N` de ese import retira lo que su diario anotó, como antes de V31
 
-**Tests:** `a_database_from_the_previous_version_opens_with_its_imports_as_they_were` (`crates/clawg-core/src/memory/db.rs`, sembrado con `seed_on_disk(dir, Some(30))`); la fila 31 de `published_migration_checksums_are_pinned` (`migrations.rs`).
+**Tests:** `a_database_from_the_previous_version_opens_with_its_imports_as_they_were` (`crates/clawg-core/src/memory/store/db.rs`, sembrado con `seed_on_disk(dir, Some(30))`); la fila 31 de `published_migration_checksums_are_pinned` (`migrations.rs`).
 
 #### Vuelta atrás de V31
 
@@ -1250,21 +1250,21 @@ Un binario anterior a V31 MUST NOT abrir una base en V31: la rechaza sin tocarla
 
 ### LP4. El detector
 
-`clawg_core::memory::language::detect` (`crates/clawg-core/src/memory/language.rs:88`) MUST ser una función pura de un texto que devuelve `en`, `es` o «indeciso». MUST ignorar los bloques y spans de código, las URL, las rutas y los identificadores (palabras con dígitos, `_`, `::`, `.` interno o mayúsculas internas), y decidir por palabras funcionales de cada idioma y por las marcas del español (`ñ`, `¿`, `¡`, vocales con tilde). Con menos de `MIN_EVIDENCE` (3) puntos MUST dar «indeciso», salvo que la evidencia sea de un idioma solo y el texto tenga `TERSE_PROSE` (8) palabras de prosa o más, y entonces alcanza un punto (`language.rs:58-64`): las notas técnicas escuetas casi no traen palabras funcionales.
+`clawg_core::memory::language::detect` (`crates/clawg-core/src/memory/retrieval/language.rs:88`) MUST ser una función pura de un texto que devuelve `en`, `es` o «indeciso». MUST ignorar los bloques y spans de código, las URL, las rutas y los identificadores (palabras con dígitos, `_`, `::`, `.` interno o mayúsculas internas), y decidir por palabras funcionales de cada idioma y por las marcas del español (`ñ`, `¿`, `¡`, vocales con tilde). Con menos de `MIN_EVIDENCE` (3) puntos MUST dar «indeciso», salvo que la evidencia sea de un idioma solo y el texto tenga `TERSE_PROSE` (8) palabras de prosa o más, y entonces alcanza un punto (`language.rs:58-64`): las notas técnicas escuetas casi no traen palabras funcionales.
 
 #### Escenario: prosa y código
 - WHEN el texto es un párrafo en español, uno en inglés, un bloque de código, un identificador suelto, una ruta o tres palabras
 - THEN da `es`, `en`, indeciso, indeciso, indeciso e indeciso
 
 #### Escenario: identificadores en prosa
-- WHEN un párrafo en español nombra `content_hash`, `MemoryStore::open` y `crates/clawg-core/src/memory/db.rs`
+- WHEN un párrafo en español nombra `content_hash`, `MemoryStore::open` y `crates/clawg-core/src/memory/store/db.rs`
 - THEN da `es`
 
 **Test:** `spanish_prose_is_spanish`, `english_prose_is_english`, `code_paths_and_identifiers_are_undecided`, `a_short_text_is_undecided`, `identifiers_in_spanish_prose_do_not_make_it_english`, `a_mixed_text_follows_its_prose` y `a_terse_note_with_evidence_of_one_language_alone_is_that_language` (`language.rs`).
 
 ### LP5. `memory.lang`
 
-V22 (`crates/clawg-core/migrations/V22__memory_lang.sql`) MUST agregar a `memory` la columna `lang` (NULL o `en`, `es`, `und`, con un `CHECK`), el índice parcial `idx_memory_lang` sobre las filas vivas y `idx_memory_lang_unset` sobre las filas sin clasificar, sin cambiar ninguna fila. Ningún trigger de `memory` lee la columna. Cada fila que inserten el save (`PreparedRow`) y la importación MUST llevar el idioma que `detect` da sobre su propio texto ya enmascarado (`und` si indeciso; `column_value`, `language.rs:119`). El mantenimiento MUST clasificar las filas con `lang` NULL, borradas incluidas, por tandas de a lo sumo 500 (`LANG_BATCH`, `crates/clawg-core/src/memory/maintenance.rs:160`), cada una en su transacción, sin cambiar `content`, `content_hash`, `last_modified_at`, `update_count` ni `memory_fts`, hasta que no quede ninguna (`classify_languages`, `maintenance.rs:168`). MUST NOT tocar `episodic_trajectory` ni `procedural_skill`.
+V22 (`crates/clawg-core/migrations/V22__memory_lang.sql`) MUST agregar a `memory` la columna `lang` (NULL o `en`, `es`, `und`, con un `CHECK`), el índice parcial `idx_memory_lang` sobre las filas vivas y `idx_memory_lang_unset` sobre las filas sin clasificar, sin cambiar ninguna fila. Ningún trigger de `memory` lee la columna. Cada fila que inserten el save (`PreparedRow`) y la importación MUST llevar el idioma que `detect` da sobre su propio texto ya enmascarado (`und` si indeciso; `column_value`, `language.rs:119`). El mantenimiento MUST clasificar las filas con `lang` NULL, borradas incluidas, por tandas de a lo sumo 500 (`LANG_BATCH`, `crates/clawg-core/src/memory/upkeep/maintenance.rs:160`), cada una en su transacción, sin cambiar `content`, `content_hash`, `last_modified_at`, `update_count` ni `memory_fts`, hasta que no quede ninguna (`classify_languages`, `maintenance.rs:168`). MUST NOT tocar `episodic_trajectory` ni `procedural_skill`.
 
 #### Escenario: una base anterior
 - GIVEN una base en V21 con filas en los dos idiomas, sin autor, con claves, borradas y reemplazadas
@@ -1302,7 +1302,7 @@ Una fila viva MUST quedar con el vector de su tabla, si tenía, y en el índice 
 - WHEN se abre con la versión nueva
 - THEN cada fila vieja está en `memory` como dice RL1, una búsqueda encuentra cada fila viva por su texto y por su vector, la borrada no aparece, el índice de texto tiene exactamente las filas vivas, la fila de `memory` y el proyecto borrado siguen igual, y no queda ninguna de las cuatro tablas
 
-**Test:** `trajectories_and_skills_move_to_memory_and_their_tables_go` (`crates/clawg-core/src/memory/migrations.rs`); el checksum de V32 en `published_migration_checksums_are_pinned`.
+**Test:** `trajectories_and_skills_move_to_memory_and_their_tables_go` (`crates/clawg-core/src/memory/store/migrations.rs`); el checksum de V32 en `published_migration_checksums_are_pinned`.
 
 #### Vuelta atrás de V32
 
@@ -1337,14 +1337,14 @@ El código de producción de `crates/clawg-cli/src` y de `crates/clawg-eval/src`
 
 ### SB2. La conexión es del núcleo
 
-`MemoryStore::conn` (`crates/clawg-core/src/memory/db.rs:170`) MUST ser `pub(crate)`. Desde otro crate, la conexión MUST alcanzarse sólo con `MemoryStore::conn_for_test()` (`db.rs:294`), compilado sólo con `cfg(any(test, feature = "testing"))`. Sólo un `[dev-dependencies]` enciende `testing`, y `only_dev_dependencies_turn_on_the_test_stand_ins` lo comprueba.
+`MemoryStore::conn` (`crates/clawg-core/src/memory/store/db.rs:156`) MUST ser `pub(crate)`. Desde otro crate, la conexión MUST alcanzarse sólo con `MemoryStore::conn_for_test()` (`db.rs:280`), compilado sólo con `cfg(any(test, feature = "testing"))`. Sólo un `[dev-dependencies]` enciende `testing`, y `only_dev_dependencies_turn_on_the_test_stand_ins` lo comprueba.
 
 #### Escenario
 - GIVEN un crate que usa `clawg_core` sin `testing`
 - WHEN lee `store.conn`, y en otra función llama a `store.probe_wait()`
 - THEN la primera no compila (E0616, campo privado) y la segunda sí
 
-**Tests:** los dos doctests de `MemoryStore` (`crates/clawg-core/src/memory/db.rs`), uno normal y uno `compile_fail,E0616`; `only_dev_dependencies_turn_on_the_test_stand_ins` (`crates/clawg-cli/tests/conventions.rs`). Un `rustdoc` estable no comprueba el código `E0616`; sólo lo hace uno nightly.
+**Tests:** los dos doctests de `MemoryStore` (`crates/clawg-core/src/memory/store/db.rs`), uno normal y uno `compile_fail,E0616`; `only_dev_dependencies_turn_on_the_test_stand_ins` (`crates/clawg-cli/tests/conventions.rs`). Un `rustdoc` estable no comprueba el código `E0616`; sólo lo hace uno nightly.
 
 ### SB4. Cerrar dice si cerró
 
@@ -1364,7 +1364,7 @@ El código de producción de `crates/clawg-cli/src` y de `crates/clawg-eval/src`
 
 ### SB5. Una sola variante de almacenamiento
 
-Una falla de almacenamiento que llega a otro crate dentro de un `MemoryError` MUST ser `MemoryError::Storage(StorageError)` (`crates/clawg-core/src/memory/error.rs`). Una función que sólo puede fallar por el almacenamiento (`close`, `own_folder_count`) MAY devolver el `StorageError` solo.
+Una falla de almacenamiento que llega a otro crate dentro de un `MemoryError` MUST ser `MemoryError::Storage(StorageError)` (`crates/clawg-core/src/memory/store/error.rs`). Una función que sólo puede fallar por el almacenamiento (`close`, `own_folder_count`) MAY devolver el `StorageError` solo.
 
 - `MemoryError` MUST NOT tener una variante con un tipo de `rusqlite`, `tokio_rusqlite` o `refinery`, ni directo ni dentro de un tipo que envuelva. Sus variantes son `Storage`, `Internal`, `WorkspaceIo`, `StoreInUse`, `SchemaNewer`, `SchemaDiverged`, `Backup`, `Purge`, `DataDir` y `StoreLockIo`.
 - `StorageError` MUST ser opaco: sin campos públicos y sin métodos públicos más allá de `Display`, `Debug` y `std::error::Error`, y se convierte desde los errores de `rusqlite`, de `tokio_rusqlite` y de `refinery`.
@@ -1399,21 +1399,21 @@ Cada falla de almacenamiento MUST mostrarse con este texto, que llega tal cual a
 La causa MUST ser la que da `rusqlite`, `tokio-rusqlite` o refinery, sin un encabezado más: el `StorageError` la muestra sola y cada envoltorio pone el suyo. Las tres redacciones de una conexión cerrada son las de `ClosedAs` (`During`, `Named` y `AsIs`), y cada llamada conserva la suya.
 
 **Tests:**
-- `each_storage_failure_keeps_its_text` (`crates/clawg-core/src/memory/error.rs`), sobre un store cerrado.
-- `a_failed_migration_keeps_its_text` (`crates/clawg-core/src/memory/db.rs`): una migración rota y `run_migrations` sobre una conexión cerrada.
-- `a_snapshot_in_a_transaction_says_why_it_failed` (`crates/clawg-core/src/memory/backup.rs`).
+- `each_storage_failure_keeps_its_text` (`crates/clawg-core/src/memory/store/error.rs`), sobre un store cerrado.
+- `a_failed_migration_keeps_its_text` (`crates/clawg-core/src/memory/store/db.rs`): una migración rota y `run_migrations` sobre una conexión cerrada.
+- `a_snapshot_in_a_transaction_says_why_it_failed` (`crates/clawg-core/src/memory/store/backup.rs`).
 - `a_store_error_of_the_docs_index_keeps_its_text` (`crates/clawg-core/src/memory/project_docs/mod.rs`).
 - `a_sqlite_error_of_an_export_keeps_its_text` (`crates/clawg-core/src/memory/portability/export.rs`).
 
 ### SB7. Una sola traducción
 
-Un `call` fallido sobre la conexión MUST traducirse con las conversiones de `crates/clawg-core/src/memory/error.rs`: los `From` de los errores de los tres crates y `failed_call` (`error.rs:65`). Una migración fallida se traduce con `failed_migration` (`error.rs:82`). Ningún archivo de `crates/clawg-core/src` MUST nombrar una variante de `tokio_rusqlite::Error` (`tokio_rusqlite::Error::`) en su código de producción, salvo `memory/error.rs`.
+Un `call` fallido sobre la conexión MUST traducirse con las conversiones de `crates/clawg-core/src/memory/store/error.rs`: los `From` de los errores de los tres crates y `failed_call` (`error.rs:65`). Una migración fallida se traduce con `failed_migration` (`error.rs:82`). Ningún archivo de `crates/clawg-core/src` MUST nombrar una variante de `tokio_rusqlite::Error` (`tokio_rusqlite::Error::`) en su código de producción, salvo `memory/store/error.rs`.
 
 **Test:** `no_memory_code_translates_a_connection_error_by_hand` (`crates/clawg-cli/tests/conventions.rs`).
 
 ### SB9. La superficie de `memory` es la que usan los otros crates
 
-- Cada `pub mod` de `crates/clawg-core/src/memory/mod.rs` MUST estar nombrado por otro crate, en una ruta `clawg_core::memory::<módulo>` o en un grupo `clawg_core::memory::{…}`. Los demás MUST ser `pub(crate)`.
+- Cada módulo que muestra `crates/clawg-core/src/memory/mod.rs` MUST estar nombrado por otro crate, en una ruta `clawg_core::memory::<módulo>` o en un grupo `clawg_core::memory::{…}`. Los muestra con un `pub mod <módulo>;` (`portability`, `project_docs`) o con un `pub use <carpeta>::<módulo>;` de una carpeta que la raíz declara `pub(crate) mod` ([`specs/quality`](../quality/spec.md), ML5). Los demás MUST ser `pub(crate)`.
 - Dentro de un módulo `pub`, un ítem MUST ser `pub` sólo si otro crate lo usa, o si está en la firma de algo que otro crate usa; las dos gemelas de plataforma que tienen una definición por sistema (`keep_one_malloc_arena`, `sync_dir`) siguen `pub` en ambas.
 - Un ítem que sólo usan los tests de otro crate MUST compilarse sólo con `cfg(any(test, feature = "testing"))`.
 - Un ítem que sólo usa `eval_api` MUST compilarse sólo con `cfg(feature = "eval")`, o con `cfg(any(test, feature = "eval"))` si también lo usan los tests del núcleo; `query_context` es uno de ellos, entero.

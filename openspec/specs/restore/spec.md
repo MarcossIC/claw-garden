@@ -8,22 +8,22 @@ Fuente de verdad del comportamiento actual de la vuelta atrás de `delete_memory
 ## Definiciones
 
 - **Borrada:** una fila de `memory` con `deleted_at` no nulo, todavía en la tabla. Una fila purgada (`clawg purge`, [`specs/secrets`](../secrets/spec.md) R5) ya no está y no es una borrada.
-- **Restaurar:** volver a dejar viva una borrada, con el mismo id (`restore_memory_core`, `crates/clawg-core/src/memory/admin.rs:609`).
-- **Texto de embedding de una fila:** su `content`, o la cabecera de su vínculo de pedazo, el separador y su `content` cuando el vínculo tiene contexto (`embedding_text`, `crates/clawg-core/src/memory/chunker/mod.rs:55`). Es el mismo que usa el re-embed ([`specs/pieces`](../pieces/spec.md) R7). El contexto sale de `RESTORE_READ` (`admin.rs:460`).
-- **Gemela viva:** una fila viva de `memory`, con `status` `active` o `disputed`, del mismo proyecto (`COALESCE(project_id, '')`) y con el mismo `content_hash` no nulo, de cualquier autor que el lector del restore alcance (`RESTORE_TWIN`, `admin.rs`). Es la que encontraría el dedup del save (`REINFORCE_LOOKUP_SQL`, `crates/clawg-core/src/memory/store_insert.rs`).
-- **Titular de la clave:** una fila viva (`active` o `disputed`) del mismo proyecto, de cualquier autor que el lector alcance, con la misma `topic_key` que la borrada, que no es un pedazo del save de la borrada (`RESTORE_TOPIC_HOLDER`, `admin.rs:479`). Un save largo con clave se la da a todos sus pedazos, así que los hermanos de un pedazo no la tienen "tomada". Tampoco la tiene una fila que el borrado de la propia fila revivió (`revived_from`), porque el restore la vuelve a reemplazar.
+- **Restaurar:** volver a dejar viva una borrada, con el mismo id (`restore_memory_core`, `crates/clawg-core/src/memory/upkeep/admin.rs:511`).
+- **Texto de embedding de una fila:** su `content`, o la cabecera de su vínculo de pedazo, el separador y su `content` cuando el vínculo tiene contexto (`embedding_text`, `crates/clawg-core/src/memory/embedding/chunker/mod.rs:55`). Es el mismo que usa el re-embed ([`specs/pieces`](../pieces/spec.md) R7). El contexto sale de `RESTORE_READ` (`admin.rs:362`).
+- **Gemela viva:** una fila viva de `memory`, con `status` `active` o `disputed`, del mismo proyecto (`COALESCE(project_id, '')`) y con el mismo `content_hash` no nulo, de cualquier autor que el lector del restore alcance (`RESTORE_TWIN`, `admin.rs`). Es la que encontraría el dedup del save (`REINFORCE_LOOKUP_SQL`, `crates/clawg-core/src/memory/ingest/store_insert.rs`).
+- **Titular de la clave:** una fila viva (`active` o `disputed`) del mismo proyecto, de cualquier autor que el lector alcance, con la misma `topic_key` que la borrada, que no es un pedazo del save de la borrada (`RESTORE_TOPIC_HOLDER`, `admin.rs:381`). Un save largo con clave se la da a todos sus pedazos, así que los hermanos de un pedazo no la tienen "tomada". Tampoco la tiene una fila que el borrado de la propia fila revivió (`revived_from`), porque el restore la vuelve a reemplazar.
 
 ## R1. Qué se restaura
 
 Restaurar `(kind, id)` con un lector opcional ([`specs/visibility`](../visibility/spec.md), definiciones) MUST rechazarse sin escribir nada cuando:
 
-- `kind` no es `memory` (`RestoreError::OnlyMemory`, `admin.rs:408`), con un error que lo dice, distinto de "no existe";
-- no hay fila con ese id, está viva, o está fuera del alcance del lector: los tres MUST dar el mismo "no existe" (`RestoreError::NotFound`, `admin.rs:412`), igual que un id purgado;
-- la fila tiene una gemela viva: el error MUST nombrar el id de la gemela (`RestoreError::LiveTwin`, `admin.rs:414`);
-- la fila tiene `topic_key` y su proyecto ya tiene un titular: el error MUST nombrar la clave y el id del titular (`RestoreError::TopicTaken`, `admin.rs:416`). Restaurarla dejaría dos versiones vivas de un tema que una revisión mantiene en una. Las demás piezas del propio save de la fila, y un titular que el lector no alcanza, no cuentan;
-- `redact` encuentra en su `content` un secreto de formato conocido, con las reglas de hoy y no las de cuando se guardó (`admin.rs:642`): el error MUST nombrar los tipos, nunca el secreto, y MUST nombrar `clawg purge` (`RestoreError::HoldsSecret`, `admin.rs:418`).
+- `kind` no es `memory` (`RestoreError::OnlyMemory`, `admin.rs:346`), con un error que lo dice, distinto de "no existe";
+- no hay fila con ese id, está viva, o está fuera del alcance del lector: los tres MUST dar el mismo "no existe" (`RestoreError::NotFound`, `admin.rs:350`), igual que un id purgado;
+- la fila tiene una gemela viva: el error MUST nombrar el id de la gemela (`RestoreError::LiveTwin`, `admin.rs:352`);
+- la fila tiene `topic_key` y su proyecto ya tiene un titular: el error MUST nombrar la clave y el id del titular (`RestoreError::TopicTaken`, `admin.rs:354`). Restaurarla dejaría dos versiones vivas de un tema que una revisión mantiene en una. Las demás piezas del propio save de la fila, y un titular que el lector no alcanza, no cuentan;
+- `redact` encuentra en su `content` un secreto de formato conocido, con las reglas de hoy y no las de cuando se guardó (`admin.rs:544`): el error MUST nombrar los tipos, nunca el secreto, y MUST nombrar `clawg purge` (`RestoreError::HoldsSecret`, `admin.rs:356`).
 
-El vector MUST calcularse antes de la transacción, con el embedder vigente y el texto de embedding de la fila (`admin.rs:647-654`). Si el embedder falla o no está listo, MUST rechazarse sin escribir nada (`RestoreError::Embed`, `admin.rs:424`). La gemela y el titular se vuelven a mirar dentro de la transacción, junto con que la fila siga borrada y al alcance del lector (`admin.rs`), así que un restore o un save que llegó entre el cálculo del vector y la transacción se ve: el segundo restore de una misma fila da "no existe".
+El vector MUST calcularse antes de la transacción, con el embedder vigente y el texto de embedding de la fila (`admin.rs:549-556`). Si el embedder falla o no está listo, MUST rechazarse sin escribir nada (`RestoreError::Embed`, `revival.rs:21`). La gemela y el titular se vuelven a mirar dentro de la transacción, junto con que la fila siga borrada y al alcance del lector (`admin.rs`), así que un restore o un save que llegó entre el cálculo del vector y la transacción se ve: el segundo restore de una misma fila da "no existe".
 
 #### Escenario: una gemela viva
 - GIVEN una fila A borrada, y después el mismo texto guardado otra vez como B
@@ -47,22 +47,22 @@ El vector MUST calcularse antes de la transacción, con el embedder vigente y el
 - WHEN se restaura
 - THEN el error nombra el tipo de secreto y `clawg purge`, y la fila sigue borrada
 
-**Test:** `restoring_needs_a_deleted_row_in_reach`, `only_memory_rows_are_restored`, `a_live_twin_blocks_the_restore`, `a_restore_finds_another_agents_twin`, `a_row_whose_key_is_live_again_is_not_restored`, `a_row_whose_key_another_agent_holds_is_not_restored`, `a_piece_of_a_keyed_save_is_restored_beside_its_live_siblings`, `a_whole_keyed_save_is_restored_piece_by_piece`, `a_live_row_of_another_save_blocks_the_restore_of_a_piece`, `a_row_holding_a_secret_stays_deleted` y `a_failed_embedding_restores_nothing` en `crates/clawg-core/src/memory/admin.rs`. Ningún test pisa la ventana entre el vector y la transacción: la relectura dentro de la transacción la cubre sólo la lectura del código.
+**Test:** `restoring_needs_a_deleted_row_in_reach`, `only_memory_rows_are_restored`, `a_live_twin_blocks_the_restore`, `a_restore_finds_another_agents_twin`, `a_row_whose_key_is_live_again_is_not_restored`, `a_row_whose_key_another_agent_holds_is_not_restored`, `a_piece_of_a_keyed_save_is_restored_beside_its_live_siblings`, `a_whole_keyed_save_is_restored_piece_by_piece`, `a_live_row_of_another_save_blocks_the_restore_of_a_piece`, `a_row_holding_a_secret_stays_deleted` y `a_failed_embedding_restores_nothing` en `crates/clawg-core/src/memory/upkeep/admin.rs`. Ningún test pisa la ventana entre el vector y la transacción: la relectura dentro de la transacción la cubre sólo la lectura del código.
 
 Una fila que se restaura bajo un proyecto borrado ([`specs/project`](../project/spec.md), PL22) lo deja vivo y sin revisar: lo hace el disparador `memory_project_restored` de V29 ([`specs/storage`](../storage/spec.md)), sin código del restore. El borrado del proyecto sigue abierto, con `back`, y sus otras filas borradas siguen borradas. Las negativas de esta sección (gemela, titular de la clave, secreto) son también las del `--undo` de un borrado de proyecto, que las aplica a todas sus filas (PL26).
 
 ## R2. Qué escribe un restore
 
-Un restore aceptado MUST, en una sola transacción, y sólo si la fila sigue borrada, sin gemela y sin titular al abrirla (`admin.rs:668-713`):
+Un restore aceptado MUST, en una sola transacción, y sólo si la fila sigue borrada, sin gemela y sin titular al abrirla (`admin.rs:570-583`):
 
-- poner `deleted_at = NULL`, `last_modified_at` en ahora y sumar 1 a `update_count` (`RESTORE_ROW`, `admin.rs:488`);
-- borrar cualquier vector que la fila todavía tenga y escribir el nuevo: un delete de una versión anterior, antes de que borrara el vector en línea y de que `sweep_orphaned_vectors` (`crates/clawg-core/src/memory/maintenance.rs:181`) lo barriera, pudo dejar uno, de otro modelo;
-- sumar su entrada en `memory_fts` exactamente una vez (`RESTORE_TEXT_INDEX`, `admin.rs:496`): el trigger de borrado del índice (`memory_fts_au_deleted`, `crates/clawg-core/migrations/V8__memory_fts.sql:73`) sólo resta en el paso de viva a borrada y no hay trigger de la vuelta, así que el restore escribe esa mitad, y sólo justo después de que `RESTORE_ROW` dejó viva a la fila;
-- llevar a su estado de reposo a la fila (`settle_row`, `crates/clawg-core/src/memory/dispute.rs:222`) y a toda fila viva cuyo `disputed_against` la nombra (`settle_challengers`, `dispute.rs:215`), ambas en `admin.rs:698-699`: el estado de reposo de una fila que no es `superseded` es `disputed` sólo si `disputed_against` nombra una fila viva y no superseded, y `active` si no. El par escalado que el borrado liberó vuelve con ella ([`specs/disputes`](../disputes/spec.md) R4, que lo fija).
+- poner `deleted_at = NULL`, `last_modified_at` en ahora y sumar 1 a `update_count` (`RESTORE_ROW`, `admin.rs:390`);
+- borrar cualquier vector que la fila todavía tenga y escribir el nuevo: un delete de una versión anterior, antes de que borrara el vector en línea y de que `sweep_orphaned_vectors` (`crates/clawg-core/src/memory/upkeep/maintenance.rs:181`) lo barriera, pudo dejar uno, de otro modelo;
+- sumar su entrada en `memory_fts` exactamente una vez (`RESTORE_TEXT_INDEX`, `admin.rs:398`): el trigger de borrado del índice (`memory_fts_au_deleted`, `crates/clawg-core/migrations/V8__memory_fts.sql:73`) sólo resta en el paso de viva a borrada y no hay trigger de la vuelta, así que el restore escribe esa mitad, y sólo justo después de que `RESTORE_ROW` dejó viva a la fila;
+- llevar a su estado de reposo a la fila (`settle_row`, `crates/clawg-core/src/memory/revision/dispute.rs:222`) y a toda fila viva cuyo `disputed_against` la nombra (`settle_challengers`, `dispute.rs:215`), ambas en `listing.rs:30-31`: el estado de reposo de una fila que no es `superseded` es `disputed` sólo si `disputed_against` nombra una fila viva y no superseded, y `active` si no. El par escalado que el borrado liberó vuelve con ella ([`specs/disputes`](../disputes/spec.md) R4, que lo fija).
 
 MUST NOT cambiar `content`, `content_hash`, `importance`, `tier`, `memory_type`, `access_count`, `last_accessed_at`, `superseded_by`, `memory_derivation` ni `memory_piece`, ni escribir en otra fila fuera de las que `settle_challengers` lleva a su estado de reposo, y de las filas que el restore vuelve a reemplazar por ser lo que su borrado había revivido («Restaurar la borrada deshace la revivida»), y de los pares de la redetección, que son filas nuevas en `memory_conflict`. Una fila `superseded` MUST volver `superseded` y con su `superseded_by`: está viva pero la búsqueda la deja afuera hasta que un veredicto de `resolve_conflict` la conserve.
 
-Devuelve el id, el `status` y el `superseded_by` con que quedó la fila (`RestoredRow`, `admin.rs:435`).
+Devuelve el id, el `status` y el `superseded_by` con que quedó la fila (`RestoredRow`, `revival.rs:32`).
 
 #### Escenario: vuelve a la búsqueda
 - GIVEN una fila con la palabra "zircon" en su texto, borrada
@@ -97,7 +97,7 @@ Devuelve el id, el `status` y el `superseded_by` con que quedó la fila (`Restor
 - WHEN se restaura el segundo
 - THEN su vector es el de la cabecera más el pedazo, y `read_memory` lo trae sin faltantes
 
-**Test:** `a_restored_piece_is_embedded_behind_its_head_again` y `a_stale_vector_does_not_stop_a_restore` (el vector viejo es de otro modelo) en `admin.rs`; `a_restored_conclusion_covers_its_sources_again` en `crates/clawg-core/src/memory/synthesis.rs`.
+**Test:** `a_restored_piece_is_embedded_behind_its_head_again` y `a_stale_vector_does_not_stop_a_restore` (el vector viejo es de otro modelo) en `admin.rs`; `a_restored_conclusion_covers_its_sources_again` en `crates/clawg-core/src/memory/upkeep/synthesis.rs`.
 
 ## R4. HTTP
 
@@ -107,9 +107,9 @@ Devuelve el id, el `status` y el `superseded_by` con que quedó la fila (`Restor
 - 400 si `kind` no es `memory` o no es un kind; el kind se mira antes que el embedder, así que un pedido que no puede salir bien lo dice aunque el modelo siga cargando;
 - 404 por "no existe" (R1);
 - 409 por gemela viva, con su id en el mensaje, por titular de la clave, con la clave y su id, y por secreto, con los tipos y `clawg purge` (`api.rs:1765`);
-- 503 cuando no hay un embedder con que calcular el vector. Con el modelo todavía sin cargar, `ready_embedder` (`api.rs:1414`) responde `embedder_not_ready` (cargando) o `embedder_failed` con la causa y si se reintenta (la carga falló), como la búsqueda. Con el modelo ya cargado una vez, aunque el daemon lo haya soltado por inactivo, el embedder es el `IdleEmbedder` ([`specs/storage`](../storage/spec.md), «Las herramientas funcionan con el modelo suelto»): el restore espera la recarga y responde 200, y sólo si esa recarga falla (o vuelve un modelo de otra identidad) responde `embedder_not_ready` (`embed_failure`, `api.rs:1406`; `crates/clawg-core/src/memory/idle_embedder.rs:128-135`) y la siguiente llamada vuelve a intentar. Cualquier otro error del embedder es un 500.
+- 503 cuando no hay un embedder con que calcular el vector. Con el modelo todavía sin cargar, `ready_embedder` (`api.rs:1414`) responde `embedder_not_ready` (cargando) o `embedder_failed` con la causa y si se reintenta (la carga falló), como la búsqueda. Con el modelo ya cargado una vez, aunque el daemon lo haya soltado por inactivo, el embedder es el `IdleEmbedder` ([`specs/storage`](../storage/spec.md), «Las herramientas funcionan con el modelo suelto»): el restore espera la recarga y responde 200, y sólo si esa recarga falla (o vuelve un modelo de otra identidad) responde `embedder_not_ready` (`embed_failure`, `api.rs:1406`; `crates/clawg-core/src/memory/embedding/idle_embedder.rs:128-135`) y la siguiente llamada vuelve a intentar. Cualquier otro error del embedder es un 500.
 
-`GET /v1/memories` MUST aceptar `deleted=true`: lista sólo borradas, de la más recién borrada a la más vieja (`ORDER BY deleted_at DESC, id DESC`, `admin.rs:848`), con los mismos filtros y con `deleted_at` en cada ítem. Sin `deleted`, el listado MUST NOT cambiar. `deleted=true` con `q` MUST ser 400 (`api.rs:228-233`): una borrada no tiene entrada en el índice de texto.
+`GET /v1/memories` MUST aceptar `deleted=true`: lista sólo borradas, de la más recién borrada a la más vieja (`ORDER BY deleted_at DESC, id DESC`, `listing.rs:180`), con los mismos filtros y con `deleted_at` en cada ítem. Sin `deleted`, el listado MUST NOT cambiar. `deleted=true` con `q` MUST ser 400 (`api.rs:228-233`): una borrada no tiene entrada en el índice de texto.
 
 #### Escenario
 - GIVEN una memoria guardada y borrada por HTTP
@@ -159,9 +159,9 @@ El restore no tiene migración propia: escribe sobre las columnas, el índice y 
 
 ### Borrar la vigente revive a la anterior
 
-Borrar una fila viva (`delete_memory_core`, `crates/clawg-core/src/memory/admin.rs:342`) MUST aplicar la regla de `plan_revival` (`crates/clawg-core/src/memory/revival.rs:42`), en la misma transacción. Nada revive si la borrada no estaba `active` o `disputed`, o si otra fila viva de su proyecto, de cualquier autor, tiene la clave. El revivir no mira `sharing.json`: un borrado puede no tener lector, y la misma fila revive igual la borre quien la borre. Si no, revive el save de causa `revision` de id mayor, entero (todas sus piezas), y las demás filas de causa `revision` pasan a estar reemplazadas por la primera fila revivida. Las de causa `verdict` quedan como estaban y se nombran como escondidas.
+Borrar una fila viva (`delete_memory_core`, `crates/clawg-core/src/memory/upkeep/admin.rs:280`) MUST aplicar la regla de `plan_revival` (`crates/clawg-core/src/memory/revision/revival.rs:79`), en la misma transacción. Nada revive si la borrada no estaba `active` o `disputed`, o si otra fila viva de su proyecto, de cualquier autor, tiene la clave. El revivir no mira `sharing.json`: un borrado puede no tener lector, y la misma fila revive igual la borre quien la borre. Si no, revive el save de causa `revision` de id mayor, entero (todas sus piezas), y las demás filas de causa `revision` pasan a estar reemplazadas por la primera fila revivida. Las de causa `verdict` quedan como estaban y se nombran como escondidas.
 
-Revivir MUST dejar la fila `active` (o `disputed` si sus disputas siguen), sin `superseded_by` ni causa, con `revived_from` igual al id borrado (`REVIVE_SQL`, `crates/clawg-core/src/memory/dispute.rs:344`), de vuelta en el KNN y en el índice de texto, y MUST llevar a su estado de reposo a la fila y a las retadoras que la disputaban antes (`settle_row` y `settle_challengers`, `dispute.rs:222` y `dispute.rs:215`). El borrado de una pieza viva de un save largo cuya primera pieza ya está borrada aplica la regla también a esa primera pieza (`revive_after_delete_of_piece`, `revival.rs:137`). Un borrado que no afectó ninguna fila MUST NOT revivir nada, y las filas de otro proyecto MUST NOT revivir; la que reemplazó una revisión de otro agente en el proyecto sí. `clawg purge` de una fila viva la marca borrada y aplica la misma regla antes de sacarla, en la misma transacción ([`specs/secrets`](../secrets/spec.md), R5).
+Revivir MUST dejar la fila `active` (o `disputed` si sus disputas siguen), sin `superseded_by` ni causa, con `revived_from` igual al id borrado (`REVIVE_SQL`, `crates/clawg-core/src/memory/revision/dispute.rs:344`), de vuelta en el KNN y en el índice de texto, y MUST llevar a su estado de reposo a la fila y a las retadoras que la disputaban antes (`settle_row` y `settle_challengers`, `dispute.rs:222` y `dispute.rs:215`). El borrado de una pieza viva de un save largo cuya primera pieza ya está borrada aplica la regla también a esa primera pieza (`revive_after_delete_of_piece`, `revival.rs:174`). Un borrado que no afectó ninguna fila MUST NOT revivir nada, y las filas de otro proyecto MUST NOT revivir; la que reemplazó una revisión de otro agente en el proyecto sí. `clawg purge` de una fila viva la marca borrada y aplica la misma regla antes de sacarla, en la misma transacción ([`specs/secrets`](../secrets/spec.md), R5).
 
 La respuesta de `DELETE /v1/memories/{kind}/{id}` (`DeletedBody`, `crates/clawg-cli/src/daemon/api.rs:813`) MUST sumar `revived` (id y primera línea) y `hidden` (ids), omitidos cuando están vacíos, y `delete_memory` MUST nombrarlos (`format_delete`, `crates/clawg-cli/src/mcp/tools.rs:389`).
 
@@ -180,11 +180,11 @@ La respuesta de `DELETE /v1/memories/{kind}/{id}` (`DeletedBody`, `crates/clawg-
 - WHEN se borra K
 - THEN L sigue reemplazada y la respuesta la nombra en `hidden`
 
-**Test:** `revival_cases` (`revival.rs`); `deleting_the_current_revision_revives_the_one_it_replaced`, `deleting_the_head_of_a_chain_revives_only_the_one_before`, `deleting_a_replaced_revision_revives_nothing`, `deleting_a_verdict_winner_leaves_the_loser_hidden`, `deleting_an_undone_revision_revives_nothing`, `a_revived_save_comes_back_whole_and_the_rest_repoint`, `deleting_every_piece_of_a_long_revision_revives_the_one_before`, `deleting_another_agents_revision_revives_the_earlier_one`, `a_revival_stays_in_its_project` y `a_revived_row_is_disputed_again` en `crates/clawg-core/src/memory/admin.rs`; `deleting_the_current_revision_answers_what_it_revived` en `crates/clawg-cli/tests/api.rs`; `format_delete_names_what_came_back_and_what_stays_hidden` en `crates/clawg-cli/src/mcp/tools.rs`.
+**Test:** `revival_cases` (`revival.rs`); `deleting_the_current_revision_revives_the_one_it_replaced`, `deleting_the_head_of_a_chain_revives_only_the_one_before`, `deleting_a_replaced_revision_revives_nothing`, `deleting_a_verdict_winner_leaves_the_loser_hidden`, `deleting_an_undone_revision_revives_nothing`, `a_revived_save_comes_back_whole_and_the_rest_repoint`, `deleting_every_piece_of_a_long_revision_revives_the_one_before`, `deleting_another_agents_revision_revives_the_earlier_one`, `a_revival_stays_in_its_project` y `a_revived_row_is_disputed_again` en `crates/clawg-core/src/memory/upkeep/admin.rs`; `deleting_the_current_revision_answers_what_it_revived` en `crates/clawg-cli/tests/api.rs`; `format_delete_names_what_came_back_and_what_stays_hidden` en `crates/clawg-cli/src/mcp/tools.rs`.
 
 ### Restaurar la borrada deshace la revivida
 
-Restaurar una borrada D MUST NOT dar `TopicTaken` por las filas que el borrado de D revivió: la consulta de titular (`RESTORE_TOPIC_HOLDER`, `admin.rs:479`) las deja afuera. Si D no vuelve `superseded`, cada fila viva con `revived_from = D` MUST quedar otra vez `superseded` por D con causa `revision` y sin `revived_from` (`take_back_revived`, `admin.rs:584`), y la respuesta MUST listarla en `replaced`. Una fila vigente de la clave que D no revivió sigue dando `TopicTaken`.
+Restaurar una borrada D MUST NOT dar `TopicTaken` por las filas que el borrado de D revivió: la consulta de titular (`RESTORE_TOPIC_HOLDER`, `admin.rs:381`) las deja afuera. Si D no vuelve `superseded`, cada fila viva con `revived_from = D` MUST quedar otra vez `superseded` por D con causa `revision` y sin `revived_from` (`take_back_revived`, `admin.rs:486`), y la respuesta MUST listarla en `replaced`. Una fila vigente de la clave que D no revivió sigue dando `TopicTaken`.
 
 #### Escenario
 - GIVEN v1 revivida por el borrado de v2, sin otra fila viva con la clave
@@ -193,17 +193,17 @@ Restaurar una borrada D MUST NOT dar `TopicTaken` por las filas que el borrado d
 - WHEN en cambio, antes de restaurar v2, se guarda v3 con la clave
 - THEN v3 reemplaza a v1 (causa `revision`), y restaurar v2 da `TopicTaken`
 
-**Test:** `restoring_the_deleted_revision_replaces_the_revived_one_again` y `a_newer_revision_still_blocks_the_restore` en `crates/clawg-core/src/memory/admin.rs`; `a_restore_answers_its_key_and_its_new_pairs` en `crates/clawg-cli/tests/api.rs`.
+**Test:** `restoring_the_deleted_revision_replaces_the_revived_one_again` y `a_newer_revision_still_blocks_the_restore` en `crates/clawg-core/src/memory/upkeep/admin.rs`; `a_restore_answers_its_key_and_its_new_pairs` en `crates/clawg-cli/tests/api.rs`.
 
 ### Restaurar una fila reemplazada por una borrada
 
-Restaurar una fila reemplazada por una borrada D MUST aplicar la regla a D (`revive_after_delete` dentro de `restore_memory_core`, `admin.rs:694`): la fila vuelve vigente si su causa es `revision` y la clave no tiene otra vigente. Si sigue reemplazada, la respuesta MUST decir `superseded_by_deleted` (la borrada que la reemplaza) y el texto de `restore_memory` MUST NOT mandar a `resolve_conflict`, porque ese reemplazante no está para juzgarse: restaurar D, o guardar de nuevo el contenido.
+Restaurar una fila reemplazada por una borrada D MUST aplicar la regla a D (`revive_after_delete` dentro de `restore_memory_core`, `listing.rs:26`): la fila vuelve vigente si su causa es `revision` y la clave no tiene otra vigente. Si sigue reemplazada, la respuesta MUST decir `superseded_by_deleted` (la borrada que la reemplaza) y el texto de `restore_memory` MUST NOT mandar a `resolve_conflict`, porque ese reemplazante no está para juzgarse: restaurar D, o guardar de nuevo el contenido.
 
 **Test:** `a_row_replaced_by_a_deleted_revision_comes_back_current` y `a_row_replaced_by_a_deleted_verdict_winner_says_so` en `admin.rs`; `format_restore_names_key_replacements_and_pairs` en `crates/clawg-cli/src/mcp/tools.rs`.
 
 ### Redetección al restaurar
 
-Cuando la fila restaurada queda viva sin estar `superseded`, MUST compararse con el detector de un save (`detect_contradiction`, con sus reglas de banda, tipo y `needs_user`; `restore_candidates`, `admin.rs:510`) contra las filas vivas guardadas después de su `deleted_at` (`note_restored_pairs`, `admin.rs:547`). Cada candidata MUST anotarse como par `(new_id = C, old_id = A)`, en estado `pending` o `escalated`, con `INSERT OR IGNORE`, de modo que un par ya existente con su veredicto no se pisa. Un par escalado MUST sumar A a `disputed_against` de C (`add_dispute_in`, `crates/clawg-core/src/memory/dispute.rs:367`) y dejar a C `disputed`. La respuesta MUST devolver las candidatas en `related` (`RestoredRow.related`, `admin.rs:445`), y `format_restore` MUST marcar las escaladas con «asks the user».
+Cuando la fila restaurada queda viva sin estar `superseded`, MUST compararse con el detector de un save (`detect_contradiction`, con sus reglas de banda, tipo y `needs_user`; `restore_candidates`, `admin.rs:412`) contra las filas vivas guardadas después de su `deleted_at` (`note_restored_pairs`, `admin.rs:449`). Cada candidata MUST anotarse como par `(new_id = C, old_id = A)`, en estado `pending` o `escalated`, con `INSERT OR IGNORE`, de modo que un par ya existente con su veredicto no se pisa. Un par escalado MUST sumar A a `disputed_against` de C (`add_dispute_in`, `crates/clawg-core/src/memory/revision/dispute.rs:367`) y dejar a C `disputed`. La respuesta MUST devolver las candidatas en `related` (`RestoredRow.related`, `revival.rs:42`), y `format_restore` MUST marcar las escaladas con «asks the user».
 
 No se anotan: las filas guardadas antes del borrado, las que ya tienen par con A (con o sin veredicto) y las que A vuelve a reemplazar. Si la fila restaurada termina `superseded`, no se escribe ningún par. Un fallo del detector se registra en el log y no devuelve ninguna candidata, como en un save (`contradiction.rs:200-206`); el restore no lo reintenta.
 
@@ -217,9 +217,9 @@ No se anotan: las filas guardadas antes del borrado, las que ya tienen par con A
 
 ### Barrido de mantenimiento
 
-La pasada de mantenimiento (`run_maintenance_once_at`, `crates/clawg-core/src/memory/maintenance.rs:92`, y `revive_hidden_revisions`, `maintenance.rs:235`) MUST aplicar la regla a cada borrada que sigue `active` o `disputed` y a la que todavía apunta una fila viva de causa `revision` (`revive_hidden`, `crates/clawg-core/src/memory/revival.rs:165`). Es idempotente. Lo que revive se registra sólo en el log: `maintenance: brought back N rows a delete of the current version of their topic left hidden` (`maintenance.rs:126`).
+La pasada de mantenimiento (`run_maintenance_once_at`, `crates/clawg-core/src/memory/upkeep/maintenance.rs:92`, y `revive_hidden_revisions`, `maintenance.rs:235`) MUST aplicar la regla a cada borrada que sigue `active` o `disputed` y a la que todavía apunta una fila viva de causa `revision` (`revive_hidden`, `crates/clawg-core/src/memory/revision/revival.rs:202`). Es idempotente. Lo que revive se registra sólo en el log: `maintenance: brought back N rows a delete of the current version of their topic left hidden` (`maintenance.rs:126`).
 
-**Test:** `maintenance_revives_what_an_earlier_delete_left_hidden` en `crates/clawg-core/src/memory/maintenance.rs`.
+**Test:** `maintenance_revives_what_an_earlier_delete_left_hidden` en `crates/clawg-core/src/memory/upkeep/maintenance.rs`.
 
 ### Restaurar en HTTP y en la CLI
 
@@ -229,7 +229,7 @@ La pasada de mantenimiento (`run_maintenance_once_at`, `crates/clawg-core/src/me
 
 ### Filas de una versión anterior a V17
 
-Abrir con V17 una base escrita por una versión anterior, en la que se borró la vigente de un tema, deja la versión anterior `superseded` por una fila borrada, con causa `revision` ([`specs/storage`](../storage/spec.md), «Una base en V16 abre con sus causas de reemplazo»). El primer paso de mantenimiento, `STARTUP_DELAY` después de arrancar el daemon (`crates/clawg-core/src/memory/maintenance.rs:25`), la trae de vuelta con el barrido. Esto se acepta como está diseñado: queda sólo en el log del daemon, `clawg update` no lo informa, y restaurar la borrada la vuelve a reemplazar (`revived_from`).
+Abrir con V17 una base escrita por una versión anterior, en la que se borró la vigente de un tema, deja la versión anterior `superseded` por una fila borrada, con causa `revision` ([`specs/storage`](../storage/spec.md), «Una base en V16 abre con sus causas de reemplazo»). El primer paso de mantenimiento, `STARTUP_DELAY` después de arrancar el daemon (`crates/clawg-core/src/memory/upkeep/maintenance.rs:25`), la trae de vuelta con el barrido. Esto se acepta como está diseñado: queda sólo en el log del daemon, `clawg update` no lo informa, y restaurar la borrada la vuelve a reemplazar (`revived_from`).
 
 ## RL3. Una fila migrada se restaura y se purga
 
@@ -240,7 +240,7 @@ Una fila migrada por V32 que está borrada MUST poder restaurarse con `restore_m
 - WHEN se abre con la versión nueva
 - THEN se restaura la migrada de la trayectoria y una búsqueda la encuentra, y se purga la de la habilidad y no queda en `memory` ni en `memory_vectors`
 
-**Test:** `a_trajectory_and_a_skill_deleted_before_the_move_are_restored_and_purged` (`crates/clawg-core/src/memory/migrations.rs`).
+**Test:** `a_trajectory_and_a_skill_deleted_before_the_move_are_restored_and_purged` (`crates/clawg-core/src/memory/store/migrations.rs`).
 
 ## Límites conocidos
 

@@ -1,0 +1,22 @@
+change: memory-module-layout
+objective: "transversal"
+depends_on: [store-boundary]  # archivado
+phase: archived
+release: "0.87.0"  # las diez carpetas de memory, la tabla de qué carpeta puede nombrar a cuál y los cinco ciclos listados, fijados por dos reglas de conventions.rs (verify.md)
+artifacts:
+  exploration: done  # anterior a store-boundary; la propuesta vuelve a comprobar sus rutas y sus números
+  proposal: done  # el enfoque A; dice qué resolvió store-boundary y sale del alcance
+  spec: done  # R1 a R7
+  design: done  # D1 a D10; las tres decisiones abiertas en D2, D3 y D4
+  tasks: done  # partes 1 a 9; archivar y subir la versión quedan fuera
+  apply: done  # las tareas 2 a 8: el test en rojo, los cortes, admin en tres, las ocho carpetas, las rutas y las citas
+  verify: done  # la suite y los dos clippy pasan en Linux, en el CI de Linux y Windows y en Windows en local; queda lo que pide el modelo real (verify.md, «Pendiente»)
+  archive: done  # R1 a R5 son ML1 a ML5 en specs/quality; R6 y R7 no se consolidan; SB9 de specs/storage dice lo que muestra la raíz hoy
+decisions:
+  dispute_topic_contradiction: revision  # carpeta propia, con revival (D2)
+  project_docs: own_domain_in_place  # fila propia de la tabla; no se mueve ni se edita (D3)
+  memory_level: kept  # las carpetas van bajo memory::, y las rutas públicas no cambian (D4)
+  folders: 10  # domain, store, embedding, retrieval, revision, project_docs, projects, ingest, upkeep, portability (D1)
+  cycles: "de un grupo de 34 módulos a cinco, de 7, 5, 4, 2 y 2, cada uno dentro de una carpeta (D7)"
+updated: 2026-11-13
+main_spec: openspec/specs/quality/spec.md
