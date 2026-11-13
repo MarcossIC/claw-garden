@@ -96,7 +96,7 @@ Lo mismo en `tools_es.rs`. `agent_contract.json` y `agent_contract.es.json` MUST
 
 ## R6. Lo que no cambia
 
-- El detector anota los mismos pares, `pending` o `escalated`, con su distancia ([`specs/disputes`](../../specs/disputes/spec.md), «El detector anota candidatas»).
+- El detector anota los mismos pares, `pending` o `escalated`, con su distancia ([`specs/disputes`](../../../specs/disputes/spec.md), «El detector anota candidatas»).
 - `resolve_conflict` acepta `supersedes`, `compatible`, `scoped` y `conflicts` con el mismo efecto (R1, R2 y R3 de `specs/disputes`). Un agente con el protocolo anterior sigue funcionando.
 - `GET /v1/disputes` devuelve lo mismo, así que un puente anterior sigue listando los pendientes.
 - La nota de ACTIVE CONFLICTS sigue ofreciendo `compatible` y `scoped`: sobre un par escalado ese veredicto es la respuesta de la persona.
@@ -105,6 +105,6 @@ Lo mismo en `tools_es.rs`. `agent_contract.json` y `agent_contract.es.json` MUST
 
 ## Specs que se consolidan al archivar
 
-- [`specs/disputes`](../../specs/disputes/spec.md), «Las candidatas en la respuesta del save»: lo que pide la línea.
-- [`specs/mcp`](../../specs/mcp/spec.md), «Los conflictos en las herramientas» y «El protocolo de memoria»: R1 a R5.
-- [`specs/provenance`](../../specs/provenance/spec.md), P4: el escenario de la marca en la línea de `memory_status` deja de existir en el puente; la marca sigue en `GET /v1/disputes` y en ACTIVE CONFLICTS.
+- [`specs/disputes`](../../../specs/disputes/spec.md), «Las candidatas en la respuesta del save»: lo que pide la línea.
+- [`specs/mcp`](../../../specs/mcp/spec.md), «Los conflictos en las herramientas» y «El protocolo de memoria»: R1 a R5.
+- [`specs/provenance`](../../../specs/provenance/spec.md), P4: el escenario de la marca en la línea de `memory_status` deja de existir en el puente; la marca sigue en `GET /v1/disputes` y en ACTIVE CONFLICTS.

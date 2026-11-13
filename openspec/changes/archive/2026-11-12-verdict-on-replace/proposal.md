@@ -2,11 +2,11 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| 1 | S | — ; se coordina con [topic-key-warning](../topic-key-warning/proposal.md) (68) y [memory-delivery](../memory-delivery/proposal.md) (127) | propuesta; las cuatro decisiones abiertas de la exploración se cerraron con su opción recomendada |
+| 1 | S | — ; se coordina con [topic-key-warning](../../topic-key-warning/proposal.md) (68) y [memory-delivery](../../memory-delivery/proposal.md) (127) | propuesta; las cuatro decisiones abiertas de la exploración se cerraron con su opción recomendada |
 
 ## Problema
 
-La [exploración](exploration.md) muestra que, después de un save con memorias cercanas, el agente gasta un pedido al modelo en juzgar cada par: 382 pedidos que sólo juzgan en los transcripts medidos, el 2,7 % de todo el contexto leído. El 95 % de esos veredictos es `compatible`, que no cambia lo que se recupera ([`specs/disputes`](../../specs/disputes/spec.md), R2), y se da sin leer la memoria vieja. El detector no puede elegir qué pares pedir: los reemplazos ocupan toda la banda de distancias. El trabajo lo piden dos textos:
+La [exploración](exploration.md) muestra que, después de un save con memorias cercanas, el agente gasta un pedido al modelo en juzgar cada par: 382 pedidos que sólo juzgan en los transcripts medidos, el 2,7 % de todo el contexto leído. El 95 % de esos veredictos es `compatible`, que no cambia lo que se recupera ([`specs/disputes`](../../../specs/disputes/spec.md), R2), y se da sin leer la memoria vieja. El detector no puede elegir qué pares pedir: los reemplazos ocupan toda la banda de distancias. El trabajo lo piden dos textos:
 
 - la línea de la respuesta del save, que ofrece `compatible` o `scoped` cuando valen las dos (`related_text`, `crates/clawg-cli/src/mcp/server.rs:391-411`);
 - el protocolo, que ordena juzgar cada cercana (`crates/clawg-cli/src/mcp/protocol.md:24-27`, `protocol.es.md:24-27`).
@@ -22,7 +22,7 @@ En `crates/clawg-cli`, en el puente MCP:
 - **El protocolo**, en inglés y en español: la frase «juzga cada una» pasa a decir lo mismo que la respuesta. La apertura sigue entrando en sus 2.048 caracteres.
 - **`memory_status`.** Deja de listar los pares pendientes y de pedir que se juzguen. Sigue diciendo cuántos pares esperan a la persona en ACTIVE CONFLICTS.
 - **La descripción de `resolve_conflict`**, en lo que diga que el agente juzga los pares que nombra `memory_status`.
-- **El contrato fijado** (`agent_contract.json` y `agent_contract.es.json`), las specs [`mcp`](../../specs/mcp/spec.md) y [`disputes`](../../specs/disputes/spec.md), y `docs/reference/daemon.md` donde describa estos textos.
+- **El contrato fijado** (`agent_contract.json` y `agent_contract.es.json`), las specs [`mcp`](../../../specs/mcp/spec.md) y [`disputes`](../../../specs/disputes/spec.md), y `docs/reference/daemon.md` donde describa estos textos.
 
 ## Fuera de alcance
 

@@ -2,7 +2,7 @@
 
 Fuente de verdad del comportamiento actual del origen de una memoria: con qué `source` y `created_by_type` se sella cada save, cómo el agente declara que algo lo dijo el usuario, y qué marca muestra cada lector. El origen no cambia ningún par, estado ni puntaje: cómo se forman y se juzgan los pares está en [`specs/disputes`](../disputes/spec.md), y qué es una conclusión, en [`specs/synthesis`](../synthesis/spec.md).
 
-**Origen:** [memory-provenance](../../changes/archive/2026-10-18-memory-provenance/proposal.md), archivado el 2026-10-18. Los ids de requisito son los de esa spec. [preference-model](../../changes/archive/2026-11-06-preference-model/proposal.md), archivado el 2026-11-06, que salió en 0.77.0, sumó PM5 y PM9, con los ids de su spec: la marca de un hit de preferencia, cuyo formato está en [`specs/retrieval`](../retrieval/spec.md), PM5, y el sello de un save declarado que repite una fila.
+**Origen:** [memory-provenance](../../changes/archive/2026-10-18-memory-provenance/proposal.md), archivado el 2026-10-18. Los ids de requisito son los de esa spec. [preference-model](../../changes/archive/2026-11-06-preference-model/proposal.md), archivado el 2026-11-06, que salió en 0.77.0, sumó PM5 y PM9, con los ids de su spec: la marca de un hit de preferencia, cuyo formato está en [`specs/retrieval`](../retrieval/spec.md), PM5, y el sello de un save declarado que repite una fila. [verdict-on-replace](../../changes/archive/2026-11-12-verdict-on-replace/proposal.md), archivado el 2026-11-12, que sale en 0.85.0, cambió P4: `memory_status` ya no lista los pares ni su marca (VR4 de [`specs/mcp`](../mcp/spec.md)).
 
 ## Definiciones
 
@@ -58,17 +58,12 @@ Un evento `chat`, `code_file` o `compaction` MUST sellarse como antes: por el ro
 
 ## P4. Los pares
 
-- `GET /v1/disputes` MUST traer la marca de cada lado de cada par pendiente que nombra (`new_mark`, `old_mark` de `OpenPair`, `crates/clawg-core/src/memory/revision/dispute.rs:490-500`).
-- `memory_status` MUST nombrar primero, en cada par, un lado sin marca cuando el otro la tiene, y MUST escribir la marca junto al id del lado que la tiene (`format_open_pairs`, `crates/clawg-cli/src/mcp/tools.rs:277-283`): una inferencia es la que más probablemente cede, aunque el par lo sigue juzgando el agente.
-- ACTIVE CONFLICTS MUST escribir la marca de cada lado que la tiene: en el rótulo cuando imprime su texto (`[AAAA-MM-DD #N disputed inferred] …`) y junto al id cuando lo cita (`format_conflict_block`, `crates/clawg-core/src/memory/retrieval/prompt_builder.rs:817-853`). No reordena: agrupa por la fila `disputed`, y reordenar rompería el grupo.
+- `GET /v1/disputes` MUST traer la marca de cada lado de cada par pendiente que nombra (`new_mark`, `old_mark` de `OpenPair`, `crates/clawg-core/src/memory/revision/dispute.rs:485-496`).
+- `memory_status` MUST NOT listar pares ni su marca: dice sólo cuántos esperan a la persona en ACTIVE CONFLICTS ([`specs/mcp`](../mcp/spec.md), VR4), así que la marca no se imprime ahí. `GET /v1/disputes` la sigue trayendo, y el puente la lee sin imprimirla.
+- ACTIVE CONFLICTS MUST escribir la marca de cada lado que la tiene: en el rótulo cuando imprime su texto (`[AAAA-MM-DD #N disputed inferred] …`) y junto al id cuando lo cita (`format_conflict_block`, `crates/clawg-core/src/memory/retrieval/prompt_builder.rs:883`). No reordena: agrupa por la fila `disputed`, y reordenar rompería el grupo.
 - El origen MUST NOT cambiar el estado de un par ni el de sus filas, ni el orden de los pares listados.
 
-#### Escenario: inferencia contra lo dicho
-- GIVEN un par pendiente cuya fila nueva es `explicit` / `agent` y la vieja `explicit` / `user`
-- WHEN el agente llama a `memory_status`
-- THEN la línea es `#<vieja> close to #<nueva> inferred` y el par sigue `pending`
-
-**Test:** `open_pairs_carry_each_sides_mark` en `crates/clawg-core/src/memory/revision/dispute.rs`; `the_unmarked_side_of_a_pair_goes_first` en `crates/clawg-cli/src/mcp/tools.rs`; `the_conflict_block_marks_an_inferred_side` en `crates/clawg-core/src/memory/retrieval/prompt_builder.rs`; `memory_status_counts_pending_candidates` en `crates/clawg-cli/src/mcp/server.rs`, que por HTTP ve dos saves sin declarar marcados `inferred`.
+**Test:** `open_pairs_carry_each_sides_mark` en `crates/clawg-core/src/memory/revision/dispute.rs`; `the_conflict_block_marks_an_inferred_side` en `crates/clawg-core/src/memory/retrieval/prompt_builder.rs`.
 
 ## P5. Síntesis
 

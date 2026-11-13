@@ -24,9 +24,9 @@ Strict TDD: en cada tarea el test va primero y falla por la aserción. Una tarea
 ## 5. Verificación
 
 - [x] `cargo clean --workspace --target-dir target-test`, y después la suite y clippy de `.claude/CLAUDE.md` en Windows (`target-test`), una vez, sobre el último commit.
-- [ ] El CI en verde en Linux y Windows.
-- [ ] Pendiente en local, con uso real: correr `clawg setup` otra vez para que el bloque del protocolo del usuario tome la frase nueva, y con los transcripts de algunas semanas medir los pedidos que sólo juzgan por save con cercanas (umbral fijado: menos de 0,15; hoy 0,79) y los `supersedes` por cada cien saves con cercanas (hoy 3,3; se informa).
+- [x] El CI en verde en Linux y Windows: `test (ubuntu-latest)` y `test (windows-latest)` pasan ([verify.md](verify.md#el-ci-2026-11-12)).
+- [ ] Pendiente en prod, con uso real ([verify.md](verify.md#pendiente-en-prod)): correr `clawg setup` otra vez para que el bloque del protocolo del usuario tome la frase nueva, y con los transcripts de algunas semanas medir los pedidos que sólo juzgan por save con cercanas (umbral fijado: menos de 0,15; hoy 0,79) y los `supersedes` por cada cien saves con cercanas (hoy 3,3; se informa).
 
 ## 6. Al archivar
 
-- [ ] Consolidar R1 a R6 en `specs/disputes`, `specs/mcp` y `specs/provenance`, como dice la [spec](spec.md#specs-que-se-consolidan-al-archivar), y corregir en `docs/reference/` lo que describa estos textos.
+- [x] Consolidar R1 a R6 en `specs/disputes`, `specs/mcp` y `specs/provenance`, como dice la [spec](spec.md#specs-que-se-consolidan-al-archivar), y corregir en `docs/reference/` lo que describa estos textos. Los ids pasan a VR1 a VR5 y R6 no se consolida ([verify.md](verify.md#al-archivar-2026-11-12)).

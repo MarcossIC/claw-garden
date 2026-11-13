@@ -162,7 +162,7 @@ Con el embedder `ready`, `POST /v1/memories` MUST encolar el evento con un canal
 
 Si la ingesta enmascaró secretos, la respuesta lleva además `redacted` con sus tipos, y `save_memory` los nombra en su texto: ver [`specs/secrets`](../secrets/spec.md), R3.
 
-Si el detector de contradicciones encontró memorias cercanas, la respuesta lleva además `related`, una por memoria vieja, y `save_memory` las nombra para que el agente las juzgue: ver [`specs/disputes`](../disputes/spec.md), «Las candidatas en la respuesta del save». Sin candidatas, el campo no va.
+Si el detector de contradicciones encontró memorias cercanas, la respuesta lleva además `related`, una por memoria vieja, y `save_memory` las nombra para que el agente diga si el save reemplaza alguna: ver [`specs/disputes`](../disputes/spec.md), «Las candidatas en la respuesta del save». Sin candidatas, el campo no va.
 
 #### Escenario: inserción
 - GIVEN un daemon con el embedder listo y la base vacía

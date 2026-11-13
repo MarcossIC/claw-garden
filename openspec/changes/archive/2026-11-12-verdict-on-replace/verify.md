@@ -29,9 +29,9 @@ Lo que aplicar el cambio movió respecto de la spec inicial, ya anotado en ella:
 
 Nada cambió en `crates/clawg-core` ni en `crates/clawg-cli/src/daemon`.
 
-## Pendiente en el CI
+## El CI (2026-11-12)
 
-El CI en Linux y Windows, que corre con el pull request.
+El código del cambio es el commit `8eec6645`, que está en `9bd82ee4`. El CI del pull request de `9bd82ee4` pasó en `test (ubuntu-latest)` y en `test (windows-latest)`: [la corrida](https://github.com/MarcossIC/claw-garden/actions/runs/43249735426).
 
 ## Pendiente en prod
 
@@ -41,3 +41,14 @@ Con la versión instalada:
 2. Con los transcripts de algunas semanas de uso, repetir la pasada de la [exploración](exploration.md#los-transcripts-de-claude-code-de-este-repositorio):
    - los pedidos que sólo juzgan por cada save con cercanas, con el umbral fijado antes de mirar: menos de 0,15 (antes 0,79);
    - los `supersedes` por cada cien saves con cercanas (antes 3,3), que se informan y no deciden.
+
+## Al archivar (2026-11-12)
+
+- Los ids cambian al consolidar. R1 a R6 chocarían con los ids de cada spec, así que los requisitos de este cambio pasan a VR. Mapeo: R1 pasa a VR1 en [`specs/disputes`](../../../specs/disputes/spec.md), en «Las candidatas en la respuesta del save». R2 pasa a VR2 en [`specs/mcp`](../../../specs/mcp/spec.md), en «Borrar y restaurar en las herramientas» (la respuesta de `restore_memory`). R3 pasa a VR3 en `specs/mcp`, en «La apertura lleva los hábitos que más rinden», con los largos nuevos en «Las instrucciones caben en 2.048 caracteres». R4 pasa a VR4 en `specs/mcp`, en «Los conflictos en las herramientas» y en BI8. R5 pasa a VR5 en `specs/mcp`, en las descripciones de `resolve_conflict` («Los conflictos en las herramientas») y de `restore_memory` («Borrar y restaurar en las herramientas»). R6 («Lo que no cambia») no se consolida, porque es de conservación; sus tests siguen donde estaban. Este archivo conserva los ids R.
+- [`specs/provenance`](../../../specs/provenance/spec.md), P4: se quitó el requisito y el escenario de la marca en la línea de `memory_status`, que ya no existe en el puente; la marca sigue en `GET /v1/disputes` y en ACTIVE CONFLICTS.
+- Otras specs: la de [`retrieval`](../../../specs/retrieval/spec.md) (la definición de par de conflicto) y la de [`ingest`](../../../specs/ingest/spec.md) decían que el agente juzga las candidatas o que `memory_status` las cuenta, y dicen lo de ahora. En [`docs/reference/daemon.md`](../../../../docs/reference/daemon.md) se corrigió la frase del detector sobre `related` y `memory_status`.
+- La nota de ACTIVE CONFLICTS de [`specs/retrieval`](../../../specs/retrieval/spec.md) no cambió y no se tocó.
+- Sale en 0.85.0.
+- Largos de la apertura: con los textos de `protocol.md` y `protocol.es.md` de hoy, y la función `opening` y la regla de LP9 de `protocol.rs`, miden 2.030 sin preferencia, 2.047 con `en` y 1.933 con `es`. Se contaron con un script aparte, no con `the_instructions_fit_older_clients`, que no se corrió al archivar. Las tres cifras de `specs/mcp` se actualizaron con eso.
+- Citas: las `archivo:línea` de las frases que se reescribieron se tomaron del código de hoy (`related_text`, `format_open_pairs`, `memory_status_impl`, `ResolveConflictArgs`, `verdict_enum`, las descripciones de `resolve_conflict` y `restore_memory`, `format_restore`, `DaemonClient::judge`, `SaveBody` y `RelatedMemory`), y los nombres de test que se citan existen. Las citas de otras frases de esas secciones no se revisaron.
+- Lo que sigue pendiente es la medición con uso real, en [«Pendiente en prod»](#pendiente-en-prod).
