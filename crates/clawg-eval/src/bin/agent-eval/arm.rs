@@ -313,13 +313,23 @@ pub fn plan(task: &Task, arm: Arm, layout: &Layout, options: &Options) -> Result
     // Nothing can approve a prompt in `-p`, so without a mode the client denies edits and MCP calls.
     // Edits are approved inside the working directory only; a shell is the one way an unattended
     // session could act outside it, and no task needs one. A denial outranks an allowance.
-    let mut denied: Vec<String> = vec!["Bash".into()];
+    // A task that names shell commands lifts the denial and allows each as a scoped rule, which
+    // leaves every other command denied.
+    let mut denied: Vec<String> = if task.shell.is_empty() { vec!["Bash".into()] } else { Vec::new() };
     if arm == Arm::B {
         denied.extend(READ_TOOLS.iter().map(|t| format!("mcp__{server_name}__{t}")));
     }
-    args.extend(["--permission-mode".into(), "acceptEdits".into(), "--disallowedTools".into(), denied.join(",")]);
+    args.extend(["--permission-mode".into(), "acceptEdits".into()]);
+    if !denied.is_empty() {
+        args.extend(["--disallowedTools".into(), denied.join(",")]);
+    }
+    let mut allowed: Vec<String> = Vec::new();
     if arm.has_clawg() {
-        args.extend(["--allowedTools".into(), format!("mcp__{server_name}")]);
+        allowed.push(format!("mcp__{server_name}"));
+    }
+    allowed.extend(task.shell.iter().map(|command| format!("Bash({command}:*)")));
+    if !allowed.is_empty() {
+        args.extend(["--allowedTools".into(), allowed.join(",")]);
     }
 
     let home = text(&layout.home())?;
@@ -674,6 +684,32 @@ mod tests {
             let denied = pair_value(&plan, "--disallowedTools").unwrap();
             assert!(denied.split(',').any(|t| t == "Bash"), "{}: {denied}", arm.as_str());
         }
+    }
+
+    #[test]
+    fn a_task_with_a_shell_allows_its_commands_and_no_other() {
+        let shelled = parse(
+            r#"{"id": "t", "category": "E", "fixture": "tally", "prompt": "Count the files.", "shell": ["eza", "ls"],
+                "checks": [{"kind": "answer_contains", "text": "3"}]}"#,
+        )
+        .unwrap();
+        for arm in ARMS {
+            let plan = plan(&shelled, arm, &layout(), &options(None)).unwrap();
+            let allowed: Vec<&str> = pair_value(&plan, "--allowedTools").unwrap().split(',').collect();
+            assert!(allowed.contains(&"Bash(eza:*)") && allowed.contains(&"Bash(ls:*)"), "{}: {allowed:?}", arm.as_str());
+            assert!(!allowed.contains(&"Bash"), "{}: a bare Bash allows every command", arm.as_str());
+            assert_eq!(allowed.contains(&"mcp__clawg-dev"), arm.has_clawg(), "{}", arm.as_str());
+            let denied = pair_value(&plan, "--disallowedTools");
+            assert!(denied.is_none_or(|d| !d.split(',').any(|t| t == "Bash")), "{}: {denied:?}", arm.as_str());
+        }
+        let b = plan(&shelled, Arm::B, &layout(), &options(None)).unwrap();
+        assert_eq!(
+            pair_value(&b, "--disallowedTools"),
+            Some("mcp__clawg-dev__search_memory,mcp__clawg-dev__read_memory,mcp__clawg-dev__list_memories")
+        );
+        let a0 = plan(&shelled, Arm::A0, &layout(), &options(None)).unwrap();
+        assert_eq!(pair_value(&a0, "--disallowedTools"), None, "nothing to deny");
+        assert_eq!(pair_value(&a0, "--allowedTools"), Some("Bash(eza:*),Bash(ls:*)"));
     }
 
     #[test]

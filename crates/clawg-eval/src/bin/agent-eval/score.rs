@@ -43,6 +43,7 @@ pub fn score(task: &Task, t: &Transcript, read_file: impl Fn(&str) -> Option<Str
                 Check::FileContains { path, text } => read_file(path).is_some_and(|body| file_has(&body, text)),
                 Check::FileLacks { path, text } => !read_file(path).is_some_and(|body| file_has(&body, text)),
                 Check::ToolCalled { name } => t.calls.iter().any(|c| is_tool(&c.name, name)),
+                Check::ToolFailedCount { name, max, text } => failed_calls(t, name, text.as_deref()) <= *max as usize,
             };
             CheckResult { check: check.describe(), passed }
         })
@@ -50,6 +51,20 @@ pub fn score(task: &Task, t: &Transcript, read_file: impl Fn(&str) -> Option<Str
     let ended = t.result.as_ref().is_some_and(|r| !r.is_error);
     let tracers = task.tracers.iter().map(|tr| (tr.clone(), fate(t, &task.id, tr))).collect();
     Score { success: ended && checks.iter().all(|c| c.passed), ended, checks, tracers }
+}
+
+/// The calls to the tool `name`, a subagent's included, that failed: those
+/// marked as an error or, given `text`, those whose result holds it, marked or
+/// not, since a command that is missing behind a `|` comes back unmarked.
+fn failed_calls(t: &Transcript, name: &str, text: Option<&str>) -> usize {
+    t.calls
+        .iter()
+        .filter(|c| is_tool(&c.name, name))
+        .filter(|c| match text {
+            Some(text) => c.result.as_deref().is_some_and(|r| contains_ci(r, text)),
+            None => c.is_error,
+        })
+        .count()
 }
 
 /// A checkout with `core.autocrlf` leaves CRLF in the fixtures and the agent's edits keep it,
@@ -223,5 +238,36 @@ mod tests {
 {"type":"result","subtype":"success","is_error":false,"result":"done"}"#,
         );
         assert_eq!(score(&task(), &t, files).tracers[1].1, TracerFate::RetrievedButIgnored);
+    }
+
+    #[test]
+    fn the_failed_calls_of_a_tool_are_those_marked_or_those_that_hold_a_text() {
+        let stream = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"b1","name":"Bash","input":{"command":"eza src | wc -l"}}]}}
+{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"b1","content":"bash: line 1: EZA: command not found\n0"}]}}
+{"type":"assistant","message":{"content":[{"type":"tool_use","id":"b2","name":"Bash","input":{"command":"ls nope"}}]}}
+{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"b2","is_error":true,"content":"ls: cannot access 'nope'"}]}}
+{"type":"assistant","parent_tool_use_id":"agent","message":{"content":[{"type":"tool_use","id":"b3","name":"Bash","input":{"command":"eza"}}]}}
+{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"b3","content":"eza: command not found"}]}}
+{"type":"assistant","message":{"content":[{"type":"tool_use","id":"b4","name":"Bash","input":{"command":"ls src"}}]}}
+{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"b4","content":"a.py"}]}}
+{"type":"result","subtype":"success","is_error":false,"result":"2 files"}
+"#;
+        let t = parse_stream(stream);
+        let check = |max: u32, text: Option<&str>| {
+            let task = parse_task(&format!(
+                r#"{{"id": "t", "category": "E", "fixture": "f", "prompt": "p", "shell": ["ls", "eza"],
+                    "checks": [{{"kind": "tool_failed_count", "name": "Bash", "max": {max}{}}}]}}"#,
+                text.map_or(String::new(), |x| format!(r#", "text": "{x}""#))
+            ))
+            .unwrap();
+            score(&task, &t, |_| None).checks[0].clone()
+        };
+        assert!(check(1, None).passed, "without a text only the call marked as an error failed");
+        assert!(!check(0, None).passed);
+        assert!(!check(1, Some("eza: command not found")).passed, "two calls hold the text, whatever their mark and their case, a subagent's included");
+        assert!(check(2, Some("eza: command not found")).passed);
+        assert!(check(0, Some("no such text")).passed);
+        assert_eq!(check(2, Some("eza: command not found")).check, "Bash failed at most 2 times with \"eza: command not found\"");
+        assert_eq!(check(1, None).check, "Bash failed at most 1 times");
     }
 }

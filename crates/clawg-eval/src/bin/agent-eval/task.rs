@@ -8,7 +8,7 @@ use std::path::{Component, Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 /// The categories a task may have. Each one is checked without a judge.
-pub const CATEGORIES: [&str; 11] = ["K1", "K2", "K3", "K4", "K5", "S", "C", "N", "Q", "D", "R"];
+pub const CATEGORIES: [&str; 12] = ["K1", "K2", "K3", "K4", "K5", "S", "C", "N", "Q", "D", "R", "E"];
 
 /// The memory types `save_memory` takes, as the protocol lists them.
 pub const MEMORY_TYPES: [&str; 7] = [
@@ -41,6 +41,12 @@ pub struct Task {
     /// clawg's store and for the client's native memory.
     #[serde(default)]
     pub memories: Vec<SeedMemory>,
+    /// Shell commands every arm may run, by name; with none, no arm has a shell.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shell: Vec<String>,
+    /// Commands of `shell` that must not exist where the session runs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub missing_commands: Vec<String>,
     /// Strings found only in the seeded memories: where one shows up in the
     /// session tells whether the fact reached the agent and whether it was used.
     #[serde(default)]
@@ -139,12 +145,20 @@ pub enum Check {
     FileLacks { path: String, text: String },
     /// A tool named `name`, or an MCP tool ending in `__name`, was called.
     ToolCalled { name: String },
+    /// At most `max` calls to the tool `name` failed: those that came back
+    /// marked as an error or, with `text`, those whose result holds `text`.
+    ToolFailedCount {
+        name: String,
+        max: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
+    },
 }
 
 impl Check {
     /// Whether the check reads the stream of a session and not the files it left.
     pub fn reads_only_the_stream(&self) -> bool {
-        matches!(self, Check::AnswerContains { .. } | Check::AnswerLacks { .. } | Check::ToolCalled { .. })
+        matches!(self, Check::AnswerContains { .. } | Check::AnswerLacks { .. } | Check::ToolCalled { .. } | Check::ToolFailedCount { .. })
     }
 
     pub fn describe(&self) -> String {
@@ -154,6 +168,8 @@ impl Check {
             Check::FileContains { path, text } => format!("{path} contains {text:?}"),
             Check::FileLacks { path, text } => format!("{path} lacks {text:?}"),
             Check::ToolCalled { name } => format!("{name} was called"),
+            Check::ToolFailedCount { name, max, text: None } => format!("{name} failed at most {max} times"),
+            Check::ToolFailedCount { name, max, text: Some(text) } => format!("{name} failed at most {max} times with {text:?}"),
         }
     }
 }
@@ -233,6 +249,14 @@ pub fn problems(task: &Task) -> Vec<String> {
     }
     for (i, memory) in task.memories.iter().enumerate() {
         out.extend(memory_problems(&format!("memory {}", i + 1), memory));
+    }
+    for command in &task.shell {
+        if command.is_empty() || !command.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+            out.push(format!("the shell command {command:?} is not letters, digits, dashes and underscores"));
+        }
+    }
+    for command in task.missing_commands.iter().filter(|c| !task.shell.contains(c)) {
+        out.push(format!("the missing command {command:?} is not in the shell"));
     }
     for tracer in &task.tracers {
         if tracer.trim().is_empty() {
@@ -544,6 +568,36 @@ mod tests {
         std::fs::write(dir.path().join(NOISE_FILE), r#"[{"content": "Defaults\nUse 4.5, 41 for every call.", "rule": {}}]"#).unwrap();
         let found = load_noise(dir.path(), &[parse(SESSIONS).unwrap()]).unwrap_err().to_string();
         assert!(found.contains("noise memory 1 holds the tracer \"4.5, 41\" of the task relay"), "{found}");
+    }
+
+    #[test]
+    fn a_task_names_the_shell_commands_it_allows_and_those_that_must_be_missing() {
+        let with = |fields: &str| TASK.replace("\"checks\"", &format!("{fields}, \"checks\""));
+        let task = parse(&with(r#""shell": ["eza", "ls", "wc-l_2"], "missing_commands": ["eza"]"#)).unwrap();
+        assert_eq!((task.shell.as_slice(), task.missing_commands.as_slice()), (["eza".to_owned(), "ls".to_owned(), "wc-l_2".to_owned()].as_slice(), ["eza".to_owned()].as_slice()));
+        assert!(problems(&task).is_empty(), "{:?}", problems(&task));
+        let plain = serde_json::to_value(parse(TASK).unwrap()).unwrap();
+        assert!(plain.get("shell").is_none() && plain.get("missing_commands").is_none(), "{plain}");
+
+        let found = problems(&parse(&with(r#""shell": ["ls -a", "", "a/b", "rm;ls"], "missing_commands": ["eza"]"#)).unwrap()).join("
+");
+        for expected in [
+            "the shell command \"ls -a\" is not letters, digits, dashes and underscores",
+            "the shell command \"\" is not letters",
+            "the shell command \"a/b\" is not letters",
+            "\"rm;ls\" is not letters",
+            "the missing command \"eza\" is not in the shell",
+        ] {
+            assert!(found.contains(expected), "{expected} missing from:
+{found}");
+        }
+    }
+
+    #[test]
+    fn e_is_a_category() {
+        assert!(CATEGORIES.contains(&"E"));
+        let task = parse(&TASK.replace("\"K1\"", "\"E\"")).unwrap();
+        assert!(problems(&task).is_empty());
     }
 
     fn with_memory_fields(fields: &str) -> String {

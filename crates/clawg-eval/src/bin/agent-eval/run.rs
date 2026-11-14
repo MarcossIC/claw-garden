@@ -263,6 +263,8 @@ pub enum Leak {
     Context { out: PathBuf, dir: PathBuf, name: &'static str },
     #[error("the working directory {} holds {what} (the client tells the session its working directory, so the agent reads it)", .workdir.display())]
     Named { workdir: PathBuf, what: String },
+    #[error("{command} is on the PATH, at {}, and the task needs it missing", .path.display())]
+    Present { command: String, path: PathBuf },
 }
 
 fn join_leaks(leaks: &[Leak]) -> String {
@@ -282,6 +284,7 @@ fn leaks(
     effort_level: Option<&str>,
     out: &Path,
     ancestors: &[(PathBuf, Vec<&'static str>)],
+    present: &[(String, PathBuf)],
     task: &Task,
 ) -> Vec<Leak> {
     let set = |v: Option<&str>| v.is_some_and(|v| !v.is_empty());
@@ -305,6 +308,7 @@ fn leaks(
         found.push(named(format!("the id of its task, {}", task.id)));
     }
     found.extend(task.every_tracer().filter(|tr| task::contains_ci(&path, tr)).map(|tr| named(format!("the tracer {tr:?}"))));
+    found.extend(present.iter().map(|(command, path)| Leak::Present { command: command.clone(), path: path.clone() }));
     found
 }
 
@@ -313,6 +317,23 @@ fn leaks(
 fn probe_ancestors(out: &Path) -> Vec<(PathBuf, Vec<&'static str>)> {
     out.ancestors()
         .map(|dir| (dir.to_owned(), CONTEXT_NAMES.into_iter().filter(|name| dir.join(name).exists()).collect()))
+        .collect()
+}
+
+/// Each command the task needs missing that a directory of `path` holds, with
+/// the file that would run.
+fn on_path(task: &Task, path: Option<&std::ffi::OsStr>) -> Vec<(String, PathBuf)> {
+    let Some(path) = path else { return Vec::new() };
+    let extensions: &[&str] = if cfg!(windows) { &["", ".exe", ".cmd", ".bat", ".com"] } else { &[""] };
+    let dirs: Vec<PathBuf> = std::env::split_paths(path).collect();
+    task.missing_commands
+        .iter()
+        .filter_map(|command| {
+            dirs.iter()
+                .flat_map(|dir| extensions.iter().map(move |ext| dir.join(format!("{command}{ext}"))))
+                .find(|file| file.is_file())
+                .map(|file| (command.clone(), file))
+        })
         .collect()
 }
 
@@ -326,6 +347,7 @@ pub fn check_paid_run(out: &Path, task: &Task) -> Result<(), RunError> {
         var("CLAUDE_CODE_EFFORT_LEVEL").as_deref(),
         &out,
         &probe_ancestors(&out),
+        &on_path(task, std::env::var_os("PATH").as_deref()),
         task,
     );
     if found.is_empty() { Ok(()) } else { Err(RunError::PaidRun(found)) }
@@ -762,7 +784,7 @@ mod tests {
     #[test]
     fn a_paid_run_with_its_key_and_a_clean_directory_has_no_leaks() {
         let out = Path::new("/runs/1");
-        assert_eq!(leaks(Some("sk-key"), None, None, out, &clean_ancestors(out), &staging_port()), []);
+        assert_eq!(leaks(Some("sk-key"), None, None, out, &clean_ancestors(out), &[], &staging_port()), []);
     }
 
     #[test]
@@ -770,19 +792,19 @@ mod tests {
         let out = Path::new("/runs/1");
         let ancestors = clean_ancestors(out);
         let t = staging_port();
-        assert_eq!(leaks(None, None, None, out, &ancestors, &t), [Leak::NoApiKey]);
-        assert_eq!(leaks(Some(""), None, None, out, &ancestors, &t), [Leak::NoApiKey]);
+        assert_eq!(leaks(None, None, None, out, &ancestors, &[], &t), [Leak::NoApiKey]);
+        assert_eq!(leaks(Some(""), None, None, out, &ancestors, &[], &t), [Leak::NoApiKey]);
         assert_eq!(
-            leaks(None, Some("token"), Some("high"), out, &ancestors, &t),
+            leaks(None, Some("token"), Some("high"), out, &ancestors, &[], &t),
             [Leak::NoApiKey, Leak::AuthToken, Leak::EffortLevel]
         );
-        assert_eq!(leaks(Some("k"), Some(""), Some(""), out, &ancestors, &t), [], "an empty variable sets nothing");
+        assert_eq!(leaks(Some("k"), Some(""), Some(""), out, &ancestors, &[], &t), [], "an empty variable sets nothing");
     }
 
     #[test]
     fn a_working_directory_that_names_its_task_or_a_tracer_is_named() {
         let t = staging_port();
-        let found = |out: &str| leaks(Some("k"), None, None, Path::new(out), &clean_ancestors(Path::new(out)), &t);
+        let found = |out: &str| leaks(Some("k"), None, None, Path::new(out), &clean_ancestors(Path::new(out)), &[], &t);
         let workdir = |out: &str| Layout { root: PathBuf::from(out) }.workdir();
         assert_eq!(found("/runs/t5f0c2a9e.a0.1"), []);
         assert_eq!(
@@ -803,9 +825,36 @@ mod tests {
         )
         .unwrap();
         let out = "/runs/4.5-41/1";
-        let found = leaks(Some("k"), None, None, Path::new(out), &clean_ancestors(Path::new(out)), &relay);
+        let found = leaks(Some("k"), None, None, Path::new(out), &clean_ancestors(Path::new(out)), &[], &relay);
         let workdir = Layout { root: PathBuf::from(out) }.workdir();
         assert_eq!(found, [Leak::Named { workdir, what: "the tracer \"4.5-41\"".into() }]);
+    }
+
+    #[test]
+    fn a_paid_run_refuses_a_command_that_should_be_missing() {
+        let eza = task::parse(
+            r#"{"id": "listing", "category": "E", "fixture": "f", "prompt": "Count.", "shell": ["eza", "ls"], "missing_commands": ["eza"],
+                "checks": [{"kind": "answer_contains", "text": "3"}]}"#,
+        )
+        .unwrap();
+        let out = Path::new("/runs/1");
+        let present = [("eza".to_owned(), PathBuf::from("/usr/bin/eza"))];
+        let found = leaks(Some("k"), None, None, out, &clean_ancestors(out), &present, &eza);
+        assert_eq!(found, [Leak::Present { command: "eza".into(), path: PathBuf::from("/usr/bin/eza") }]);
+        let said = RunError::PaidRun(found).to_string();
+        assert!(said.contains("eza") && said.contains("/usr/bin/eza") && said.contains("missing"), "{said}");
+        assert_eq!(leaks(Some("k"), None, None, out, &clean_ancestors(out), &[], &eza), []);
+
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let file = if cfg!(windows) { "eza.exe" } else { "eza" };
+        std::fs::write(bin.join(file), "").unwrap();
+        std::fs::write(bin.join("ls-other"), "").unwrap();
+        let path = std::env::join_paths([dir.path().join("empty"), bin.clone()]).unwrap();
+        assert_eq!(on_path(&eza, Some(&path)), [("eza".to_owned(), bin.join(file))]);
+        assert_eq!(on_path(&eza, None), []);
+        assert_eq!(on_path(&staging_port(), Some(&path)), [], "a task with no missing command looks for none");
     }
 
     #[test]
@@ -817,7 +866,7 @@ mod tests {
             (PathBuf::from("/repo"), vec![".git", ".claude/CLAUDE.md"]),
             (PathBuf::from("/"), vec![]),
         ];
-        let found = leaks(Some("k"), None, None, out, &ancestors, &staging_port());
+        let found = leaks(Some("k"), None, None, out, &ancestors, &[], &staging_port());
         assert_eq!(
             found,
             [
