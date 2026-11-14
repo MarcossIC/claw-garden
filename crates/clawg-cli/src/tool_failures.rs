@@ -798,7 +798,7 @@ mod tests {
     }
 
     #[test]
-    fn what_a2_finds_is_one_rule() {
+    fn only_a_program_that_never_worked_and_is_missing_is_a_rule() {
         let mut lines = vec![fail(5, "eza", "s1"), fail(4, "eza", "s2")];
         lines.extend([fail(9, "rg", "r1"), ok(9, "rg", "r1"), fail(8, "rg", "r2"), ok(8, "rg", "r2"), fail(7, "rg", "r3"), ok(7, "rg", "r3")]);
         lines.extend([fail(6, "gh", "g1"), fail(5, "gh", "g2")]);
