@@ -204,7 +204,7 @@ fn is_assignment(word: &str) -> bool {
 /// command: a script the command launched can miss its own dependencies, and
 /// that is not the machine's. A success is a program the command called when
 /// the call showed no missing program at all and the command does not hide its
-/// own errors, with a `2>`, a `&>` or a `||`: a success erases what was
+/// own errors, with a `2>`, a `&>`, a `|&` or a `||`: a success erases what was
 /// learned, so it asks for more than a failure does.
 pub fn observe(tool: &str, command: &str, outputs: &[&str], after: After) -> Vec<Observation> {
     if tool != SHELL_TOOL {
@@ -221,7 +221,7 @@ pub fn observe(tool: &str, command: &str, outputs: &[&str], after: After) -> Vec
         }
     }
     let doubtful = !signatures.is_empty() || outputs.iter().any(|text| text.contains("is not recognized"));
-    let hides_errors = ["2>", "&>", "||"].iter().any(|mark| command.contains(mark));
+    let hides_errors = ["2>", "&>", "||", "|&"].iter().any(|mark| command.contains(mark));
     if after == After::Success && !doubtful && !hides_errors {
         for word in words {
             if has_program_shape(word) && !seen.contains(&word) {
@@ -581,7 +581,7 @@ mod tests {
     fn a_redirected_or_chained_command_is_no_success() {
         assert_eq!(oks(&observe("Bash", "rg todo src", &["src/a.rs:1: todo"], After::Success)), ["rg"]);
         assert_eq!(oks(&observe("Bash", "cd src && rg todo | head", &[""], After::Success)), ["cd", "rg", "head"]);
-        for hiding in ["rg todo 2>/dev/null", "rg todo 2>&1", "rg todo &> out", "rg todo || true", "eza 2>/dev/null | head"] {
+        for hiding in ["rg todo 2>/dev/null", "rg todo 2>&1", "rg todo &> out", "rg todo || true", "eza 2>/dev/null | head", "eza |& true"] {
             assert_eq!(observe("Bash", hiding, &[""], After::Success), [], "{hiding}");
         }
         assert_eq!(observe("Bash", "rg todo", &[], After::Failure), [], "a success is only for a call that ended well");

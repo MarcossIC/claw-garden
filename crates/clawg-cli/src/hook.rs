@@ -612,6 +612,10 @@ async fn after_tool(
         HookEvent::PostToolUse => (After::Success, &input.tool_response),
         _ => (After::Failure, &input.error),
     };
+    // A command in the background answers before it runs: its response holds nothing of its programs.
+    if input.tool_input.as_ref().is_some_and(|asked| asked["run_in_background"] == true) {
+        return None;
+    }
     let command = input.tool_input.as_ref().and_then(|asked| asked["command"].as_str()).unwrap_or_default();
     let outputs = output.as_ref().map(|value| tool_failures::response_texts(value, command)).unwrap_or_default();
     let observed = tool_failures::observe(tool, command, &outputs, after);
@@ -1949,6 +1953,17 @@ mod tests {
         let merged = bash_ended("s1", "eza 2>&1", printed);
         let line = line_of(after(HookEvent::PostToolUse, HookClient::ClaudeCode, dir.path(), &merged).await);
         assert!(line.contains("`eza`"), "a redirect puts the shell's words in stdout: {line}");
+    }
+
+    #[tokio::test]
+    async fn a_command_in_the_background_is_no_success() {
+        let dir = tempfile::tempdir().unwrap();
+        tool_failures::append(dir.path(), &[tool_failures::Line { at_ms: now_ms(), event: tool_failures::Kind::Fail, tool: "Bash".into(), program: "eza".into(), session: "s0".into() }]);
+        let mut started: serde_json::Value = serde_json::from_str(&bash_ended("s1", "eza -la", serde_json::json!({ "stdout": "", "stderr": "" }))).unwrap();
+        started["tool_input"]["run_in_background"] = true.into();
+        assert_eq!(after(HookEvent::PostToolUse, HookClient::ClaudeCode, dir.path(), &started.to_string()).await, None);
+        let kept = [(tool_failures::Kind::Fail, "eza".to_string())];
+        assert_eq!(ledger(dir.path()), kept, "the response of a command still running says nothing of its program");
     }
 
     #[tokio::test]
