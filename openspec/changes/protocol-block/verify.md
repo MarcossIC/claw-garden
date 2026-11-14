@@ -61,3 +61,13 @@ Ninguno.
 - **El bloque de la máquina.** Con la versión instalada que trae este cambio, abrir una sesión de Claude Code en una máquina con el bloque de antes de 0.85.0. El agente tiene que nombrar `clawg setup claude-code --profile prod`. Después, correr `clawg setup claude-code --profile prod` (primero con `--dry-run`: la línea del protocolo tiene que decir `would update it (protocol=full)`, o `se actualizaría (protocol=full)` con la preferencia `es`) y `clawg doctor --profile prod`, que tiene que dar `protocol_block` `ok` `healthy` con `written_by` igual a `this_version`. Con el perfil `dev` también instalado, `clawg doctor --profile dev` puede dar `stale` o `newer` según su versión (W1).
 - **El efecto en las sesiones.** Con los scripts de A1 (`docs/completed-impl/hipotesis/A1/`) sobre los transcripts de las semanas siguientes, los `resolve_conflict` por cada save con cercanas tienen que bajar a menos de 0,15, el umbral de verdict-on-replace.
 - **El valor por defecto.** Lo decide la campaña sobre las tres tareas largas de agent-eval-sessions, con `a3`, `a3-short` y `l0`, 3 corridas por celda, 18 corridas nuevas y un tope de 15 USD, aplicando la regla de [D6](design.md#d6-la-regla-de-decisión-del-valor-por-defecto) tal como quedó fijada. La campaña es paga y la autoriza la persona. Si la regla elige `short` u `off`, el cambio va en un commit propio.
+
+## Arreglos después de la verificación
+
+| Hallazgo | Commit | Lo fija |
+| --- | --- | --- |
+| W1, la misma versión en `dev` y `prod`, con la alternativa (c) | `14ab7891` | `block_notice` calla en el perfil `dev` cuando el sello lleva su propia versión y el bloque es `Stale`; `prod`, un bloque sin sello y uno con sello anterior siguen avisando. Casos nuevos en `the_block_notice_is_for_a_block_that_differs`; `docs/reference/commands.md` |
+| W3, el peor caso del tope | `7c3e357c` | `what_the_hook_adds_stays_small` con `conclusions_to_review` de 10.000, que suma el `review_nudge`; el tope de 2.000 bytes se cumple |
+| S1 y S2 | `6bb07af9` | la documentación de `parse_agent` y de `parse_protocol` en su función; `DEFAULT_VARIANT` privado |
+
+W2 queda como está: al consolidar PB6 en `specs/setup` se escribe que `setup cursor --protocol` sale con 1. S3 lo comprueba la guía de la campaña.
