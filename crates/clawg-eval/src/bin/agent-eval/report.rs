@@ -614,6 +614,7 @@ mod tests {
                 first_request_cache_read: None,
                 instructions_loaded: vec![],
                 untouched: vec![],
+                outside_reads: vec![],
                 outcome: Some(Outcome {
                     subtype: "success".to_owned(),
                     is_error: false,

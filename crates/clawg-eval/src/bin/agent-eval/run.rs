@@ -128,7 +128,20 @@ pub struct Session {
     /// What the task asked this session to leave untouched, and whether it did.
     #[serde(default)]
     pub untouched: Vec<UntouchedEntry>,
+    /// Every read of a path outside its working directory, denied or not.
+    #[serde(default)]
+    pub outside_reads: Vec<OutsideRead>,
     pub outcome: Option<Outcome>,
+}
+
+/// A call that read a path outside the working directory of its session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutsideRead {
+    pub tool: String,
+    /// As the call wrote it.
+    pub path: String,
+    /// The client denied it: its result came back marked as an error.
+    pub denied: bool,
 }
 
 /// An entry of a session's `untouched`, as the working directory held it when
@@ -245,8 +258,10 @@ pub struct RunInfo<'a> {
     pub lang: Option<Lang>,
     pub shape: Shape,
     pub noise_rules: usize,
-    /// The working directory of the sessions, from which a relative path is read.
+    /// The working directory the client ran the sessions in, from which a relative path is read.
     pub workdir: &'a Path,
+    /// The directories besides it that the plan lets the sessions read.
+    pub additional_dirs: &'a [String],
     /// Where the client keeps the native memory of the run, when its arm has one.
     pub native_dir: Option<&'a Path>,
 }
@@ -315,6 +330,7 @@ fn record(t: &Transcript, profile: Profile, loaded: Vec<Loaded>, untouched: Vec<
         first_request_cache_read: t.requests.iter().find(|r| r.context.is_some()).and_then(|r| r.cache_read),
         instructions_loaded: loaded,
         untouched,
+        outside_reads: Vec::new(),
         outcome: t.result.clone(),
     }
 }
@@ -335,7 +351,10 @@ pub fn evaluate(task: &Task, info: &RunInfo, played: &[Played], read_file: impl 
         .zip(scored)
         .enumerate()
         .map(|(k, (p, s))| SessionResult {
-            session: record(&p.transcript, info.profile, p.loaded.clone(), p.untouched.clone()),
+            session: Session {
+                outside_reads: outside_reads(&p.transcript.calls, info.workdir, info.additional_dirs, p.transcript.session_id.as_deref()),
+                ..record(&p.transcript, info.profile, p.loaded.clone(), p.untouched.clone())
+            },
             score: s.score,
             followed: s.followed,
             saved: saved(task, k, &p.transcript, native.as_deref()),
@@ -423,13 +442,18 @@ fn touched(call: &ToolCall) -> Option<&str> {
     file_path(call).or_else(|| call.input.get("notebook_path").and_then(Value::as_str))
 }
 
+/// Whether `path`, as [`norm_path`] writes it, does not start from the working directory.
+fn is_absolute(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    path.starts_with('/') || path.starts_with('~') || (bytes.len() > 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'/')
+}
+
 /// A path as the session wrote it, resolved from `workdir` (already as
 /// [`norm_path`] writes it): the same file is found whatever its separators,
 /// case, `.` and `..`.
 fn resolved(path: &str, workdir: &str) -> String {
     let path = norm_path(path);
-    let drive = path.as_bytes().get(1) == Some(&b':') && path.as_bytes()[0].is_ascii_alphabetic();
-    let joined = if path.starts_with('/') || path.starts_with('~') || drive { path } else { format!("{workdir}/{path}") };
+    let joined = if is_absolute(&path) { path } else { format!("{workdir}/{path}") };
     let mut parts: Vec<&str> = Vec::new();
     for part in joined.split('/') {
         match part {
@@ -441,6 +465,49 @@ fn resolved(path: &str, workdir: &str) -> String {
         }
     }
     format!("{}{}", if joined.starts_with('/') { "/" } else { "" }, parts.join("/"))
+}
+
+/// The paths a call reads: `Read` its file; `Grep` and `Glob` their `path`, and
+/// their `pattern` when it is an absolute path; `LSP` its file; and `Bash` each
+/// word of its command that is an absolute path or goes up with `..`.
+fn read_paths(call: &ToolCall) -> Vec<String> {
+    let text = |key: &str| call.input.get(key).and_then(Value::as_str).map(str::to_owned);
+    match call.name.as_str() {
+        "Read" => text("file_path").into_iter().collect(),
+        "Grep" | "Glob" => text("path").into_iter().chain(text("pattern").filter(|p| is_absolute(&norm_path(p)))).collect(),
+        "LSP" => text("filePath").or_else(|| text("file_path")).into_iter().collect(),
+        "Bash" => text("command")
+            .map(|line| {
+                line.split_whitespace()
+                    .map(|word| word.trim_matches(|c| "'\"`;&|()<>".contains(c)))
+                    .filter(|word| is_absolute(&norm_path(word)) || word.split(['/', '\\']).any(|part| part == ".."))
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+/// Every read of `calls`, a subagent's included, of a path outside `workdir` and
+/// the `additional` directories, each resolved from `workdir`. The files the
+/// client writes for the session and asks it to read hold its `session_id` in
+/// their path, and are not listed.
+pub fn outside_reads(calls: &[ToolCall], workdir: &Path, additional: &[String], session_id: Option<&str>) -> Vec<OutsideRead> {
+    let workdir = norm_path(&workdir.to_string_lossy());
+    let dirs: Vec<String> = std::iter::once(workdir.clone()).chain(additional.iter().map(|dir| norm_path(dir))).collect();
+    let id = session_id.filter(|id| !id.is_empty()).map(str::to_lowercase);
+    let mut found = Vec::new();
+    for call in calls {
+        for path in read_paths(call) {
+            let full = resolved(&path, &workdir);
+            let inside = dirs.iter().any(|dir| full == *dir || in_dir(&full, dir));
+            if !inside && !id.as_deref().is_some_and(|id| full.contains(id)) {
+                found.push(OutsideRead { tool: call.name.clone(), path, denied: call.is_error });
+            }
+        }
+    }
+    found
 }
 
 /// What `second` reads again after `first`, from `workdir`; a path is compared
@@ -1142,6 +1209,13 @@ fn clear_dir(dir: &Path, keep: &[&str]) -> Result<(), RunError> {
     Ok(())
 }
 
+/// The directories besides the working directory that the `settings.json` of the plan lets the client read.
+fn additional_dirs(plan: &RunPlan) -> Vec<String> {
+    let settings = plan.files.iter().find(|(path, _)| path.file_name().is_some_and(|name| name == "settings.json"));
+    let settings: Value = settings.and_then(|(_, body)| serde_json::from_str(body).ok()).unwrap_or(Value::Null);
+    settings["permissions"]["additionalDirectories"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_owned).collect()
+}
+
 // The native memory file of the plan, when its arm has one.
 fn native_memory_file(plan: &RunPlan) -> Option<&Path> {
     plan.files.iter().map(|(path, _)| path.as_path()).find(|path| path.ends_with("memory/MEMORY.md"))
@@ -1453,7 +1527,20 @@ fn score_run(root: &Path, record: &Value, branch: Option<Shape>) -> Result<RunRe
     let out_dir = branch_dir.unwrap_or_else(|| root.to_owned());
     let workdir = Layout { root: out_dir.clone() }.workdir();
     let read_file = |rel: &str| task::is_relative_inside(rel).then(|| std::fs::read_to_string(workdir.join(rel)).ok()).flatten();
-    let info = RunInfo { arm: &arm, client: client.name(), profile, lang, shape, noise_rules, workdir: &workdir, native_dir: native_memory_file(&plan).and_then(Path::parent) };
+    // The client ran in the working directory of the run, which a fork moves under its branch afterwards.
+    let ran_in = Layout { root: root.to_owned() }.workdir();
+    let additional = additional_dirs(&plan);
+    let info = RunInfo {
+        arm: &arm,
+        client: client.name(),
+        profile,
+        lang,
+        shape,
+        noise_rules,
+        workdir: &ran_in,
+        additional_dirs: &additional,
+        native_dir: native_memory_file(&plan).and_then(Path::parent),
+    };
     let mut result = evaluate(&task, &info, &played, read_file);
     for (session, (started, ended)) in result.sessions.iter_mut().zip(times) {
         session.session.started_at = started;
@@ -1634,7 +1721,7 @@ mod tests {
 "#;
 
     fn info(arm: &str, profile: Profile) -> RunInfo<'_> {
-        RunInfo { arm, client: "replay", profile, lang: None, shape: Shape::Split, noise_rules: 0, workdir: Path::new(WORKDIR), native_dir: None }
+        RunInfo { arm, client: "replay", profile, lang: None, shape: Shape::Split, noise_rules: 0, workdir: Path::new(WORKDIR), additional_dirs: &[], native_dir: None }
     }
 
     fn played(stream: &str) -> Played {
@@ -2123,6 +2210,104 @@ mod tests {
         assert_eq!(rereads(&first, &second, Path::new(WORKDIR), None), Rereads { again: 600, to_edit: 0 }, "the note the first session left is what a memory replaces");
     }
 
+    /// The calls of a session that began as `session_id`, each with its tool, its input and whether
+    /// its result came back marked as an error; the first of them is a subagent's.
+    fn calls_of(session_id: &str, calls: &[(&str, Value, bool)]) -> Vec<ToolCall> {
+        let mut stream = format!("{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"{session_id}\"}}\n");
+        for (i, (name, input, denied)) in calls.iter().enumerate() {
+            let mut event = json!({"type": "assistant", "message": {"content": [{"type": "tool_use", "id": format!("c{i}"), "name": name, "input": input}]}});
+            if i == 0 {
+                event["parent_tool_use_id"] = json!("agent");
+            }
+            stream.push_str(&format!("{event}\n"));
+            let result = json!({"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": format!("c{i}"), "is_error": denied, "content": "x"}]}});
+            stream.push_str(&format!("{result}\n"));
+        }
+        stream::parse(&stream).calls
+    }
+
+    #[test]
+    fn a_read_outside_the_working_directory_is_listed_whatever_the_tool() {
+        let memory = "/runs/r/claude-config/projects/p/memory";
+        let calls = calls_of(
+            "s1",
+            &[
+                ("Read", json!({"file_path": "/etc/hosts"}), false),
+                ("Read", json!({"file_path": "../run.json"}), false),
+                ("Read", json!({"file_path": "src/a.py"}), false),
+                ("Read", json!({"file_path": "/RUNS\\R\\Work/src/a.py"}), false),
+                ("Read", json!({"file_path": "src/../../stream-1.jsonl"}), false),
+                ("Grep", json!({"pattern": "port", "path": "/runs/r/fork"}), false),
+                ("Grep", json!({"pattern": "port"}), false),
+                ("Grep", json!({"pattern": "port", "path": "src"}), false),
+                ("Glob", json!({"pattern": "/runs/r/stream-*.jsonl"}), false),
+                ("Glob", json!({"pattern": "**/*.py"}), false),
+                ("LSP", json!({"operation": "hover", "filePath": "/runs/r/run.json"}), false),
+                ("Bash", json!({"command": "ls src && cat ../run.json | wc -l; ls /runs/r/fork \"/tmp/x y\""}), false),
+                ("Bash", json!({"command": "ls src -a"}), false),
+                ("Read", json!({"file_path": format!("{memory}/MEMORY.md")}), false),
+                ("Write", json!({"file_path": "/runs/r/run.json", "content": "x"}), false),
+            ],
+        );
+        let work = Path::new(WORKDIR);
+        let listed = |additional: &[String]| -> Vec<(String, String)> {
+            outside_reads(&calls, work, additional, Some("s1")).into_iter().map(|r| (r.tool, r.path)).collect()
+        };
+        let pair = |tool: &str, path: &str| (tool.to_owned(), path.to_owned());
+        let all = [
+            pair("Read", "/etc/hosts"),
+            pair("Read", "../run.json"),
+            pair("Read", "src/../../stream-1.jsonl"),
+            pair("Grep", "/runs/r/fork"),
+            pair("Glob", "/runs/r/stream-*.jsonl"),
+            pair("LSP", "/runs/r/run.json"),
+            pair("Bash", "../run.json"),
+            pair("Bash", "/runs/r/fork"),
+            pair("Bash", "/tmp/x"),
+        ];
+        let mut expected = all.to_vec();
+        expected.push(pair("Read", &format!("{memory}/MEMORY.md")));
+        expected.sort();
+        let mut found = listed(&[]);
+        found.sort();
+        assert_eq!(found, expected, "a write is no read, a path inside is not listed, and the native memory is outside until the plan adds it");
+        let mut with_memory = listed(&[memory.to_owned()]);
+        with_memory.sort();
+        let mut without = all.to_vec();
+        without.sort();
+        assert_eq!(with_memory, without, "a directory the plan adds is a working directory");
+    }
+
+    #[test]
+    fn a_denied_read_outside_is_listed_and_is_no_artifact() {
+        let calls = calls_of(
+            "s1",
+            &[
+                ("Read", json!({"file_path": "../run.json"}), false),
+                ("Grep", json!({"pattern": "x", "path": "/runs/r/fork"}), true),
+                ("Read", json!({"file_path": "src/a.py"}), false),
+            ],
+        );
+        let found = outside_reads(&calls, Path::new(WORKDIR), &[], Some("s1"));
+        assert_eq!(
+            found,
+            [
+                OutsideRead { tool: "Read".into(), path: "../run.json".into(), denied: false },
+                OutsideRead { tool: "Grep".into(), path: "/runs/r/fork".into(), denied: true },
+            ]
+        );
+    }
+
+    #[test]
+    fn the_files_the_client_writes_for_the_session_are_not_outside() {
+        let own = "/runs/r/claude-config/projects/p/Session-ABC/tool-results/b1.txt";
+        let calls = calls_of("session-abc", &[("Read", json!({"file_path": own}), false), ("Bash", json!({"command": format!("head {own}")}), false)]);
+        assert_eq!(outside_reads(&calls, Path::new(WORKDIR), &[], Some("session-abc")), []);
+        let other = outside_reads(&calls, Path::new(WORKDIR), &[], Some("session-xyz"));
+        assert_eq!(other.len(), 2, "the file of another session is outside: {other:?}");
+        assert_eq!(outside_reads(&calls, Path::new(WORKDIR), &[], None).len(), 2, "a session that never said its id");
+    }
+
     #[test]
     fn a_continued_session_has_rereads_and_no_relay_overhead() {
         let first = session_of(1000, &[("Read", json!({"file_path": "a.py"}), 1)]);
@@ -2178,7 +2363,9 @@ mod tests {
             r#"{"type":"system","subtype":"init","session_id":"s1","mcp_servers":[]}"#.to_owned() + "\n",
             line(json!({"type": "assistant", "message": {"content": [
                 {"type": "tool_use", "id": "w1", "name": "Write", "input": {"file_path": memory.join("notes.md"), "content": "timeout 4.5-41"}},
-                {"type": "tool_use", "id": "m1", "name": "mcp__clawg-dev__save_memory", "input": {"content": "Timeout decision\nUse 4.5-41 as http_timeout."}}]}})),
+                {"type": "tool_use", "id": "m1", "name": "mcp__clawg-dev__save_memory", "input": {"content": "Timeout decision\nUse 4.5-41 as http_timeout."}},
+                {"type": "tool_use", "id": "r1", "name": "Read", "input": {"file_path": memory.join("MEMORY.md")}},
+                {"type": "tool_use", "id": "r2", "name": "Read", "input": {"file_path": "../run.json"}}]}})),
             line(json!({"type": "user", "message": {"content": [
                 {"type": "tool_result", "tool_use_id": "w1", "content": "written"}, {"type": "tool_result", "tool_use_id": "m1", "content": "saved"}]}})),
             r#"{"type":"result","subtype":"success","is_error":false,"result":"Noted."}"#.to_owned() + "\n",
@@ -2207,6 +2394,12 @@ mod tests {
         assert_eq!(brought(1, "4.5-41"), Some((TracerFate::Used, vec!["context".to_owned()])), "the prompt of the session before, and the file the agent wrote");
         assert_eq!(brought(0, "4.5-41"), None, "a session does not follow its own fact");
         assert_eq!(r.facts, [Fact { tracer: "4.5-41".into(), born: 1, class: FactClass::Used }]);
+        assert_eq!(
+            r.sessions[0].session.outside_reads,
+            [OutsideRead { tool: "Read".into(), path: "../run.json".into(), denied: false }],
+            "the plan of a4 lets it read its native memory, and the file of the run beside the working directory is outside"
+        );
+        assert!(r.sessions[1].session.outside_reads.is_empty());
         assert!(r.score.success && r.score.ended, "{:?}", r.score);
         assert_eq!(r.score.checks.len(), 2);
         assert_eq!((r.overhead, r.rereads), (None, Some(Rereads::default())), "the second session continues the conversation");
