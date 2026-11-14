@@ -125,7 +125,20 @@ pub struct Session {
     /// hook of every arm writes.
     #[serde(default)]
     pub instructions_loaded: Vec<Loaded>,
+    /// What the task asked this session to leave untouched, and whether it did.
+    #[serde(default)]
+    pub untouched: Vec<UntouchedEntry>,
     pub outcome: Option<Outcome>,
+}
+
+/// An entry of a session's `untouched`, as the working directory held it when
+/// the session ended.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UntouchedEntry {
+    pub path: String,
+    pub text: String,
+    /// The file held the text: the session did what it was asked not to.
+    pub present: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -221,6 +234,7 @@ pub struct Played {
     pub transcript: Transcript,
     pub delivered: Vec<String>,
     pub loaded: Vec<Loaded>,
+    pub untouched: Vec<UntouchedEntry>,
 }
 
 /// What a run is besides the sessions it played.
@@ -272,7 +286,7 @@ fn saved(task: &Task, k: usize, t: &Transcript, native_dir: Option<&str>) -> Vec
         .collect()
 }
 
-fn record(t: &Transcript, profile: Profile, loaded: Vec<Loaded>) -> Session {
+fn record(t: &Transcript, profile: Profile, loaded: Vec<Loaded>, untouched: Vec<UntouchedEntry>) -> Session {
     let server = profile.mcp_server_name();
     let prefix = format!("mcp__{server}__");
     let mut clawg_calls = BTreeMap::new();
@@ -300,6 +314,7 @@ fn record(t: &Transcript, profile: Profile, loaded: Vec<Loaded>) -> Session {
         request_tokens: t.requests.iter().filter_map(|r| r.context).collect(),
         first_request_cache_read: t.requests.iter().find(|r| r.context.is_some()).and_then(|r| r.cache_read),
         instructions_loaded: loaded,
+        untouched,
         outcome: t.result.clone(),
     }
 }
@@ -320,7 +335,7 @@ pub fn evaluate(task: &Task, info: &RunInfo, played: &[Played], read_file: impl 
         .zip(scored)
         .enumerate()
         .map(|(k, (p, s))| SessionResult {
-            session: record(&p.transcript, info.profile, p.loaded.clone()),
+            session: record(&p.transcript, info.profile, p.loaded.clone(), p.untouched.clone()),
             score: s.score,
             followed: s.followed,
             saved: saved(task, k, &p.transcript, native.as_deref()),
@@ -788,6 +803,12 @@ fn read_run(root: &Path) -> Result<(RunPlan, Client), RunError> {
     Ok((plan, client))
 }
 
+/// The task `prepare` recorded in `root`'s `run.json`.
+fn read_task(root: &Path) -> Result<Task, RunError> {
+    let mut record = read_record(root)?;
+    serde_json::from_value(record["task"].take()).map_err(|e| RunError::NotARun(root.to_owned(), e.to_string()))
+}
+
 fn read_record(root: &Path) -> Result<Value, RunError> {
     let path = root.join(RUN_FILE);
     let text = std::fs::read_to_string(&path).map_err(io(&path))?;
@@ -804,12 +825,14 @@ fn read_record(root: &Path) -> Result<Value, RunError> {
 /// binary, is the replay client.
 pub fn execute(root: &Path, agent_eval: &Path) -> Result<(), RunError> {
     let (plan, client) = read_run(root)?;
+    let task = read_task(root)?;
     let layout = Layout { root: root.to_owned() };
+    let stage = Stage { plan: &plan, client: &client, layout: &layout, agent_eval, task: &task };
     if read_shape(&read_record(root)?) == Shape::Both {
-        return fork(&plan, &client, &layout, agent_eval);
+        return fork(stage);
     }
     let Some(daemon) = &plan.daemon else {
-        return play(&plan, &client, &layout, agent_eval);
+        return play(&stage);
     };
     let served = Served::start(daemon, &plan.env, root, root.join(SERVE_LOG))?;
     served.listening(&daemon.state_file)?;
@@ -818,7 +841,7 @@ pub fn execute(root: &Path, agent_eval: &Path) -> Result<(), RunError> {
     let session = served
         .ready(&daemon.status, &plan.env, root, &mut log, &log_path)
         .and_then(|()| plan.before.iter().try_for_each(|step| run_step(step, &plan.env, root, &mut log, &log_path)))
-        .and_then(|()| play(&plan, &client, &layout, agent_eval));
+        .and_then(|()| play(&stage));
     let stopped = plan.after.iter().try_for_each(|step| run_step(step, &plan.env, root, &mut log, &log_path));
     let gone = served.gone_within(EXIT_BUDGET);
     session?;
@@ -835,11 +858,21 @@ fn read_shape(record: &Value) -> Shape {
     serde_json::from_value(record["shape"].clone()).unwrap_or_default()
 }
 
-/// Plays the sessions of `plan` in order.
-fn play(plan: &RunPlan, client: &Client, layout: &Layout, agent_eval: &Path) -> Result<(), RunError> {
-    for (i, planned) in plan.sessions().into_iter().enumerate() {
+/// What playing a session needs besides which one it is.
+#[derive(Clone, Copy)]
+struct Stage<'a> {
+    plan: &'a RunPlan,
+    client: &'a Client,
+    layout: &'a Layout,
+    agent_eval: &'a Path,
+    task: &'a Task,
+}
+
+/// Plays the sessions of the plan in order.
+fn play(stage: &Stage) -> Result<(), RunError> {
+    for (i, planned) in stage.plan.sessions().into_iter().enumerate() {
         let k = i + 1;
-        play_session(plan, client, layout, agent_eval, k, planned, &format!("session-{k}.jsonl"))?;
+        play_session(stage, k, planned, &format!("session-{k}.jsonl"))?;
     }
     Ok(())
 }
@@ -848,8 +881,10 @@ fn play(plan: &RunPlan, client: &Client, layout: &Layout, agent_eval: &Path) -> 
 /// file `replayed` of its directory. Before it, the native memory the agent
 /// finds is copied to `memory-before-K.md`; after it, in a run of several, the
 /// instruction files the client loaded move to `instructions-K.jsonl`, so each
-/// session has its own. A session that is not the last must end well.
-fn play_session(plan: &RunPlan, client: &Client, layout: &Layout, agent_eval: &Path, k: usize, planned: &Step, replayed: &str) -> Result<(), RunError> {
+/// session has its own, and what the task asked it to leave untouched is read
+/// into `untouched-K.json`. A session that is not the last must end well.
+fn play_session(stage: &Stage, k: usize, planned: &Step, replayed: &str) -> Result<(), RunError> {
+    let Stage { plan, client, layout, agent_eval, task } = *stage;
     let of = plan.sessions().len();
     if let Some(memory) = native_memory_file(plan).filter(|m| m.is_file()) {
         let copy = layout.root.join(format!("memory-before-{k}.md"));
@@ -862,6 +897,13 @@ fn play_session(plan: &RunPlan, client: &Client, layout: &Layout, agent_eval: &P
     if code != Some(0) {
         return Err(RunError::Client { code, log });
     }
+    let held = task.sessions.get(k - 1).map_or(&[][..], |s| &s.untouched[..]);
+    if !held.is_empty() {
+        let workdir = layout.workdir();
+        let entries = untouched_entries(held, |rel| task::is_relative_inside(rel).then(|| std::fs::read_to_string(workdir.join(rel)).ok()).flatten());
+        let path = layout.root.join(untouched_file(k));
+        std::fs::write(&path, serde_json::to_string_pretty(&entries).expect("JSON serializes") + "\n").map_err(io(&path))?;
+    }
     if k < of {
         let stream_path = layout.root.join(stream_name);
         let stream = std::fs::read_to_string(&stream_path).map_err(io(&stream_path))?;
@@ -873,6 +915,20 @@ fn play_session(plan: &RunPlan, client: &Client, layout: &Layout, agent_eval: &P
         std::fs::rename(&instructions, &moved).map_err(io(&moved))?;
     }
     Ok(())
+}
+
+/// Each file a session had to leave untouched, with whether it holds the text
+/// it must not hold yet: a missing file does not, and the text is looked for
+/// as a file check does, reading CRLF as LF.
+fn untouched_entries(held: &[task::Untouched], read_file: impl Fn(&str) -> Option<String>) -> Vec<UntouchedEntry> {
+    held.iter()
+        .map(|u| UntouchedEntry { path: u.path.clone(), text: u.text.clone(), present: read_file(&u.path).is_some_and(|body| score::file_has(&body, &u.text)) })
+        .collect()
+}
+
+/// The name of the file with what session `k` had to leave untouched.
+fn untouched_file(k: usize) -> String {
+    format!("untouched-{k}.json")
 }
 
 /// What a run that forks does, in order.
@@ -930,18 +986,15 @@ fn branch_step(planned: &Step, branch: Shape) -> Step {
 /// A run that forks: its state, the daemon it serves and the log of what its
 /// clawg commands printed, as the steps of [`fork_steps`] go by.
 struct Fork<'a> {
-    plan: &'a RunPlan,
-    client: &'a Client,
-    layout: &'a Layout,
-    agent_eval: &'a Path,
+    stage: Stage<'a>,
     journal: Option<(File, PathBuf)>,
     served: Option<Served>,
 }
 
-fn fork(plan: &RunPlan, client: &Client, layout: &Layout, agent_eval: &Path) -> Result<(), RunError> {
-    let mut run = Fork { plan, client, layout, agent_eval, journal: None, served: None };
+fn fork(stage: Stage) -> Result<(), RunError> {
+    let mut run = Fork { stage, journal: None, served: None };
     let mut outcome = Ok(());
-    for step in fork_steps(plan.daemon.is_some()) {
+    for step in fork_steps(stage.plan.daemon.is_some()) {
         outcome = run.apply(step);
         if outcome.is_err() {
             break;
@@ -956,11 +1009,11 @@ fn fork(plan: &RunPlan, client: &Client, layout: &Layout, agent_eval: &Path) -> 
 
 impl Fork<'_> {
     fn data_dir(&self) -> Option<&Path> {
-        self.plan.daemon.as_ref().and_then(|d| d.state_file.parent())
+        self.stage.plan.daemon.as_ref().and_then(|d| d.state_file.parent())
     }
 
     fn apply(&mut self, step: ForkStep) -> Result<(), RunError> {
-        let (plan, layout) = (self.plan, self.layout);
+        let (plan, layout) = (self.stage.plan, self.stage.layout);
         let root = &layout.root;
         match step {
             ForkStep::Start { branch, seed } => {
@@ -986,7 +1039,7 @@ impl Fork<'_> {
                     None => (planned.clone(), format!("session-{k}.jsonl")),
                     Some(b) => (branch_step(planned, b), format!("{}-{k}.jsonl", b.as_str())),
                 };
-                play_session(plan, self.client, layout, self.agent_eval, k, &step, &replayed)
+                play_session(&self.stage, k, &step, &replayed)
             }
             ForkStep::Stop => {
                 let served = self.served.take().expect("a daemon is stopped only after it started");
@@ -1003,7 +1056,7 @@ impl Fork<'_> {
                 let work = dir.join("work");
                 std::fs::rename(layout.workdir(), &work).map_err(io(&work))?;
                 let (stream, log) = session_files(2, 2);
-                for name in [stream, log, instructions_file(2, 2), "memory-before-2.md".to_owned()] {
+                for name in [stream, log, instructions_file(2, 2), "memory-before-2.md".to_owned(), untouched_file(2)] {
                     let from = root.join(&name);
                     if from.is_file() {
                         std::fs::rename(&from, dir.join(&name)).map_err(io(&from))?;
@@ -1368,7 +1421,11 @@ fn score_run(root: &Path, record: &Value, branch: Option<Shape>) -> Result<RunRe
         texts.extend(earlier_prompts(&task, shape, k));
         let meta = std::fs::metadata(&stream_path).map_err(io(&stream_path))?;
         times.push((utc(meta.created()), utc(meta.modified())));
-        played.push(Played { transcript: stream::parse(&stream), delivered: texts, loaded });
+        let untouched = match read_optional(&dir.join(untouched_file(k)))? {
+            Some(text) => serde_json::from_str(&text).map_err(|e| not_a_run(&format!("{}: {e}", untouched_file(k))))?,
+            None => Vec::new(),
+        };
+        played.push(Played { transcript: stream::parse(&stream), delivered: texts, loaded, untouched });
     }
     let out_dir = branch_dir.unwrap_or_else(|| root.to_owned());
     let workdir = Layout { root: out_dir.clone() }.workdir();
@@ -1545,7 +1602,7 @@ mod tests {
     }
 
     fn played(stream: &str) -> Played {
-        Played { transcript: stream::parse(stream), delivered: Vec::new(), loaded: Vec::new() }
+        Played { transcript: stream::parse(stream), delivered: Vec::new(), loaded: Vec::new(), untouched: Vec::new() }
     }
 
     #[test]
@@ -1953,7 +2010,7 @@ mod tests {
     }
 
     fn played_of(first: Transcript, second: Transcript) -> [Played; 2] {
-        [first, second].map(|transcript| Played { transcript, delivered: Vec::new(), loaded: Vec::new() })
+        [first, second].map(|transcript| Played { transcript, delivered: Vec::new(), loaded: Vec::new(), untouched: Vec::new() })
     }
 
     #[test]

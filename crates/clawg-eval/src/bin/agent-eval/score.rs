@@ -164,7 +164,7 @@ fn is_assignment(word: &str) -> bool {
 
 /// A checkout with `core.autocrlf` leaves CRLF in the fixtures and the agent's edits keep it,
 /// while a check is written with LF.
-fn file_has(body: &str, text: &str) -> bool {
+pub fn file_has(body: &str, text: &str) -> bool {
     body.replace("\r\n", "\n").contains(&text.replace("\r\n", "\n"))
 }
 
@@ -406,8 +406,7 @@ mod tests {
             ("ls src || eza docs", 1),
             ("ls; eza", 1),
             ("ls & eza", 1),
-            ("ls
-eza", 1),
+            ("ls\neza", 1),
             ("echo $(eza src)", 1),
             ("echo `eza src`", 1),
             ("(eza src)", 1),

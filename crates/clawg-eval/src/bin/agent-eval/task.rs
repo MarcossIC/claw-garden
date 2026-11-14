@@ -79,6 +79,20 @@ pub struct SessionSpec {
     /// Checks on this session alone, of those that read its stream.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub checks: Vec<Check>,
+    /// What this session must not do yet: it decides nothing about success,
+    /// and a session that does it leaves the run with nothing to compare.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub untouched: Vec<Untouched>,
+}
+
+/// A file the working directory holds when a session ends, which must not
+/// hold `text` yet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Untouched {
+    /// Relative to the working directory.
+    pub path: String,
+    pub text: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -231,6 +245,13 @@ pub fn problems(task: &Task) -> Vec<String> {
         }
         for check in session.checks.iter().filter(|c| outside_the_shell(c, &task.shell)) {
             out.push(format!("session {n} has the check {}, which names a command that is not in the shell", check.describe()));
+        }
+        for entry in &session.untouched {
+            if !is_relative_inside(&entry.path) {
+                out.push(format!("session {n} leaves {:?} untouched, a path that leaves the working directory", entry.path));
+            } else if entry.text.trim().is_empty() {
+                out.push(format!("session {n} leaves {:?} untouched with an empty text", entry.path));
+            }
         }
         for tracer in &session.tracers {
             if tracer.trim().is_empty() {
@@ -656,6 +677,35 @@ mod tests {
         ));
         let found = problems(&parse(&in_a_session).unwrap()).join("; ");
         assert!(found.contains("session 1 has the check eza was run at most 0 times, which names a command that is not in the shell"), "{found}");
+    }
+
+    #[test]
+    fn a_session_names_what_it_must_leave_untouched() {
+        let with = |untouched: &str| {
+            parse(&TASK.replace(
+                "\"prompt\": \"Which port does staging use?\"",
+                &format!(r#""sessions": [{{"prompt": "Decide.", "untouched": {untouched}}}, {{"prompt": "Apply."}}]"#),
+            ))
+            .unwrap()
+        };
+        let task = with(r#"[{"path": "src/a.py", "text": "x"}, {"path": "HISTORY.md", "text": "FORK"}]"#);
+        assert_eq!(task.sessions[0].untouched, [Untouched { path: "src/a.py".into(), text: "x".into() }, Untouched { path: "HISTORY.md".into(), text: "FORK".into() }]);
+        assert!(task.sessions[1].untouched.is_empty());
+        assert!(problems(&task).is_empty(), "{:?}", problems(&task));
+        let plain = serde_json::to_value(&task).unwrap();
+        assert!(plain["sessions"][1].get("untouched").is_none(), "{plain}");
+        assert!(parse(&TASK.replace("\"prompt\": \"Which", "\"untouched\": [], \"prompt\": \"Which")).is_err(), "only a session leaves something untouched");
+        assert!(parse(&TASK.replace("\"prompt\": \"Which port does staging use?\"", r#""sessions": [{"prompt": "p", "untouched": [{"path": "a"}]}]"#)).is_err(), "an entry has its text");
+
+        let found = problems(&with(r#"[{"path": "../a.py", "text": "x"}, {"path": "/etc/hosts", "text": "x"}, {"path": "a.py", "text": " "}, {"path": "", "text": "x"}]"#)).join("; ");
+        for expected in [
+            "session 1 leaves \"../a.py\" untouched, a path that leaves the working directory",
+            "session 1 leaves \"/etc/hosts\" untouched, a path that leaves the working directory",
+            "session 1 leaves \"a.py\" untouched with an empty text",
+            "session 1 leaves \"\" untouched, a path that leaves the working directory",
+        ] {
+            assert!(found.contains(expected), "{expected} missing from: {found}");
+        }
     }
 
     #[test]

@@ -5,7 +5,12 @@
   "sessions": [
     {
       "prompt": "Before we change anything I need an inventory of how timeouts are handled in this repository. Read every module under src/requests/, the tests under tests/, docs/user/advanced.rst, docs/user/quickstart.rst and HISTORY.md, and write the inventory to a new file called TIMEOUTS.md at the top of the project. For each place that sets, passes, validates, documents or tests a timeout, give the file and the line number and say in one sentence what it does. Do not touch any code yet. For the work that comes later I have decided this for our fork: the library gets a module constant named FORK_DEFAULT_TIMEOUT in src/requests/adapters.py, with the value (4.5, 41), a connect timeout of 4.5 seconds and a read timeout of 41 seconds, used whenever a caller passes no timeout. Do not apply it now.",
-      "tracers": ["FORK_DEFAULT_TIMEOUT", "4.5, 41"]
+      "tracers": ["FORK_DEFAULT_TIMEOUT", "4.5, 41"],
+      "untouched": [
+        {"path": "src/requests/adapters.py", "text": "FORK_DEFAULT_TIMEOUT"},
+        {"path": "HISTORY.md", "text": "FORK_DEFAULT_TIMEOUT"},
+        {"path": "docs/user/advanced.rst", "text": "4.5, 41"}
+      ]
     },
     {
       "prompt": "The review approved the decision I gave you in the previous session about the default timeout. Apply it now: implement it in the library, document it for users in docs/user/advanced.rst, and add a note about it to HISTORY.md under the newest heading. Do not change anything else."

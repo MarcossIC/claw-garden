@@ -5,11 +5,13 @@
   "sessions": [
     {
       "prompt": "Read src/requests/utils.py and get to know how it handles URLs. Later we will add a function there called redact_url_credentials that returns a URL with the user name and the password in it hidden. For that function I have decided that each credential is replaced by [hidden]. Do not change any file now; just read the module.",
-      "tracers": ["[hidden]"]
+      "tracers": ["[hidden]"],
+      "untouched": [{"path": "src/requests/utils.py", "text": "def redact_url_credentials"}]
     },
     {
       "prompt": "I revised the decision for redact_url_credentials: each credential is replaced by _:_ from now on, and the earlier choice no longer applies. Separately, add a test to tests/test_utils.py that checks that requests.utils.to_key_val_list(None) returns None. Do not write the function yet.",
-      "tracers": ["_:_"]
+      "tracers": ["_:_"],
+      "untouched": [{"path": "src/requests/utils.py", "text": "def redact_url_credentials"}]
     },
     {
       "prompt": "Now implement redact_url_credentials in src/requests/utils.py as it was decided, and add a test for it to tests/test_utils.py."

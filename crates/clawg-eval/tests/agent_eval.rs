@@ -422,6 +422,58 @@ fn the_replayed_relay_example_follows_its_fact_to_the_second_session() {
 }
 
 #[test]
+fn a_session_that_wrote_what_it_had_to_leave_untouched_is_found() {
+    let dir = tempfile::tempdir().unwrap();
+    let (output, run) = replay_of(dir.path(), "example-relay-port", "a3", &relay_replays(), clawg());
+    ok(&output);
+    let held = serde_json::json!([{"path": "notes.md", "text": "confirmed", "present": false}]);
+    let r = result(&run);
+    assert_eq!(r["sessions"][0]["session"]["untouched"], held, "the stream of the example leaves notes.md as the prompt asks: {r:#}");
+    assert_eq!(r["sessions"][1]["session"]["untouched"], serde_json::json!([]));
+    let written: Value = serde_json::from_str(&std::fs::read_to_string(run.join("untouched-1.json")).unwrap()).unwrap();
+    assert_eq!(written, held, "the entries are written when the session ends, before the next one begins");
+    assert!(!run.join("untouched-2.json").exists(), "a session that names nothing leaves no file");
+
+    let early = dir.path().join("early");
+    std::fs::create_dir_all(&early).unwrap();
+    std::fs::copy(relay_replays().join("session-2.jsonl"), early.join("session-2.jsonl")).unwrap();
+    let first = std::fs::read_to_string(relay_replays().join("session-1.jsonl")).unwrap();
+    std::fs::write(early.join("session-1.jsonl"), first.replace(r#""content":"staging port: 48213\n""#, r#""content":"staging port: 48213\nconfirmed\n""#)).unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let (output, again) = replay_of(other.path(), "example-relay-port", "a3", &early, clawg());
+    ok(&output);
+    let present = serde_json::json!([{"path": "notes.md", "text": "confirmed", "present": true}]);
+    assert_eq!(result(&again)["sessions"][0]["session"]["untouched"], present);
+    let written: Value = serde_json::from_str(&std::fs::read_to_string(again.join("untouched-1.json")).unwrap()).unwrap();
+    assert_eq!(written, present);
+}
+
+#[test]
+fn the_tasks_that_hold_a_decision_back_name_what_stays_untouched() {
+    let tasks = |id: &str| -> Value {
+        let text = std::fs::read_to_string(data().join("tasks").join(format!("{id}.json"))).unwrap();
+        serde_json::from_str(&text).unwrap()
+    };
+    let untouched = |id: &str, session: usize| -> Vec<(String, String)> {
+        tasks(id)["sessions"][session]["untouched"]
+            .as_array()
+            .map(|a| a.iter().map(|e| (e["path"].as_str().unwrap().to_owned(), e["text"].as_str().unwrap().to_owned())).collect())
+            .unwrap_or_default()
+    };
+    let pair = |path: &str, text: &str| (path.to_owned(), text.to_owned());
+    assert_eq!(
+        untouched("requests-timeout-decision-relay", 0),
+        [pair("src/requests/adapters.py", "FORK_DEFAULT_TIMEOUT"), pair("HISTORY.md", "FORK_DEFAULT_TIMEOUT"), pair("docs/user/advanced.rst", "4.5, 41")]
+    );
+    assert!(untouched("requests-timeout-decision-relay", 1).is_empty());
+    let redact = [pair("src/requests/utils.py", "def redact_url_credentials")];
+    assert_eq!(untouched("requests-redact-decision-revised", 0), redact);
+    assert_eq!(untouched("requests-redact-decision-revised", 1), redact);
+    assert!(untouched("requests-redact-decision-revised", 2).is_empty(), "the last session is the one that applies it");
+    assert_eq!(untouched("example-relay-port", 0), [pair("notes.md", "confirmed")]);
+}
+
+#[test]
 fn the_replayed_missing_command_example_counts_its_failures() {
     let dir = tempfile::tempdir().unwrap();
     let streams = data().join("replays").join("example-missing-command.a0");

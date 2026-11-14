@@ -9,7 +9,8 @@
       "tracers": ["48213"],
       "checks": [
         {"kind": "tool_called", "name": "Write"}
-      ]
+      ],
+      "untouched": [{"path": "notes.md", "text": "confirmed"}]
     },
     {
       "prompt": "Which port did I say the staging service would move to? Answer with the number, and add a line to notes.md saying you confirmed it."
