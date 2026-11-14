@@ -8,7 +8,7 @@ artifacts:
   spec: done  # RE1 a RE9
   design: done  # D1 a D9
   tasks: done  # siete commits del producto, la verificación local y uno del arnés
-  apply: partial  # tareas 1 a 7 hechas; falta la 9, el brazo a3-notools, que espera a 129 y a arm.rs
-  verify: pending
+  apply: done  # tareas 1 a 7 y la 9, el brazo a3-notools; la 8 es la verificación local
+  verify: partial  # RE1 a RE8 sin CRITICAL, con tres WARNING antes de archivar; RE9 y la tarea 8, pendientes (verify.md)
   archive: pending
 updated: 2026-11-14

@@ -60,8 +60,8 @@ TDD estricto: en cada tarea con conducta nueva el test va primero y falla, por l
 
 ## 9. La medición en agent-eval (RE9), cuando 129 esté aplicado
 
-- [ ] RED: `a3_notools_is_a3_without_the_tool_hooks`, `a3_notools_reads_and_prints_by_its_name` (`arm.rs`).
-- [ ] GREEN: `Arm::A3NoTools`, con su nombre en el parseo y en el reporte. La tarea, el shell y el check son los de 129.
+- [x] RED: `a3_notools_is_a3_without_the_tool_hooks`, `a3_notools_reads_and_prints_by_its_name` (`arm.rs`).
+- [x] GREEN: `Arm::A3NoTools`, con su nombre en el parseo y en el reporte. La tarea, el shell y el check son los de 129.
 - Commit: `feat(agent-eval): add arm a3-notools, a3 without the post-tool hooks`
 
 ## Después de este cambio
