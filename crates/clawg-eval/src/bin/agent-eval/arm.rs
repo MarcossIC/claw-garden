@@ -5,6 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
+use clawg_cli::mcp::protocol::Variant;
 use clawg_cli::setup::{self, FileStep, Mode, State};
 use clawg_core::paths::Profile;
 use clawg_core::preferences::{Lang, Preferences};
@@ -24,6 +25,9 @@ pub enum Arm {
     A3,
     /// A3 with the client's tool search off, so clawg's tools load up front.
     A3Eager,
+    /// A3 with the short protocol block `clawg setup claude-code --protocol
+    /// short` writes.
+    A3Short,
     /// The client's native memory holding the same facts, without clawg.
     A4,
     /// A3 without the tools that read memories back: only what reaches the
@@ -74,7 +78,7 @@ impl Shape {
     }
 }
 
-pub const ARMS: [Arm; 9] = [Arm::A0, Arm::A2, Arm::A3, Arm::A3Eager, Arm::A4, Arm::B, Arm::L0, Arm::L1, Arm::L2];
+pub const ARMS: [Arm; 10] = [Arm::A0, Arm::A2, Arm::A3, Arm::A3Eager, Arm::A3Short, Arm::A4, Arm::B, Arm::L0, Arm::L1, Arm::L2];
 
 /// The tools arm B takes away.
 const READ_TOOLS: [&str; 3] = ["search_memory", "read_memory", "list_memories"];
@@ -100,6 +104,7 @@ impl Arm {
             Arm::A2 => "a2",
             Arm::A3 => "a3",
             Arm::A3Eager => "a3-eager",
+            Arm::A3Short => "a3-short",
             Arm::A4 => "a4",
             Arm::B => "b",
             Arm::L0 => "l0",
@@ -110,17 +115,17 @@ impl Arm {
 
     /// Whether a run of this arm starts clawg: its daemon, its bridge, its hooks.
     pub fn has_clawg(self) -> bool {
-        matches!(self, Arm::A2 | Arm::A3 | Arm::A3Eager | Arm::B | Arm::L0 | Arm::L1 | Arm::L2)
+        matches!(self, Arm::A2 | Arm::A3 | Arm::A3Eager | Arm::A3Short | Arm::B | Arm::L0 | Arm::L1 | Arm::L2)
     }
 
     /// Whether the arm has the hooks `setup` writes in `settings.json`.
     fn has_setup(self) -> bool {
-        matches!(self, Arm::A3 | Arm::A3Eager | Arm::B | Arm::L0 | Arm::L1 | Arm::L2)
+        matches!(self, Arm::A3 | Arm::A3Eager | Arm::A3Short | Arm::B | Arm::L0 | Arm::L1 | Arm::L2)
     }
 
     /// Whether the arm has the protocol block `setup` writes in `CLAUDE.md`.
     fn has_protocol(self) -> bool {
-        matches!(self, Arm::A3 | Arm::A3Eager | Arm::B)
+        matches!(self, Arm::A3 | Arm::A3Eager | Arm::A3Short | Arm::B)
     }
 
     /// Whether the arm delivers the seeded rules and, if it does, whether
@@ -300,7 +305,7 @@ pub fn plan(task: &Task, arm: Arm, layout: &Layout, options: &Options) -> Result
             instructions: setup::File { path: layout.config_dir().join("CLAUDE.md"), text: None },
             language: options.lang,
             version: setup::own_version()?,
-            protocol: None,
+            protocol: (arm == Arm::A3Short).then_some(Variant::Short),
         };
         let setup_plan = setup::plan(&state, Mode::Install)?;
         servers.insert(
@@ -537,7 +542,7 @@ mod tests {
         assert!(with(by_glob.clone(), Arm::L2).is_ok(), "l2 delivers the rules with globs by file, so nothing goes at startup");
         assert!(matches!(with(by_glob, Arm::L1), Err(ArmError::StartupTooLong { .. })));
 
-        for arm in [Arm::A3, Arm::A4, Arm::L0] {
+        for arm in [Arm::A3, Arm::A3Short, Arm::A4, Arm::L0] {
             assert!(with(rules(300, "{}"), arm).is_ok(), "{arm:?} has no startup hook of the harness");
         }
     }
@@ -552,6 +557,31 @@ mod tests {
             assert_eq!(file(&l0, name), file(&a3, name), "{name}");
         }
         assert_eq!((&l0.daemon, &l0.before, &l0.after, &l0.client.args), (&a3.daemon, &a3.before, &a3.after, &a3.client.args));
+    }
+
+    #[test]
+    fn a3_short_is_a3_with_the_short_block() {
+        let own = setup::own_version().unwrap();
+        let a3 = plan(&task(true), Arm::A3, &layout(), &options(None)).unwrap();
+        let short = plan(&task(true), Arm::A3Short, &layout(), &options(None)).unwrap();
+        let full_block = file(&a3, "CLAUDE.md").unwrap();
+        assert!(full_block.contains(&format!("<!-- clawg {own} -->")) && full_block.contains("## How to write a save"), "a3 keeps the whole block");
+        let block = file(&short, "CLAUDE.md").unwrap();
+        assert!(block.contains(&format!("<!-- clawg {own} protocol=short -->")), "{block}");
+        assert!(block.contains("## Session summary") && block.contains("## After a compaction"), "{block}");
+        assert!(!block.contains("## How to write a save") && block.len() < full_block.len() / 4, "{block}");
+
+        let without_block = |plan: &RunPlan| RunPlan {
+            arm: String::new(),
+            files: plan.files.iter().filter(|(path, _)| !path.ends_with("CLAUDE.md")).cloned().collect(),
+            ..plan.clone()
+        };
+        assert_eq!(without_block(&short), without_block(&a3), "everything but the block is a3's");
+
+        let spanish = plan(&task(true), Arm::A3Short, &layout(), &options(Some(Lang::Es))).unwrap();
+        let block = file(&spanish, "CLAUDE.md").unwrap();
+        assert!(block.contains("## Resumen de sesión") && !block.contains("## Cómo escribir un save"), "{block}");
+        assert!(file(&plan(&task(true), Arm::L0, &layout(), &options(None)).unwrap(), "CLAUDE.md").is_none(), "l0 has none");
     }
 
     #[test]
@@ -608,7 +638,7 @@ mod tests {
             assert!(plan.files.iter().any(|(p, _)| *p == layout().config_dir().join("settings.json")), "{}", arm.as_str());
             let settings = settings(&plan);
             assert_eq!(settings["hooks"]["InstructionsLoaded"], logged, "{}", arm.as_str());
-            let with_setup = matches!(arm, Arm::A3 | Arm::A3Eager | Arm::B | Arm::L0 | Arm::L1 | Arm::L2);
+            let with_setup = matches!(arm, Arm::A3 | Arm::A3Eager | Arm::A3Short | Arm::B | Arm::L0 | Arm::L1 | Arm::L2);
             assert_eq!(settings["hooks"]["UserPromptSubmit"].is_array(), with_setup, "setup's hooks stay: {}", arm.as_str());
         }
     }
@@ -673,7 +703,7 @@ mod tests {
     #[test]
     fn the_arms_with_clawg_start_a_daemon_of_the_run_on_an_ephemeral_port() {
         let with_daemon: Vec<Arm> = ARMS.into_iter().filter(|arm| plan(&task(true), *arm, &layout(), &options(None)).unwrap().daemon.is_some()).collect();
-        assert_eq!(with_daemon, [Arm::A2, Arm::A3, Arm::A3Eager, Arm::B, Arm::L0, Arm::L1, Arm::L2]);
+        assert_eq!(with_daemon, [Arm::A2, Arm::A3, Arm::A3Eager, Arm::A3Short, Arm::B, Arm::L0, Arm::L1, Arm::L2]);
 
         let plan = plan(&task(true), Arm::A3, &layout(), &options(None)).unwrap();
         let daemon = plan.daemon.unwrap();

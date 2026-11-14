@@ -117,7 +117,7 @@ agent-eval hook-log FILE
                  input it gets to FILE, one line each.
 
 RUN_OPTIONS:
-  --task ID --arm a0|a2|a3|a3-eager|a4|b|l0|l1|l2 --out DIR --clawg PATH --model M
+  --task ID --arm a0|a2|a3|a3-eager|a3-short|a4|b|l0|l1|l2 --out DIR --clawg PATH --model M
   [--effort E] [--max-budget-usd N] [--claude-version V] [--profile dev|prod]
   [--lang en|es] [--data DIR] [--sessions split|joined|both] [--noise NAME]
 
