@@ -302,8 +302,11 @@ fn the_second_replayed_session_finds_what_the_first_one_saved() {
 /// The example relay played `--sessions both` under `arm`: its first session
 /// once, and its second one continued and then new.
 fn fork(dir: &Path, arm: &str) -> (Output, PathBuf) {
+    fork_of(dir, arm, &data().join("replays").join(format!("example-relay-port.{arm}.both")))
+}
+
+fn fork_of(dir: &Path, arm: &str, streams: &Path) -> (Output, PathBuf) {
     let out = dir.join(format!("fork.{arm}"));
-    let streams = data().join("replays").join(format!("example-relay-port.{arm}.both"));
     let output = agent_eval(&[
         "run",
         "--task",
@@ -329,6 +332,77 @@ fn result_of(run: &Path, branch: &str, id: &str) -> String {
     let stream = std::fs::read_to_string(run.join(branch).join("stream-2.jsonl")).unwrap();
     let line = stream.lines().find(|l| l.contains(&format!("\"{id}\"")) && l.contains("tool_result")).expect("the result of the call");
     serde_json::from_str::<Value>(line).unwrap()["message"]["content"][0]["content"].as_str().unwrap().to_owned()
+}
+
+/// A stream whose replay cannot be applied, so the client exits with an error before it prints anything.
+const UNPLAYABLE: &str = "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"Edit\",\"input\":{\"file_path\":\"missing.txt\",\"old_string\":\"x\",\"new_string\":\"y\"}}]}}\n";
+
+#[test]
+fn a_failed_run_of_one_session_leaves_its_result() {
+    let dir = tempfile::tempdir().unwrap();
+    let stream = dir.path().join("failing.jsonl");
+    std::fs::write(&stream, UNPLAYABLE).unwrap();
+
+    let (output, run) = replay_of(dir.path(), "example-staging-port", "a0", &stream, clawg());
+
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(stderr(&output).contains("the client exited"), "{}", stderr(&output));
+    let r = result(&run);
+    assert_eq!(r["score"]["success"], false, "{r:#}");
+    assert_eq!(r["artifacts"], serde_json::json!([{"cause": "session_failed", "session": 1}]), "{r:#}");
+    assert!(stdout(&output).contains("failure"), "the summary of what ran is printed: {}", stdout(&output));
+}
+
+#[test]
+fn a_branch_whose_second_session_fails_keeps_its_files_and_is_scored() {
+    let dir = tempfile::tempdir().unwrap();
+    let streams = dir.path().join("streams");
+    std::fs::create_dir_all(&streams).unwrap();
+    let source = data().join("replays").join("example-relay-port.a3.both");
+    for name in ["session-1.jsonl", "joined-2.jsonl"] {
+        std::fs::copy(source.join(name), streams.join(name)).unwrap();
+    }
+    std::fs::write(streams.join("split-2.jsonl"), UNPLAYABLE).unwrap();
+
+    let (output, run) = fork_of(dir.path(), "a3", &streams);
+
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    let split = run.join("split");
+    assert!(split.join("stream-2.jsonl").is_file() && split.join("client-2.log").is_file() && split.join("work").join("notes.md").is_file(), "the failed branch keeps its files");
+    assert!(!run.join("stream-2.jsonl").exists() && !run.join("work").exists(), "nothing of it is left in the root");
+    let failed = result(&split);
+    assert_eq!(failed["sessions"].as_array().unwrap().len(), 2, "scored as a run of two sessions: {failed:#}");
+    assert_eq!((&failed["score"]["ended"], &failed["score"]["success"]), (&Value::Bool(false), &Value::Bool(false)));
+    assert_eq!(failed["artifacts"], serde_json::json!([{"cause": "session_failed", "session": 2}]), "{failed:#}");
+    assert_eq!(result(&run.join("joined"))["score"]["success"], true, "the branch that ran before it is scored too");
+    assert!(stdout(&output).contains("2 sessions split") && stdout(&output).contains("2 sessions joined"), "{}", stdout(&output));
+    assert!(!run.join("home").join(".clawg-dev").join("daemon.json").exists(), "clawg stop ended the daemon");
+
+    let costs = agent_eval(&["costs", "--runs", dir.path().to_str().unwrap()]);
+    ok(&costs);
+    let lines: Vec<String> = stdout(&costs).lines().skip(1).map(str::to_owned).collect();
+    assert_eq!(lines.len(), 3, "a line for each session that left a stream: {lines:?}");
+    assert!(lines.iter().any(|l| l.starts_with("fork.a3/split,") && l.ends_with(",2,split")), "the session that failed has its line: {lines:?}");
+}
+
+#[test]
+fn a_fork_whose_first_session_fails_leaves_the_result_of_that_session_in_its_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let streams = dir.path().join("streams");
+    std::fs::create_dir_all(&streams).unwrap();
+    let source = data().join("replays").join("example-relay-port.a3.both");
+    for name in ["joined-2.jsonl", "split-2.jsonl"] {
+        std::fs::copy(source.join(name), streams.join(name)).unwrap();
+    }
+    std::fs::write(streams.join("session-1.jsonl"), UNPLAYABLE).unwrap();
+
+    let (output, run) = fork_of(dir.path(), "a3", &streams);
+
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    let r = result(&run);
+    assert_eq!((r["sessions"].as_array().unwrap().len(), &r["paired"]), (1, &Value::Null), "a result of the first session, with no pair: {r:#}");
+    assert_eq!(r["score"]["success"], false);
+    assert!(!run.join("joined").exists() && !run.join("split").exists(), "no branch ran");
 }
 
 #[test]
@@ -600,7 +674,7 @@ fn a_client_that_fails_still_stops_the_daemon_of_its_run() {
     let log = clawg_log(&run);
     assert!(log.contains(&imported(noise() + 1)) && log.contains(" stop --profile dev"), "{log}");
     assert!(!run.join("home").join(".clawg-dev").join("daemon.json").exists(), "clawg stop ended the daemon");
-    assert!(!run.join("result.json").exists());
+    assert_eq!(result(&run)["score"]["success"], false, "the session left a stream, so it is scored");
 }
 
 #[test]

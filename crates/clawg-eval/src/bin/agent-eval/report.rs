@@ -996,6 +996,24 @@ mod tests {
     }
 
     #[test]
+    fn the_costs_count_the_sessions_of_a_run_that_failed() {
+        let [joined, mut split] = pair("r1", (true, false), &[1000], (0.35, Some(900)), 0.25);
+        let failed = split.1.sessions.last_mut().unwrap();
+        failed.session.outcome = None;
+        failed.session.started_at = Some("2026-11-11 15:00:00 UTC".to_owned());
+        split.1.session = failed.session.clone();
+        let csv = costs(&[joined, split]);
+        let keyed: Vec<(String, String)> = csv.lines().skip(1).map(|l| (l.split(',').next().unwrap().to_owned(), l.rsplit(',').take(2).collect::<Vec<_>>().join(","))).collect();
+        assert_eq!(
+            keyed,
+            [("r1/joined".into(), "joined,1".into()), ("r1/joined".into(), "joined,2".into()), ("r1/split".into(), "split,2".into())],
+            "the failed session has its line, without figures, and the shared first session is listed once: {csv}"
+        );
+        let last = csv.lines().last().unwrap();
+        assert!(last.contains("2026-11-11 15:00:00 UTC") && last.ends_with(",,,,,,,,,,2,split"), "{last}");
+    }
+
+    #[test]
     fn the_costs_have_a_line_per_session_with_its_number_and_shape() {
         let fork = pair("r1", (true, true), &[1000], (0.35, Some(900)), 0.25);
         let mut once = result(&spec("short", "a0"));

@@ -262,7 +262,8 @@ pub fn artifacts(sessions: &[SessionResult], shape: Shape, server: Option<&str>)
         if record.outcome.as_ref().is_none_or(|o| o.is_error) {
             causes.push(ArtifactCause::SessionFailed);
         }
-        if server.is_some_and(|name| !record.mcp_servers.iter().any(|(n, status)| n == name && status == "connected")) {
+        // A stream that never reached its `init` says nothing about the server.
+        if record.session_id.is_some() && server.is_some_and(|name| !record.mcp_servers.iter().any(|(n, status)| n == name && status == "connected")) {
             causes.push(ArtifactCause::ServerNotConnected);
         }
         let before = i.checked_sub(1).and_then(|j| sessions[j].session.request_tokens.last());
@@ -1148,15 +1149,23 @@ struct Fork<'a> {
 fn fork(stage: Stage) -> Result<(), RunError> {
     let mut run = Fork { stage, journal: None, served: None };
     let mut outcome = Ok(());
+    let mut failed_at = None;
     for step in fork_steps(stage.plan.daemon.is_some()) {
         outcome = run.apply(step);
         if outcome.is_err() {
+            failed_at = Some(step);
             break;
         }
     }
-    if outcome.is_err() && run.served.is_some() {
-        // The daemon is stopped whatever failed; the failure is what is reported.
-        let _ = run.apply(ForkStep::Stop);
+    if outcome.is_err() {
+        // The daemon is stopped whatever failed, and the second session of a branch keeps its
+        // files, so it is scored: the failure is what is reported.
+        if run.served.is_some() {
+            let _ = run.apply(ForkStep::Stop);
+        }
+        if let Some(ForkStep::Play { k: 2, branch: Some(branch) }) = failed_at {
+            let _ = run.apply(ForkStep::Keep(branch));
+        }
     }
     outcome
 }
@@ -1515,7 +1524,8 @@ fn instructions_file(k: usize, of: usize) -> String {
 /// each began with and the working directory, and writes `result.json`. A run
 /// stopped by a session that failed is scored with the sessions it played. A
 /// run that forked has no result of its own: each branch that ran is scored
-/// as a run of two sessions of its shape, in its own directory.
+/// as a run of two sessions of its shape, in its own directory; when none ran,
+/// the first session is the run's result.
 pub fn score_dir(root: &Path) -> Result<Vec<RunResult>, RunError> {
     let record = read_record(root)?;
     if read_shape(&record) != Shape::Both {
@@ -1527,7 +1537,8 @@ pub fn score_dir(root: &Path) -> Result<Vec<RunResult>, RunError> {
         .map(|branch| score_run(root, &record, Some(branch)))
         .collect::<Result<_, _>>()?;
     if results.is_empty() {
-        return Err(RunError::NotARun(root.to_owned(), "no branch of the fork ran".to_owned()));
+        // The first session failed: its result is the run's, with no pair.
+        return Ok(vec![score_run(root, &record, None)?]);
     }
     Ok(results)
 }
@@ -2404,6 +2415,7 @@ mod tests {
     /// A session that ended well, connected to clawg, with nothing else to report.
     fn healthy() -> SessionResult {
         let mut s = walked(&[], &[]);
+        s.session.session_id = Some("s".to_owned());
         s.session.mcp_servers = vec![("clawg-dev".to_owned(), "connected".to_owned())];
         s.session.outcome = Some(Outcome { subtype: "success".to_owned(), ..Outcome::default() });
         s
@@ -2426,6 +2438,8 @@ mod tests {
         third.session.outcome = Some(Outcome { is_error: true, ..Outcome::default() });
         let mut fourth = healthy();
         fourth.session.outcome = None;
+        fourth.session.session_id = None;
+        fourth.session.mcp_servers = vec![];
         let sessions = [first, second, third, fourth];
         let found = |shape: Shape, server: Option<&str>, n: usize| artifacts(&sessions[..n], shape, server);
         let at = |cause: ArtifactCause, session: usize| Artifact { cause, session };
@@ -2442,7 +2456,7 @@ mod tests {
                 at(ArtifactCause::CompactedEarly, 3),
                 at(ArtifactCause::SessionFailed, 4),
             ],
-            "in order of session and then of cause; a read that was denied and a compaction in the last session are none, and a read found twice counts once"
+            "in order of session and then of cause; a read that was denied and a compaction in the last session are none, a read found twice counts once, and a stream with no init has no server to miss"
         );
         assert_eq!(
             found(Shape::Split, None, 2),

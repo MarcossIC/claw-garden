@@ -450,11 +450,9 @@ fn execute(command: Command) -> Result<(), String> {
             let layout = prepare(&args, &t, noise, &client)?;
             let exe = std::env::current_exe().map_err(|e| format!("cannot locate agent-eval: {e}"))?;
             if let Err(failed) = run::execute(&layout.root, &exe) {
-                // The sessions that ran before the failure are still a result.
-                if t.prompts().len() > 1 {
-                    for result in run::score_dir(&layout.root).unwrap_or_default() {
-                        println!("{}", run::summary(&result));
-                    }
+                // Every session that left a stream is still a result: it was paid for.
+                for result in run::score_dir(&layout.root).unwrap_or_default() {
+                    println!("{}", run::summary(&result));
                 }
                 return Err(failed.to_string());
             }
