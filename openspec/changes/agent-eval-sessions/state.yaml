@@ -8,8 +8,8 @@ artifacts:
   spec: done  # AS1 a AS12; AS1 modifica MD3 de specs/eval
   design: done  # D1 a D13
   tasks: done  # 14 tareas; la campaña paga, en «Después de este cambio»
-  apply: in_progress  # tareas 1 a 7 hechas; siguen la 8 (puntaje por sesión y camino de un hecho) a la 14
-  verify: pending
+  apply: in_progress  # las 14 tareas hechas
+  verify: done  # la suite y los dos clippy pasan; queda el CI de Linux y Windows, ver verify.md
   archive: pending
 decisions:
   long_session: continue_per_part  # un proceso por parte, el segundo con --continue (D1)
