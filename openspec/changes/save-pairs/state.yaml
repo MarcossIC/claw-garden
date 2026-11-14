@@ -1,0 +1,15 @@
+change: save-pairs
+objective: "1"
+depends_on: []
+phase: tasks
+artifacts:
+  exploration: skipped  # el análisis es docs/completed-impl/hipotesis/A1/informe.md
+  proposal: done
+  spec: done
+  design: skipped  # dos decisiones chicas, con sus alternativas en la propuesta
+  tasks: done
+  apply: pending
+  verify: pending
+  archive: pending
+main_spec: openspec/specs/disputes/spec.md
+updated: 2026-11-13
