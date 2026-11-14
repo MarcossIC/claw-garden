@@ -67,6 +67,8 @@ Sólo para tareas de dos sesiones. Con más, habría que decidir en qué sesión
 | Dejar los resultados grabados | La sesión 2 no puede encontrar lo que guardó la 1: el relevo, la bifurcación y la clasificación de un hecho no se podrían ensayar sin pagar |
 | Llamar a la API HTTP del daemon | No es el camino del agente: se saltea el puente, sus textos y el proyecto que resuelve por el directorio |
 
+En seco el modelo es el falso, que arma el vector con un hash del texto: una búsqueda encuentra lo que guardó la sesión anterior sólo por un identificador en común (con letras, como `STAGING_PORT`) o por el texto idéntico, así que los streams de ejemplo buscan por identificador.
+
 Decidir qué llamadas van al servidor y armar el stream con las respuestas es puro; hablar con el proceso es la única parte con I/O. No corre los hooks del cliente: lo que inyecta `session-start` no se ensaya así.
 
 ## D7. La memoria nativa: el archivo real, cortado como lo carga el cliente
