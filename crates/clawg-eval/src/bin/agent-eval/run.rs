@@ -1212,7 +1212,7 @@ impl Fork<'_> {
                 stopped?;
                 if gone { Ok(()) } else { Err(RunError::DaemonStayed(served.log.clone())) }
             }
-            ForkStep::Save => save_state(layout, self.data_dir()),
+            ForkStep::Save => save_state(layout),
             ForkStep::Keep(branch) => {
                 let dir = root.join(branch.as_str());
                 std::fs::create_dir_all(&dir).map_err(io(&dir))?;
@@ -1233,38 +1233,33 @@ impl Fork<'_> {
 }
 
 /// Copies what the first session left to `fork/`: the working directory, the
-/// client's configuration and, when the run has clawg, its data directory
-/// without the models. The daemon is not running: on Windows a file it holds
-/// open cannot be replaced.
-fn save_state(layout: &Layout, data: Option<&Path>) -> Result<(), RunError> {
+/// client's configuration and the whole home, which holds the data directory of
+/// clawg and whatever else the client or a hook wrote there, without the
+/// models. The daemon is not running: on Windows a file it holds open cannot be
+/// replaced.
+fn save_state(layout: &Layout) -> Result<(), RunError> {
     let fork = layout.root.join(FORK_DIR);
     copy_dir(&layout.workdir(), &fork.join("work"), &[])?;
     copy_dir(&layout.config_dir(), &fork.join("claude-config"), &[])?;
-    if let Some(data) = data {
-        copy_dir(data, &fork.join("data"), &[MODELS_DIR])?;
-    }
-    Ok(())
+    copy_dir(&layout.home(), &fork.join("home"), &[MODELS_DIR])
 }
 
 /// Puts back what [`save_state`] copied, in the same paths: whatever a branch
-/// added or changed is removed first, and the models stay where they are.
+/// added or changed is removed first, and the models in `data`, the data
+/// directory of clawg when the run has one, stay where they are.
 fn restore_state(layout: &Layout, data: Option<&Path>) -> Result<(), RunError> {
     let fork = layout.root.join(FORK_DIR);
-    let mut parts: Vec<(PathBuf, PathBuf, &[&str])> =
-        vec![(fork.join("work"), layout.workdir(), &[]), (fork.join("claude-config"), layout.config_dir(), &[])];
-    if let Some(data) = data {
-        parts.push((fork.join("data"), data.to_owned(), &[MODELS_DIR]));
-    }
-    for (saved, live, keep) in parts {
-        clear_dir(&live, keep)?;
+    let models = data.map(|data| data.join(MODELS_DIR));
+    for (saved, live) in [(fork.join("work"), layout.workdir()), (fork.join("claude-config"), layout.config_dir()), (fork.join("home"), layout.home())] {
+        clear_dir(&live, models.as_deref())?;
         copy_dir(&saved, &live, &[])?;
     }
     Ok(())
 }
 
-/// Removes what `dir` holds except the entries named in `keep`; a directory
-/// that is not there holds nothing.
-fn clear_dir(dir: &Path, keep: &[&str]) -> Result<(), RunError> {
+/// Removes what `dir` holds except `keep`, a path below it, and the directories
+/// that lead to it; a directory that is not there holds nothing.
+fn clear_dir(dir: &Path, keep: Option<&Path>) -> Result<(), RunError> {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -1272,12 +1267,19 @@ fn clear_dir(dir: &Path, keep: &[&str]) -> Result<(), RunError> {
     };
     for entry in entries {
         let entry = entry.map_err(io(dir))?;
-        if keep.iter().any(|name| entry.file_name() == *name) {
+        let path = entry.path();
+        if keep == Some(path.as_path()) {
             continue;
         }
-        let path = entry.path();
-        let removed = if entry.file_type().map_err(io(&path))?.is_dir() { std::fs::remove_dir_all(&path) } else { std::fs::remove_file(&path) };
-        removed.map_err(io(&path))?;
+        if entry.file_type().map_err(io(&path))?.is_dir() {
+            if keep.is_some_and(|kept| kept.starts_with(&path)) {
+                clear_dir(&path, keep)?;
+            } else {
+                std::fs::remove_dir_all(&path).map_err(io(&path))?;
+            }
+        } else {
+            std::fs::remove_file(&path).map_err(io(&path))?;
+        }
     }
     Ok(())
 }
@@ -2634,26 +2636,33 @@ mod tests {
         assert_eq!(branch_step(&alone, Shape::Split), alone);
     }
 
+    fn put(path: PathBuf, text: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+
+    fn read(path: PathBuf) -> Option<String> {
+        std::fs::read_to_string(path).ok()
+    }
+
     #[test]
-    fn a_restore_puts_back_the_work_the_config_and_the_data_but_leaves_the_models() {
+    fn a_fork_restores_the_whole_home_but_the_models() {
         let dir = tempfile::tempdir().unwrap();
         let layout = Layout { root: dir.path().join("run") };
         let data = layout.home().join(".clawg-dev");
-        let put = |path: PathBuf, text: &str| {
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(path, text).unwrap();
-        };
-        let read = |path: PathBuf| std::fs::read_to_string(path).ok();
         put(layout.workdir().join("src").join("a.txt"), "first");
         put(layout.config_dir().join("settings.json"), "config");
         put(data.join("memory.db"), "store");
         put(data.join("models").join("m.bin"), "model");
+        put(layout.home().join(".cache").join("tool.json"), "cache");
+        put(layout.home().join("rc"), "rc");
 
-        save_state(&layout, Some(&data)).unwrap();
+        save_state(&layout).unwrap();
         let saved = layout.root.join(FORK_DIR);
         assert_eq!(read(saved.join("work").join("src").join("a.txt")).as_deref(), Some("first"));
-        assert_eq!(read(saved.join("data").join("memory.db")).as_deref(), Some("store"));
-        assert!(!saved.join("data").join("models").exists(), "the models are not copied: no session writes them");
+        assert_eq!(read(saved.join("home").join(".clawg-dev").join("memory.db")).as_deref(), Some("store"));
+        assert_eq!(read(saved.join("home").join(".cache").join("tool.json")).as_deref(), Some("cache"), "what is in the home outside the data directory is saved too");
+        assert!(!saved.join("home").join(".clawg-dev").join("models").exists(), "the models are not copied: no session writes them");
 
         put(layout.workdir().join("src").join("a.txt"), "changed");
         put(layout.workdir().join("new.txt"), "new");
@@ -2661,6 +2670,9 @@ mod tests {
         put(data.join("memory.db"), "grown");
         put(data.join("extra.db"), "extra");
         put(data.join("models").join("m.bin"), "other model");
+        put(layout.home().join(".cache").join("tool.json"), "warm");
+        put(layout.home().join(".cache").join("more.json"), "more");
+        put(layout.home().join("dropped"), "left by the continued branch");
 
         restore_state(&layout, Some(&data)).unwrap();
 
@@ -2670,10 +2682,37 @@ mod tests {
         assert_eq!(read(layout.config_dir().join("settings.json")).as_deref(), Some("config"));
         assert_eq!(read(data.join("memory.db")).as_deref(), Some("store"));
         assert!(!data.join("extra.db").exists());
+        assert_eq!(read(layout.home().join(".cache").join("tool.json")).as_deref(), Some("cache"));
+        assert!(!layout.home().join(".cache").join("more.json").exists() && !layout.home().join("dropped").exists(), "a file the continued branch left in the home is gone");
+        assert_eq!(read(layout.home().join("rc")).as_deref(), Some("rc"));
         assert_eq!(read(data.join("models").join("m.bin")).as_deref(), Some("other model"), "the models stay where they are");
 
         std::fs::remove_dir_all(layout.workdir()).unwrap();
         restore_state(&layout, Some(&data)).unwrap();
         assert_eq!(read(layout.workdir().join("src").join("a.txt")).as_deref(), Some("first"), "a working directory moved away comes back");
+
+        put(layout.home().join("dropped"), "again");
+        restore_state(&layout, None).unwrap();
+        assert!(!layout.home().join("dropped").exists(), "a run without a data directory restores its home all the same");
+        assert_eq!(read(layout.home().join("rc")).as_deref(), Some("rc"));
+    }
+
+    #[test]
+    fn a_fork_puts_back_the_native_memory_the_continued_branch_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = dir.path().join("fixture");
+        std::fs::create_dir_all(&fixture).unwrap();
+        let layout = Layout { root: dir.path().join("run") };
+        let plan = prepare(&task(), Arm::A4, &fixture, &layout, &options(dir.path().join("clawg")), &Client::Claude).unwrap();
+        let memory = native_memory_file(&plan).unwrap().to_owned();
+        let before = read(memory.clone()).unwrap();
+
+        save_state(&layout).unwrap();
+        put(memory.clone(), &format!("{before}\nThe continued branch noted quokka\n"));
+        put(memory.with_file_name("topic.md"), "a note of the continued branch");
+        restore_state(&layout, None).unwrap();
+
+        assert_eq!(read(memory.clone()), Some(before), "the new branch finds the file as the first session left it");
+        assert!(!memory.with_file_name("topic.md").exists());
     }
 }
