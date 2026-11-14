@@ -115,6 +115,12 @@ pub struct Session {
     /// [`Transcript::first_request_tokens`].
     #[serde(default)]
     pub first_request_tokens: Option<u64>,
+    /// The context of every request of the main loop that has one, in order.
+    #[serde(default)]
+    pub request_tokens: Vec<u64>,
+    /// How much of the first request's context the cache gave.
+    #[serde(default)]
+    pub first_request_cache_read: Option<u64>,
     /// Each instruction file the client reported loading, from the log the
     /// hook of every arm writes.
     #[serde(default)]
@@ -286,6 +292,8 @@ fn record(t: &Transcript, profile: Profile, loaded: Vec<Loaded>) -> Session {
         unknown_lines: t.unknown_lines,
         invalid_lines: t.invalid_lines.clone(),
         first_request_tokens: t.first_request_tokens,
+        request_tokens: t.requests.iter().filter_map(|r| r.context).collect(),
+        first_request_cache_read: t.requests.iter().find(|r| r.context.is_some()).and_then(|r| r.cache_read),
         instructions_loaded: loaded,
         outcome: t.result.clone(),
     }

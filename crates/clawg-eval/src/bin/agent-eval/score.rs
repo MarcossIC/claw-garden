@@ -3,7 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::stream::{is_tool, ToolCall, Transcript};
+use crate::stream::{is_tool, tool_name, ToolCall, Transcript};
 use crate::task::{contains_ci, Check, Task};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -123,11 +123,6 @@ fn file_has(body: &str, text: &str) -> bool {
 /// writes or reads holds the id, and an id can hold a tracer.
 pub fn shows(text: &str, task_id: &str, tracer: &str) -> bool {
     contains_ci(&text.to_lowercase().replace(&task_id.to_lowercase(), ""), tracer)
-}
-
-/// A tool as the agent knows it: an MCP tool without its server's prefix.
-fn tool_name(name: &str) -> &str {
-    name.strip_prefix("mcp__").and_then(|rest| rest.split_once("__")).map_or(name, |(_, tool)| tool)
 }
 
 fn journey(t: &Transcript, task_id: &str, tracer: &str, delivered: &[String]) -> Journey {

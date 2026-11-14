@@ -37,6 +37,8 @@ pub struct Request {
     /// The input, cache written and cache read of its `usage`, which is
     /// everything the model read to answer it.
     pub context: Option<u64>,
+    /// How much of that context the cache gave: its cache read.
+    pub cache_read: Option<u64>,
     /// Indexes into [`Transcript::calls`] of the calls it made.
     pub calls: Vec<usize>,
 }
@@ -140,6 +142,11 @@ pub fn is_tool(call_name: &str, name: &str) -> bool {
     call_name == name || (call_name.starts_with("mcp__") && call_name.ends_with(&format!("__{name}")))
 }
 
+/// A tool as the agent knows it: an MCP tool without its server's prefix.
+pub fn tool_name(name: &str) -> &str {
+    name.strip_prefix("mcp__").and_then(|rest| rest.split_once("__")).map_or(name, |(_, tool)| tool)
+}
+
 pub fn parse(text: &str) -> Transcript {
     let mut t = Transcript::default();
     let mut searched = false;
@@ -176,13 +183,16 @@ pub fn parse(text: &str) -> Transcript {
                 if !subagent {
                     let message = event.get("message");
                     let id = message.and_then(|m| m.get("id")).and_then(Value::as_str).map(str::to_owned);
-                    let context = message.and_then(|m| m.get("usage")).map(|u| {
-                        let tokens = |name: &str| u.get(name).and_then(Value::as_u64).unwrap_or(0);
-                        tokens("input_tokens") + tokens("cache_creation_input_tokens") + tokens("cache_read_input_tokens")
-                    });
+                    let usage = message.and_then(|m| m.get("usage"));
+                    let tokens = |u: &Value, name: &str| u.get(name).and_then(Value::as_u64).unwrap_or(0);
+                    let context = usage.map(|u| tokens(u, "input_tokens") + tokens(u, "cache_creation_input_tokens") + tokens(u, "cache_read_input_tokens"));
+                    let cache_read = usage.map(|u| tokens(u, "cache_read_input_tokens"));
                     match t.requests.last_mut() {
-                        Some(last) if id.is_some() && last.id == id => last.context = last.context.or(context),
-                        _ => t.requests.push(Request { id, context, calls: Vec::new() }),
+                        Some(last) if id.is_some() && last.id == id => {
+                            last.context = last.context.or(context);
+                            last.cache_read = last.cache_read.or(cache_read);
+                        }
+                        _ => t.requests.push(Request { id, context, cache_read, calls: Vec::new() }),
                     }
                 }
                 for block in content(&event) {
@@ -420,6 +430,16 @@ not json
         assert_eq!((t.requests[1].context, t.requests[1].calls.clone()), (Some(1800), vec![2, 3]));
         assert_eq!((t.requests[2].context, t.requests[2].calls.len()), (None, 0), "a message without usage has no context");
         assert_eq!(t.first_request_tokens, Some(1000));
+    }
+
+    #[test]
+    fn a_request_tells_how_much_of_its_context_came_from_the_cache() {
+        let stream = message("m1", 1000, &call("a"), "null")
+            + &message("m1", 1000, &call("b"), "null")
+            + r#"{"type":"assistant","message":{"id":"m2","content":[{"type":"text","text":"no usage"}]}}"#;
+        let t = parse(&stream);
+        assert_eq!((t.requests[0].context, t.requests[0].cache_read), (Some(1000), Some(990)));
+        assert_eq!((t.requests[1].context, t.requests[1].cache_read), (None, None), "a message without usage reads nothing from the cache");
     }
 
     #[test]

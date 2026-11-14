@@ -26,6 +26,7 @@ agent-eval run RUN_OPTIONS (--replay STREAM | --max-budget-usd N --claude-versio
 agent-eval score --run DIR
 agent-eval report --runs DIR
 agent-eval costs --runs DIR
+agent-eval calls --runs DIR
 agent-eval replay-client STREAM [--mcp-config FILE]
 agent-eval hook-context FILE
 agent-eval hook-log FILE
@@ -73,15 +74,32 @@ agent-eval hook-log FILE
                  session, and the run as a whole. A run that a session stopped
                  is scored with the sessions that ran, and did not end.
   report         reads the result.json of every directory up to 3 levels
-                 below DIR and prints a Markdown table by task and arm: runs,
-                 successes, runs that did not end, mean cost, turns, seconds
-                 and clawg calls, the tracer fates summed, a totals line and
-                 the tokens of every model summed.
+                 below DIR and prints a Markdown table by task, arm and shape
+                 (split, joined): runs, successes, runs that did not end, mean
+                 cost, turns, seconds (of the whole run, the sum of its
+                 sessions) and clawg calls, the tracer fates summed, the first
+                 request tokens, the sessions per run, the median context of
+                 every request, the median relay overhead and the facts born
+                 in a session summed by what became of them, a totals line
+                 (the first session of a fork counted once) and the tokens of
+                 every model summed. Then, for the runs that forked, a table by
+                 task and arm with their pairs: how many each branch passed,
+                 how many the continued one passed and the new one failed, the
+                 median context at the fork and the median saving in cost of
+                 the new session over the continued one, of the pairs whose
+                 continuation read 80 % of its first request from the cache.
   costs          reads the same results and prints a CSV with a line per
                  session and model: when the session started and ended
                  (UTC), the credential that paid, the tokens by kind, the
-                 main loop's cache writes for 5 minutes and for 1 hour, and
-                 the client's estimate of the cost.
+                 main loop's cache writes for 5 minutes and for 1 hour, the
+                 client's estimate of the cost, and the number of the
+                 session and the shape of its run.
+  calls          reads the stream of every session below DIR and prints a
+                 table by tool: its calls, those that carry tokens of their
+                 own (alone in their message and followed by another request),
+                 and the median and p90 of the tokens they add to the context.
+                 A tool of a server whose median passes 1500 is noted as a
+                 candidate for a diet.
   replay-client  the client a dry run starts: prints STREAM after making
                  its file changes in the current directory. With the
                  --mcp-config of a run that has a server, each call of STREAM
@@ -146,6 +164,7 @@ enum Command {
     Score { dir: PathBuf },
     Report { dir: PathBuf },
     Costs { dir: PathBuf },
+    Calls { dir: PathBuf },
     ReplayClient { stream: PathBuf, mcp_config: Option<PathBuf> },
     HookContext { file: PathBuf },
     HookLog { file: PathBuf },
@@ -251,6 +270,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Command>, Str
         "score" => Command::Score { dir: PathBuf::from(required(&mut flags(rest, &["run"])?, "run")?) },
         "report" => Command::Report { dir: PathBuf::from(required(&mut flags(rest, &["runs"])?, "runs")?) },
         "costs" => Command::Costs { dir: PathBuf::from(required(&mut flags(rest, &["runs"])?, "runs")?) },
+        "calls" => Command::Calls { dir: PathBuf::from(required(&mut flags(rest, &["runs"])?, "runs")?) },
         "replay-client" => {
             let rest: Vec<String> = rest.collect();
             let (stream, mcp_config) = match rest.as_slice() {
@@ -428,13 +448,24 @@ fn execute(command: Command) -> Result<(), String> {
             Ok(())
         }
         Command::Report { dir } => {
-            let results = report::load(&dir).map_err(|e| e.to_string())?;
+            let named = report::load_named(&dir).map_err(|e| e.to_string())?;
+            let results: Vec<run::RunResult> = named.iter().map(|(_, r)| r.clone()).collect();
             print!("{}", report::render(&report::aggregate(&results)));
+            let forks = report::render_pairs(&report::pairs(&named));
+            if !forks.is_empty() {
+                print!("
+{forks}");
+            }
             Ok(())
         }
         Command::Costs { dir } => {
             let runs = report::load_named(&dir).map_err(|e| e.to_string())?;
             print!("{}", report::costs(&runs));
+            Ok(())
+        }
+        Command::Calls { dir } => {
+            let streams = report::load_streams(&dir).map_err(|e| e.to_string())?;
+            print!("{}", report::calls(&streams));
             Ok(())
         }
         Command::ReplayClient { stream, mcp_config } => {
@@ -539,6 +570,14 @@ mod tests {
         assert!(parse_args(args(&["report", "--run", "d"])).unwrap_err().contains("unknown argument --run"));
         assert_eq!(parse_args(args(&["--help"])), Ok(None));
         assert_eq!(parse_args(args(&["run", "-h"])), Ok(None));
+    }
+
+    #[test]
+    fn the_calls_command_parses() {
+        assert_eq!(parse_args(args(&["calls", "--runs", "d"])), Ok(Some(Command::Calls { dir: "d".into() })));
+        assert!(parse_args(args(&["calls"])).unwrap_err().contains("--runs is required"));
+        assert!(parse_args(args(&["calls", "--run", "d"])).unwrap_err().contains("unknown argument --run"));
+        assert!(HELP_TEXT.contains("agent-eval calls --runs DIR"));
     }
 
     #[test]
