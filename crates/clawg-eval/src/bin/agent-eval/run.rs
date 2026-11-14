@@ -625,6 +625,7 @@ pub fn prepare(task: &Task, arm: Arm, fixture: &Path, layout: &Layout, options: 
         "claude_version": options.claude_version,
         "client": client,
         "shape": options.shape,
+        "noise": options.noise_name,
         "noise_rules": options.noise.len(),
         "plan": plan,
     });
@@ -1512,6 +1513,7 @@ mod tests {
             claude_version: Some("2.1.300".into()),
             now_ms: 0,
             noise: Vec::new(),
+            noise_name: "noise".into(),
             shape: Shape::Split,
             agent_eval: PathBuf::from("/bin/agent-eval"),
         }
@@ -1565,7 +1567,9 @@ mod tests {
         std::fs::create_dir_all(&fixture).unwrap();
         let layout = Layout { root: dir.path().join("run") };
         prepare(&task(), Arm::A0, &fixture, &layout, &options(dir.path().join("clawg")), &Client::Claude).unwrap();
-        assert_eq!(read_record(&layout.root).unwrap()["shape"], "split");
+        let record = read_record(&layout.root).unwrap();
+        assert_eq!(record["shape"], "split");
+        assert_eq!((&record["noise"], &record["noise_rules"]), (&json!("noise"), &json!(0)), "the noise the run was seeded with, by name and by how many rules");
     }
 
     #[test]

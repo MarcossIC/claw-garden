@@ -136,6 +136,53 @@ fn the_example_tasks_are_valid_and_leak_no_tracer() {
     assert!(listed.contains("example-count-lines N"), "{listed}");
     assert!(noise() > 0);
     assert!(listed.contains(&format!("noise rules={}", noise())), "{listed}");
+    assert!(listed.contains("noise-300 rules=300"), "every noise is listed with its rules: {listed}");
+}
+
+#[test]
+fn the_large_noise_is_300_distinct_rules_older_than_a_week() {
+    let text = std::fs::read_to_string(data().join("noise-300.json")).unwrap();
+    let rules: Vec<Value> = serde_json::from_str(&text).unwrap();
+    assert_eq!(rules.len(), 300);
+    let titles: std::collections::BTreeSet<&str> = rules.iter().map(|r| r["content"].as_str().unwrap().lines().next().unwrap()).collect();
+    assert_eq!(titles.len(), 300, "every rule has a title of its own");
+    assert!(rules.iter().all(|r| r["age_days"].as_u64().unwrap() > 7), "older than 7 days, outside the recent context of the startup");
+    assert!(rules.iter().all(|r| r.get("rule").is_some()), "every one is a rule");
+    let always = rules.iter().filter(|r| r["rule"].get("paths").is_none()).count();
+    assert!(always >= 100, "enough rules without globs for the startup of l2 to be too long: {always}");
+}
+
+#[test]
+fn a_run_names_its_noise_and_l1_refuses_the_large_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let prepare = |arm: &str, out: &str, noise: &[&str]| {
+        let out = dir.path().join(out);
+        let mut args = vec!["prepare", "--task", "example-count-lines", "--arm", arm, "--out", out.to_str().unwrap(), "--clawg", clawg().to_str().unwrap(), "--model", "m"];
+        args.extend(noise);
+        (agent_eval(&args), out)
+    };
+
+    let (output, small) = prepare("a3", "small", &[]);
+    ok(&output);
+    let record: Value = serde_json::from_str(&std::fs::read_to_string(small.join("run.json")).unwrap()).unwrap();
+    assert_eq!((record["noise"].as_str(), record["noise_rules"].as_u64()), (Some("noise"), Some(noise() as u64)));
+
+    let (output, large) = prepare("a3", "large", &["--noise", "noise-300"]);
+    ok(&output);
+    let record: Value = serde_json::from_str(&std::fs::read_to_string(large.join("run.json")).unwrap()).unwrap();
+    assert_eq!((record["noise"].as_str(), record["noise_rules"].as_u64()), (Some("noise-300"), Some(300)));
+    assert_eq!(std::fs::read_to_string(large.join("seed.jsonl")).unwrap().lines().count(), 2 + 300, "the header, the project and the rules");
+
+    let (output, refused) = prepare("l1", "l1", &["--noise", "noise-300"]);
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(stderr(&output).contains("10000") && stderr(&output).contains("characters"), "{}", stderr(&output));
+    assert!(!refused.exists(), "nothing was laid out");
+
+    let (output, _) = prepare("a3", "missing", &["--noise", "noise-none"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr(&output).contains("noise-none.json"), "{}", stderr(&output));
+    let (output, _) = prepare("a3", "bad", &["--noise", "tasks"]);
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
 }
 
 #[test]

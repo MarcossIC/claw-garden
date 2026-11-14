@@ -117,7 +117,8 @@ pub struct Rule {
 
 /// The rules of other topics, in the data directory, that every arm with
 /// memory is seeded with besides a task's memories: what a real store holds.
-pub const NOISE_FILE: &str = "noise.json";
+/// A run seeds the noise it names, which is this one when it names none.
+pub const DEFAULT_NOISE: &str = "noise";
 
 fn default_type() -> String {
     "semantic_fact".to_owned()
@@ -184,6 +185,10 @@ pub enum TaskError {
     NoiseJson { path: PathBuf, source: serde_json::Error },
     #[error("{path}: {problems}")]
     Invalid { path: PathBuf, problems: String },
+    #[error("{0:?} is not a noise: its name is noise, or noise- and letters, digits and dashes")]
+    NoiseName(String),
+    #[error("{}: no such noise file", .0.display())]
+    NoNoise(PathBuf),
     #[error("two tasks have the id {0}")]
     DuplicateId(String),
     #[error("no task has the id {0}")]
@@ -295,13 +300,35 @@ fn memory_problems(name: &str, memory: &SeedMemory) -> Vec<String> {
     out
 }
 
-/// The noise of `data`, each memory a rule that holds no tracer of `tasks`;
-/// none when the directory has no [`NOISE_FILE`].
-pub fn load_noise(data: &Path, tasks: &[Task]) -> Result<Vec<SeedMemory>, TaskError> {
-    let path = data.join(NOISE_FILE);
+/// Whether `name` names a noise: [`DEFAULT_NOISE`], or that and a dash and a name
+/// in lowercase letters, digits and dashes, so it cannot reach another file.
+pub fn check_noise_name(name: &str) -> Result<(), TaskError> {
+    let named = name.strip_prefix("noise-").is_some_and(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'));
+    if name == DEFAULT_NOISE || named { Ok(()) } else { Err(TaskError::NoiseName(name.to_owned())) }
+}
+
+/// The names of the noises `data` holds, by file: every `noise.json` and `noise-NAME.json`.
+pub fn noise_names(data: &Path) -> Result<Vec<String>, TaskError> {
+    let entries = std::fs::read_dir(data).map_err(|source| TaskError::Read { path: data.to_owned(), source })?;
+    let mut names: Vec<String> = entries
+        .filter_map(|e| e.ok()?.file_name().into_string().ok())
+        .filter_map(|file| file.strip_suffix(".json").map(str::to_owned))
+        .filter(|name| check_noise_name(name).is_ok())
+        .collect();
+    names.sort();
+    Ok(names)
+}
+
+/// The noise `name` of `data`, each memory a rule that holds no tracer of
+/// `tasks`. The default noise is none when the directory has no file for it;
+/// any other that is not there is refused.
+pub fn load_noise(data: &Path, name: &str, tasks: &[Task]) -> Result<Vec<SeedMemory>, TaskError> {
+    check_noise_name(name)?;
+    let path = data.join(format!("{name}.json"));
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && name == DEFAULT_NOISE => return Ok(Vec::new()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(TaskError::NoNoise(path)),
         Err(source) => return Err(TaskError::Read { path, source }),
     };
     let noise: Vec<SeedMemory> = serde_json::from_str(&text).map_err(|source| TaskError::NoiseJson { path: path.clone(), source })?;
@@ -565,8 +592,8 @@ mod tests {
     #[test]
     fn the_noise_holds_no_tracer_born_in_a_session() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join(NOISE_FILE), r#"[{"content": "Defaults\nUse 4.5, 41 for every call.", "rule": {}}]"#).unwrap();
-        let found = load_noise(dir.path(), &[parse(SESSIONS).unwrap()]).unwrap_err().to_string();
+        std::fs::write(dir.path().join("noise.json"), r#"[{"content": "Defaults\nUse 4.5, 41 for every call.", "rule": {}}]"#).unwrap();
+        let found = load_noise(dir.path(), DEFAULT_NOISE, &[parse(SESSIONS).unwrap()]).unwrap_err().to_string();
         assert!(found.contains("noise memory 1 holds the tracer \"4.5, 41\" of the task relay"), "{found}");
     }
 
@@ -631,19 +658,19 @@ mod tests {
     fn the_noise_is_rules_that_hold_no_tracer() {
         let dir = tempfile::tempdir().unwrap();
         let tasks = vec![parse(TASK).unwrap()];
-        let write = |text: &str| std::fs::write(dir.path().join(NOISE_FILE), text).unwrap();
+        let write = |text: &str| std::fs::write(dir.path().join("noise.json"), text).unwrap();
 
         write(r#"[{"content": "Commit messages\nConventional commits.", "rule": {}},
                   {"content": "Go errors\nWrap them.", "age_days": 30, "rule": {"paths": ["**/*.go"]}}]"#);
-        let noise = load_noise(dir.path(), &tasks).unwrap();
+        let noise = load_noise(dir.path(), DEFAULT_NOISE, &tasks).unwrap();
         assert_eq!(noise.len(), 2);
         assert_eq!(noise[1].rule, Some(Rule { paths: vec!["**/*.go".into()] }));
 
         write(r#"[{"content": "Not a rule"}, {"content": "The proxy listens on 48213", "rule": {}},
                   {"content": " ", "rule": {"paths": ["../x"]}}]"#);
-        let found = load_noise(dir.path(), &tasks).unwrap_err().to_string();
+        let found = load_noise(dir.path(), DEFAULT_NOISE, &tasks).unwrap_err().to_string();
         for expected in [
-            NOISE_FILE,
+            "noise.json",
             "noise memory 1 is not a rule",
             "noise memory 2 holds the tracer \"48213\" of the task staging-port",
             "noise memory 3 is empty",
@@ -653,13 +680,36 @@ mod tests {
         }
 
         write("{}");
-        assert!(load_noise(dir.path(), &tasks).unwrap_err().to_string().contains("is not a list of seeded memories"));
+        assert!(load_noise(dir.path(), DEFAULT_NOISE, &tasks).unwrap_err().to_string().contains("is not a list of seeded memories"));
     }
 
     #[test]
     fn a_data_directory_without_noise_has_none() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(load_noise(dir.path(), &[]).unwrap(), Vec::<SeedMemory>::new());
+        assert_eq!(load_noise(dir.path(), DEFAULT_NOISE, &[]).unwrap(), Vec::<SeedMemory>::new());
+    }
+
+    #[test]
+    fn a_run_is_seeded_with_the_noise_it_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str, text: &str| std::fs::write(dir.path().join(name), text).unwrap();
+        write("noise.json", r#"[{"content": "Small\nOne rule.", "rule": {}}]"#);
+        write("noise-big.json", r#"[{"content": "Big one\nA rule.", "rule": {}}, {"content": "Big two\nAnother rule.", "rule": {"paths": ["**/*.go"]}}]"#);
+        write("other.json", r#"[{"content": "Not noise\nA rule.", "rule": {}}]"#);
+
+        assert_eq!(load_noise(dir.path(), "noise", &[]).unwrap().len(), 1, "noise is the default");
+        assert_eq!(load_noise(dir.path(), "noise-big", &[]).unwrap().len(), 2);
+        for refused in ["other", "tasks", "noise_big", "noise-", "noise-../x", "noise/x", "", "Noise-big", "noise-big.json"] {
+            let said = load_noise(dir.path(), refused, &[]).unwrap_err().to_string();
+            assert!(said.contains("is not a noise") && said.contains(&format!("{refused:?}")), "{refused}: {said}");
+        }
+        let missing = load_noise(dir.path(), "noise-none", &[]).unwrap_err().to_string();
+        assert!(missing.contains("noise-none.json") && missing.contains("no such"), "a named noise that is not there is refused: {missing}");
+        assert_eq!(noise_names(dir.path()).unwrap(), ["noise", "noise-big"], "every noise file, and no other");
+
+        write("noise-big.json", r#"[{"content": "Big one\nThe proxy listens on 48213", "rule": {}}]"#);
+        let found = load_noise(dir.path(), "noise-big", &[parse(TASK).unwrap()]).unwrap_err().to_string();
+        assert!(found.contains("noise-big.json") && found.contains("holds the tracer \"48213\""), "each noise is checked as the default one is: {found}");
     }
 
     #[test]

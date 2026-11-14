@@ -33,8 +33,10 @@ agent-eval hook-log FILE
 
   tasks          reads every task in DIR/tasks/*.json, checks each one and
                  that no tracer is in a file of its fixture, and lists them;
-                 then checks DIR/noise.json, rules of other topics, and that
-                 none of them holds a tracer.
+                 then checks every noise, DIR/noise.json
+                 and DIR/noise-NAME.json, rules of other topics, and that
+                 none of them holds a tracer, and lists how many rules each
+                 has.
   prepare        lays out one run of a task under an arm in --out: the
                  fixture copied as the working directory, the client's
                  configuration, the seed (the task's memories and the noise,
@@ -116,11 +118,15 @@ agent-eval hook-log FILE
 RUN_OPTIONS:
   --task ID --arm a0|a2|a3|a3-eager|a4|b|l0|l1|l2 --out DIR --clawg PATH --model M
   [--effort E] [--max-budget-usd N] [--claude-version V] [--profile dev|prod]
-  [--lang en|es] [--data DIR] [--sessions split|joined|both]
+  [--lang en|es] [--data DIR] [--sessions split|joined|both] [--noise NAME]
 
   --clawg is the absolute path of the clawg binary the arms with clawg run;
   --profile (dev by default) picks its data directory under the run's home.
   --data defaults to this crate's data/agent-tasks.
+  --noise names the rules of other topics every arm with memory is seeded
+  with besides the task's: DIR/NAME.json, where NAME is noise (the default) or
+  noise-NAME. An l1 or l2 run refuses one whose rules at startup pass the 10000
+  characters the client injects from a hook.
   --sessions says how a task of several sessions is played: split (the
   default) starts a conversation for each session, joined continues the
   conversation of the one before with --continue, and both plays the second
@@ -153,6 +159,7 @@ struct RunArgs {
     profile: Profile,
     lang: Option<Lang>,
     shape: Shape,
+    noise: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -197,7 +204,8 @@ fn required(flags: &mut Vec<(String, String)>, name: &str) -> Result<String, Str
     take(flags, name).ok_or_else(|| format!("--{name} is required"))
 }
 
-const RUN_FLAGS: [&str; 12] = ["task", "arm", "out", "clawg", "model", "effort", "max-budget-usd", "claude-version", "profile", "lang", "data", "sessions"];
+const RUN_FLAGS: [&str; 13] =
+    ["task", "arm", "out", "clawg", "model", "effort", "max-budget-usd", "claude-version", "profile", "lang", "data", "sessions", "noise"];
 
 fn run_args(f: &mut Vec<(String, String)>) -> Result<RunArgs, String> {
     let arm_name = required(f, "arm")?;
@@ -223,6 +231,8 @@ fn run_args(f: &mut Vec<(String, String)>) -> Result<RunArgs, String> {
         Some(name) => Shape::parse(&name).ok_or_else(|| format!("unknown shape {name}"))?,
         None => Shape::Split,
     };
+    let noise = take(f, "noise").unwrap_or_else(|| task::DEFAULT_NOISE.to_owned());
+    task::check_noise_name(&noise).map_err(|e| format!("--noise {e}"))?;
     Ok(RunArgs {
         data: take(f, "data").map_or_else(default_data, PathBuf::from),
         task: required(f, "task")?,
@@ -236,6 +246,7 @@ fn run_args(f: &mut Vec<(String, String)>) -> Result<RunArgs, String> {
         profile,
         lang,
         shape,
+        noise,
     })
 }
 
@@ -296,7 +307,10 @@ fn now_ms() -> i64 {
 
 fn list_tasks(data: &Path) -> Result<(), String> {
     let tasks = task::load(data).map_err(|e| e.to_string())?;
-    let noise = task::load_noise(data, &tasks).map_err(|e| e.to_string())?;
+    let mut noises = Vec::new();
+    for name in task::noise_names(data).map_err(|e| e.to_string())? {
+        noises.push((task::load_noise(data, &name, &tasks).map_err(|e| e.to_string())?.len(), name));
+    }
     let mut leaks = Vec::new();
     for t in &tasks {
         let mut files = Vec::new();
@@ -313,7 +327,9 @@ fn list_tasks(data: &Path) -> Result<(), String> {
             if t.example { " example" } else { "" }
         );
     }
-    println!("noise rules={}", noise.len());
+    for (rules, name) in noises {
+        println!("{name} rules={rules}");
+    }
     if leaks.is_empty() {
         Ok(())
     } else {
@@ -339,7 +355,7 @@ fn read_files(dir: &Path, prefix: &str, out: &mut Vec<(String, String)>) -> std:
 /// The task of the run and the noise every arm with memory is seeded with.
 fn load_task(args: &RunArgs) -> Result<(task::Task, Vec<task::SeedMemory>), String> {
     let tasks = task::load(&args.data).map_err(|e| e.to_string())?;
-    let noise = task::load_noise(&args.data, &tasks).map_err(|e| e.to_string())?;
+    let noise = task::load_noise(&args.data, &args.noise, &tasks).map_err(|e| e.to_string())?;
     let task = task::find(tasks, &args.task).map_err(|e| e.to_string())?;
     check_shape(&task, args.shape)?;
     Ok((task, noise))
@@ -363,6 +379,7 @@ fn prepare(args: &RunArgs, t: &task::Task, noise: Vec<task::SeedMemory>, client:
         claude_version: args.claude_version.clone(),
         now_ms: now_ms(),
         noise,
+        noise_name: args.noise.clone(),
         shape: args.shape,
         agent_eval,
     };
@@ -573,6 +590,26 @@ mod tests {
     }
 
     #[test]
+    fn the_noise_of_a_run_parses() {
+        let base = ["prepare", "--task", "t", "--arm", "a3", "--out", "r", "--clawg", clawg(), "--model", "m"];
+        let with = |extra: &[&str]| parse_args(args(&[&base[..], extra].concat()));
+        let noise = |extra: &[&str]| match with(extra) {
+            Ok(Some(Command::Prepare(run))) => run.noise,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(noise(&[]), "noise");
+        assert_eq!(noise(&["--noise", "noise-300"]), "noise-300");
+        assert_eq!(noise(&["--noise", "noise"]), "noise");
+        for refused in ["tasks", "other", "noise-", "../noise"] {
+            let said = with(&["--noise", refused]).unwrap_err();
+            assert!(said.contains("is not a noise") && said.contains(refused), "{refused}: {said}");
+        }
+        assert!(HELP_TEXT.contains("--noise NAME"));
+        let run = parse_args(args(&["run", "--task", "t", "--arm", "a3", "--out", "r", "--clawg", clawg(), "--model", "m", "--noise", "noise-300", "--replay", "s"]));
+        assert!(matches!(run, Ok(Some(Command::Run { args, .. })) if args.noise == "noise-300"));
+    }
+
+    #[test]
     fn the_calls_command_parses() {
         assert_eq!(parse_args(args(&["calls", "--runs", "d"])), Ok(Some(Command::Calls { dir: "d".into() })));
         assert!(parse_args(args(&["calls"])).unwrap_err().contains("--runs is required"));
@@ -655,6 +692,7 @@ mod tests {
             profile: Profile::Dev,
             lang: None,
             shape: Shape::Split,
+            noise: "noise".into(),
         };
         for replay in [dir.path().join("missing.jsonl"), dir.path().to_path_buf()] {
             let err = execute(Command::Run { args: args.clone(), replay: Some(replay.clone()) }).unwrap_err();

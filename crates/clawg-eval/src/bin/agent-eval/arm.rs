@@ -79,6 +79,9 @@ pub const ARMS: [Arm; 9] = [Arm::A0, Arm::A2, Arm::A3, Arm::A3Eager, Arm::A4, Ar
 /// The tools arm B takes away.
 const READ_TOOLS: [&str; 3] = ["search_memory", "read_memory", "list_memories"];
 
+/// The most characters of the output of a hook the client puts in the context.
+const HOOK_CONTEXT_MAX_CHARS: usize = 10_000;
+
 /// The client a real run starts, found on the `PATH`.
 pub const CLIENT: &str = "claude";
 
@@ -186,6 +189,8 @@ pub struct Options {
     pub now_ms: i64,
     /// The rules of other topics every arm with memory is seeded with.
     pub noise: Vec<SeedMemory>,
+    /// The name of that noise, which a run records.
+    pub noise_name: String,
     pub shape: Shape,
     /// The `agent-eval` binary the hooks of the harness run; absolute.
     pub agent_eval: PathBuf,
@@ -248,6 +253,8 @@ pub enum ArmError {
     Setup(#[from] setup::SetupError),
     #[error("a path of the run is not valid Unicode: {0}")]
     NonUnicode(PathBuf),
+    #[error("the rules that start the session are {chars} characters, and the client injects at most {max} from the output of a hook")]
+    StartupTooLong { chars: usize, max: usize },
 }
 
 fn text(path: &Path) -> Result<String, ArmError> {
@@ -333,6 +340,10 @@ pub fn plan(task: &Task, arm: Arm, layout: &Layout, options: &Options) -> Result
     let harness = text(&options.agent_eval)?;
     if let Some(by_file) = arm.rules_by_file() {
         if let Some(rules) = rules::startup(&memories, by_file, options.lang) {
+            let chars = rules.chars().count();
+            if chars > HOOK_CONTEXT_MAX_CHARS {
+                return Err(ArmError::StartupTooLong { chars, max: HOOK_CONTEXT_MAX_CHARS });
+            }
             add_hook(&mut settings, "SessionStart", harness_hook(&harness, "hook-context", &text(&layout.startup_rules())?));
             files.push((layout.startup_rules(), rules));
         }
@@ -451,6 +462,7 @@ mod tests {
             claude_version: Some("2.1.300".into()),
             now_ms: 1_800_000_000_000,
             noise: Vec::new(),
+            noise_name: "noise".into(),
             shape: Shape::Split,
             agent_eval: harness(),
         }
@@ -489,6 +501,43 @@ mod tests {
 
     fn rules_files(plan: &RunPlan) -> Vec<&(PathBuf, String)> {
         plan.files.iter().filter(|(p, _)| p.starts_with(layout().rules_dir())).collect()
+    }
+
+    #[test]
+    fn the_startup_rules_must_fit_what_the_client_injects() {
+        let rules = |n: usize, paths: &str| -> Vec<SeedMemory> {
+            (0..n)
+                .map(|i| {
+                    serde_json::from_str(&format!(
+                        r#"{{"content": "Rule number {i}\nThe rule says something about case {i} that takes a few words to say.", "rule": {paths}}}"#
+                    ))
+                    .unwrap()
+                })
+                .collect()
+        };
+        let with = |noise: Vec<SeedMemory>, arm: Arm| {
+            let mut opts = options(None);
+            opts.noise = noise;
+            plan(&task(true), arm, &layout(), &opts)
+        };
+
+        assert!(with(rules(15, "{}"), Arm::L1).is_ok());
+        assert!(with(rules(15, "{}"), Arm::L2).is_ok());
+
+        let refused = with(rules(300, "{}"), Arm::L1).unwrap_err();
+        assert!(matches!(refused, ArmError::StartupTooLong { chars, max: 10_000 } if chars > 10_000), "{refused:?}");
+        let said = refused.to_string();
+        let ArmError::StartupTooLong { chars, .. } = refused else { unreachable!() };
+        assert!(said.contains(&chars.to_string()) && said.contains("10000") && said.contains("hook"), "the size and the limit are named: {said}");
+        assert!(matches!(with(rules(300, "{}"), Arm::L2), Err(ArmError::StartupTooLong { .. })), "the rules without globs are delivered at startup by l2 too");
+
+        let by_glob = rules(300, r#"{"paths": ["**/*.py"]}"#);
+        assert!(with(by_glob.clone(), Arm::L2).is_ok(), "l2 delivers the rules with globs by file, so nothing goes at startup");
+        assert!(matches!(with(by_glob, Arm::L1), Err(ArmError::StartupTooLong { .. })));
+
+        for arm in [Arm::A3, Arm::A4, Arm::L0] {
+            assert!(with(rules(300, "{}"), arm).is_ok(), "{arm:?} has no startup hook of the harness");
+        }
     }
 
     #[test]
