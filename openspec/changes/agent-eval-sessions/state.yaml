@@ -1,0 +1,21 @@
+change: agent-eval-sessions
+objective: "medición (1, 5)"
+depends_on: [agent-eval]  # el arnés; sigue a memory-delivery, archivado
+phase: tasks
+artifacts:
+  exploration: done  # las sesiones reales, lo que el arnés no puede y lo que documenta el cliente, leído el 2026-11-13
+  proposal: done  # las seis hipótesis, las cuatro tareas, la regla de decisión y el presupuesto, fijados antes de correr
+  spec: done  # AS1 a AS12; AS1 modifica MD3 de specs/eval
+  design: done  # D1 a D13
+  tasks: done  # 14 tareas; la campaña paga, en «Después de este cambio»
+  apply: pending
+  verify: pending
+  archive: pending
+decisions:
+  long_session: continue_per_part  # un proceso por parte, el segundo con --continue (D1)
+  comparison: fork_in_place  # la segunda sesión se juega de las dos formas desde una misma primera (D5)
+  relay_rule: safety_and_overhead  # seguro y 20.000 tokens o menos de sobrecosto; el ahorro medido en el par no decide
+  missing_command: bounded_shell  # un shell acotado a los comandos de la tarea, no un hook (D8)
+  budget_usd: 25  # tope; estimado 23,90 en 95 corridas
+updated: 2026-11-13
+main_spec: openspec/specs/eval/spec.md

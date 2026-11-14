@@ -41,6 +41,8 @@ Se publica lo anterior y se instalan los hooks de Claude Code en un repositorio 
 
 [verdict-on-replace](changes/archive/2026-11-12-verdict-on-replace/proposal.md) (128) se hizo en la nube: son textos del puente y sus tests, y no toca `memory.db`. Abarató cada sesión que guarda: sacó el pedido al modelo que sólo juzgaba pares `compatible`. Está archivado el 2026-11-12 y sale en 0.85.0 ([verify](changes/archive/2026-11-12-verdict-on-replace/verify.md)). Lo que sólo se ve con uso real, cuántos pedidos siguen juzgando y cuántos reemplazos se detectan, queda por medir en local sobre los transcripts de las semanas siguientes, después de correr `clawg setup` otra vez en cada cliente ([pendiente](changes/archive/2026-11-12-verdict-on-replace/verify.md#pendiente-en-prod)).
 
+[agent-eval-sessions](changes/agent-eval-sessions/proposal.md) (129) va acá porque mide y no toca el producto: cambia sólo `crates/clawg-eval`, que ningún binario publicado enlaza, y no abre `memory.db`. Su código va en la nube, con la corrida en seco y el modelo falso. Su campaña paga es local, pide autorización de gasto (estimada en 23,90 USD, con tope de 25) y decide qué se construye después: el relevo entre sesiones, y la línea base de repeated-errors (131). Tiene las tareas escritas y está sin aplicar ([tareas](changes/agent-eval-sessions/tasks.md)).
+
 ## Corte (una noche local, con el piloto aprobado)
 
 La reimportación del historial ya se hizo, el 2026-11-08 y antes del piloto ([history-reimport](changes/archive/2026-11-12-history-reimport/verify.md#el-corte-en-prod)). Queda:
