@@ -168,3 +168,14 @@ De las sugerencias, S1 la cierra la tarea 23, S2 las 16 y 24, S3 la 25 y S6 la 2
 ### Lo que queda para la guía
 
 Los topes de `--max-budget-usd` por tarea y la cuenta contra el tope de la campaña, que pasó a 30 USD; `--claude-version` 2.1.257 o posterior; el canario; una sesión del humo que intenta leer fuera y sale negada, y la lista de `outside_reads` de cada corrida del humo; el texto de `eza` y el primer pedido de las sesiones de E bajo `a0`; que H6 se lee en el check `command_runs` de cada `result.json`, porque el reporte no muestra los intentos; y que `again` se informa por herramienta.
+
+### Lo que pidió, hecho
+
+| Punto | Commit | Lo fija |
+| --- | --- | --- |
+| W2, falsos `read_outside` | `6145d95a` | `pattern` es ruta sólo en `Glob`; `Bash` salta `/dev/null`; `drive_form` lee `/c/…` como `c:/…`, pura. Tests `a_grep_pattern_is_no_path`, `dev_null_is_no_read_outside`, `a_drive_in_git_bash_form_is_the_same_path` |
+| W3, `untouched` de R | `31a8044b` | los dos trazadores en `adapters.py`, `sessions.py`, `api.py`, `advanced.rst` y `HISTORY.md`, ninguno ya en el fixture (comprobado con `rg -uu -F`). Test `the_relay_decision_stays_untouched_wherever_it_could_be_applied` |
+| W5, el `Keep` tras otro paso que falla | `138d719e` | `branch_to_keep`, pura, da la última rama que jugó y no guardó. Test `a_branch_keeps_its_files_when_the_daemon_does_not_stop` |
+| W1 y el error de puntuar | `5bf17808` | `Command::Score` hace absoluta su ruta; un error de `score_dir` tras un fallo se suma al mensaje. Test `score_reads_a_relative_run_as_absolute`; la rama del mensaje no tiene test propio |
+
+Sobre `5bf17808`, en `target-test`: `cargo test --workspace` pasa, los dos `cargo clippy` pasan y `agent-eval tasks` sale con 0 y lista los dos ruidos. W4 queda como se dijo: la regla de H1 no cambia y la revisión informa `again` por herramienta.

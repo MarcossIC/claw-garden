@@ -213,9 +213,9 @@ La [tercera verificación](verify.md#tercera-verificación) encontró cuatro pun
 
 ## 33. Verificación
 
-- [ ] `cargo test --workspace` y los dos `cargo clippy`, sobre el último commit, en `target-test`.
-- [ ] `agent-eval tasks` da válidas las tareas.
-- [ ] `verify.md`: cada punto de la tercera verificación contra su tarea.
+- [x] `cargo test --workspace` y los dos `cargo clippy`, sobre el último commit, en `target-test`.
+- [x] `agent-eval tasks` da válidas las tareas.
+- [x] `verify.md`: cada punto de la tercera verificación contra su tarea.
 - Commit: `docs(openspec): record agent-eval-sessions progress`
 
 ## Después de este cambio
