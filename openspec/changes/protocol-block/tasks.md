@@ -44,10 +44,10 @@ Strict TDD: en cada tarea el test va primero y falla por la aserción (o porque 
 
 ## 7. Verificación
 
-- [ ] `cargo clean --workspace --target-dir target-test`, y después la suite y los dos clippy de `.claude/CLAUDE.md`, una vez, sobre el último commit.
-- [ ] `the_agent_contract_matches_its_file` y `the_spanish_agent_contract_matches_its_file` pasan sin regenerar nada (PB8); `git diff` no toca `crates/clawg-cli/src/mcp/agent_contract*.json` ni `crates/clawg-cli/src/daemon/`.
+- [x] `cargo clean --workspace --target-dir target-test`, y después la suite y los dos clippy de `.claude/CLAUDE.md`, una vez, sobre el último commit. Pasan según el informe de apply; la verificación fue de lectura y no los volvió a correr ([verify](verify.md#qué-se-revisó)).
+- [x] `the_agent_contract_matches_its_file` y `the_spanish_agent_contract_matches_its_file` pasan sin regenerar nada (PB8); `git diff` no toca `crates/clawg-cli/src/mcp/agent_contract*.json` ni `crates/clawg-cli/src/daemon/`.
 - [ ] El CI en verde en Linux y Windows.
-- [ ] `verify.md`: los requisitos con sus tests, y lo pendiente en local.
+- [x] `verify.md`: los requisitos con sus tests, y lo pendiente en local.
 
 ## Después de este cambio
 

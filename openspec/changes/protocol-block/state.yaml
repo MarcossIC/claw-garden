@@ -9,7 +9,7 @@ artifacts:
   design: done  # D1 a D6; D6 es la regla de decisión del valor por defecto, fijada antes de correr la campaña
   tasks: done  # seis tareas de código y la de verificación
   apply: done  # seis tareas de código
-  verify: pending
+  verify: done  # sin CRITICAL; tres WARNING y el CI pendiente, ver verify.md
   archive: pending
-updated: 2026-11-13
+updated: 2026-11-14
 main_spec: openspec/specs/setup/spec.md, openspec/specs/doctor/spec.md, openspec/specs/hooks/spec.md, openspec/specs/preferences/spec.md, openspec/specs/eval/spec.md
