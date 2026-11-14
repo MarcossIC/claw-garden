@@ -512,6 +512,8 @@ struct ToolStats {
     calls: usize,
     /// The tokens each call that could be measured alone added to the context.
     added: Vec<u64>,
+    /// The bytes of the result of each call that has one.
+    results: Vec<usize>,
     /// It is a tool of an MCP server, not one of the client's.
     server: bool,
 }
@@ -521,7 +523,10 @@ struct ToolStats {
 const DIET_MEDIAN: f64 = 1500.0;
 
 /// A table by tool, over every session of `transcripts`: its calls, those that
-/// carry tokens of their own and the median and p90 of those tokens.
+/// carry tokens of their own, the median and p90 of those tokens, and the median
+/// of the size of the results at 4 bytes a token. What a call adds holds the
+/// words the model wrote in that message, so a tool is noted as a candidate for a
+/// diet only when its results are big too.
 pub fn calls(transcripts: &[Transcript]) -> String {
     let mut tools: BTreeMap<String, ToolStats> = BTreeMap::new();
     for call in transcripts.iter().flat_map(|t| &t.calls) {
@@ -529,21 +534,25 @@ pub fn calls(transcripts: &[Transcript]) -> String {
         stats.calls += 1;
         stats.server |= call.name.starts_with("mcp__");
         stats.added.extend(call.added_tokens);
+        stats.results.extend(call.result.as_deref().map(str::len));
     }
     let mut rows: Vec<(String, ToolStats)> = tools.into_iter().collect();
     rows.sort_by(|a, b| b.1.calls.cmp(&a.1.calls).then_with(|| a.0.cmp(&b.0)));
-    let mut out = String::from("| tool | calls | with tokens | median tokens | p90 tokens | note |\n| --- | ---: | ---: | ---: | ---: | --- |\n");
+    let mut out = String::from("| tool | calls | with tokens | median tokens | p90 tokens | median result tokens | note |\n| --- | ---: | ---: | ---: | ---: | ---: | --- |\n");
     for (name, mut stats) in rows {
         stats.added.sort_unstable();
-        let median = median(stats.added.iter().map(|t| *t as f64));
+        let adds = median(stats.added.iter().map(|t| *t as f64));
         let p90 = (!stats.added.is_empty()).then(|| stats.added[(stats.added.len() * 9).div_ceil(10) - 1]);
-        let note = if stats.server && median.is_some_and(|m| m > DIET_MEDIAN) { "candidate for a diet" } else { "" };
+        let result = median(stats.results.iter().map(|b| *b as f64)).map(|bytes| bytes / 4.0);
+        let heavy = |m: Option<f64>| m.is_some_and(|m| m > DIET_MEDIAN);
+        let note = if stats.server && heavy(adds) && heavy(result) { "candidate for a diet" } else { "" };
         out.push_str(&format!(
-            "| {name} | {} | {} | {} | {} | {note} |\n",
+            "| {name} | {} | {} | {} | {} | {} | {note} |\n",
             stats.calls,
             stats.added.len(),
-            median.map_or_else(|| "-".to_owned(), |m| format!("{m:.0}")),
+            adds.map_or_else(|| "-".to_owned(), |m| format!("{m:.0}")),
             p90.map_or_else(|| "-".to_owned(), |p| p.to_string()),
+            result.map_or_else(|| "-".to_owned(), |r| format!("{r:.0}")),
         ));
     }
     out
@@ -1245,9 +1254,43 @@ mod tests {
         let text = calls(&transcripts);
 
         let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines[0], "| tool | calls | with tokens | median tokens | p90 tokens | note |");
-        assert_eq!(lines[2], "| search_memory | 3 | 3 | 300 | 2000 |  |", "its calls added 2000, 200 and 300 tokens: {text}");
-        assert!(text.contains("| recall_context | 1 | 1 | 2700 | 2700 | candidate for a diet |"), "{text}");
-        assert!(text.contains("| Read | 1 | 1 | 100 | 100 |  |"), "a tool that is not a server one is never a candidate: {text}");
+        assert_eq!(lines[0], "| tool | calls | with tokens | median tokens | p90 tokens | median result tokens | note |");
+        assert_eq!(lines[2], "| search_memory | 3 | 3 | 300 | 2000 | 0 |  |", "its calls added 2000, 200 and 300 tokens: {text}");
+        assert!(text.contains("| recall_context | 1 | 1 | 2700 | 2700 | 0 |  |"), "what a call adds holds the model's own words, so alone it marks no diet: {text}");
+        assert!(text.contains("| Read | 1 | 1 | 100 | 100 | 0 |  |"), "{text}");
+    }
+
+    #[test]
+    fn the_calls_table_gives_the_size_of_a_result_beside_what_a_call_adds() {
+        // A result of `bytes` bytes, which the table counts at 4 bytes a token.
+        let message = |id: &str, context: u64, call: &str, tool: &str, bytes: Option<usize>| {
+            let mut text = format!(
+                "{}\n",
+                serde_json::json!({"type": "assistant", "message": {"id": id, "content": [{"type": "tool_use", "id": call, "name": tool, "input": {}}], "usage": {"input_tokens": context}}})
+            );
+            if let Some(bytes) = bytes {
+                text.push_str(&format!(
+                    "{}\n",
+                    serde_json::json!({"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": call, "content": "z".repeat(bytes)}]}})
+                ));
+            }
+            text
+        };
+        let end = |id: &str, context: u64| format!("{}\n", serde_json::json!({"type": "assistant", "message": {"id": id, "content": [], "usage": {"input_tokens": context}}}));
+        let stream = message("m1", 1000, "a", "mcp__clawg__search_memory", Some(400))
+            + &message("m2", 1300, "b", "mcp__clawg__search_memory", Some(8000))
+            + &message("m3", 3300, "c", "mcp__clawg__search_memory", Some(40))
+            + &message("m4", 3400, "d", "mcp__clawg__recall_context", Some(12000))
+            + &message("m5", 6400, "e", "mcp__clawg__recall_context", Some(9000))
+            + &message("m6", 9400, "f", "mcp__clawg__read_memory", Some(400))
+            + &message("m7", 12400, "g", "mcp__clawg__list_memories", None)
+            + &end("m8", 12500);
+
+        let text = calls(&[crate::stream::parse(&stream)]);
+
+        assert!(text.contains("| search_memory | 3 | 3 | 300 | 2000 | 100 |  |"), "the median of the results is 100 tokens, 400 bytes: {text}");
+        assert!(text.contains("| recall_context | 2 | 2 | 3000 | 3000 | 2625 | candidate for a diet |"), "both medians pass 1500: {text}");
+        assert!(text.contains("| read_memory | 1 | 1 | 3000 | 3000 | 100 |  |"), "it adds a lot with a small result: the model thought in that message: {text}");
+        assert!(text.contains("| list_memories | 1 | 1 | 100 | 100 | - |  |"), "a call without a result has no size: {text}");
     }
 }
