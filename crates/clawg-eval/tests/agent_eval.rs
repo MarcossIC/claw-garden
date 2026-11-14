@@ -229,6 +229,24 @@ fn a_replayed_run_of_two_sessions_shares_its_daemon_and_its_working_directory() 
 }
 
 #[test]
+fn the_second_replayed_session_finds_what_the_first_one_saved() {
+    let dir = tempfile::tempdir().unwrap();
+    let (output, run) = replay_of(dir.path(), "example-relay-port", "a3", &relay_replays(), clawg());
+    ok(&output);
+    let first_result = |run: &Path| -> String {
+        let stream = std::fs::read_to_string(run.join("stream-2.jsonl")).unwrap();
+        let line = stream.lines().find(|l| l.contains("\"toolu_1\"") && l.contains("tool_result")).expect("the result of its first call");
+        serde_json::from_str::<Value>(line).unwrap()["message"]["content"][0]["content"].as_str().unwrap().to_owned()
+    };
+    assert!(first_result(&run).contains("48213"), "the first call of session 2 listed what session 1 saved: {}", first_result(&run));
+    assert!(!first_result(&run).contains("nothing found"), "the recorded result was replaced");
+
+    let (output, bare) = replay_of(dir.path(), "example-relay-port", "a0", &relay_replays(), clawg());
+    ok(&output);
+    assert_eq!(first_result(&bare), "nothing found", "an arm without clawg has no server: the stream is as recorded");
+}
+
+#[test]
 fn a_session_that_fails_stops_the_run_and_still_stops_the_daemon() {
     let dir = tempfile::tempdir().unwrap();
     let replays = dir.path().join("replays");

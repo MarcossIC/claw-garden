@@ -69,13 +69,17 @@ impl Client {
     }
 
     /// The command that starts session `k`: the plan's own, or `agent_eval`
-    /// replaying its stream.
-    fn step(&self, planned: &Step, agent_eval: &Path, k: usize) -> Step {
+    /// replaying its stream, with `mcp_config` when the run has a server.
+    fn step(&self, planned: &Step, agent_eval: &Path, k: usize, mcp_config: Option<&Path>) -> Step {
         match self {
             Client::Claude => planned.clone(),
             Client::Replay(stream) => {
                 let stream = if stream.is_dir() { stream.join(format!("session-{k}.jsonl")) } else { stream.clone() };
-                Step { program: agent_eval.to_string_lossy().into_owned(), args: vec!["replay-client".into(), stream.to_string_lossy().into_owned()] }
+                let mut args = vec!["replay-client".to_owned(), stream.to_string_lossy().into_owned()];
+                if let Some(config) = mcp_config {
+                    args.extend(["--mcp-config".to_owned(), config.to_string_lossy().into_owned()]);
+                }
+                Step { program: agent_eval.to_string_lossy().into_owned(), args }
             }
         }
     }
@@ -528,7 +532,8 @@ fn play(plan: &RunPlan, client: &Client, layout: &Layout, agent_eval: &Path) -> 
             let copy = layout.root.join(format!("memory-before-{k}.md"));
             std::fs::copy(memory, &copy).map_err(io(&copy))?;
         }
-        let code = start_client(plan, layout, &client.step(planned, agent_eval, k), k)?;
+        let mcp_config = plan.daemon.as_ref().map(|_| layout.mcp_config());
+        let code = start_client(plan, layout, &client.step(planned, agent_eval, k, mcp_config.as_deref()), k)?;
         let (stream_name, log_name) = session_files(k, of);
         let log = layout.root.join(log_name);
         if code != Some(0) {
@@ -1009,17 +1014,22 @@ mod tests {
     fn the_client_is_claude_as_planned_or_a_replay_of_a_stream() {
         let planned = Step { program: "claude".into(), args: vec!["-p".into(), "Which port?".into()] };
         let exe = Path::new("/bin/agent-eval");
-        assert_eq!(Client::Claude.step(&planned, exe, 1), planned);
+        assert_eq!(Client::Claude.step(&planned, exe, 1, Some(Path::new("/runs/mcp.json"))), planned);
 
         let dir = tempfile::tempdir().unwrap();
         let streams = Client::Replay(dir.path().to_owned());
         assert_eq!(
-            streams.step(&planned, exe, 2).args,
+            streams.step(&planned, exe, 2, None).args,
             ["replay-client", dir.path().join("session-2.jsonl").to_str().unwrap()],
             "a directory holds a stream for each session"
         );
         let replay = Client::Replay(PathBuf::from("/runs/s.jsonl"));
-        assert_eq!(replay.step(&planned, exe, 1), Step { program: "/bin/agent-eval".into(), args: vec!["replay-client".into(), "/runs/s.jsonl".into()] });
+        assert_eq!(replay.step(&planned, exe, 1, None), Step { program: "/bin/agent-eval".into(), args: vec!["replay-client".into(), "/runs/s.jsonl".into()] });
+        assert_eq!(
+            replay.step(&planned, exe, 1, Some(Path::new("/runs/mcp.json"))).args,
+            ["replay-client", "/runs/s.jsonl", "--mcp-config", "/runs/mcp.json"],
+            "a run with a server tells the replay where it is"
+        );
         assert_eq!((Client::Claude.name(), replay.name()), ("claude", "replay"));
         assert_eq!(serde_json::to_value(&Client::Claude).unwrap(), json!("claude"));
         assert_eq!(serde_json::to_value(&replay).unwrap(), json!({ "replay": "/runs/s.jsonl" }));

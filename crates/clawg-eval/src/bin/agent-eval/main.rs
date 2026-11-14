@@ -26,7 +26,7 @@ agent-eval run RUN_OPTIONS (--replay STREAM | --max-budget-usd N --claude-versio
 agent-eval score --run DIR
 agent-eval report --runs DIR
 agent-eval costs --runs DIR
-agent-eval replay-client STREAM
+agent-eval replay-client STREAM [--mcp-config FILE]
 agent-eval hook-context FILE
 agent-eval hook-log FILE
 
@@ -79,7 +79,13 @@ agent-eval hook-log FILE
                  main loop's cache writes for 5 minutes and for 1 hour, and
                  the client's estimate of the cost.
   replay-client  the client a dry run starts: prints STREAM after making
-                 its file changes in the current directory.
+                 its file changes in the current directory. With the
+                 --mcp-config of a run that has a server, each call of STREAM
+                 to a tool of that server is made to it, started as the file
+                 names it, and STREAM is printed with what the server
+                 answered in place of the results it recorded; the other
+                 calls stay as recorded. A call the server cannot answer
+                 fails the client, naming the tool.
   hook-context   the startup hook of the arms l1 and l2: prints FILE as the
                  context a SessionStart hook adds.
   hook-log       the hook of every arm on InstructionsLoaded: appends the
@@ -130,7 +136,7 @@ enum Command {
     Score { dir: PathBuf },
     Report { dir: PathBuf },
     Costs { dir: PathBuf },
-    ReplayClient { stream: PathBuf },
+    ReplayClient { stream: PathBuf, mcp_config: Option<PathBuf> },
     HookContext { file: PathBuf },
     HookLog { file: PathBuf },
 }
@@ -236,8 +242,13 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Command>, Str
         "report" => Command::Report { dir: PathBuf::from(required(&mut flags(rest, &["runs"])?, "runs")?) },
         "costs" => Command::Costs { dir: PathBuf::from(required(&mut flags(rest, &["runs"])?, "runs")?) },
         "replay-client" => {
-            let [stream]: [String; 1] = rest.collect::<Vec<_>>().try_into().map_err(|_| "replay-client takes one stream file")?;
-            Command::ReplayClient { stream: PathBuf::from(stream) }
+            let rest: Vec<String> = rest.collect();
+            let (stream, mcp_config) = match rest.as_slice() {
+                [stream] => (stream, None),
+                [stream, flag, config] if flag == "--mcp-config" => (stream, Some(PathBuf::from(config))),
+                _ => return Err("replay-client takes one stream file and, optionally, --mcp-config FILE".into()),
+            };
+            Command::ReplayClient { stream: PathBuf::from(stream), mcp_config }
         }
         "hook-context" | "hook-log" => {
             let [file]: [String; 1] = rest.collect::<Vec<_>>().try_into().map_err(|_| format!("{kind} takes one file"))?;
@@ -406,9 +417,9 @@ fn execute(command: Command) -> Result<(), String> {
             print!("{}", report::costs(&runs));
             Ok(())
         }
-        Command::ReplayClient { stream } => {
+        Command::ReplayClient { stream, mcp_config } => {
             let cwd = std::env::current_dir().map_err(|e| format!("cannot read the current directory: {e}"))?;
-            replay::run(&stream, &cwd)
+            replay::run(&stream, &cwd, mcp_config.as_deref())
         }
         Command::HookContext { file } => {
             let text = std::fs::read_to_string(&file).map_err(|e| format!("{}: {e}", file.display()))?;
@@ -495,7 +506,12 @@ mod tests {
     fn the_other_commands_parse() {
         assert_eq!(parse_args(args(&["tasks"])), Ok(Some(Command::Tasks { data: default_data() })));
         assert_eq!(parse_args(args(&["score", "--run", "r"])), Ok(Some(Command::Score { dir: "r".into() })));
-        assert_eq!(parse_args(args(&["replay-client", "s"])), Ok(Some(Command::ReplayClient { stream: "s".into() })));
+        assert_eq!(parse_args(args(&["replay-client", "s"])), Ok(Some(Command::ReplayClient { stream: "s".into(), mcp_config: None })));
+        assert_eq!(
+            parse_args(args(&["replay-client", "s", "--mcp-config", "m.json"])),
+            Ok(Some(Command::ReplayClient { stream: "s".into(), mcp_config: Some("m.json".into()) }))
+        );
+        assert!(parse_args(args(&["replay-client", "s", "--other", "m"])).unwrap_err().contains("--mcp-config"));
         assert_eq!(parse_args(args(&["report", "--runs", "d"])), Ok(Some(Command::Report { dir: "d".into() })));
         assert_eq!(parse_args(args(&["costs", "--runs", "d"])), Ok(Some(Command::Costs { dir: "d".into() })));
         assert!(parse_args(args(&["costs"])).unwrap_err().contains("--runs is required"));
