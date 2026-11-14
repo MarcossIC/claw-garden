@@ -18,7 +18,7 @@ use crate::memory::embedding::chunker::{
     embedding_text, select_chunker, ChatChunker, Chunk, ChunkerKind, SaveSplit,
 };
 use crate::memory::ingest::outbox::{resume_positions, Claimed, NotedPiece, OutboxNote};
-use crate::memory::revision::contradiction::{Candidate, SaveKey};
+use crate::memory::revision::contradiction::{saves_already_paired, Candidate, SaveKey};
 use crate::memory::retrieval::pieces::StoredPiece;
 use crate::memory::embedding::embedder::{EmbedError, EmbedRole, Embedder};
 use crate::memory::domain::events::{MemoryEvent, MemorySource};
@@ -835,13 +835,14 @@ fn split_event(evt: &MemoryEvent, chat_chunker: &ChatChunker) -> (Vec<SecretKind
 }
 
 /// What the dedup gate left of a save: what each position already became,
-/// the head each of those was embedded behind, the pieces still to embed and
-/// the progress noted so far.
+/// the head each of those was embedded behind, the pieces still to embed, the
+/// progress noted so far and the rows an earlier take of the save inserted.
 struct Gated {
     stored: Vec<Option<SavedChunk>>,
     contexts: Vec<String>,
     survivors: Vec<(usize, PendingChunk)>,
     noted: Vec<NotedPiece>,
+    resumed_rows: Vec<i64>,
 }
 
 /// The head a piece at `position` is embedded behind: none for the first,
@@ -890,8 +891,12 @@ async fn gate_pieces(
     let mut stored: Vec<Option<SavedChunk>> = vec![None; pending_chunks.len()];
     let mut contexts: Vec<String> = vec![String::new(); pending_chunks.len()];
     let mut survivors: Vec<(usize, PendingChunk)> = Vec::new();
+    let mut resumed_rows: Vec<i64> = Vec::new();
     for (position, pending) in pending_chunks.into_iter().enumerate() {
         if let Some(done) = resumed[position].take() {
+            if done.inserted {
+                resumed_rows.push(done.id);
+            }
             let outcome = if done.inserted { ChunkOutcome::Inserted } else { ChunkOutcome::Reinforced };
             stored[position] = Some(SavedChunk { id: done.id, outcome });
             contexts[position] = done.context;
@@ -916,7 +921,7 @@ async fn gate_pieces(
         }
         survivors.push((position, pending));
     }
-    Gated { stored, contexts, survivors, noted }
+    Gated { stored, contexts, survivors, noted, resumed_rows }
 }
 
 /// Embeds the pieces the gate left, each behind the head its position takes,
@@ -1061,13 +1066,16 @@ async fn store_pieces(to: &PieceStore<'_>, absorbed: &mut u64, gated: &mut Gated
     // earlier rows of the save's topic key: it replaces them once it finishes.
     let PieceStore { evt, saver, store, track, earlier, drain, head } = *to;
     let context = |position: usize| head_for(head, position);
-    let Gated { stored, contexts, survivors, noted } = gated;
+    let Gated { stored, contexts, survivors, noted, resumed_rows } = gated;
     let mut siblings: Vec<i64> = evt.sources().to_vec();
     siblings.extend_from_slice(earlier);
     siblings.extend(stored.iter().flatten().filter(|s| s.outcome == ChunkOutcome::Inserted).map(|s| s.id));
     // A long save probes the same earlier save from several of its chunks;
     // the first chunk that finds it holds the pair, so two saves pair once.
-    let mut paired: HashSet<SaveKey> = HashSet::new();
+    // A take that resumes the save starts with the saves its earlier take
+    // already paired with, or a piece left for after the pause would pair
+    // with one of them again.
+    let mut paired: HashSet<SaveKey> = saves_already_paired(store, resumed_rows).await;
     let mut related: Vec<Candidate> = Vec::new();
     // Every take stores at least one piece before it may pause, so the embed
     // it paid for is not thrown away whole and a save always moves forward.
@@ -1364,6 +1372,7 @@ mod tests {
                 })
                 .collect(),
             noted: Vec::new(),
+            resumed_rows: Vec::new(),
         };
         let vectors = |n: usize| vec![vec![0.1_f32; 384]; n];
         let track = Track { row: 1, progress: Vec::new(), accepted: TimestampMs::now() };
@@ -4064,6 +4073,136 @@ mod tests {
             assert_eq!((save_id, piece, memory_id), (1, i as i64 + 1, ids[i]));
             assert_eq!(context, if i == 0 { String::new() } else { head.clone() });
         }
+    }
+
+    /// Places each piece of one save by its text, whichever batch it is
+    /// embedded in, so two takes of the save give a piece the same vector. A
+    /// piece after the first is embedded behind the head, which is why the
+    /// text is matched by its end. One batch position can come back NaN, which
+    /// cuts a take short at the piece that sits there.
+    struct PiecesAt {
+        places: Vec<(String, Vec<f32>)>,
+        nan_at: Option<usize>,
+    }
+
+    impl PiecesAt {
+        fn new(content: &str, nan_at: Option<usize>, place: impl Fn(usize) -> Vec<f32>) -> Arc<Self> {
+            let places = ChatChunker::with_fallback()
+                .split_save(content)
+                .pieces
+                .into_iter()
+                .enumerate()
+                .map(|(i, piece)| (piece.text, place(i)))
+                .collect();
+            Arc::new(Self { places, nan_at })
+        }
+
+        fn vector_of(&self, text: &str) -> Vec<f32> {
+            let (_, vector) = self.places.iter().find(|(piece, _)| text.ends_with(piece.as_str())).expect("a placed piece");
+            vector.clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Embedder for PiecesAt {
+        async fn embed_with_role(&self, text: &str, _role: EmbedRole) -> Result<Vec<f32>, EmbedError> {
+            Ok(self.vector_of(text))
+        }
+        async fn embed_batch(&self, texts: &[String], _role: EmbedRole) -> Result<Vec<Vec<f32>>, EmbedError> {
+            let mut out: Vec<Vec<f32>> = texts.iter().map(|t| self.vector_of(t)).collect();
+            if let Some(v) = self.nan_at.and_then(|at| out.get_mut(at)) {
+                *v = vec![f32::NAN; 384];
+            }
+            Ok(out)
+        }
+        fn dimensions(&self) -> usize { 384 }
+        fn model_id(&self) -> &str { "pieces-at" }
+        fn query_prefix(&self) -> &str { "" }
+        fn passage_prefix(&self) -> &str { "" }
+    }
+
+    /// The row of each piece of the one linked save, in order.
+    async fn rows_of_the_save(store: &MemoryStore) -> Vec<i64> {
+        piece_links(store).await.into_iter().map(|(_, _, memory_id, _)| memory_id).collect()
+    }
+
+    #[tokio::test]
+    async fn a_resumed_save_pairs_once_with_an_earlier_save() {
+        use crate::memory::revision::dispute::{judge_pair, Verdict};
+
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let older = PlacedEmbedder { vectors: vec![turned(2, 0.2)] };
+        let older = process_with(Arc::new(older), &store, &explicit_fact("the build uses cargo")).await.memories[0].id;
+        let content = long_save();
+        let last = chunk_count(&content) - 1;
+        assert!(last >= 2, "fixture must split into three pieces or more");
+        // The second piece and the last sit in the band of the older row.
+        let place = |i: usize| if i == 1 || i == last { turned(1, 0.01 * i as f32) } else { turned(3, 1.5) };
+        let row = record_event(&store, explicit_fact(&content)).await;
+
+        replay_pending(&store, PiecesAt::new(&content, Some(2), place)).await;
+        assert_eq!(outbox_row(&store, row).await.expect("the row stays").3.len(), 2, "the first take stored two pieces");
+        replay_pending(&store, PiecesAt::new(&content, None, place)).await;
+
+        assert_eq!(outbox_row(&store, row).await, None);
+        let rows = rows_of_the_save(&store).await;
+        assert_eq!(pairs(&store).await, vec![(rows[1], older, "pending".to_string())]);
+        judge_pair(&store, rows[0], older, Verdict::Supersedes, None, false, None).await.unwrap();
+        assert_eq!(pairs(&store).await, vec![(rows[1], older, "judged".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn a_resumed_save_pairs_once_with_a_save_made_while_it_waited() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let content = long_save();
+        let last = chunk_count(&content) - 1;
+        assert!(last >= 2, "fixture must split into three pieces or more");
+        let place = |i: usize| match i {
+            1 => turned(1, 0.0),
+            i if i == last => turned(1, 0.01),
+            _ => turned(4, 1.5),
+        };
+        let row = record_event(&store, explicit_fact(&content)).await;
+        replay_pending(&store, PiecesAt::new(&content, Some(2), place)).await;
+        let second = memory_ids(&store).await[1];
+
+        let between = PlacedEmbedder { vectors: vec![turned(2, 0.2)] };
+        let between = process_with(Arc::new(between), &store, &explicit_fact("the build uses make")).await.memories[0].id;
+        assert_eq!(pairs(&store).await, vec![(between, second, "pending".to_string())]);
+        replay_pending(&store, PiecesAt::new(&content, None, place)).await;
+
+        assert_eq!(outbox_row(&store, row).await, None);
+        assert_eq!(pairs(&store).await, vec![(between, second, "pending".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn a_resumed_absorbed_piece_does_not_seed_the_pairs() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let content = long_save();
+        let SaveSplit { pieces, .. } = ChatChunker::with_fallback().split_save(&content);
+        let last = pieces.len() - 1;
+        assert!(last >= 2, "fixture must split into three pieces or more");
+        let older = PlacedEmbedder { vectors: vec![turned(1, 0.0)] };
+        let older = process_with(Arc::new(older), &store, &explicit_fact("the build uses cargo")).await.memories[0].id;
+        // The row the second piece will be absorbed into pairs with the older
+        // row, and sits too far from the last piece to pair with it.
+        let held = PlacedEmbedder { vectors: vec![turned(3, 0.35)] };
+        let held = process_with(Arc::new(held), &store, &explicit_fact(&pieces[1].text)).await.memories[0].id;
+        assert_eq!(pairs(&store).await, vec![(held, older, "pending".to_string())]);
+        let place = |i: usize| if i == last { turned(2, 0.35) } else { turned(4, 1.5) };
+        let row = record_event(&store, explicit_fact(&content)).await;
+
+        replay_pending(&store, PiecesAt::new(&content, Some(1), place)).await;
+        let progress = outbox_row(&store, row).await.expect("the row stays").3;
+        assert!(progress.iter().any(|p| p.id == held && !p.inserted), "the first take absorbed the second piece: {progress:?}");
+        replay_pending(&store, PiecesAt::new(&content, None, place)).await;
+
+        assert_eq!(outbox_row(&store, row).await, None);
+        let last = *rows_of_the_save(&store).await.last().unwrap();
+        assert_eq!(
+            pairs(&store).await,
+            vec![(held, older, "pending".to_string()), (last, older, "pending".to_string())]
+        );
     }
 
     #[tokio::test]
