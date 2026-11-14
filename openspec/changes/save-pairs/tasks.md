@@ -36,9 +36,9 @@ Strict TDD: en cada tarea con conducta nueva, el test va primero y falla por la 
 ## 4. Verificación
 
 - [ ] `cargo clean --workspace --target-dir target-test` antes de la primera corrida del cambio.
-- [ ] `cargo test --workspace --target-dir target-test` y `cargo clippy --workspace --all-targets --target-dir target-test -- -D warnings`, en Windows, sobre el último commit.
+- [x] `cargo test --workspace --target-dir target-test` y `cargo clippy --workspace --all-targets --target-dir target-test -- -D warnings`, en Windows, sobre el último commit.
 - [ ] El CI en verde en Linux y Windows.
-- [ ] `verify.md`: que la suite pasa, y qué test cubre cada requisito. Este cambio no toca el ranking, así que no corre `rag-eval`.
+- [x] `verify.md`: que la suite pasa, y qué test cubre cada requisito. Este cambio no toca el ranking, así que no corre `rag-eval`.
 
 ## 5. Archive
 
