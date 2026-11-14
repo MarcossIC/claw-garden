@@ -1152,6 +1152,20 @@ pub fn fork_steps(with_daemon: bool) -> Vec<ForkStep> {
     .concat()
 }
 
+/// The branch whose second session played, by the steps up to the one that
+/// failed, and whose files are not kept yet.
+fn branch_to_keep(steps: &[ForkStep], failed_at: usize) -> Option<Shape> {
+    let mut played = None;
+    for step in &steps[..=failed_at] {
+        match step {
+            ForkStep::Play { k: 2, branch: Some(branch) } => played = Some(*branch),
+            ForkStep::Keep(_) => played = None,
+            _ => {}
+        }
+    }
+    played
+}
+
 /// Where a fork keeps the state the first session left.
 const FORK_DIR: &str = "fork";
 
@@ -1179,21 +1193,22 @@ struct Fork<'a> {
 fn fork(stage: Stage) -> Result<(), RunError> {
     let mut run = Fork { stage, journal: None, served: None };
     let mut outcome = Ok(());
+    let steps = fork_steps(stage.plan.daemon.is_some());
     let mut failed_at = None;
-    for step in fork_steps(stage.plan.daemon.is_some()) {
-        outcome = run.apply(step);
+    for (i, step) in steps.iter().enumerate() {
+        outcome = run.apply(*step);
         if outcome.is_err() {
-            failed_at = Some(step);
+            failed_at = Some(i);
             break;
         }
     }
     if outcome.is_err() {
-        // The daemon is stopped whatever failed, and the second session of a branch keeps its
-        // files, so it is scored: the failure is what is reported.
+        // The daemon is stopped whatever failed, and the branch that played its second session
+        // keeps its files, so it is scored: the failure is what is reported.
         if run.served.is_some() {
             let _ = run.apply(ForkStep::Stop);
         }
-        if let Some(ForkStep::Play { k: 2, branch: Some(branch) }) = failed_at {
+        if let Some(branch) = failed_at.and_then(|i| branch_to_keep(&steps, i)) {
             let _ = run.apply(ForkStep::Keep(branch));
         }
     }
@@ -2678,6 +2693,22 @@ mod tests {
             [Play { k: 1, branch: None }, Save, Play { k: 2, branch: joined }, Keep(Shape::Joined), Restore, Play { k: 2, branch: split }, Keep(Shape::Split)],
             "an arm without clawg has no daemon to start or stop"
         );
+    }
+
+    #[test]
+    fn a_branch_keeps_its_files_when_the_daemon_does_not_stop() {
+        let steps = fork_steps(true);
+        let at = |step: ForkStep, nth: usize| steps.iter().enumerate().filter(|(_, s)| **s == step).nth(nth).map(|(i, _)| i).unwrap();
+        let (joined, split) = (Some(Shape::Joined), Some(Shape::Split));
+        let play = |k, branch| ForkStep::Play { k, branch };
+        assert_eq!(branch_to_keep(&steps, at(ForkStep::Stop, 1)), joined, "the daemon of the branch that played did not stop");
+        assert_eq!(branch_to_keep(&steps, at(play(2, joined), 0)), joined, "the session itself failed");
+        assert_eq!(branch_to_keep(&steps, at(ForkStep::Stop, 2)), split);
+        assert_eq!(branch_to_keep(&steps, at(play(2, split), 0)), split);
+        assert_eq!(branch_to_keep(&steps, at(ForkStep::Stop, 0)), None, "the first session has no branch");
+        assert_eq!(branch_to_keep(&steps, at(ForkStep::Restore, 0)), None, "a branch already kept is not kept twice");
+        assert_eq!(branch_to_keep(&steps, at(ForkStep::Keep(Shape::Joined), 0)), None);
+        assert_eq!(branch_to_keep(&steps, at(ForkStep::Save, 0)), None);
     }
 
     #[test]

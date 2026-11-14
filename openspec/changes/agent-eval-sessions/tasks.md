@@ -201,8 +201,8 @@ La [tercera verificación](verify.md#tercera-verificación) encontró cuatro pun
 
 ## 31. La rama que jugó guarda sus archivos aunque falle otro paso (W5)
 
-- [ ] RED: `a_branch_keeps_its_files_when_the_daemon_does_not_stop` (`run.rs`): un `ForkStep::Stop` que falla después del `Play` de una rama.
-- [ ] GREEN: `fork` aplica el `Keep` de la última rama que jugó, cualquiera sea el paso que falló.
+- [x] RED: `a_branch_keeps_its_files_when_the_daemon_does_not_stop` (`run.rs`): un `ForkStep::Stop` que falla después del `Play` de una rama.
+- [x] GREEN: `fork` aplica el `Keep` de la última rama que jugó, cualquiera sea el paso que falló.
 - Commit: `fix(agent-eval): keep the files of the branch that played whatever step failed`
 
 ## 32. `score` por su ruta absoluta, y el error de puntuar (W1 y una sugerencia)
