@@ -17,6 +17,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clawg_core::memory::prompt_builder::DEFAULT_BUDGET;
 use clawg_core::memory::ProjectIdentity;
+use clawg_core::paths::Profile;
 use clawg_core::preferences::{self, Lang};
 use serde::Deserialize;
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -26,6 +27,8 @@ use crate::client::{ClientError, Context, DaemonClient, Health, ListArgs, Sessio
 use crate::hook_log::{self, Outcome, Run};
 use crate::mcp::roots::folder_of;
 use crate::mcp::tools::{review_nudge, suggestion_note, synthesis_nudge};
+use crate::setup::{self, Freshness};
+use crate::update::version::Version;
 
 /// The most a hook takes, from reading stdin to the answer: under the five
 /// seconds a hook is configured with, so the client never cancels one.
@@ -49,9 +52,10 @@ pub fn deadline_of(event: HookEvent) -> Duration {
 /// Windows with every core busy; an idle machine takes about 1 ms.
 pub const RECORD_RESERVE: Duration = Duration::from_millis(50);
 
-/// How long a hook waits for the preferred language before it goes on without
-/// one, so that a read a stuck disk holds up costs the language and not the
-/// memory. Above the worst read measured, 785 ms on Windows with twice as many
+/// How long a hook waits for the preferred language, and for the protocol block
+/// of the user's `CLAUDE.md`, which it reads at the same time, before it goes
+/// on without them, so that a read a stuck disk holds up costs the language or
+/// the notice and not the memory. Above the worst read measured, 785 ms on Windows with twice as many
 /// busy threads as cores (99% under 17 ms, and under 1 ms on an idle machine),
 /// and it leaves two of the three seconds for the rest.
 pub const LANGUAGE_WAIT: Duration = Duration::from_secs(1);
@@ -111,17 +115,51 @@ pub fn language_line(language: Lang) -> String {
     }
 }
 
-/// What `session-start` injects: the language line, the context, then what
-/// the agent should know about it, in the preferred language. `None` when
-/// there is nothing to say.
+/// What `session-start` says when the protocol block in the user's `CLAUDE.md`
+/// (`installed`, from its first marker to the end of its last) is not the one
+/// this clawg, at version `own`, writes for `language`: that the agent may
+/// read other rules there than in the server's instructions, which it is to
+/// follow, and the command that rewrites the block for `profile`. Like the
+/// language line it is clawg's own word to the agent. Nothing for a block that
+/// is current or that a later clawg wrote, or for none.
+pub fn block_notice(language: Option<Lang>, installed: Option<&str>, own: Version, profile: Profile) -> Option<String> {
+    if setup::freshness(installed?, language, own) != Freshness::Stale {
+        return None;
+    }
+    let profile = profile.as_str();
+    Some(match language.unwrap_or(Lang::En) {
+        Lang::En => format!(
+            "clawg: the memory protocol block in the user CLAUDE.md is not the one this clawg ({own}) writes, and may \
+             contradict this server's instructions; where they differ, follow the server's instructions. Tell the user \
+             once that `clawg setup claude-code --profile {profile}` rewrites it."
+        ),
+        Lang::Es => format!(
+            "clawg: el bloque del protocolo de memoria del CLAUDE.md del usuario no es el que escribe este clawg ({own}), \
+             y puede contradecir las instrucciones de este servidor; donde difieran, sigue las del servidor. Dile una \
+             vez a la persona que `clawg setup claude-code --profile {profile}` lo reescribe."
+        ),
+    })
+}
+
+/// What opens `session-start`: the language line, then the notice about the
+/// block, each when there is one.
+fn opening_lines(language: Option<Lang>, notice: Option<&str>) -> Vec<String> {
+    language.map(language_line).into_iter().chain(notice.map(String::from)).collect()
+}
+
+/// What `session-start` injects: the language line, the notice about the
+/// protocol block ([`block_notice`]), the context, then what the agent should
+/// know about it, in the preferred language. `None` when there is nothing to
+/// say.
 pub fn session_start_text(
     context: &Context,
     health: Option<&Health>,
     compacted: bool,
     language: Option<Lang>,
+    notice: Option<&str>,
 ) -> Option<String> {
     let lang = language.unwrap_or(Lang::En);
-    let mut parts: Vec<String> = language.map(language_line).into_iter().collect();
+    let mut parts = opening_lines(language, notice);
     let prompt = context.prompt.trim();
     if !prompt.is_empty() {
         parts.push(match lang {
@@ -266,7 +304,8 @@ fn now_ms() -> i64 {
 /// nothing. No daemon is started. With a preferred language, `session-start`
 /// names it whatever the daemon does: absent, failing or too slow, the line
 /// is still printed alone. Both events speak that language, read again at
-/// every event since a hook has no session to keep one.
+/// every event since a hook has no session to keep one. It does not read the
+/// protocol block of the user's `CLAUDE.md`; [`respond_and_record`] does.
 ///
 /// Cursor's `beforeSubmitPrompt` cannot add to the context, so
 /// `user-prompt-submit` says nothing to Cursor; and a hook installed for
@@ -286,7 +325,10 @@ pub async fn respond(
 /// [`respond`], with the run written to the record by the time it returns, so
 /// that a print that fails still leaves the evidence. The whole takes `deadline`
 /// at most: a session start answers within all of it but [`RECORD_RESERVE`], and
-/// a write still held up when it ends is left behind.
+/// a write still held up when it ends is left behind. With a `profile`, a
+/// `session-start` of Claude Code also reads the protocol block of the user's
+/// `CLAUDE.md` and says when it is not the one this clawg writes
+/// ([`block_notice`]), naming the command that rewrites it for that profile.
 pub async fn respond_and_record(
     event: HookEvent,
     host: HookClient,
@@ -294,13 +336,14 @@ pub async fn respond_and_record(
     base_dir: &Path,
     input: impl AsyncRead + Unpin,
     deadline: Duration,
+    profile: Option<Profile>,
 ) -> Option<String> {
     let end = tokio::time::Instant::now() + deadline;
     let to_answer = match event {
         HookEvent::SessionStart => deadline.saturating_sub(RECORD_RESERVE),
         HookEvent::UserPromptSubmit | HookEvent::SessionEnd => deadline,
     };
-    let (out, run) = respond_with_run(event, host, agent, base_dir, input, to_answer).await;
+    let (out, run) = respond_checking(event, host, agent, base_dir, input, to_answer, profile).await;
     if let Some(run) = run {
         hook_log::record_by(end, base_dir.to_path_buf(), run).await;
     }
@@ -317,12 +360,44 @@ pub async fn respond_with_run(
     input: impl AsyncRead + Unpin,
     deadline: Duration,
 ) -> (Option<String>, Option<Run>) {
-    let preferences_dir = base_dir.to_path_buf();
-    respond_reading(event, host, agent, base_dir, input, deadline, move || preferences::language_in(&preferences_dir)).await
+    respond_checking(event, host, agent, base_dir, input, deadline, None).await
 }
 
-/// [`respond_with_run`] with its read of the language as an argument, since no
-/// file holds up a read on every system and a test needs one that does.
+/// [`respond_with_run`] that reads the protocol block of the user's
+/// `CLAUDE.md` too when it is given a `profile`, and only for a `session-start`
+/// of Claude Code.
+async fn respond_checking(
+    event: HookEvent,
+    host: HookClient,
+    agent: &str,
+    base_dir: &Path,
+    input: impl AsyncRead + Unpin,
+    deadline: Duration,
+    profile: Option<Profile>,
+) -> (Option<String>, Option<Run>) {
+    let preferences_dir = base_dir.to_path_buf();
+    let block = profile.zip(setup::own_version().ok());
+    let read_language = move || preferences::language_in(&preferences_dir);
+    respond_reading(event, host, agent, base_dir, input, deadline, read_language, block, read_user_block).await
+}
+
+/// The block of the user's `CLAUDE.md` as `clawg setup claude-code` reads it,
+/// from its first marker to the end of its last; `None` when there is none or
+/// the file does not read, which the hook does not tell apart.
+fn read_user_block() -> Option<String> {
+    let home = clawg_core::paths::home_dir();
+    let (_, _, path) = setup::locations(home.as_deref(), std::env::var_os("CLAUDE_CONFIG_DIR")).ok()?;
+    let file = setup::File { text: Some(std::fs::read_to_string(&path).ok()?), path };
+    let (begin, end) = setup::find_block(&file).ok()??;
+    Some(file.text?[begin..end].to_string())
+}
+
+/// [`respond_with_run`] with its reads of the language and of the protocol
+/// block as arguments, since no file holds up a read on every system and a
+/// test needs one that does. `block` is the profile whose command the notice
+/// names and the version that writes the block; without it `read_block` is
+/// never called.
+#[expect(clippy::too_many_arguments, reason = "the two reads are injected apart so a test can hold either up; a type to group them is a refactor of its own")]
 async fn respond_reading(
     event: HookEvent,
     host: HookClient,
@@ -331,6 +406,8 @@ async fn respond_reading(
     input: impl AsyncRead + Unpin,
     deadline: Duration,
     read_language: impl FnOnce() -> Option<Lang> + Send + 'static,
+    block: Option<(Profile, Version)>,
+    read_block: impl FnOnce() -> Option<String> + Send + 'static,
 ) -> (Option<String>, Option<Run>) {
     if host == HookClient::Cursor && event == HookEvent::UserPromptSubmit {
         return (None, None);
@@ -343,14 +420,22 @@ async fn respond_reading(
     let at_ms = now_ms();
     let now = tokio::time::Instant::now();
     let deadline = now + deadline;
-    let language = read_by(deadline.min(now + LANGUAGE_WAIT), read_language).await;
+    let wait = deadline.min(now + LANGUAGE_WAIT);
+    let block = block.filter(|_| host == HookClient::ClaudeCode && event == HookEvent::SessionStart);
+    let (language, installed) = tokio::join!(read_by(wait, read_language), async {
+        match block {
+            Some(_) => read_by(wait, read_block).await,
+            None => None,
+        }
+    });
+    let notice = block.and_then(|(profile, own)| block_notice(language, installed.as_deref(), own, profile));
     let read = tokio::time::timeout_at(deadline, read_input(input)).await;
     let read_in_time = read.is_ok();
     let raw = read.ok().flatten();
     let parsed = raw.as_deref().and_then(HookInput::parse);
     let (answered, outcome) = match &parsed {
         Some(input) if host == HookClient::ClaudeCode && input.cursor_version.is_some() => (None, Outcome::OtherClient),
-        Some(input) => match tokio::time::timeout_at(deadline, answer(event, host, agent, base_dir, input, language)).await {
+        Some(input) => match tokio::time::timeout_at(deadline, answer(event, host, agent, base_dir, input, language, notice.as_deref())).await {
             Ok(done) => done,
             Err(_) => (None, Outcome::TimedOut),
         },
@@ -359,7 +444,10 @@ async fn respond_reading(
     };
     let text = match (event, outcome) {
         (_, Outcome::OtherClient) => None,
-        (HookEvent::SessionStart, _) => answered.or_else(|| language.map(language_line)),
+        (HookEvent::SessionStart, _) => answered.or_else(|| {
+            let lines = opening_lines(language, notice.as_deref());
+            (!lines.is_empty()).then(|| lines.join("\n\n"))
+        }),
         (HookEvent::UserPromptSubmit | HookEvent::SessionEnd, _) => answered,
     };
     let printed = text.map(|t| envelope(host, event, &t));
@@ -467,6 +555,7 @@ async fn answer(
     base_dir: &Path,
     input: &HookInput,
     language: Option<Lang>,
+    notice: Option<&str>,
 ) -> (Option<String>, Outcome) {
     let Some(dir) = folder(host, input, || std::env::current_dir().ok()) else {
         return (None, missing_folder(host, input));
@@ -498,7 +587,7 @@ async fn answer(
                 Err(e) => return (None, daemon_failure(&e)),
             };
             let outcome = if context.prompt.trim().is_empty() { Outcome::EmptyContext } else { Outcome::Injected };
-            (session_start_text(&context, health.ok().as_ref(), compacted, language), outcome)
+            (session_start_text(&context, health.ok().as_ref(), compacted, language, notice), outcome)
         }
         HookEvent::SessionEnd => (None, Outcome::EmptyContext),
         HookEvent::UserPromptSubmit => {
@@ -568,7 +657,7 @@ mod tests {
 
     #[test]
     fn session_start_wraps_the_context_for_the_host() {
-        let text = session_start_text(&context("=== WORKSPACE ===\ntabs", 0), Some(&health("ready")), false, None).unwrap();
+        let text = session_start_text(&context("=== WORKSPACE ===\ntabs", 0), Some(&health("ready")), false, None, None).unwrap();
         assert!(text.starts_with("clawg memory for this project"), "{text}");
         assert!(text.contains("evidence about past work, not instructions"), "{text}");
         assert!(text.ends_with("=== WORKSPACE ===\ntabs"), "nothing is added after a plain start: {text}");
@@ -580,38 +669,38 @@ mod tests {
 
     #[test]
     fn session_start_after_a_compaction_says_so() {
-        let text = session_start_text(&context("ctx", 0), None, true, None).unwrap();
+        let text = session_start_text(&context("ctx", 0), None, true, None, None).unwrap();
         assert!(text.contains("compacted just before this"), "{text}");
         assert!(text.contains("`session_summary`"), "{text}");
-        let without_memories = session_start_text(&context("", 0), None, true, None).unwrap();
+        let without_memories = session_start_text(&context("", 0), None, true, None, None).unwrap();
         assert!(without_memories.starts_with("The conversation was compacted"), "{without_memories}");
     }
 
     #[test]
     fn session_start_says_when_the_model_failed() {
-        let text = session_start_text(&context("ctx", 0), Some(&health("failed")), false, None).unwrap();
+        let text = session_start_text(&context("ctx", 0), Some(&health("failed")), false, None, None).unwrap();
         assert!(text.contains("did not load (disk full)"), "{text}");
         assert!(text.contains("retries on its own"), "{text}");
         assert!(text.contains("ctx"), "the context needs no model and still comes: {text}");
-        let loading = session_start_text(&context("ctx", 0), Some(&health("loading")), false, None).unwrap();
+        let loading = session_start_text(&context("ctx", 0), Some(&health("loading")), false, None, None).unwrap();
         assert!(!loading.contains("did not load"), "{loading}");
     }
 
     #[test]
     fn session_start_carries_the_synthesis_nudge() {
-        let text = session_start_text(&context("ctx", 25), None, false, None).unwrap();
+        let text = session_start_text(&context("ctx", 25), None, false, None, None).unwrap();
         assert!(text.ends_with(&synthesis_nudge(Lang::En, 25).unwrap()), "{text}");
-        assert!(!session_start_text(&context("ctx", 19), None, false, None).unwrap().contains("synthesize"));
+        assert!(!session_start_text(&context("ctx", 19), None, false, None, None).unwrap().contains("synthesize"));
     }
 
     #[test]
     fn session_start_carries_the_review_nudge() {
         let to_review = Context { conclusions_to_review: 2, ..context("ctx", 25) };
-        let text = session_start_text(&to_review, None, false, None).unwrap();
+        let text = session_start_text(&to_review, None, false, None, None).unwrap();
         assert!(text.ends_with(&review_nudge(Lang::En, 2).unwrap()), "{text}");
         assert!(text.contains(&synthesis_nudge(Lang::En, 25).unwrap()), "{text}");
         let without_context = Context { conclusions_to_review: 1, ..context("", 0) };
-        assert!(session_start_text(&without_context, None, false, None).is_some(), "the reminder comes on its own");
+        assert!(session_start_text(&without_context, None, false, None, None).is_some(), "the reminder comes on its own");
     }
 
     #[test]
@@ -624,7 +713,7 @@ mod tests {
         };
         let pending = Context { suggestions: vec![suggestion], ..context("ctx", 0) };
 
-        let text = session_start_text(&pending, None, false, None).unwrap();
+        let text = session_start_text(&pending, None, false, None, None).unwrap();
         assert!(
             text.ends_with(
                 "This project may be the same as notas (notas-1a2b). Ask the user, and record their answer with \
@@ -632,7 +721,7 @@ mod tests {
             ),
             "{text}"
         );
-        let text = session_start_text(&pending, None, false, Some(Lang::Es)).unwrap();
+        let text = session_start_text(&pending, None, false, Some(Lang::Es), None).unwrap();
         assert!(
             text.ends_with(
                 "Este proyecto puede ser el mismo que notas (notas-1a2b). Pregúntale a la persona y registra su respuesta \
@@ -641,14 +730,14 @@ mod tests {
             "{text}"
         );
         let many = Context { suggestions: vec![pending.suggestions[0].clone(); 5], ..context("ctx", 0) };
-        assert!(session_start_text(&many, None, false, None).unwrap().contains("notas (notas-1a2b), notas (notas-1a2b), 3 more."));
+        assert!(session_start_text(&many, None, false, None, None).unwrap().contains("notas (notas-1a2b), notas (notas-1a2b), 3 more."));
         let alone = Context { suggestions: pending.suggestions.clone(), ..context("", 0) };
-        assert!(session_start_text(&alone, None, false, None).is_some(), "the suggestion comes on its own");
+        assert!(session_start_text(&alone, None, false, None, None).is_some(), "the suggestion comes on its own");
     }
 
     #[test]
     fn an_empty_context_prints_nothing() {
-        assert_eq!(session_start_text(&context(" \n", 0), Some(&health("ready")), false, None), None);
+        assert_eq!(session_start_text(&context(" \n", 0), Some(&health("ready")), false, None, None), None);
     }
 
     #[test]
@@ -661,9 +750,10 @@ mod tests {
             created_at: 1,
         };
         let full = Context { suggestions: vec![suggestion; 9], ..context("x", 10_000) };
-        let added = session_start_text(&full, Some(&failed), true, Some(Lang::Es)).unwrap().len() - "x".len();
-        assert!(added < 1_500, "{added} bytes added");
-        const { assert!(SESSION_BUDGET + 1_500 <= 10_000, "the whole stays under what the client injects") }
+        let notice = block_notice(Some(Lang::Es), Some("an old block"), version("0.88.0"), Profile::Prod).expect("a block that differs");
+        let added = session_start_text(&full, Some(&failed), true, Some(Lang::Es), Some(&notice)).unwrap().len() - "x".len();
+        assert!(added < 2_000, "{added} bytes added");
+        const { assert!(SESSION_BUDGET + 2_000 <= 10_000, "the whole stays under what the client injects") }
     }
 
     const SPANISH_LINE: &str = "clawg: el idioma de la persona es el español. Respóndele en español salvo que escriba \
@@ -671,17 +761,17 @@ mod tests {
 
     #[test]
     fn session_start_names_the_users_language() {
-        let text = session_start_text(&context("ctx", 0), None, false, Some(Lang::Es)).unwrap();
+        let text = session_start_text(&context("ctx", 0), None, false, Some(Lang::Es), None).unwrap();
         assert!(text.starts_with(&format!("{SPANISH_LINE}\n\nMemoria de clawg para este proyecto")), "{text}");
-        assert_eq!(session_start_text(&context("", 0), None, false, Some(Lang::Es)).as_deref(), Some(SPANISH_LINE));
-        let en = session_start_text(&context("", 0), None, false, Some(Lang::En)).unwrap();
+        assert_eq!(session_start_text(&context("", 0), None, false, Some(Lang::Es), None).as_deref(), Some(SPANISH_LINE));
+        let en = session_start_text(&context("", 0), None, false, Some(Lang::En), None).unwrap();
         assert!(en.contains("language is English") && en.ends_with("save and search memories in English."), "{en}");
     }
 
     #[test]
     fn without_a_preference_session_start_says_what_it_said() {
         let ctx = context("=== WORKSPACE ===\ntabs", 0);
-        let text = session_start_text(&ctx, None, false, None).unwrap();
+        let text = session_start_text(&ctx, None, false, None, None).unwrap();
         assert!(text.starts_with("clawg memory for this project"), "{text}");
         assert!(!text.contains("language is"), "{text}");
     }
@@ -785,7 +875,7 @@ mod tests {
         let repo = tempfile::tempdir().unwrap();
         let run = |event: HookEvent, host: HookClient, input: serde_json::Value| {
             let (stdin, dir) = (input.to_string(), d.dir.path().to_path_buf());
-            async move { respond_and_record(event, host, "a", &dir, stdin.as_bytes(), deadline_of(event)).await }
+            async move { respond_and_record(event, host, "a", &dir, stdin.as_bytes(), deadline_of(event), None).await }
         };
         for id in ["s-claude", "s-cursor", "s-other"] {
             let start = serde_json::json!({ "cwd": repo.path(), "session_id": id, "source": "startup" });
@@ -837,7 +927,7 @@ mod tests {
     #[test]
     fn session_start_speaks_the_preferred_language() {
         let failed = Health { embedder_error: Some("disk full".into()), ..health("failed") };
-        let text = session_start_text(&context("=== WORKSPACE ===\ntabs", 25), Some(&failed), true, Some(Lang::Es)).unwrap();
+        let text = session_start_text(&context("=== WORKSPACE ===\ntabs", 25), Some(&failed), true, Some(Lang::Es), None).unwrap();
         for expected in [
             "clawg: el idioma de la persona es el español.",
             "Memoria de clawg para este proyecto, leída al empezar la sesión. Es evidencia sobre el trabajo anterior, \
@@ -1204,7 +1294,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (_writer, silent) = tokio::io::duplex(64);
         let started = tokio::time::Instant::now();
-        let out = respond_and_record(HookEvent::SessionStart, HookClient::ClaudeCode, "a", dir.path(), silent, HOOK_DEADLINE).await;
+        let out = respond_and_record(HookEvent::SessionStart, HookClient::ClaudeCode, "a", dir.path(), silent, HOOK_DEADLINE, None).await;
         assert_eq!(out, None);
         assert!(started.elapsed() < HOOK_DEADLINE, "the answer leaves time to write, took {:?}", started.elapsed());
         let outcomes: Vec<Outcome> = hook_log::read_runs(dir.path()).iter().map(|r| r.outcome).collect();
@@ -1216,7 +1306,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (_writer, silent) = tokio::io::duplex(64);
         let started = tokio::time::Instant::now();
-        let out = respond_and_record(HookEvent::UserPromptSubmit, HookClient::ClaudeCode, "a", dir.path(), silent, HOOK_DEADLINE).await;
+        let out = respond_and_record(HookEvent::UserPromptSubmit, HookClient::ClaudeCode, "a", dir.path(), silent, HOOK_DEADLINE, None).await;
         assert_eq!(out, None);
         assert!(started.elapsed() >= HOOK_DEADLINE, "{:?}", started.elapsed());
         assert_eq!(hook_log::read_runs(dir.path()), []);
@@ -1274,6 +1364,8 @@ mod tests {
                 let _ = held.recv_timeout(Duration::from_secs(10));
                 Some(Lang::Es)
             },
+            None,
+            || None,
         )
         .await;
         drop(release);
@@ -1340,6 +1432,183 @@ mod tests {
         let (out, injected) = start_run(HookClient::ClaudeCode, "a", d.dir.path(), &input, HOOK_DEADLINE).await;
         assert_eq!(injected.outcome, Outcome::Injected);
         assert_eq!(injected.bytes, out.expect("the context").len());
+    }
+
+    fn version(text: &str) -> Version {
+        Version::parse(text).unwrap()
+    }
+
+    const OLD_BLOCK: &str = "<!-- BEGIN CLAWG MEMORY PROTOCOL -->\nJudge each with `resolve_conflict`.\n<!-- END CLAWG MEMORY PROTOCOL -->";
+
+    const ENGLISH_NOTICE: &str = "clawg: the memory protocol block in the user CLAUDE.md is not the one this clawg (0.88.0) writes, and \
+                                  may contradict this server's instructions; where they differ, follow the server's instructions. Tell \
+                                  the user once that `clawg setup claude-code --profile prod` rewrites it.";
+
+    const SPANISH_NOTICE: &str = "clawg: el bloque del protocolo de memoria del CLAUDE.md del usuario no es el que escribe este clawg \
+                                  (0.88.0), y puede contradecir las instrucciones de este servidor; donde difieran, sigue las del \
+                                  servidor. Dile una vez a la persona que `clawg setup claude-code --profile dev` lo reescribe.";
+
+    /// The block this binary, at 0.88.0, writes for `language`.
+    fn written_block(language: Option<Lang>) -> String {
+        crate::setup::block("\n", language, crate::mcp::protocol::Variant::Full, crate::setup::Stamp { version: version("0.88.0"), choice: None })
+    }
+
+    #[test]
+    fn the_block_notice_is_for_a_block_that_differs() {
+        let own = version("0.88.0");
+        assert_eq!(block_notice(None, Some(OLD_BLOCK), own, Profile::Prod).as_deref(), Some(ENGLISH_NOTICE));
+        assert_eq!(block_notice(Some(Lang::En), Some(OLD_BLOCK), own, Profile::Prod).as_deref(), Some(ENGLISH_NOTICE));
+        assert_eq!(block_notice(Some(Lang::Es), Some(OLD_BLOCK), own, Profile::Dev).as_deref(), Some(SPANISH_NOTICE));
+
+        let later = "<!-- BEGIN CLAWG MEMORY PROTOCOL -->\n<!-- clawg 0.90.0 -->\nother rules\n<!-- END CLAWG MEMORY PROTOCOL -->";
+        assert_eq!(block_notice(None, Some(later), own, Profile::Dev), None, "a later clawg wrote it");
+        assert_eq!(block_notice(None, Some(&written_block(None)), own, Profile::Dev), None, "it is the one written now");
+        assert_eq!(block_notice(Some(Lang::Es), Some(&written_block(None)), own, Profile::Dev).as_deref(), Some(SPANISH_NOTICE), "the other language's text");
+        assert_eq!(block_notice(None, None, own, Profile::Dev), None, "no block, or one that did not read");
+    }
+
+    #[test]
+    fn session_start_puts_the_notice_after_the_language_and_before_the_context() {
+        let text = session_start_text(&context("ctx", 0), None, false, Some(Lang::Es), Some("AVISO")).unwrap();
+        assert!(text.starts_with(&format!("{SPANISH_LINE}\n\nAVISO\n\nMemoria de clawg para este proyecto")), "{text}");
+        let without_language = session_start_text(&context("ctx", 0), None, false, None, Some("NOTICE")).unwrap();
+        assert!(without_language.starts_with("NOTICE\n\nclawg memory for this project"), "{without_language}");
+        assert_eq!(session_start_text(&context("", 0), None, false, None, Some("NOTICE")).as_deref(), Some("NOTICE"), "on its own");
+    }
+
+    /// A session start of Claude Code in a folder with no daemon, as the hook
+    /// would answer it with `language` and `installed` as the files hold them.
+    async fn start_holding(
+        host: HookClient,
+        event: HookEvent,
+        language: Option<Lang>,
+        installed: Option<&str>,
+    ) -> (Option<String>, bool) {
+        let installed = installed.map(String::from);
+        let dir = tempfile::tempdir().unwrap();
+        let asked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = asked.clone();
+        let input = if host == HookClient::Cursor { cursor_input(&[dir.path()]) } else { hook_input(dir.path()) };
+        let (out, _) = respond_reading(
+            event,
+            host,
+            "a",
+            dir.path(),
+            input.as_bytes(),
+            HOOK_DEADLINE,
+            move || language,
+            Some((Profile::Prod, version("0.88.0"))),
+            move || {
+                flag.store(true, Ordering::SeqCst);
+                installed
+            },
+        )
+        .await;
+        (out, asked.load(Ordering::SeqCst))
+    }
+
+    fn printed_context(out: Option<String>) -> String {
+        let out: serde_json::Value = serde_json::from_str(&out.expect("something printed")).unwrap();
+        out["hookSpecificOutput"]["additionalContext"].as_str().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn session_start_says_when_the_block_is_stale() {
+        let (out, asked) = start_holding(HookClient::ClaudeCode, HookEvent::SessionStart, None, Some(OLD_BLOCK)).await;
+        assert!(asked);
+        assert_eq!(printed_context(out), ENGLISH_NOTICE, "with no daemon and no preference the notice is all there is");
+
+        let (out, _) = start_holding(HookClient::ClaudeCode, HookEvent::SessionStart, Some(Lang::Es), Some(OLD_BLOCK)).await;
+        let spanish = SPANISH_NOTICE.replace("--profile dev", "--profile prod");
+        assert_eq!(printed_context(out), format!("{SPANISH_LINE}\n\n{spanish}"));
+
+        for quiet in [None, Some("<!-- BEGIN CLAWG MEMORY PROTOCOL -->\n<!-- clawg 0.90.0 -->\nother\n<!-- END CLAWG MEMORY PROTOCOL -->")] {
+            let (out, _) = start_holding(HookClient::ClaudeCode, HookEvent::SessionStart, None, quiet).await;
+            assert_eq!(out, None, "no block, or a later one: {quiet:?}");
+        }
+        let current = written_block(None);
+        let (out, _) = start_holding(HookClient::ClaudeCode, HookEvent::SessionStart, None, Some(&current)).await;
+        assert_eq!(out, None, "the block of this clawg");
+
+        let (out, asked) = start_holding(HookClient::Cursor, HookEvent::SessionStart, None, Some(OLD_BLOCK)).await;
+        assert_eq!((out, asked), (None, false), "Cursor has no block, and its hook does not read one");
+        let (out, asked) = start_holding(HookClient::ClaudeCode, HookEvent::UserPromptSubmit, None, Some(OLD_BLOCK)).await;
+        assert_eq!((out, asked), (None, false), "only a session start says it");
+    }
+
+    #[tokio::test]
+    async fn a_hook_cursor_runs_for_claude_code_does_not_name_the_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = cursor_input(&[dir.path()]);
+        let (out, _) = respond_reading(
+            HookEvent::SessionStart,
+            HookClient::ClaudeCode,
+            "claude-code",
+            dir.path(),
+            input.as_bytes(),
+            HOOK_DEADLINE,
+            || None,
+            Some((Profile::Prod, version("0.88.0"))),
+            || Some(OLD_BLOCK.to_string()),
+        )
+        .await;
+        assert_eq!(out, None);
+    }
+
+    #[tokio::test]
+    async fn a_block_that_never_reads_costs_the_notice_and_not_the_memory() {
+        use crate::client::tests::{publish, start_daemon};
+        let d = start_daemon().await;
+        publish(&d);
+        let client = DaemonClient::from_data_dir(d.dir.path()).expect("client");
+        let repo = tempfile::tempdir().unwrap();
+        let root = ProjectIdentity::resolve(repo.path()).root;
+        let project = client.register_project(&root, None, &[], false).await.unwrap().project_id;
+        let save = crate::client::SaveArgs {
+            content: "The deploy script lives in ops/deploy.sh".into(),
+            agent_id: "a".into(),
+            project_id: Some(project),
+            memory_type: Some("semantic_fact".into()),
+            importance: None,
+            derived_from: Vec::new(),
+            topic_key: None,
+            user_stated: false,
+        };
+        client.save(save).await.expect("save");
+        let input = serde_json::json!({ "cwd": root, "source": "startup" }).to_string();
+        let read_with = |read: Box<dyn FnOnce() -> Option<String> + Send>| {
+            respond_reading(
+                HookEvent::SessionStart,
+                HookClient::ClaudeCode,
+                "a",
+                d.dir.path(),
+                input.as_bytes(),
+                HOOK_DEADLINE,
+                || None,
+                Some((Profile::Prod, version("0.88.0"))),
+                read,
+            )
+        };
+
+        let (with, _) = read_with(Box::new(|| Some(OLD_BLOCK.to_string()))).await;
+        let with = with.expect("the context");
+        assert!(with.contains("ops/deploy.sh") && with.contains("clawg setup claude-code --profile prod"), "{with}");
+        assert!(with.find("clawg setup").unwrap() < with.find("ops/deploy.sh").unwrap(), "the notice comes first: {with}");
+
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let started = tokio::time::Instant::now();
+        // Bounded so that a wait with no limit fails this test and does not hang it.
+        let (without, run) = read_with(Box::new(move || {
+            let _ = held.recv_timeout(Duration::from_secs(10));
+            Some(OLD_BLOCK.to_string())
+        }))
+        .await;
+        drop(release);
+
+        assert_eq!(run.expect("a run").outcome, Outcome::Injected);
+        let without = without.expect("the context");
+        assert!(without.contains("ops/deploy.sh") && !without.contains("clawg setup"), "a block not read in time is no block: {without}");
+        assert!(started.elapsed() < HOOK_DEADLINE, "the wait is the one of the language, took {:?}", started.elapsed());
     }
 
     #[tokio::test]

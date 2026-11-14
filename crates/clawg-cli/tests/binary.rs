@@ -70,6 +70,8 @@ impl Sandbox {
             .env("CLAWG_TEST_EMBEDDER", "fake")
             .env_remove("CLAWG_PROFILE")
             .env_remove("CLAWG_TEST_DEFAULT_PORT")
+            // Never the configuration of the Claude Code the tests run under.
+            .env_remove("CLAUDE_CONFIG_DIR")
             .env("RUST_LOG", "info")
             .current_dir(&self.home)
             .stdin(Stdio::null())
@@ -1751,6 +1753,55 @@ async fn session_start_without_a_daemon_still_names_the_language() {
 
     let out = hook(&sandbox, &["user-prompt-submit", "--agent", "smoke", "--profile", "dev"], &input);
     assert_eq!((out.status.code(), stdout_of(&out)), (Some(0), String::new()), "only the session's start names it");
+}
+
+#[tokio::test]
+async fn session_start_names_an_old_protocol_block() {
+    let sandbox = Sandbox::new();
+    let claude = sandbox.home.join(".claude");
+    std::fs::create_dir_all(&claude).unwrap();
+    let md = claude.join("CLAUDE.md");
+    let old = "# Mine\n\n<!-- BEGIN CLAWG MEMORY PROTOCOL -->\nJudge each with `resolve_conflict`.\n<!-- END CLAWG MEMORY PROTOCOL -->\n";
+    std::fs::write(&md, old).unwrap();
+    let input = json!({ "cwd": sandbox.home, "source": "startup" }).to_string();
+    let start = || hook(&sandbox, &["session-start", "--agent", "claude-code", "--profile", "dev"], &input);
+    let context = |out: &Output| {
+        assert_eq!(out.status.code(), Some(0), "{}", stderr_of(out));
+        let printed: Value = serde_json::from_str(&stdout_of(out)).expect("the hook's envelope");
+        printed["hookSpecificOutput"]["additionalContext"].as_str().unwrap_or_default().to_string()
+    };
+
+    let notice = context(&start());
+    assert!(notice.starts_with("clawg: the memory protocol block in the user CLAUDE.md is not the one this clawg ("), "{notice}");
+    assert!(notice.contains(env!("CARGO_PKG_VERSION")), "{notice}");
+    assert!(notice.ends_with("Tell the user once that `clawg setup claude-code --profile dev` rewrites it."), "{notice}");
+    assert!(!sandbox.data_dir().join("daemon.json").exists(), "no daemon was started");
+    assert_eq!(std::fs::read_to_string(&md).unwrap(), old, "the hook writes nothing of the user's");
+
+    let set = sandbox.run(&["preferences", "set", "language", "es", "--profile", "dev"]);
+    assert_eq!(set.status.code(), Some(0), "{}", stderr_of(&set));
+    let spanish = context(&start());
+    assert!(spanish.starts_with("clawg: el idioma de la persona es el español."), "{spanish}");
+    assert!(spanish.contains("\n\nclawg: el bloque del protocolo de memoria del CLAUDE.md del usuario no es el que escribe este clawg"), "{spanish}");
+    assert!(spanish.ends_with("`clawg setup claude-code --profile dev` lo reescribe."), "{spanish}");
+
+    let prompt = hook(&sandbox, &["user-prompt-submit", "--agent", "claude-code", "--profile", "dev"], &input);
+    assert_eq!((prompt.status.code(), stdout_of(&prompt)), (Some(0), String::new()), "only the session's start says it");
+    let cursor = hook_in(&sandbox, &dot_cursor(&sandbox), &["session-start", "--agent", "cursor", "--client", "cursor", "--profile", "dev"], &cursor_session_start(&[&sandbox.home]));
+    assert!(!stdout_of(&cursor).contains("CLAUDE.md"), "Cursor has no block: {}", stdout_of(&cursor));
+
+    // Once `setup` has rewritten the block, the hook has nothing to say about it.
+    let empty = sandbox.home.join("empty-path");
+    std::fs::create_dir_all(&empty).unwrap();
+    let out = sandbox
+        .command(&["setup", "claude-code", "--profile", "dev"])
+        .env("CLAUDE_CONFIG_DIR", &claude)
+        .env("PATH", &empty)
+        .output()
+        .expect("run clawg setup");
+    assert!(std::fs::read_to_string(&md).unwrap().contains("<!-- clawg "), "{}", stderr_of(&out));
+    let current = context(&start());
+    assert!(!current.contains("CLAUDE.md"), "{current}");
 }
 
 #[tokio::test]
