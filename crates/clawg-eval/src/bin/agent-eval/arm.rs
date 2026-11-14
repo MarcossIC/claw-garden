@@ -293,7 +293,7 @@ pub fn plan(task: &Task, arm: Arm, layout: &Layout, options: &Options) -> Result
 
     let mut args: Vec<String> = vec![
         "-p".into(),
-        task.prompt.clone(),
+        task.prompts()[0].to_owned(),
         "--output-format".into(),
         "stream-json".into(),
         "--verbose".into(),

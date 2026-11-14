@@ -304,7 +304,7 @@ fn leaks(
     if task::contains_ci(&path, &task.id) {
         found.push(named(format!("the id of its task, {}", task.id)));
     }
-    found.extend(task.tracers.iter().filter(|tr| task::contains_ci(&path, tr)).map(|tr| named(format!("the tracer {tr:?}"))));
+    found.extend(task.every_tracer().filter(|tr| task::contains_ci(&path, tr)).map(|tr| named(format!("the tracer {tr:?}"))));
     found
 }
 
@@ -792,6 +792,20 @@ mod tests {
         assert_eq!(found("/runs/48213/1"), [Leak::Named { workdir: workdir("/runs/48213/1"), what: "the tracer \"48213\"".into() }]);
         let said = RunError::PaidRun(found("/runs/staging-port.a0.1")).to_string();
         assert!(said.contains("staging-port") && said.contains("the agent reads it"), "{said}");
+    }
+
+    #[test]
+    fn a_working_directory_that_names_a_tracer_of_a_session_is_named() {
+        let relay = task::parse(
+            r#"{"id": "relay", "category": "R", "fixture": "f",
+                "sessions": [{"prompt": "Decide on 4.5-41.", "tracers": ["4.5-41"]}, {"prompt": "Apply it."}],
+                "checks": [{"kind": "answer_contains", "text": "x"}]}"#,
+        )
+        .unwrap();
+        let out = "/runs/4.5-41/1";
+        let found = leaks(Some("k"), None, None, Path::new(out), &clean_ancestors(Path::new(out)), &relay);
+        let workdir = Layout { root: PathBuf::from(out) }.workdir();
+        assert_eq!(found, [Leak::Named { workdir, what: "the tracer \"4.5-41\"".into() }]);
     }
 
     #[test]
