@@ -130,14 +130,20 @@ async fn wait_until(deadline: Instant, write: impl FnOnce() + Send + 'static) {
 }
 
 fn append(dir: &Path, line: &str) -> std::io::Result<()> {
-    let path = dir.join(FILE);
+    append_rolled(dir, FILE, ROLLED, ROLL_AT, line)
+}
+
+/// Appends `text` to `file` of `dir` in one write, after renaming `file` to
+/// `rolled` when it holds `roll_at` bytes or more, and without creating `dir`.
+pub fn append_rolled(dir: &Path, file: &str, rolled: &str, roll_at: u64, text: &str) -> std::io::Result<()> {
+    let path = dir.join(file);
     // Renaming instead of rewriting: two hooks that start together never
     // lose a line to a copy of the file. A roll that fails costs nothing: the
-    // run is still appended and the next one tries again.
-    if std::fs::metadata(&path).is_ok_and(|m| m.len() >= ROLL_AT) {
-        let _ = std::fs::rename(&path, dir.join(ROLLED));
+    // text is still appended and the next write tries again.
+    if std::fs::metadata(&path).is_ok_and(|m| m.len() >= roll_at) {
+        let _ = std::fs::rename(&path, dir.join(rolled));
     }
-    std::fs::OpenOptions::new().append(true).create(true).open(path)?.write_all(line.as_bytes())
+    std::fs::OpenOptions::new().append(true).create(true).open(path)?.write_all(text.as_bytes())
 }
 
 #[cfg(test)]
