@@ -142,9 +142,16 @@ pub fn language_line(language: Lang) -> String {
 /// read other rules there than in the server's instructions, which it is to
 /// follow, and the command that rewrites the block for `profile`. Like the
 /// language line it is clawg's own word to the agent. Nothing for a block that
-/// is current or that a later clawg wrote, or for none.
+/// is current or that a later clawg wrote, for none, or, in the `dev` profile,
+/// for one stamped with this same version.
 pub fn block_notice(language: Option<Lang>, installed: Option<&str>, own: Version, profile: Profile) -> Option<String> {
-    if setup::freshness(installed?, language, own) != Freshness::Stale {
+    let installed = installed?;
+    if setup::freshness(installed, language, own) != Freshness::Stale {
+        return None;
+    }
+    // A dev build made halfway through a change shares its version with the installed prod build, and each
+    // would call the other's text stale at every session; the prod build is the one that keeps telling.
+    if profile == Profile::Dev && setup::read_stamp(installed).is_some_and(|stamp| stamp.version == own) {
         return None;
     }
     let profile = profile.as_str();
@@ -1562,7 +1569,11 @@ mod tests {
         let later = "<!-- BEGIN CLAWG MEMORY PROTOCOL -->\n<!-- clawg 0.90.0 -->\nother rules\n<!-- END CLAWG MEMORY PROTOCOL -->";
         assert_eq!(block_notice(None, Some(later), own, Profile::Dev), None, "a later clawg wrote it");
         assert_eq!(block_notice(None, Some(&written_block(None)), own, Profile::Dev), None, "it is the one written now");
-        assert_eq!(block_notice(Some(Lang::Es), Some(&written_block(None)), own, Profile::Dev).as_deref(), Some(SPANISH_NOTICE), "the other language's text");
+        let spanish_for_prod = SPANISH_NOTICE.replace("--profile dev", "--profile prod");
+        assert_eq!(block_notice(Some(Lang::Es), Some(&written_block(None)), own, Profile::Prod).as_deref(), Some(spanish_for_prod.as_str()), "the other language's text");
+        assert_eq!(block_notice(Some(Lang::Es), Some(&written_block(None)), own, Profile::Dev), None, "a dev build is quiet over a block of its own version");
+        let earlier = written_block(None).replace("0.88.0", "0.87.0");
+        assert_eq!(block_notice(Some(Lang::Es), Some(&earlier), own, Profile::Dev).as_deref(), Some(SPANISH_NOTICE), "an earlier version is still told");
         assert_eq!(block_notice(None, None, own, Profile::Dev), None, "no block, or one that did not read");
     }
 
