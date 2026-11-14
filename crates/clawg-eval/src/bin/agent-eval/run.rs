@@ -547,19 +547,20 @@ fn resolved(path: &str, workdir: &str) -> String {
 }
 
 /// The paths a call reads: `Read` its file; `Grep` and `Glob` their `path`, and
-/// their `pattern` when it is an absolute path; `LSP` its file; and `Bash` each
+/// their `pattern` when it is an absolute path (a `Glob`'s only: a `Grep` pattern is a regex); `LSP` its file; and `Bash` each
 /// word of its command that is an absolute path or goes up with `..`.
 fn read_paths(call: &ToolCall) -> Vec<String> {
     let text = |key: &str| call.input.get(key).and_then(Value::as_str).map(str::to_owned);
     match call.name.as_str() {
         "Read" => text("file_path").into_iter().collect(),
-        "Grep" | "Glob" => text("path").into_iter().chain(text("pattern").filter(|p| is_absolute(&norm_path(p)))).collect(),
+        "Grep" => text("path").into_iter().collect(),
+        "Glob" => text("path").into_iter().chain(text("pattern").filter(|p| is_absolute(&norm_path(p)))).collect(),
         "LSP" => text("filePath").or_else(|| text("file_path")).into_iter().collect(),
         "Bash" => text("command")
             .map(|line| {
                 line.split_whitespace()
                     .map(|word| word.trim_matches(|c| "'\"`;&|()<>".contains(c)))
-                    .filter(|word| is_absolute(&norm_path(word)) || word.split(['/', '\\']).any(|part| part == ".."))
+                    .filter(|word| *word != "/dev/null" && (is_absolute(&norm_path(word)) || word.split(['/', '\\']).any(|part| part == "..")))
                     .map(str::to_owned)
                     .collect()
             })
@@ -568,18 +569,33 @@ fn read_paths(call: &ToolCall) -> Vec<String> {
     }
 }
 
+/// A Git Bash path `/c/dir` as the drive `c:/dir` when `windows`: the client
+/// and the shell name one file in both ways.
+fn drive_form(path: &str, windows: bool) -> String {
+    let bytes = path.as_bytes();
+    if windows && bytes.len() >= 2 && bytes[0] == b'/' && bytes[1].is_ascii_alphabetic() && bytes.get(2).is_none_or(|b| *b == b'/') {
+        format!("{}:{}", bytes[1] as char, &path[2..])
+    } else {
+        path.to_owned()
+    }
+}
+
 /// Every read of `calls`, a subagent's included, of a path outside `workdir` and
 /// the `additional` directories, each resolved from `workdir`. The files the
 /// client writes for the session and asks it to read hold its `session_id` in
 /// their path, and are not listed.
 pub fn outside_reads(calls: &[ToolCall], workdir: &Path, additional: &[String], session_id: Option<&str>) -> Vec<OutsideRead> {
+    outside_reads_on(calls, workdir, additional, session_id, cfg!(windows))
+}
+
+fn outside_reads_on(calls: &[ToolCall], workdir: &Path, additional: &[String], session_id: Option<&str>, windows: bool) -> Vec<OutsideRead> {
     let workdir = norm_path(&workdir.to_string_lossy());
     let dirs: Vec<String> = std::iter::once(workdir.clone()).chain(additional.iter().map(|dir| norm_path(dir))).collect();
     let id = session_id.filter(|id| !id.is_empty()).map(str::to_lowercase);
     let mut found = Vec::new();
     for call in calls {
         for path in read_paths(call) {
-            let full = resolved(&path, &workdir);
+            let full = drive_form(&resolved(&path, &workdir), windows);
             let inside = dirs.iter().any(|dir| full == *dir || in_dir(&full, dir));
             if !inside && !id.as_deref().is_some_and(|id| full.contains(id)) {
                 found.push(OutsideRead { tool: call.name.clone(), path, denied: call.is_error });
@@ -2375,6 +2391,29 @@ mod tests {
         let mut without = all.to_vec();
         without.sort();
         assert_eq!(with_memory, without, "a directory the plan adds is a working directory");
+    }
+
+    #[test]
+    fn a_grep_pattern_is_no_path() {
+        let calls = calls_of("s1", &[("Grep", json!({"pattern": "/etc/hosts"}), false), ("Glob", json!({"pattern": "/etc/*.conf"}), false)]);
+        let found: Vec<(String, String)> = outside_reads(&calls, Path::new(WORKDIR), &[], Some("s1")).into_iter().map(|r| (r.tool, r.path)).collect();
+        assert_eq!(found, [("Glob".to_owned(), "/etc/*.conf".to_owned())], "a regex is no path, a glob is");
+    }
+
+    #[test]
+    fn dev_null_is_no_read_outside() {
+        let calls = calls_of("s1", &[("Bash", json!({"command": "ls src >/dev/null; cat /etc/hosts 2> /dev/null"}), false)]);
+        let found: Vec<String> = outside_reads(&calls, Path::new(WORKDIR), &[], Some("s1")).into_iter().map(|r| r.path).collect();
+        assert_eq!(found, ["/etc/hosts"]);
+    }
+
+    #[test]
+    fn a_drive_in_git_bash_form_is_the_same_path() {
+        let calls = calls_of("s1", &[("Bash", json!({"command": "ls /c/Runs/R/work/src /d/other"}), false), ("Read", json!({"file_path": "/c/runs/r/work/a.py"}), false)]);
+        let work = Path::new(r"C:\Runs\R\work");
+        let paths = |windows| -> Vec<String> { outside_reads_on(&calls, work, &[], Some("s1"), windows).into_iter().map(|r| r.path).collect() };
+        assert_eq!(paths(true), ["/d/other"], "on Windows /c/ is the drive c:");
+        assert_eq!(paths(false).len(), 3, "elsewhere /c/ is a directory of its own");
     }
 
     #[test]

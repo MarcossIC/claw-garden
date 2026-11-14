@@ -189,8 +189,8 @@ La [tercera verificación](verify.md#tercera-verificación) encontró cuatro pun
 
 ## 29. Una lectura fuera, sin falsos positivos (W2)
 
-- [ ] RED: `a_grep_pattern_is_no_path`, `dev_null_is_no_read_outside`, `a_drive_in_git_bash_form_is_the_same_path` (`run.rs`).
-- [ ] GREEN: `outside_reads` toma `pattern` como ruta sólo en `Glob`; en `Bash` salta `/dev/null`; la comparación de rutas lee `/c/…` como `c:/…`, pura, con el sistema como parámetro.
+- [x] RED: `a_grep_pattern_is_no_path`, `dev_null_is_no_read_outside`, `a_drive_in_git_bash_form_is_the_same_path` (`run.rs`).
+- [x] GREEN: `outside_reads` toma `pattern` como ruta sólo en `Glob`; en `Bash` salta `/dev/null`; la comparación de rutas lee `/c/…` como `c:/…`, pura, con el sistema como parámetro.
 - Commit: `fix(agent-eval): read no path from a grep pattern, /dev/null or a git bash drive`
 
 ## 30. La decisión del relevo, sin tocar en todo archivo que la puede llevar (W3)
