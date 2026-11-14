@@ -681,19 +681,13 @@ fn split_stamp(block: &str) -> (Option<Stamp>, String) {
 }
 
 /// The block `block` writes, without its stamp, with `\n` line endings.
-pub(crate) fn unstamped(language: Option<Lang>, variant: Variant) -> String {
+fn unstamped(language: Option<Lang>, variant: Variant) -> String {
     assemble("\n", language, variant, None)
-}
-
-/// An installed block as [`unstamped`] writes it: its stamp taken out when it
-/// reads, and `\n` line endings.
-pub(crate) fn without_stamp(block: &str) -> String {
-    split_stamp(block).1
 }
 
 /// How an installed block compares with what this binary writes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Freshness {
+pub enum Freshness {
     Current,
     /// Other text, written by a later version.
     Newer,

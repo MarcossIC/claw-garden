@@ -2394,6 +2394,47 @@ async fn doctor_names_a_broken_preferences_file() {
     assert_eq!(findings(&report, "protocol_block"), [("info", "not_installed")], "{report}");
 }
 
+#[tokio::test]
+async fn doctor_marks_an_old_block_stale_without_a_preference() {
+    let sandbox = Sandbox::new();
+    let claude = sandbox.home.join(".claude");
+    std::fs::create_dir_all(&claude).expect("claude dir");
+    let md = claude.join("CLAUDE.md");
+
+    std::fs::write(&md, "# Mine\n").expect("write");
+    let (_, report) = doctor(&sandbox);
+    assert!(findings(&report, "protocol_block").is_empty(), "no block and no preference: {report}");
+
+    let old = "# Mine\n\n<!-- BEGIN CLAWG MEMORY PROTOCOL -->\nJudge each with `resolve_conflict`: `compatible` if both hold.\n<!-- END CLAWG MEMORY PROTOCOL -->\n";
+    std::fs::write(&md, old).expect("write");
+    let (_, report) = doctor(&sandbox);
+    assert_eq!(findings(&report, "protocol_block"), [("warn", "stale")], "{report}");
+    let finding = report["checks"].as_array().unwrap().iter().find(|f| f["check_id"] == "protocol_block").unwrap();
+    assert_eq!(finding["safe_next_step"], "clawg setup claude-code --profile dev");
+    assert_eq!(finding["evidence"]["written_by"], Value::Null);
+    assert_eq!(finding["evidence"]["this_version"], env!("CARGO_PKG_VERSION"));
+
+    let later = old.replace("<!-- BEGIN CLAWG MEMORY PROTOCOL -->\n", "<!-- BEGIN CLAWG MEMORY PROTOCOL -->\n<!-- clawg 99.0.0 -->\n");
+    std::fs::write(&md, later).expect("write");
+    let (_, report) = doctor(&sandbox);
+    assert_eq!(findings(&report, "protocol_block"), [("info", "newer")], "{report}");
+
+    // What `setup` writes is what `doctor` holds the block to, whichever variant was chosen.
+    let empty = sandbox.home.join("empty-path");
+    for choice in [&[][..], &["--protocol", "short"], &["--protocol", "off"], &["--protocol", "full"]] {
+        std::fs::write(&md, old).expect("write");
+        let out = sandbox
+            .command(&[&["setup", "claude-code", "--profile", "dev"], choice].concat())
+            .env("CLAUDE_CONFIG_DIR", &claude)
+            .env("PATH", &empty)
+            .output()
+            .expect("run clawg setup");
+        assert!(std::fs::read_to_string(&md).unwrap().contains(&format!("<!-- clawg {}", env!("CARGO_PKG_VERSION"))), "{}", stderr_of(&out));
+        let (_, report) = doctor(&sandbox);
+        assert_eq!(findings(&report, "protocol_block"), [("ok", "healthy")], "{choice:?}: {report}");
+    }
+}
+
 /// Every finding but its message, so two reports of the same facts compare.
 fn without_messages(report: &Value) -> Vec<Value> {
     let mut checks = report["checks"].as_array().expect("checks").clone();

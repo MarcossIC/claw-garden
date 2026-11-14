@@ -27,6 +27,8 @@ use super::Analysis;
 use crate::daemon::socket::SocketError;
 use crate::hook_log::{Outcome, Run};
 use crate::mcp::server::FALLBACK_AGENT_ID;
+use crate::setup::Freshness;
+use crate::update::version::Version;
 
 /// Days the newest snapshot may age before `backup.age` warns. A starting
 /// value, not measured: a month of memories is what goes unwarned.
@@ -429,37 +431,65 @@ pub enum BlockState {
     Missing,
     /// The file could not be read, or has a marker without its pair.
     Unreadable(String),
-    /// The block from its first marker to the end of its last.
-    Installed(String),
+    /// The block as [`Freshness`] classes it against what this clawg writes,
+    /// and the version its stamp names, when it has one.
+    Installed { freshness: Freshness, written_by: Option<Version> },
 }
 
-/// Whether the installed block is the one `clawg setup claude-code` would
-/// write now (`wanted`), line endings aside. A block that differs may hold
-/// another language's rules or an older clawg's protocol; the remedy is the
-/// same.
-pub fn protocol_block(lang: Lang, state: &BlockState, wanted: &str, path: &Path, profile: Profile) -> Vec<Finding> {
+/// Whether the installed block is the one this clawg (`this_version`) writes.
+/// A block that differs may hold another language's rules, an older clawg's
+/// protocol or the person's edits, and the remedy is the same; one a later
+/// clawg wrote is not offered one, which would take the protocol back. With no
+/// block there is a finding only when `preferred` says a language was chosen.
+pub fn protocol_block(lang: Lang, state: &BlockState, preferred: bool, this_version: Version, path: &Path, profile: Profile) -> Vec<Finding> {
     let setup = with_profile("clawg setup claude-code", profile);
+    let evidence = |written_by: Option<Version>| {
+        json!({ "path": path, "written_by": written_by.map(|v| v.to_string()), "this_version": this_version.to_string() })
+    };
     let finding = match state {
-        BlockState::Installed(text) if text.replace("\r\n", "\n") == wanted.replace("\r\n", "\n") => {
+        BlockState::Installed { freshness: Freshness::Current, written_by } => {
             let message = match lang {
                 Lang::En => "the protocol block of CLAUDE.md is the one clawg setup writes",
                 Lang::Es => "el bloque del protocolo de CLAUDE.md es el que escribe clawg setup",
             };
-            Finding::ok("protocol_block", message)
+            Finding::ok("protocol_block", message).evidence(evidence(*written_by))
         }
-        BlockState::Installed(_) => {
-            let message = match lang {
-                Lang::En => {
-                    "the protocol block of CLAUDE.md is not the one clawg setup writes for the preferred language, \
+        BlockState::Installed { freshness: Freshness::Stale, written_by } => {
+            let message = match (lang, preferred) {
+                (Lang::En, true) => {
+                    "the protocol block of CLAUDE.md is not the one this clawg writes for the preferred language, \
                      so the agent may read other rules there than in the server's instructions"
                 }
-                Lang::Es => {
-                    "el bloque del protocolo de CLAUDE.md no es el que escribe clawg setup para el idioma preferido, \
+                (Lang::En, false) => {
+                    "the protocol block of CLAUDE.md is not the one this clawg writes, \
+                     so the agent may read other rules there than in the server's instructions"
+                }
+                (Lang::Es, true) => {
+                    "el bloque del protocolo de CLAUDE.md no es el que escribe este clawg para el idioma preferido, \
+                     así que el agente puede leer ahí otras reglas que en las instrucciones del servidor"
+                }
+                (Lang::Es, false) => {
+                    "el bloque del protocolo de CLAUDE.md no es el que escribe este clawg, \
                      así que el agente puede leer ahí otras reglas que en las instrucciones del servidor"
                 }
             };
-            Finding::new("protocol_block", Severity::Warn, "stale", message).step(setup)
+            Finding::new("protocol_block", Severity::Warn, "stale", message).step(setup).evidence(evidence(*written_by))
         }
+        BlockState::Installed { freshness: Freshness::Newer, written_by } => {
+            let by = written_by.map(|v| v.to_string()).unwrap_or_default();
+            let message = match lang {
+                Lang::En => format!(
+                    "the protocol block of CLAUDE.md was written by a later clawg ({by}, and this one is {this_version}), \
+                    so it may hold rules this clawg does not know"
+                ),
+                Lang::Es => format!(
+                    "el bloque del protocolo de CLAUDE.md lo escribió un clawg posterior ({by}, y este es {this_version}), \
+                    así que puede traer reglas que este clawg no conoce"
+                ),
+            };
+            Finding::new("protocol_block", Severity::Info, "newer", message).evidence(evidence(*written_by))
+        }
+        BlockState::Missing if !preferred => return Vec::new(),
         BlockState::Missing => {
             let message = match lang {
                 Lang::En => {
@@ -470,17 +500,17 @@ pub fn protocol_block(lang: Lang, state: &BlockState, wanted: &str, path: &Path,
                      instrucciones del servidor"
                 }
             };
-            Finding::new("protocol_block", Severity::Info, "not_installed", message).step(setup)
+            Finding::new("protocol_block", Severity::Info, "not_installed", message).step(setup).evidence(json!({ "path": path }))
         }
         BlockState::Unreadable(error) => {
             let message = match lang {
                 Lang::En => format!("cannot check the protocol block: {error}"),
                 Lang::Es => format!("no se puede revisar el bloque del protocolo: {error}"),
             };
-            Finding::new("protocol_block", Severity::Warn, "unreadable", message)
+            Finding::new("protocol_block", Severity::Warn, "unreadable", message).evidence(json!({ "path": path }))
         }
     };
-    vec![finding.evidence(json!({ "path": path }))]
+    vec![finding]
 }
 
 /// Pending rows with a daemon running are being stored; without one, they
@@ -1332,18 +1362,39 @@ mod tests {
     #[test]
     fn protocol_block_findings() {
         let path = Path::new("/home/u/.claude/CLAUDE.md");
-        let wanted = "<!-- BEGIN -->\nrules\n<!-- END -->";
-        let ok = protocol_block(L, &BlockState::Installed(wanted.replace('\n', "\r\n")), wanted, path, P);
-        assert_eq!(kinds(&ok), [("protocol_block", Severity::Ok, "healthy")]);
-        let stale = protocol_block(L, &BlockState::Installed("<!-- BEGIN -->\nold\n<!-- END -->".into()), wanted, path, P);
-        assert_eq!(kinds(&stale), [("protocol_block", Severity::Warn, "stale")]);
-        assert_eq!(stale[0].safe_next_step.as_deref(), Some("clawg setup claude-code --profile dev"));
-        let missing = protocol_block(L, &BlockState::Missing, wanted, path, P);
+        let own = Version::parse("0.88.0").unwrap();
+        let installed = |freshness, written_by: Option<&str>| BlockState::Installed {
+            freshness,
+            written_by: written_by.map(|v| Version::parse(v).unwrap()),
+        };
+        let check = |state: &BlockState, preferred| protocol_block(L, state, preferred, own, path, P);
+        for preferred in [true, false] {
+            let ok = check(&installed(Freshness::Current, Some("0.87.0")), preferred);
+            assert_eq!(kinds(&ok), [("protocol_block", Severity::Ok, "healthy")]);
+            assert_eq!(ok[0].evidence, json!({ "path": path, "written_by": "0.87.0", "this_version": "0.88.0" }));
+
+            let stale = check(&installed(Freshness::Stale, None), preferred);
+            assert_eq!(kinds(&stale), [("protocol_block", Severity::Warn, "stale")]);
+            assert_eq!(stale[0].safe_next_step.as_deref(), Some("clawg setup claude-code --profile dev"));
+            assert_eq!(stale[0].evidence, json!({ "path": path, "written_by": null, "this_version": "0.88.0" }));
+            assert!(stale[0].message.contains("not the one this clawg writes"), "{}", stale[0].message);
+            assert!(stale[0].message.contains("than in the server's instructions"), "{}", stale[0].message);
+            assert_eq!(stale[0].message.contains("preferred language"), preferred, "{}", stale[0].message);
+
+            let newer = check(&installed(Freshness::Newer, Some("0.90.0")), preferred);
+            assert_eq!(kinds(&newer), [("protocol_block", Severity::Info, "newer")]);
+            assert_eq!(newer[0].safe_next_step, None, "the step would take the protocol back to an older text");
+            assert!(newer[0].message.contains("later clawg") && newer[0].message.contains("0.90.0"), "{}", newer[0].message);
+            assert_eq!(newer[0].evidence["written_by"], "0.90.0");
+
+            let unreadable = check(&BlockState::Unreadable("a lone marker".into()), preferred);
+            assert_eq!(kinds(&unreadable), [("protocol_block", Severity::Warn, "unreadable")]);
+            assert_eq!(unreadable[0].evidence["path"], "/home/u/.claude/CLAUDE.md");
+        }
+        let missing = check(&BlockState::Missing, true);
         assert_eq!(kinds(&missing), [("protocol_block", Severity::Info, "not_installed")]);
         assert_eq!(missing[0].safe_next_step.as_deref(), Some("clawg setup claude-code --profile dev"));
-        let unreadable = protocol_block(L, &BlockState::Unreadable("a lone marker".into()), wanted, path, P);
-        assert_eq!(kinds(&unreadable), [("protocol_block", Severity::Warn, "unreadable")]);
-        assert_eq!(unreadable[0].evidence["path"], "/home/u/.claude/CLAUDE.md");
+        assert!(check(&BlockState::Missing, false).is_empty(), "no block and no preference: nothing to say");
     }
 
     #[test]
@@ -1679,14 +1730,21 @@ mod tests {
         all.extend(sharing(lang, Some("sharing.json is not valid"), P));
         all.extend(preferences(lang, &PreferencesState::Readable, path));
         all.extend(preferences(lang, &PreferencesState::Invalid("preferences.json is not valid".into()), path));
-        let wanted = "<!-- BEGIN -->\nrules\n<!-- END -->";
+        let own = Version::parse("0.88.0").unwrap();
+        let installed = |freshness, written_by: Option<&str>| BlockState::Installed {
+            freshness,
+            written_by: written_by.map(|v| Version::parse(v).unwrap()),
+        };
         for state in [
-            BlockState::Installed(wanted.into()),
-            BlockState::Installed("old".into()),
+            installed(Freshness::Current, Some("0.88.0")),
+            installed(Freshness::Stale, None),
+            installed(Freshness::Newer, Some("0.90.0")),
             BlockState::Missing,
             BlockState::Unreadable("a lone marker".into()),
         ] {
-            all.extend(protocol_block(lang, &state, wanted, path, P));
+            for preferred in [true, false] {
+                all.extend(protocol_block(lang, &state, preferred, own, path, P));
+            }
         }
         all.extend(outbox(lang, &failed, false, P));
         all.extend(outbox(lang, &OutboxFacts { pending: 1, failed: vec![] }, false, P));

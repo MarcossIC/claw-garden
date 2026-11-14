@@ -182,9 +182,7 @@ pub fn run(profile: Profile) -> Result<Report, DoctorError> {
     let sharing_error = sharing::load(&data_dir).err().map(|e| e.to_string());
     found.extend(checks::sharing(lang, sharing_error.as_deref(), profile));
     found.extend(checks::preferences(lang, &state, &preferences_path));
-    if let Some(language) = language {
-        found.extend(protocol_block(language, profile));
-    }
+    found.extend(protocol_block(language, profile));
     if let Some(facts) = &inspection.facts {
         let daemon_running = owner.as_ref().is_some_and(|o| o.holder == StoreHolder::Daemon);
         found.extend(checks::outbox(lang, &facts.outbox, daemon_running, profile));
@@ -274,10 +272,13 @@ fn lines_in(path: &Path) -> usize {
 }
 
 /// The protocol block of the user `CLAUDE.md` `clawg setup claude-code`
-/// writes, against the one it would write for `language`.
-fn protocol_block(language: Lang, profile: Profile) -> Vec<Finding> {
+/// writes, against the one this binary would write for `language`, the
+/// preferred language if there is one.
+fn protocol_block(language: Option<Lang>, profile: Profile) -> Vec<Finding> {
     let home = clawg_core::paths::home_dir();
-    let Ok((_, _, path)) = crate::setup::locations(home.as_deref(), std::env::var_os("CLAUDE_CONFIG_DIR")) else {
+    let (Ok((_, _, path)), Ok(own)) =
+        (crate::setup::locations(home.as_deref(), std::env::var_os("CLAUDE_CONFIG_DIR")), crate::setup::own_version())
+    else {
         return Vec::new();
     };
     let state = match std::fs::read_to_string(&path) {
@@ -287,14 +288,18 @@ fn protocol_block(language: Lang, profile: Profile) -> Vec<Finding> {
             let file = crate::setup::File { path: path.clone(), text: Some(text) };
             match crate::setup::find_block(&file) {
                 Ok(Some((begin, end))) => {
-                    checks::BlockState::Installed(crate::setup::without_stamp(&file.text.unwrap_or_default()[begin..end]))
+                    let block = &file.text.as_deref().unwrap_or_default()[begin..end];
+                    checks::BlockState::Installed {
+                        freshness: crate::setup::freshness(block, language, own),
+                        written_by: crate::setup::read_stamp(block).map(|stamp| stamp.version),
+                    }
                 }
                 Ok(None) => checks::BlockState::Missing,
                 Err(e) => checks::BlockState::Unreadable(e.to_string()),
             }
         }
     };
-    checks::protocol_block(language, &state, &crate::setup::unstamped(Some(language), crate::setup::DEFAULT_VARIANT), &path, profile)
+    checks::protocol_block(language.unwrap_or(Lang::En), &state, language.is_some(), own, &path, profile)
 }
 
 /// Claude Code's registration of this profile's server, from the file
