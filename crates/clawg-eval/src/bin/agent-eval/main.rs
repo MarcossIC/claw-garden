@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use clawg_core::paths::Profile;
 use clawg_core::preferences::Lang;
 
-use crate::arm::{Arm, Layout, Options};
+use crate::arm::{Arm, Layout, Options, Shape};
 use crate::run::Client;
 
 const HELP_TEXT: &str = "\
@@ -88,11 +88,16 @@ agent-eval hook-log FILE
 RUN_OPTIONS:
   --task ID --arm a0|a2|a3|a3-eager|a4|b|l0|l1|l2 --out DIR --clawg PATH --model M
   [--effort E] [--max-budget-usd N] [--claude-version V] [--profile dev|prod]
-  [--lang en|es] [--data DIR]
+  [--lang en|es] [--data DIR] [--sessions split|joined|both]
 
   --clawg is the absolute path of the clawg binary the arms with clawg run;
   --profile (dev by default) picks its data directory under the run's home.
   --data defaults to this crate's data/agent-tasks.
+  --sessions says how a task of several sessions is played: split (the
+  default) starts a conversation for each session, joined continues the
+  conversation of the one before with --continue, and both plays the second
+  session of a task of two sessions each way from the same first one. A task of
+  one session takes only split.
 
 Exit 0 done, 1 a task, file or run could not be used, 2 bad arguments.";
 
@@ -113,6 +118,7 @@ struct RunArgs {
     claude_version: Option<String>,
     profile: Profile,
     lang: Option<Lang>,
+    shape: Shape,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -156,7 +162,7 @@ fn required(flags: &mut Vec<(String, String)>, name: &str) -> Result<String, Str
     take(flags, name).ok_or_else(|| format!("--{name} is required"))
 }
 
-const RUN_FLAGS: [&str; 11] = ["task", "arm", "out", "clawg", "model", "effort", "max-budget-usd", "claude-version", "profile", "lang", "data"];
+const RUN_FLAGS: [&str; 12] = ["task", "arm", "out", "clawg", "model", "effort", "max-budget-usd", "claude-version", "profile", "lang", "data", "sessions"];
 
 fn run_args(f: &mut Vec<(String, String)>) -> Result<RunArgs, String> {
     let arm_name = required(f, "arm")?;
@@ -178,6 +184,10 @@ fn run_args(f: &mut Vec<(String, String)>) -> Result<RunArgs, String> {
         Some(code) => Some(Lang::parse(&code).ok_or_else(|| format!("unknown language {code}"))?),
         None => None,
     };
+    let shape = match take(f, "sessions") {
+        Some(name) => Shape::parse(&name).ok_or_else(|| format!("unknown shape {name}"))?,
+        None => Shape::Split,
+    };
     Ok(RunArgs {
         data: take(f, "data").map_or_else(default_data, PathBuf::from),
         task: required(f, "task")?,
@@ -190,6 +200,7 @@ fn run_args(f: &mut Vec<(String, String)>) -> Result<RunArgs, String> {
         claude_version: take(f, "claude-version"),
         profile,
         lang,
+        shape,
     })
 }
 
@@ -288,7 +299,14 @@ fn read_files(dir: &Path, prefix: &str, out: &mut Vec<(String, String)>) -> std:
 fn load_task(args: &RunArgs) -> Result<(task::Task, Vec<task::SeedMemory>), String> {
     let tasks = task::load(&args.data).map_err(|e| e.to_string())?;
     let noise = task::load_noise(&args.data, &tasks).map_err(|e| e.to_string())?;
-    Ok((task::find(tasks, &args.task).map_err(|e| e.to_string())?, noise))
+    let task = task::find(tasks, &args.task).map_err(|e| e.to_string())?;
+    check_shape(&task, args.shape)?;
+    Ok((task, noise))
+}
+
+/// Why `task` cannot be played the way `shape` says, if it cannot.
+fn check_shape(task: &task::Task, shape: Shape) -> Result<(), String> {
+    shape.check(task.prompts().len())
 }
 
 fn prepare(args: &RunArgs, t: &task::Task, noise: Vec<task::SeedMemory>, client: &Client) -> Result<Layout, String> {
@@ -304,6 +322,7 @@ fn prepare(args: &RunArgs, t: &task::Task, noise: Vec<task::SeedMemory>, client:
         claude_version: args.claude_version.clone(),
         now_ms: now_ms(),
         noise,
+        shape: args.shape,
         agent_eval,
     };
     run::prepare(t, args.arm, &task::fixture_dir(&args.data, t), &layout, &options, client).map_err(|e| e.to_string())?;
@@ -464,6 +483,27 @@ mod tests {
     }
 
     #[test]
+    fn the_shape_of_a_run_parses_and_is_refused_where_the_task_cannot_take_it() {
+        let base = ["prepare", "--task", "t", "--arm", "a3", "--out", "r", "--clawg", clawg(), "--model", "m"];
+        let with = |extra: &[&str]| parse_args(args(&[&base[..], extra].concat()));
+        let shape = |extra: &[&str]| match with(extra) {
+            Ok(Some(Command::Prepare(run))) => run.shape,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(shape(&[]), Shape::Split);
+        assert_eq!(shape(&["--sessions", "joined"]), Shape::Joined);
+        assert_eq!(shape(&["--sessions", "both"]), Shape::Both);
+        assert!(with(&["--sessions", "sideways"]).unwrap_err().contains("unknown shape sideways"));
+        assert!(HELP_TEXT.contains("--sessions split|joined|both"));
+
+        let one = task::parse(r#"{"id": "t", "category": "K1", "fixture": "f", "prompt": "p", "checks": [{"kind": "answer_contains", "text": "x"}]}"#).unwrap();
+        assert_eq!(check_shape(&one, Shape::Split), Ok(()));
+        for refused in [Shape::Joined, Shape::Both] {
+            assert!(check_shape(&one, refused).unwrap_err().contains("one session"), "{refused:?}");
+        }
+    }
+
+    #[test]
     fn the_hook_commands_parse() {
         assert_eq!(parse_args(args(&["hook-context", "f.md"])), Ok(Some(Command::HookContext { file: "f.md".into() })));
         assert_eq!(parse_args(args(&["hook-log", "l.jsonl"])), Ok(Some(Command::HookLog { file: "l.jsonl".into() })));
@@ -487,6 +527,7 @@ mod tests {
             claude_version: None,
             profile: Profile::Dev,
             lang: None,
+            shape: Shape::Split,
         };
         for replay in [dir.path().join("missing.jsonl"), dir.path().to_path_buf()] {
             let err = execute(Command::Run { args: args.clone(), replay: Some(replay.clone()) }).unwrap_err();

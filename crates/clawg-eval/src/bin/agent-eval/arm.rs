@@ -38,6 +38,41 @@ pub enum Arm {
     L2,
 }
 
+/// How the sessions of a task are played on one working directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Shape {
+    /// Every session starts a conversation of its own.
+    Split,
+    /// Each session after the first continues the conversation of the one before.
+    Joined,
+    /// The second session is played both ways from the same first one.
+    Both,
+}
+
+impl Shape {
+    pub fn parse(name: &str) -> Option<Shape> {
+        [Shape::Split, Shape::Joined, Shape::Both].into_iter().find(|s| s.as_str() == name)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Shape::Split => "split",
+            Shape::Joined => "joined",
+            Shape::Both => "both",
+        }
+    }
+
+    /// Why a task of `sessions` sessions cannot be played this way, if it cannot.
+    pub fn check(self, sessions: usize) -> Result<(), String> {
+        match (self, sessions) {
+            (Shape::Split, _) | (Shape::Joined, 2..) | (Shape::Both, 2) => Ok(()),
+            (_, 1) => Err(format!("a task of one session is played only with --sessions split, not {}", self.as_str())),
+            (_, n) => Err(format!("--sessions both needs a task of two sessions, and this one has {n}")),
+        }
+    }
+}
+
 pub const ARMS: [Arm; 9] = [Arm::A0, Arm::A2, Arm::A3, Arm::A3Eager, Arm::A4, Arm::B, Arm::L0, Arm::L1, Arm::L2];
 
 /// The tools arm B takes away.
@@ -150,6 +185,7 @@ pub struct Options {
     pub now_ms: i64,
     /// The rules of other topics every arm with memory is seeded with.
     pub noise: Vec<SeedMemory>,
+    pub shape: Shape,
     /// The `agent-eval` binary the hooks of the harness run; absolute.
     pub agent_eval: PathBuf,
 }
@@ -183,16 +219,30 @@ pub struct RunPlan {
     pub daemon: Option<Daemon>,
     /// Commands run before the session, against [`RunPlan::daemon`].
     pub before: Vec<Step>,
-    /// The client session, run in [`Layout::workdir`].
+    /// The first client session, run in [`Layout::workdir`].
     pub client: Step,
+    /// The sessions after the first, in order, each with its own prompt; a
+    /// shape that continues the conversation has `--continue` in them, and a
+    /// fork plans its second session so, which the new one is without it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub later: Vec<Step>,
     /// What every process of the run gets on top of the environment it inherits.
     pub env: Vec<(String, String)>,
     /// Commands run after the session.
     pub after: Vec<Step>,
 }
 
+impl RunPlan {
+    /// Every session of the run, in order.
+    pub fn sessions(&self) -> Vec<&Step> {
+        std::iter::once(&self.client).chain(&self.later).collect()
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ArmError {
+    #[error("{0}")]
+    Shape(String),
     #[error("{0}")]
     Setup(#[from] setup::SetupError),
     #[error("a path of the run is not valid Unicode: {0}")]
@@ -220,6 +270,8 @@ fn add_hook(settings: &mut Value, event: &str, hook: Value) {
 }
 
 pub fn plan(task: &Task, arm: Arm, layout: &Layout, options: &Options) -> Result<RunPlan, ArmError> {
+    let prompts = task.prompts();
+    options.shape.check(prompts.len()).map_err(ArmError::Shape)?;
     let clawg = text(&options.clawg)?;
     let workdir = text(&layout.workdir())?;
     let server_name = options.profile.mcp_server_name();
@@ -293,7 +345,7 @@ pub fn plan(task: &Task, arm: Arm, layout: &Layout, options: &Options) -> Result
 
     let mut args: Vec<String> = vec![
         "-p".into(),
-        task.prompts()[0].to_owned(),
+        prompts[0].to_owned(),
         "--output-format".into(),
         "stream-json".into(),
         "--verbose".into(),
@@ -344,6 +396,18 @@ pub fn plan(task: &Task, arm: Arm, layout: &Layout, options: &Options) -> Result
         env.push(("ENABLE_TOOL_SEARCH".to_owned(), "false".to_owned()));
     }
 
+    let later = prompts[1..]
+        .iter()
+        .map(|prompt| {
+            let mut args = args.clone();
+            args[1] = (*prompt).to_owned();
+            if options.shape != Shape::Split {
+                args.push("--continue".into());
+            }
+            Step { program: CLIENT.into(), args }
+        })
+        .collect();
+
     Ok(RunPlan {
         task: task.id.clone(),
         arm: arm.as_str().to_owned(),
@@ -351,6 +415,7 @@ pub fn plan(task: &Task, arm: Arm, layout: &Layout, options: &Options) -> Result
         daemon,
         before,
         client: Step { program: CLIENT.into(), args },
+        later,
         env,
         after,
     })
@@ -385,6 +450,7 @@ mod tests {
             claude_version: Some("2.1.300".into()),
             now_ms: 1_800_000_000_000,
             noise: Vec::new(),
+            shape: Shape::Split,
             agent_eval: harness(),
         }
     }
@@ -710,6 +776,85 @@ mod tests {
         let a0 = plan(&shelled, Arm::A0, &layout(), &options(None)).unwrap();
         assert_eq!(pair_value(&a0, "--disallowedTools"), None, "nothing to deny");
         assert_eq!(pair_value(&a0, "--allowedTools"), Some("Bash(eza:*),Bash(ls:*)"));
+    }
+
+    fn two_sessions() -> Task {
+        parse(
+            r#"{"id": "t", "category": "R", "fixture": "tally",
+                "sessions": [{"prompt": "Inventory the timeouts."}, {"prompt": "Apply what was decided."}],
+                "checks": [{"kind": "answer_contains", "text": "done"}]}"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_task_of_one_session_plans_what_it_planned_before() {
+        for shape in [Shape::Split, Shape::Joined] {
+            let mut opts = options(None);
+            opts.shape = shape;
+            let plan = plan(&task(true), Arm::A3, &layout(), &opts);
+            assert_eq!(plan.is_ok(), shape == Shape::Split, "{shape:?}: a task of one session takes only split");
+        }
+        let plan = plan(&task(true), Arm::A3, &layout(), &options(None)).unwrap();
+        assert!(plan.later.is_empty());
+        assert_eq!(plan.sessions(), [&plan.client]);
+        assert!(serde_json::to_value(&plan).unwrap().get("later").is_none(), "an older reader finds the plan it knew");
+        assert!(has_arg_pair(&plan, "-p", "Which port?") && !plan.client.args.contains(&"--continue".to_owned()));
+    }
+
+    #[test]
+    fn each_session_has_its_prompt_and_a_joined_one_continues_the_conversation() {
+        let planned = |shape| {
+            let mut opts = options(None);
+            opts.shape = shape;
+            plan(&two_sessions(), Arm::A3, &layout(), &opts).unwrap()
+        };
+        let split = planned(Shape::Split);
+        let sessions = split.sessions();
+        assert_eq!(sessions.len(), 2);
+        assert_eq!((sessions[0].args[1].as_str(), sessions[1].args[1].as_str()), ("Inventory the timeouts.", "Apply what was decided."));
+        assert!(sessions.iter().all(|s| !s.args.contains(&"--continue".to_owned())));
+        assert_eq!(sessions[0].args[2..], sessions[1].args[2..], "the same arguments");
+
+        let joined = planned(Shape::Joined);
+        let sessions = joined.sessions();
+        assert!(!sessions[0].args.contains(&"--continue".to_owned()));
+        assert_eq!(sessions[1].args.last().map(String::as_str), Some("--continue"));
+        assert_eq!(sessions[1].args[..sessions[1].args.len() - 1], split.sessions()[1].args[..], "only --continue differs");
+
+        let both = planned(Shape::Both);
+        assert_eq!(both.sessions().len(), 2, "a fork plans the second session continued; the new one is that without --continue");
+        assert_eq!(both.later, joined.later);
+        assert_eq!((both.files.len(), both.before.len(), both.after.len()), (split.files.len(), split.before.len(), split.after.len()));
+    }
+
+    #[test]
+    fn a_plan_of_several_sessions_reads_back_and_an_older_plan_reads_as_one() {
+        let mut opts = options(None);
+        opts.shape = Shape::Joined;
+        let plan = plan(&two_sessions(), Arm::A3, &layout(), &opts).unwrap();
+        let back: RunPlan = serde_json::from_str(&serde_json::to_string(&plan).unwrap()).unwrap();
+        assert_eq!(back, plan);
+        let mut older = serde_json::to_value(&plan).unwrap();
+        older.as_object_mut().unwrap().remove("later");
+        let older: RunPlan = serde_json::from_value(older).unwrap();
+        assert_eq!(older.sessions().len(), 1);
+        assert_eq!(older.client, plan.client);
+    }
+
+    #[test]
+    fn the_shape_is_split_joined_or_both_and_both_needs_two_sessions() {
+        assert_eq!(["split", "joined", "both", "sideways"].map(Shape::parse), [Some(Shape::Split), Some(Shape::Joined), Some(Shape::Both), None]);
+        let mut opts = options(None);
+        opts.shape = Shape::Both;
+        let error = plan(&task(true), Arm::A3, &layout(), &opts).unwrap_err().to_string();
+        assert!(error.contains("one session") && error.contains("split"), "{error}");
+        let mut three = two_sessions();
+        three.sessions.push(three.sessions[0].clone());
+        let error = plan(&three, Arm::A3, &layout(), &opts).unwrap_err().to_string();
+        assert!(error.contains("both") && error.contains("two sessions") && error.contains('3'), "{error}");
+        opts.shape = Shape::Joined;
+        assert!(plan(&three, Arm::A3, &layout(), &opts).is_ok());
     }
 
     #[test]

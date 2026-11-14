@@ -387,6 +387,7 @@ pub fn prepare(task: &Task, arm: Arm, fixture: &Path, layout: &Layout, options: 
         "max_budget_usd": options.max_budget_usd,
         "claude_version": options.claude_version,
         "client": client,
+        "shape": options.shape,
         "plan": plan,
     });
     let path = root.join(RUN_FILE);
@@ -708,8 +709,9 @@ impl Drop for Served {
 /// stdout into `stream.jsonl` and its stderr into `client.log`. The exit code,
 /// `None` when it was killed.
 pub fn start_client(plan: &RunPlan, layout: &Layout, client: &Step) -> Result<Option<i32>, RunError> {
-    let stream = layout.root.join(STREAM_FILE);
-    let log = layout.root.join(CLIENT_LOG);
+    let (stream_name, log_name) = session_files(1, plan.sessions().len());
+    let stream = layout.root.join(stream_name);
+    let log = layout.root.join(log_name);
     let status = Command::new(&client.program)
         .args(&client.args)
         .envs(plan.env.iter().map(|(k, v)| (k, v)))
@@ -720,6 +722,12 @@ pub fn start_client(plan: &RunPlan, layout: &Layout, client: &Step) -> Result<Op
         .status()
         .map_err(io(Path::new(&client.program)))?;
     Ok(status.code())
+}
+
+/// The names of the stream and the log of session `k` of `of`: bare when the
+/// run has one session, numbered from 1 when it has several.
+pub fn session_files(k: usize, of: usize) -> (String, String) {
+    if of == 1 { (STREAM_FILE.to_owned(), CLIENT_LOG.to_owned()) } else { (format!("stream-{k}.jsonl"), format!("client-{k}.log")) }
 }
 
 /// Scores the run in `root` from its `run.json`, `stream.jsonl`, the log of
@@ -767,6 +775,7 @@ pub fn score_dir(root: &Path) -> Result<RunResult, RunError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::arm::Shape;
 
     fn clean_ancestors(out: &Path) -> Vec<(PathBuf, Vec<&'static str>)> {
         out.ancestors().map(|a| (a.to_owned(), Vec::new())).collect()
@@ -942,6 +951,7 @@ mod tests {
             claude_version: Some("2.1.300".into()),
             now_ms: 0,
             noise: Vec::new(),
+            shape: Shape::Split,
             agent_eval: PathBuf::from("/bin/agent-eval"),
         }
     }
@@ -956,6 +966,23 @@ mod tests {
         assert_eq!((Client::Claude.name(), replay.name()), ("claude", "replay"));
         assert_eq!(serde_json::to_value(&Client::Claude).unwrap(), json!("claude"));
         assert_eq!(serde_json::to_value(&replay).unwrap(), json!({ "replay": "/runs/s.jsonl" }));
+    }
+
+    #[test]
+    fn the_files_of_a_session_carry_its_number_only_when_there_are_several() {
+        assert_eq!(session_files(1, 1), ("stream.jsonl".to_owned(), "client.log".to_owned()));
+        assert_eq!(session_files(1, 2), ("stream-1.jsonl".to_owned(), "client-1.log".to_owned()));
+        assert_eq!(session_files(3, 3), ("stream-3.jsonl".to_owned(), "client-3.log".to_owned()));
+    }
+
+    #[test]
+    fn the_shape_of_a_run_is_recorded_in_its_run_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = dir.path().join("fixture");
+        std::fs::create_dir_all(&fixture).unwrap();
+        let layout = Layout { root: dir.path().join("run") };
+        prepare(&task(), Arm::A0, &fixture, &layout, &options(dir.path().join("clawg")), &Client::Claude).unwrap();
+        assert_eq!(read_record(&layout.root).unwrap()["shape"], "split");
     }
 
     #[test]
