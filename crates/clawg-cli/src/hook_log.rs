@@ -135,7 +135,7 @@ fn append(dir: &Path, line: &str) -> std::io::Result<()> {
 
 /// Appends `text` to `file` of `dir` in one write, after renaming `file` to
 /// `rolled` when it holds `roll_at` bytes or more, and without creating `dir`.
-pub fn append_rolled(dir: &Path, file: &str, rolled: &str, roll_at: u64, text: &str) -> std::io::Result<()> {
+pub(crate) fn append_rolled(dir: &Path, file: &str, rolled: &str, roll_at: u64, text: &str) -> std::io::Result<()> {
     let path = dir.join(file);
     // Renaming instead of rewriting: two hooks that start together never
     // lose a line to a copy of the file. A roll that fails costs nothing: the

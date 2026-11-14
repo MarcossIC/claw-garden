@@ -62,12 +62,12 @@ const SESSION_CHARS: usize = 64;
 
 /// How far back a line counts, in milliseconds. It is also how long a rule
 /// lasts: thirty days after the last failure it is forgotten.
-pub const WINDOW_MS: i64 = 30 * DAY_MS;
+pub(crate) const WINDOW_MS: i64 = 30 * DAY_MS;
 
 const DAY_MS: i64 = 24 * 60 * 60 * 1000;
 
 /// The most rules there are at a time.
-pub const MAX_RULES: usize = 5;
+pub(crate) const MAX_RULES: usize = 5;
 
 /// Sessions with a failure that make a rule.
 const SESSIONS_FOR_A_RULE: usize = 2;
@@ -77,7 +77,7 @@ const PREFIXES: [&str; 6] = ["sudo", "time", "env", "command", "exec", "xargs"];
 
 /// Every text a JSON value holds, at any depth: the client does not type the
 /// shape of a shell tool's response, so none is assumed.
-pub fn texts(value: &serde_json::Value) -> Vec<&str> {
+pub(crate) fn texts(value: &serde_json::Value) -> Vec<&str> {
     match value {
         serde_json::Value::String(text) => vec![text.as_str()],
         serde_json::Value::Array(items) => items.iter().flat_map(texts).collect(),
@@ -92,7 +92,7 @@ pub fn texts(value: &serde_json::Value) -> Vec<&str> {
 /// a log can print the signature without any program missing. Only a command
 /// that sends one stream to the other (`2>&1`, `|&`) puts the shell's words in
 /// `stdout`, and then every text counts.
-pub fn response_texts<'a>(response: &'a serde_json::Value, command: &str) -> Vec<&'a str> {
+pub(crate) fn response_texts<'a>(response: &'a serde_json::Value, command: &str) -> Vec<&'a str> {
     let merged = command.contains("2>&1") || command.contains("|&");
     match response.get("stderr").and_then(serde_json::Value::as_str) {
         Some(stderr) if !merged => vec![stderr],
@@ -104,7 +104,7 @@ pub fn response_texts<'a>(response: &'a serde_json::Value, command: &str) -> Vec
 /// wrote them and before any check of the name: `bash` and `sh` end a line in
 /// `: command not found` (with `line N: ` before the name or not), `dash` says
 /// `sh: N: X: not found`, and `zsh` says `zsh: command not found: X`.
-pub fn missing_programs(text: &str) -> Vec<&str> {
+pub(crate) fn missing_programs(text: &str) -> Vec<&str> {
     if !text.contains("not found") {
         return Vec::new();
     }
@@ -135,7 +135,7 @@ fn missing_in(line: &str) -> Option<&str> {
 
 /// Whether `name` can be the name of a program the ledger keeps: its shape,
 /// and nothing the secret detector finds in it.
-pub fn is_program_name(name: &str) -> bool {
+pub(crate) fn is_program_name(name: &str) -> bool {
     has_program_shape(name) && redact(name).kinds.is_empty()
 }
 
@@ -149,7 +149,7 @@ fn has_program_shape(name: &str) -> bool {
 /// `&`, a new line or a `(` outside quotes starts, past assignments and the words that run
 /// the next one. The command is not read further than this, and a mistake
 /// here can only cost an observation, never invent one.
-pub fn command_words(command: &str) -> Vec<&str> {
+pub(crate) fn command_words(command: &str) -> Vec<&str> {
     let bytes = command.as_bytes();
     let mut words = Vec::new();
     let mut start = 0;
@@ -263,7 +263,7 @@ pub fn parse_lines(bytes: &[u8]) -> Vec<Line> {
 
 /// `lines` as the text that is appended: one JSON object each, built whole so
 /// that the write is a single one.
-pub fn render(lines: &[Line]) -> String {
+pub(crate) fn render(lines: &[Line]) -> String {
     lines.iter().map(|line| serde_json::to_string(line).expect("a line serializes") + "\n").collect()
 }
 
@@ -289,7 +289,7 @@ pub fn to_write(call: &Call, observations: &[Observation], ledger: &[Line]) -> V
 /// in the [`WINDOW_MS`] before `now_ms`: a program that has worked lately fails
 /// now probably for a reason of the moment, and saying it does not exist
 /// would be wrong.
-pub fn to_warn<'a>(tool: &str, observed: &'a [Observation], ledger: &[Line], now_ms: i64) -> Vec<&'a str> {
+pub(crate) fn to_warn<'a>(tool: &str, observed: &'a [Observation], ledger: &[Line], now_ms: i64) -> Vec<&'a str> {
     let since = now_ms.saturating_sub(WINDOW_MS);
     observed
         .iter()
@@ -324,12 +324,6 @@ pub fn same_turn_line(language: Lang, programs: &[&str]) -> String {
         ),
     }
 }
-
-/// The most bytes [`rules_block`] takes with [`MAX_RULES`] rules, names of the
-/// longest a name can be and a hundred sessions each: `session-start` takes
-/// this much from the context it asks for, so what the hook adds never pushes
-/// the whole past what the client injects.
-pub const RULES_BLOCK_MAX: usize = 700;
 
 /// What `session-start` says in `language` about `rules`: each missing program
 /// with its sessions and how long ago it last failed, what to use instead, and
@@ -467,7 +461,7 @@ pub fn append(dir: &Path, lines: &[Line]) {
 /// Whether `program` is in a folder of `entries`, bare or with any of the
 /// `extensions` a system adds to a program's name (`.exe` on Windows, none
 /// elsewhere), as `exists` says.
-pub fn on_path_in(program: &str, entries: &[PathBuf], extensions: &[String], exists: impl Fn(&Path) -> bool + Copy) -> bool {
+pub(crate) fn on_path_in(program: &str, entries: &[PathBuf], extensions: &[String], exists: impl Fn(&Path) -> bool + Copy) -> bool {
     std::iter::once(String::new()).chain(extensions.iter().cloned()).any(|extension| {
         let name = format!("{program}{extension}");
         !crate::doctor::analyze(Path::new(""), entries, &name, exists).installs.is_empty()
@@ -495,6 +489,12 @@ mod tests {
     use super::*;
 
     const BASH: &str = "/usr/bin/bash: line 1: eza: command not found";
+
+    /// The most bytes [`rules_block`] may take with [`MAX_RULES`] rules, names of
+    /// the longest a name can be and a hundred sessions each. The runtime does not
+    /// apply it: `context_budget` discounts the real length; the test keeps the
+    /// block from growing unnoticed.
+    const RULES_BLOCK_MAX: usize = 700;
 
     fn fails(observed: &[Observation]) -> Vec<&str> {
         observed.iter().filter(|o| o.kind == Kind::Fail).map(|o| o.program.as_str()).collect()

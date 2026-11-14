@@ -440,7 +440,7 @@ fn read_user_block() -> Option<String> {
 /// names and the version that writes the block; without it `read_block` is
 /// never called. `read_rules` gives the rules of the ledger of missing programs,
 /// and only a `session-start` of Claude Code calls it.
-#[expect(clippy::too_many_arguments, reason = "the two reads are injected apart so a test can hold either up; a type to group them is a refactor of its own")]
+#[expect(clippy::too_many_arguments, reason = "the three reads are injected apart so a test can hold any up; a type to group them is a refactor of its own")]
 async fn respond_reading(
     event: HookEvent,
     host: HookClient,
@@ -565,7 +565,8 @@ async fn read_by<T: Send + 'static>(deadline: tokio::time::Instant, read: impl F
 }
 
 /// The most stdin a hook reads: the client's object is a few hundred bytes,
-/// and nothing else may fill the hook's memory.
+/// and after a shell tool it also carries the output of the command. Nothing
+/// else may fill the hook's memory.
 const INPUT_LIMIT: u64 = 1 << 20;
 
 /// All of `input`, or `None` when it fails or holds more than [`INPUT_LIMIT`].
