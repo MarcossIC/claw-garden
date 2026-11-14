@@ -630,17 +630,25 @@ impl Stamp {
     }
 }
 
-/// The protocol for `language` ([`protocol::text`]) between its markers,
-/// with `stamp` after the first, without a final line ending.
-pub(crate) fn block(eol: &str, language: Option<Lang>, stamp: Stamp) -> String {
-    assemble(eol, language, Some(stamp))
+/// What the block holds when the person chose no variant: the whole protocol.
+pub const DEFAULT_VARIANT: Variant = Variant::Full;
+
+/// The protocol for `language` as `variant` has it ([`protocol::text`],
+/// [`protocol::short`] or nothing) between its markers, with `stamp` after the
+/// first, without a final line ending.
+pub(crate) fn block(eol: &str, language: Option<Lang>, variant: Variant, stamp: Stamp) -> String {
+    assemble(eol, language, variant, Some(stamp))
 }
 
-fn assemble(eol: &str, language: Option<Lang>, stamp: Option<Stamp>) -> String {
-    let protocol = protocol::text(language).replace("\r\n", "\n");
-    let body = protocol.trim_end().replace('\n', eol);
-    let stamp = stamp.map(|s| format!("{}{eol}", s.line())).unwrap_or_default();
-    format!("{BEGIN_MARKER}{eol}{stamp}{body}{eol}{END_MARKER}")
+fn assemble(eol: &str, language: Option<Lang>, variant: Variant, stamp: Option<Stamp>) -> String {
+    let text = match variant {
+        Variant::Full => protocol::text(language).replace("\r\n", "\n"),
+        Variant::Short => protocol::short(language),
+        Variant::Off => String::new(),
+    };
+    let body = text.trim_end();
+    let lines = [Some(BEGIN_MARKER.to_string()), stamp.map(Stamp::line), (!body.is_empty()).then(|| body.to_string()), Some(END_MARKER.to_string())];
+    lines.into_iter().flatten().collect::<Vec<_>>().join("\n").replace('\n', eol)
 }
 
 /// The stamp of an installed block, if its second line is one.
@@ -660,8 +668,8 @@ fn split_stamp(block: &str) -> (Option<Stamp>, String) {
 }
 
 /// The block `block` writes, without its stamp, with `\n` line endings.
-pub(crate) fn unstamped(language: Option<Lang>) -> String {
-    assemble("\n", language, None)
+pub(crate) fn unstamped(language: Option<Lang>, variant: Variant) -> String {
+    assemble("\n", language, variant, None)
 }
 
 /// An installed block as [`unstamped`] writes it: its stamp taken out when it
@@ -681,11 +689,13 @@ pub(crate) enum Freshness {
 }
 
 /// Whether `installed`, a block as found between the markers, is the text this
-/// binary (version `own`) writes for `language`. The stamp and the line
-/// endings do not count: the same text from another version is current.
+/// binary (version `own`) writes for `language` and the variant its stamp
+/// says was chosen, or the default one. The stamp and the line endings do not
+/// count: the same text from another version is current.
 pub(crate) fn freshness(installed: &str, language: Option<Lang>, own: Version) -> Freshness {
     let (stamp, body) = split_stamp(installed);
-    if body == unstamped(language) {
+    let variant = stamp.and_then(|s| s.choice).unwrap_or(DEFAULT_VARIANT);
+    if body == unstamped(language, variant) {
         return Freshness::Current;
     }
     match stamp {
@@ -717,12 +727,12 @@ fn install_block(file: &File, language: Option<Lang>, version: Version) -> Resul
     let range = find_block(file)?;
     let stamp = Stamp { version, choice: None };
     let Some(text) = &file.text else {
-        return Ok((BlockStep::Added, FileStep::Write(block("\n", language, stamp) + "\n")));
+        return Ok((BlockStep::Added, FileStep::Write(block("\n", language, DEFAULT_VARIANT, stamp) + "\n")));
     };
     let eol = line_ending(text);
-    let wanted = block(eol, language, stamp);
+    let wanted = block(eol, language, DEFAULT_VARIANT, stamp);
     if let Some((begin, end)) = range {
-        if without_stamp(&text[begin..end]) == unstamped(language) {
+        if without_stamp(&text[begin..end]) == unstamped(language, DEFAULT_VARIANT) {
             return Ok((BlockStep::Unchanged, FileStep::Unchanged));
         }
         return Ok((BlockStep::Rewritten, FileStep::Write(format!("{}{wanted}{}", &text[..begin], &text[end..]))));
@@ -1312,7 +1322,7 @@ mod tests {
 
     /// The block as this binary writes it, in a file with LF line endings.
     fn installed_block(language: Option<Lang>) -> String {
-        block("\n", language, Stamp { version: v("0.88.0"), choice: None })
+        block("\n", language, Variant::Full, Stamp { version: v("0.88.0"), choice: None })
     }
 
     fn written(step: &FileStep) -> &str {
@@ -1396,7 +1406,7 @@ mod tests {
         let md = written(&plan_.instructions);
         assert!(md.starts_with(&format!("{BEGIN_MARKER}\n<!-- clawg 0.88.0 -->\n# Claw Garden memory protocol\n")), "{md}");
 
-        let chosen = block("\n", None, Stamp { version: v("0.88.0"), choice: Some(Variant::Short) });
+        let chosen = block("\n", None, Variant::Full, Stamp { version: v("0.88.0"), choice: Some(Variant::Short) });
         assert!(chosen.starts_with(&format!("{BEGIN_MARKER}\n<!-- clawg 0.88.0 protocol=short -->\n")), "{chosen}");
 
         let (begin, end) = find_block(&file("CLAUDE.md", Some(md))).unwrap().unwrap();
@@ -1423,7 +1433,7 @@ mod tests {
             assert_eq!(Stamp::parse(unreadable), None, "{unreadable}");
         }
 
-        let stamped = block("\n", None, chosen);
+        let stamped = block("\n", None, Variant::Full, chosen);
         assert_eq!(read_stamp(&stamped), Some(chosen));
         assert_eq!(read_stamp(&stamped.replace('\n', "\r\n")), Some(chosen), "a file with CRLF line endings");
         let before_stamps = format!("{BEGIN_MARKER}\n# Claw Garden memory protocol\n{END_MARKER}");
@@ -1435,11 +1445,11 @@ mod tests {
     #[test]
     fn a_block_is_current_stale_or_newer() {
         let own = v("0.88.0");
-        let older = block("\n", None, Stamp { version: v("0.87.0"), choice: None });
+        let older = block("\n", None, Variant::Full, Stamp { version: v("0.87.0"), choice: None });
         assert_eq!(freshness(&older, None, own), Freshness::Current, "the same text of another version");
         assert_eq!(freshness(&older.replace('\n', "\r\n"), None, own), Freshness::Current, "the same text with CRLF");
         assert_eq!(freshness(&older, Some(Lang::Es), own), Freshness::Stale, "the other language is other text");
-        let spanish = block("\n", Some(Lang::Es), Stamp { version: own, choice: None });
+        let spanish = block("\n", Some(Lang::Es), Variant::Full, Stamp { version: own, choice: None });
         assert_eq!(freshness(&spanish, Some(Lang::Es), own), Freshness::Current);
 
         let before_stamps = format!(
@@ -1453,6 +1463,35 @@ mod tests {
         assert_eq!(freshness(&same, None, own), Freshness::Stale, "this version's stamp over text it does not write");
         let unreadable = format!("{BEGIN_MARKER}\n<!-- clawg 0.99 -->\nanother text\n{END_MARKER}");
         assert_eq!(freshness(&unreadable, None, own), Freshness::Stale, "a stamp that does not read is no stamp");
+    }
+
+    #[test]
+    fn each_variant_is_its_block() {
+        let own = v("0.88.0");
+        let stamp = |choice| Stamp { version: own, choice };
+        for language in [None, Some(Lang::Es)] {
+            let full = block("\n", language, Variant::Full, stamp(None));
+            assert_eq!(full, installed_block(language));
+            assert!(full.contains(protocol::text(language).replace("\r\n", "\n").trim_end()), "the whole protocol");
+
+            let short = block("\n", language, Variant::Short, stamp(Some(Variant::Short)));
+            assert!(short.starts_with(&format!("{BEGIN_MARKER}\n<!-- clawg 0.88.0 protocol=short -->\n")), "{short}");
+            assert!(short.ends_with(&format!("\n{END_MARKER}")), "{short}");
+            assert!(short.contains(protocol::short(language).trim_end()));
+            assert!(short.len() < 2000 && short.len() < full.len() / 4, "{} bytes", short.len());
+
+            let off = block("\n", language, Variant::Off, stamp(Some(Variant::Off)));
+            assert_eq!(off, format!("{BEGIN_MARKER}\n<!-- clawg 0.88.0 protocol=off -->\n{END_MARKER}"));
+
+            for (text, choice) in [(&full, None), (&short, Some(Variant::Short)), (&off, Some(Variant::Off))] {
+                assert_eq!(freshness(text, language, own), Freshness::Current, "{choice:?} is what its own stamp asks for");
+                assert_eq!(read_stamp(text), Some(stamp(choice)));
+            }
+            let forgotten = short.replacen(" protocol=short", "", 1);
+            assert_eq!(freshness(&forgotten, language, own), Freshness::Stale, "a stamp without the choice means the default");
+        }
+        let short = block("\n", None, Variant::Short, stamp(Some(Variant::Short)));
+        assert_eq!(freshness(&short, Some(Lang::Es), own), Freshness::Stale, "the other language is other text");
     }
 
     #[test]

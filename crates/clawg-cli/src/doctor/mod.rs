@@ -294,7 +294,7 @@ fn protocol_block(language: Lang, profile: Profile) -> Vec<Finding> {
             }
         }
     };
-    checks::protocol_block(language, &state, &crate::setup::unstamped(Some(language)), &path, profile)
+    checks::protocol_block(language, &state, &crate::setup::unstamped(Some(language), crate::setup::DEFAULT_VARIANT), &path, profile)
 }
 
 /// Claude Code's registration of this profile's server, from the file
