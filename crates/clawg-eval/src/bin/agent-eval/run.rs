@@ -155,9 +155,12 @@ pub struct RunResult {
     /// Each fact born in a session, followed to the last one.
     #[serde(default)]
     pub facts: Vec<Fact>,
-    /// [`overhead`], for a run of two sessions.
+    /// [`overhead`], for a run of two sessions whose second one is new.
     #[serde(default)]
     pub overhead: Option<u64>,
+    /// [`rereads`], for a run of two sessions.
+    #[serde(default)]
+    pub rereads: Option<Rereads>,
     /// The other branch of the fork this run is one of.
     #[serde(default)]
     pub paired: Option<String>,
@@ -228,6 +231,8 @@ pub struct RunInfo<'a> {
     pub lang: Option<Lang>,
     pub shape: Shape,
     pub noise_rules: usize,
+    /// The working directory of the sessions, from which a relative path is read.
+    pub workdir: &'a Path,
     /// Where the client keeps the native memory of the run, when its arm has one.
     pub native_dir: Option<&'a Path>,
 }
@@ -324,7 +329,8 @@ pub fn evaluate(task: &Task, info: &RunInfo, played: &[Played], read_file: impl 
         })
         .collect();
     let last = sessions.last().expect("a run has its first session");
-    let relay = (played.len() == 2).then(|| overhead(&played[0].transcript, &played[1].transcript, info.native_dir));
+    let reread = (played.len() == 2).then(|| rereads(&played[0].transcript, &played[1].transcript, info.workdir, info.native_dir));
+    let relay = reread.filter(|_| info.shape != Shape::Joined).map(|r| overhead(&played[0].transcript, &played[1].transcript, r.again));
     RunResult {
         task: task.id.clone(),
         category: task.category.clone(),
@@ -340,6 +346,7 @@ pub fn evaluate(task: &Task, info: &RunInfo, played: &[Played], read_file: impl 
         shape: info.shape,
         noise_rules: info.noise_rules,
         overhead: relay,
+        rereads: reread,
         paired: None,
     }
 }
@@ -366,27 +373,87 @@ pub fn facts(task: &Task, sessions: &[SessionResult]) -> Vec<Fact> {
     told
 }
 
-/// What a relay costs the new session, in tokens: what its first request has
-/// over the first of the session before (never below 0) plus what it reads
-/// again at 4 bytes a token: the files the first one already read, the answers
-/// of the tools that read a memory and what it reads of the native memory.
-pub fn overhead(first: &Transcript, second: &Transcript, native_dir: Option<&Path>) -> u64 {
+/// What a relay costs the new session, in tokens and without what any session
+/// would pay: what its first request has over the first of the session before
+/// (never below 0) plus `again`, what it reads again ([`rereads`]).
+pub fn overhead(first: &Transcript, second: &Transcript, again: u64) -> u64 {
     let growth = match (first.first_request_tokens, second.first_request_tokens) {
         (Some(before), Some(after)) => after.saturating_sub(before),
         _ => 0,
     };
+    growth + again
+}
+
+/// What the second session reads that the first already had, in tokens at 4
+/// bytes a token.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Rereads {
+    /// The results of the `Read` of a file the first session read or wrote,
+    /// except those of a file the second one edits and the first did not write;
+    /// of the tools that read a memory; and of the `Read` of the native memory.
+    pub again: u64,
+    /// The results of the `Read` that `again` leaves out because of the edit:
+    /// the client asks for a `Read` in the same session before an `Edit`, so any
+    /// new session pays them, with a memory or without it.
+    pub to_edit: u64,
+}
+
+const EDIT_TOOLS: [&str; 4] = ["Write", "Edit", "MultiEdit", "NotebookEdit"];
+
+/// The tools that read a memory, whose answers a note of the first session would spare.
+const MEMORY_READERS: [&str; 4] = ["search_memory", "recall_context", "read_memory", "list_memories"];
+
+/// The file a call to a `Read` or an edit tool names.
+fn touched(call: &ToolCall) -> Option<&str> {
+    file_path(call).or_else(|| call.input.get("notebook_path").and_then(Value::as_str))
+}
+
+/// A path as the session wrote it, resolved from `workdir` (already as
+/// [`norm_path`] writes it): the same file is found whatever its separators,
+/// case, `.` and `..`.
+fn resolved(path: &str, workdir: &str) -> String {
+    let path = norm_path(path);
+    let drive = path.as_bytes().get(1) == Some(&b':') && path.as_bytes()[0].is_ascii_alphabetic();
+    let joined = if path.starts_with('/') || path.starts_with('~') || drive { path } else { format!("{workdir}/{path}") };
+    let mut parts: Vec<&str> = Vec::new();
+    for part in joined.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            _ => parts.push(part),
+        }
+    }
+    format!("{}{}", if joined.starts_with('/') { "/" } else { "" }, parts.join("/"))
+}
+
+/// What `second` reads again after `first`, from `workdir`; a path is compared
+/// resolved, with the native memory in `native_dir` when the arm has one.
+pub fn rereads(first: &Transcript, second: &Transcript, workdir: &Path, native_dir: Option<&Path>) -> Rereads {
+    let workdir = norm_path(&workdir.to_string_lossy());
     let native = native_dir.map(|dir| norm_path(&dir.to_string_lossy()));
-    let read_before: Vec<String> = first.calls.iter().filter(|c| c.name == "Read").filter_map(file_path).map(norm_path).collect();
-    let bytes: usize = second
-        .calls
-        .iter()
-        .filter(|c| {
-            let read = c.name == "Read" && file_path(c).is_some_and(|path| read_before.contains(&norm_path(path)) || native.as_deref().is_some_and(|dir| in_dir(path, dir)));
-            read || ["search_memory", "recall_context", "read_memory", "list_memories"].iter().any(|tool| is_tool(&c.name, tool))
-        })
-        .map(|c| c.result.as_deref().map_or(0, str::len))
-        .sum();
-    growth + (bytes / 4) as u64
+    let paths = |t: &Transcript, tools: &[&str]| -> Vec<String> {
+        t.calls.iter().filter(|c| tools.contains(&c.name.as_str())).filter_map(touched).map(|p| resolved(p, &workdir)).collect()
+    };
+    let read_before = paths(first, &["Read"]);
+    let written_before = paths(first, &EDIT_TOOLS);
+    let edited = paths(second, &EDIT_TOOLS);
+    let (mut again, mut to_edit) = (0, 0);
+    for call in &second.calls {
+        let bytes = call.result.as_deref().map_or(0, str::len);
+        if MEMORY_READERS.iter().any(|tool| is_tool(&call.name, tool)) {
+            again += bytes;
+        } else if call.name == "Read" {
+            let Some(path) = touched(call).map(|p| resolved(p, &workdir)) else { continue };
+            if native.as_deref().is_some_and(|dir| in_dir(&path, dir)) || written_before.contains(&path) {
+                again += bytes;
+            } else if read_before.contains(&path) {
+                if edited.contains(&path) { to_edit += bytes } else { again += bytes }
+            }
+        }
+    }
+    Rereads { again: (again / 4) as u64, to_edit: (to_edit / 4) as u64 }
 }
 
 /// The prompts of the sessions before session `k` (from 1) when each continues
@@ -1306,7 +1373,7 @@ fn score_run(root: &Path, record: &Value, branch: Option<Shape>) -> Result<RunRe
     let out_dir = branch_dir.unwrap_or_else(|| root.to_owned());
     let workdir = Layout { root: out_dir.clone() }.workdir();
     let read_file = |rel: &str| task::is_relative_inside(rel).then(|| std::fs::read_to_string(workdir.join(rel)).ok()).flatten();
-    let info = RunInfo { arm: &arm, client: client.name(), profile, lang, shape, noise_rules, native_dir: native_memory_file(&plan).and_then(Path::parent) };
+    let info = RunInfo { arm: &arm, client: client.name(), profile, lang, shape, noise_rules, workdir: &workdir, native_dir: native_memory_file(&plan).and_then(Path::parent) };
     let mut result = evaluate(&task, &info, &played, read_file);
     for (session, (started, ended)) in result.sessions.iter_mut().zip(times) {
         session.session.started_at = started;
@@ -1474,7 +1541,7 @@ mod tests {
 "#;
 
     fn info(arm: &str, profile: Profile) -> RunInfo<'_> {
-        RunInfo { arm, client: "replay", profile, lang: None, shape: Shape::Split, noise_rules: 0, native_dir: None }
+        RunInfo { arm, client: "replay", profile, lang: None, shape: Shape::Split, noise_rules: 0, workdir: Path::new(WORKDIR), native_dir: None }
     }
 
     fn played(stream: &str) -> Played {
@@ -1860,42 +1927,118 @@ mod tests {
         assert_eq!(class(&["alpha-1"], &[]), FactClass::Used);
     }
 
+    /// A session whose first request has `tokens` of context, followed by each
+    /// call as a request of its own with a result of the given size.
+    fn session_of(tokens: u64, calls: &[(&str, Value, usize)]) -> Transcript {
+        let usage = format!(r#""usage":{{"input_tokens":3,"cache_creation_input_tokens":{},"cache_read_input_tokens":{}}}"#, tokens - 3 - 100, 100);
+        let mut stream = format!("{{\"type\":\"assistant\",\"message\":{{\"id\":\"start\",\"content\":[],{usage}}}}}\n");
+        for (i, (name, input, result)) in calls.iter().enumerate() {
+            stream.push_str(&format!(
+                "{}\n{}\n",
+                json!({"type": "assistant", "message": {"id": format!("m{i}"), "content": [{"type": "tool_use", "id": format!("c{i}"), "name": name, "input": input}]}}),
+                json!({"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": format!("c{i}"), "content": "z".repeat(*result)}]}})
+            ));
+        }
+        stream.push_str("{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"ok\"}\n");
+        stream::parse(&stream)
+    }
+
+    fn two_sessions() -> Task {
+        task::parse(
+            r#"{"id": "t", "category": "R", "fixture": "f",
+                "sessions": [{"prompt": "one"}, {"prompt": "two"}],
+                "checks": [{"kind": "answer_contains", "text": "ok"}]}"#,
+        )
+        .unwrap()
+    }
+
+    fn played_of(first: Transcript, second: Transcript) -> [Played; 2] {
+        [first, second].map(|transcript| Played { transcript, delivered: Vec::new(), loaded: Vec::new() })
+    }
+
     #[test]
     fn the_relay_overhead_is_what_the_new_session_starts_with_and_reads_again() {
-        let usage = |tokens: u64| format!(r#""usage":{{"input_tokens":3,"cache_creation_input_tokens":{},"cache_read_input_tokens":{}}}"#, tokens - 3 - 100, 100);
-        let first = format!(
-            r#"{{"type":"assistant","message":{{"id":"m1","content":[{{"type":"tool_use","id":"r1","name":"Read","input":{{"file_path":"src/a.py"}}}}],{}}}}}
-{{"type":"user","message":{{"content":[{{"type":"tool_result","tool_use_id":"r1","content":"x"}}]}}}}
-{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}
-"#,
-            usage(1000)
-        );
         let memory = if cfg!(windows) { r"C:\runs\r\claude-config\projects\p\memory" } else { "/runs/r/claude-config/projects/p/memory" };
         let memory_file = Path::new(memory).join("MEMORY.md").to_string_lossy().into_owned();
-        let call = |id: &str, name: &str, input: Value, result: usize| {
-            format!(
-                "{}\n{}\n",
-                json!({"type": "assistant", "message": {"id": format!("m-{id}"), "content": [{"type": "tool_use", "id": id, "name": name, "input": input}]}}),
-                json!({"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": id, "content": "z".repeat(result)}]}})
-            )
-        };
+        let work = Path::new(WORKDIR);
+        let first = session_of(1000, &[("Read", json!({"file_path": "src/a.py"}), 1)]);
         let second = |tokens: u64| {
-            format!(
-                "{}{}{}{}{}{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"ok\"}}\n",
-                format_args!("{{\"type\":\"assistant\",\"message\":{{\"id\":\"n1\",\"content\":[],{}}}}}\n", usage(tokens)),
-                call("a", "Read", json!({"file_path": "src/a.py"}), 400),
-                call("b", "Read", json!({"file_path": "src/b.py"}), 4000),
-                call("c", "mcp__clawg-dev__search_memory", json!({"query": "timeout"}), 800),
-                call("d", "Read", json!({"file_path": memory_file}), 200),
+            session_of(
+                tokens,
+                &[
+                    ("Read", json!({"file_path": "src/a.py"}), 400),
+                    ("Read", json!({"file_path": "src/b.py"}), 4000),
+                    ("mcp__clawg-dev__search_memory", json!({"query": "timeout"}), 800),
+                    ("Read", json!({"file_path": memory_file}), 200),
+                ],
             )
         };
-        let (first, later) = (stream::parse(&first), stream::parse(&second(1500)));
+        let later = second(1500);
         assert_eq!((first.first_request_tokens, later.first_request_tokens), (Some(1000), Some(1500)));
         let dir = Path::new(memory);
-        assert_eq!(overhead(&first, &later, Some(dir)), 500 + (400 + 800 + 200) / 4, "what it starts with and what it reads again; src/b.py is new");
-        assert_eq!(overhead(&first, &later, None), 500 + (400 + 800) / 4, "without a native memory its directory reads nothing");
-        assert_eq!(overhead(&first, &stream::parse(&second(900)), Some(dir)), (400 + 800 + 200) / 4, "it starts with less: nothing is added, and below 0 it stays at 0");
-        assert_eq!(overhead(&stream::parse(""), &stream::parse(&second(1500)), Some(dir)), (800 + 200) / 4, "no first request to compare with, and no file read before");
+        let again = |reread: &Rereads| reread.again;
+        let reads = rereads(&first, &later, work, Some(dir));
+        assert_eq!(reads, Rereads { again: (400 + 800 + 200) / 4, to_edit: 0 }, "src/b.py is new to the second session");
+        assert_eq!(again(&rereads(&first, &later, work, None)), (400 + 800) / 4, "without a native memory its directory reads nothing");
+        assert_eq!(overhead(&first, &later, reads.again), 500 + 350, "what it starts with and what it reads again");
+        assert_eq!(overhead(&first, &second(900), reads.again), 350, "it starts with less: nothing is added, and below 0 it stays at 0");
+        assert_eq!(overhead(&stream::parse(""), &later, reads.again), 350, "no first request to compare with");
+    }
+
+    const WORKDIR: &str = "/runs/r/work";
+
+    #[test]
+    fn the_relay_overhead_leaves_out_the_reads_an_edit_needs() {
+        let first = session_of(
+            1000,
+            &[
+                ("Read", json!({"file_path": "a.py"}), 1),
+                ("Read", json!({"file_path": "b.py"}), 1),
+                ("Write", json!({"file_path": "NOTES.md", "content": "x"}), 1),
+            ],
+        );
+        let second = session_of(
+            1500,
+            &[
+                ("Read", json!({"file_path": "/runs/r/work/./SRC/../a.py"}), 400),
+                ("Edit", json!({"file_path": "a.py"}), 1),
+                ("Read", json!({"file_path": "b.py"}), 4000),
+                ("Read", json!({"file_path": "NOTES.md"}), 800),
+                ("Edit", json!({"file_path": "NOTES.md"}), 1),
+                ("Read", json!({"file_path": "c.py"}), 2000),
+            ],
+        );
+        let reads = rereads(&first, &second, Path::new(WORKDIR), None);
+        assert_eq!(reads, Rereads { again: (4000 + 800) / 4, to_edit: 400 / 4 }, "a.py is read to be edited; c.py is new");
+
+        let info = RunInfo { shape: Shape::Split, ..info("a3", Profile::Dev) };
+        let r = evaluate(&two_sessions(), &info, &played_of(first, second), |_| None);
+        assert_eq!(r.rereads, Some(reads));
+        assert_eq!(r.overhead, Some(500 + reads.again), "the growth of the first request, plus what is read again");
+    }
+
+    #[test]
+    fn a_file_the_first_session_wrote_always_counts_as_read_again() {
+        let first = session_of(
+            1000,
+            &[("Write", json!({"file_path": "TIMEOUTS.md", "content": "x"}), 1), ("NotebookEdit", json!({"notebook_path": "n.ipynb"}), 1)],
+        );
+        let second = session_of(
+            1000,
+            &[("Read", json!({"file_path": "TIMEOUTS.md"}), 2000), ("Edit", json!({"file_path": "TIMEOUTS.md"}), 1), ("Read", json!({"file_path": "n.ipynb"}), 400)],
+        );
+        assert_eq!(rereads(&first, &second, Path::new(WORKDIR), None), Rereads { again: 600, to_edit: 0 }, "the note the first session left is what a memory replaces");
+    }
+
+    #[test]
+    fn a_continued_session_has_rereads_and_no_relay_overhead() {
+        let first = session_of(1000, &[("Read", json!({"file_path": "a.py"}), 1)]);
+        let second = session_of(1800, &[("Read", json!({"file_path": "a.py"}), 400)]);
+        let info = RunInfo { shape: Shape::Joined, ..info("a3", Profile::Dev) };
+        let r = evaluate(&two_sessions(), &info, &played_of(first, second), |_| None);
+        assert_eq!(r.rereads, Some(Rereads { again: 100, to_edit: 0 }));
+        assert_eq!(r.overhead, None, "its first request is the whole conversation");
+        assert_eq!(evaluate(&two_sessions(), &info, &played_of(session_of(1000, &[]), session_of(1000, &[]))[..1], |_| None).rereads, None, "a run of one session reads nothing again");
     }
 
     const OLD_RESULT: &str = r#"{"task": "t", "category": "K1", "example": false, "arm": "a3", "client": "replay", "lang": null,
@@ -1973,7 +2116,7 @@ mod tests {
         assert_eq!(r.facts, [Fact { tracer: "4.5-41".into(), born: 1, class: FactClass::Used }]);
         assert!(r.score.success && r.score.ended, "{:?}", r.score);
         assert_eq!(r.score.checks.len(), 2);
-        assert_eq!(r.overhead, Some(0));
+        assert_eq!((r.overhead, r.rereads), (None, Some(Rereads::default())), "the second session continues the conversation");
         assert!(r.sessions.iter().all(|s| s.session.ended_at.is_some()));
         let text = summary(&r);
         assert!(text.contains("saves 1 with 0 failed criteria") && text.contains("2 sessions joined"), "{text}");

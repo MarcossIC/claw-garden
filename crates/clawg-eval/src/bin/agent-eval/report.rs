@@ -634,6 +634,7 @@ mod tests {
             noise_rules: 0,
             facts: vec![],
             overhead: None,
+            rereads: None,
             paired: None,
         }
     }
