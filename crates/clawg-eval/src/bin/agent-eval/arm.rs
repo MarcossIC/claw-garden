@@ -28,6 +28,9 @@ pub enum Arm {
     /// A3 with the short protocol block `clawg setup claude-code --protocol
     /// short` writes.
     A3Short,
+    /// A3 without the `PostToolUse` and `PostToolUseFailure` hooks that `setup`
+    /// installs for `Bash`: what a3 was before they existed.
+    A3NoTools,
     /// The client's native memory holding the same facts, without clawg.
     A4,
     /// A3 without the tools that read memories back: only what reaches the
@@ -78,7 +81,11 @@ impl Shape {
     }
 }
 
-pub const ARMS: [Arm; 10] = [Arm::A0, Arm::A2, Arm::A3, Arm::A3Eager, Arm::A3Short, Arm::A4, Arm::B, Arm::L0, Arm::L1, Arm::L2];
+pub const ARMS: [Arm; 11] = [Arm::A0, Arm::A2, Arm::A3, Arm::A3Eager, Arm::A3Short, Arm::A3NoTools, Arm::A4, Arm::B, Arm::L0, Arm::L1, Arm::L2];
+
+/// The events of the hooks `setup` installs for the tools the agent calls, which
+/// arm `a3-notools` does not have.
+const TOOL_HOOK_EVENTS: [&str; 2] = ["PostToolUse", "PostToolUseFailure"];
 
 /// The tools arm B takes away.
 const READ_TOOLS: [&str; 3] = ["search_memory", "read_memory", "list_memories"];
@@ -105,6 +112,7 @@ impl Arm {
             Arm::A3 => "a3",
             Arm::A3Eager => "a3-eager",
             Arm::A3Short => "a3-short",
+            Arm::A3NoTools => "a3-notools",
             Arm::A4 => "a4",
             Arm::B => "b",
             Arm::L0 => "l0",
@@ -115,17 +123,17 @@ impl Arm {
 
     /// Whether a run of this arm starts clawg: its daemon, its bridge, its hooks.
     pub fn has_clawg(self) -> bool {
-        matches!(self, Arm::A2 | Arm::A3 | Arm::A3Eager | Arm::A3Short | Arm::B | Arm::L0 | Arm::L1 | Arm::L2)
+        matches!(self, Arm::A2 | Arm::A3 | Arm::A3Eager | Arm::A3Short | Arm::A3NoTools | Arm::B | Arm::L0 | Arm::L1 | Arm::L2)
     }
 
     /// Whether the arm has the hooks `setup` writes in `settings.json`.
     fn has_setup(self) -> bool {
-        matches!(self, Arm::A3 | Arm::A3Eager | Arm::A3Short | Arm::B | Arm::L0 | Arm::L1 | Arm::L2)
+        matches!(self, Arm::A3 | Arm::A3Eager | Arm::A3Short | Arm::A3NoTools | Arm::B | Arm::L0 | Arm::L1 | Arm::L2)
     }
 
     /// Whether the arm has the protocol block `setup` writes in `CLAUDE.md`.
     fn has_protocol(self) -> bool {
-        matches!(self, Arm::A3 | Arm::A3Eager | Arm::A3Short | Arm::B)
+        matches!(self, Arm::A3 | Arm::A3Eager | Arm::A3Short | Arm::A3NoTools | Arm::B)
     }
 
     /// Whether the arm delivers the seeded rules and, if it does, whether
@@ -314,6 +322,13 @@ pub fn plan(task: &Task, arm: Arm, layout: &Layout, options: &Options) -> Result
         );
         if let (true, FileStep::Write(body)) = (arm.has_setup(), setup_plan.settings) {
             settings = serde_json::from_str(&body).expect("setup writes its settings as JSON");
+            if arm == Arm::A3NoTools {
+                if let Some(hooks) = settings["hooks"].as_object_mut() {
+                    for event in TOOL_HOOK_EVENTS {
+                        hooks.remove(event);
+                    }
+                }
+            }
         }
         if let (true, FileStep::Write(body)) = (arm.has_protocol(), setup_plan.instructions) {
             files.push((state.instructions.path.clone(), body));
@@ -645,7 +660,7 @@ mod tests {
             assert!(plan.files.iter().any(|(p, _)| *p == layout().config_dir().join("settings.json")), "{}", arm.as_str());
             let settings = settings(&plan);
             assert_eq!(settings["hooks"]["InstructionsLoaded"], logged, "{}", arm.as_str());
-            let with_setup = matches!(arm, Arm::A3 | Arm::A3Eager | Arm::A3Short | Arm::B | Arm::L0 | Arm::L1 | Arm::L2);
+            let with_setup = matches!(arm, Arm::A3 | Arm::A3Eager | Arm::A3Short | Arm::A3NoTools | Arm::B | Arm::L0 | Arm::L1 | Arm::L2);
             assert_eq!(settings["hooks"]["UserPromptSubmit"].is_array(), with_setup, "setup's hooks stay: {}", arm.as_str());
         }
     }
@@ -742,6 +757,37 @@ mod tests {
     }
 
     #[test]
+    fn a3_notools_is_a3_without_the_tool_hooks() {
+        let a3 = plan(&task(true), Arm::A3, &layout(), &options(None)).unwrap();
+        let notools = plan(&task(true), Arm::A3NoTools, &layout(), &options(None)).unwrap();
+        let (full, without) = (settings(&a3), settings(&notools));
+        let mut expected = full.clone();
+        for event in ["PostToolUse", "PostToolUseFailure"] {
+            assert!(full["hooks"][event].is_array(), "a3 has the {event} hooks that setup installs");
+            assert!(without["hooks"].get(event).is_none(), "a3-notools has no {event} hook");
+            expected["hooks"].as_object_mut().unwrap().remove(event);
+        }
+        assert_eq!(without, expected, "nothing else of settings.json differs: the server's hooks and the harness's stay");
+        let others = |plan: &RunPlan| plan.files.iter().filter(|(p, _)| !p.ends_with("settings.json")).cloned().collect::<Vec<_>>();
+        assert_eq!(others(&notools), others(&a3), "the server, the protocol block and the seed are a3's");
+        assert_eq!(
+            (&notools.daemon, &notools.before, &notools.after, &notools.client, &notools.env),
+            (&a3.daemon, &a3.before, &a3.after, &a3.client, &a3.env)
+        );
+        assert_eq!((notools.arm.as_str(), a3.arm.as_str()), ("a3-notools", "a3"));
+        assert!(file(&notools, "CLAUDE.md").is_some(), "it keeps the protocol block of a3");
+    }
+
+    #[test]
+    fn a3_notools_reads_and_prints_by_its_name() {
+        assert_eq!(Arm::parse("a3-notools"), Some(Arm::A3NoTools));
+        assert_eq!(Arm::A3NoTools.as_str(), "a3-notools");
+        assert!(ARMS.contains(&Arm::A3NoTools) && Arm::A3NoTools.has_clawg());
+        let order: Vec<&str> = ARMS.iter().map(|a| a.as_str()).collect();
+        assert!(order.iter().position(|a| *a == "a3-short") < order.iter().position(|a| *a == "a3-notools"), "{order:?}");
+    }
+
+    #[test]
     fn every_arm_has_a_name() {
         for arm in ARMS {
             assert_eq!(Arm::parse(arm.as_str()), Some(arm));
@@ -752,7 +798,7 @@ mod tests {
     #[test]
     fn the_arms_with_clawg_start_a_daemon_of_the_run_on_an_ephemeral_port() {
         let with_daemon: Vec<Arm> = ARMS.into_iter().filter(|arm| plan(&task(true), *arm, &layout(), &options(None)).unwrap().daemon.is_some()).collect();
-        assert_eq!(with_daemon, [Arm::A2, Arm::A3, Arm::A3Eager, Arm::A3Short, Arm::B, Arm::L0, Arm::L1, Arm::L2]);
+        assert_eq!(with_daemon, [Arm::A2, Arm::A3, Arm::A3Eager, Arm::A3Short, Arm::A3NoTools, Arm::B, Arm::L0, Arm::L1, Arm::L2]);
 
         let plan = plan(&task(true), Arm::A3, &layout(), &options(None)).unwrap();
         let daemon = plan.daemon.unwrap();
