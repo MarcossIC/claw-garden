@@ -1872,6 +1872,54 @@ async fn a_post_tool_hook_answers_without_a_daemon_and_leaves_the_store_alone() 
     assert_eq!(ledger.lines().count(), 2, "one line for each failure and none for the call that went well: {ledger}");
 }
 
+/// A Bash call that failed because `program` is not installed, in `session`.
+fn missing(sandbox: &Sandbox, session: &str, program: &str) {
+    let said = format!("Exit code 127\n/usr/bin/bash: line 1: {program}: command not found");
+    let out = hook(sandbox, &["post-tool-use-failure", "--agent", "claude-code", "--profile", "dev"], &bash_failed(session, program, &said));
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+}
+
+/// What `session-start` prints for `session`, with no daemon.
+fn start_of(sandbox: &Sandbox, session: &str) -> String {
+    let input = json!({ "session_id": session, "cwd": sandbox.home, "source": "startup" }).to_string();
+    context_of(&hook(sandbox, &["session-start", "--agent", "claude-code", "--profile", "dev"], &input))
+}
+
+#[tokio::test]
+async fn two_sessions_teach_the_third() {
+    let sandbox = Sandbox::new();
+    let set = sandbox.run(&["preferences", "set", "language", "es", "--profile", "dev"]);
+    assert_eq!(set.status.code(), Some(0), "{}", stderr_of(&set));
+    // A name no machine has, so that a PATH with the program cannot silence it.
+    let program = "eza-absent-xyz";
+
+    missing(&sandbox, "s1", program);
+    missing(&sandbox, "s2", program);
+    let start = start_of(&sandbox, "s3");
+
+    assert!(start.starts_with("clawg: el idioma de la persona es el español."), "{start}");
+    assert!(start.contains("\n\nclawg: estos programas no están instalados en el Bash de esta máquina;"), "{start}");
+    assert!(start.contains(&format!("`{program}` (2 sesiones, último fallo hoy)")), "{start}");
+    assert!(!sandbox.data_dir().join("daemon.json").exists(), "no daemon was needed");
+
+    std::fs::remove_file(sandbox.data_dir().join(clawg_cli::tool_failures::FILE)).unwrap();
+    assert!(!start_of(&sandbox, "s4").contains(program), "forgetting the ledger forgets the rule");
+}
+
+#[tokio::test]
+async fn one_session_teaches_nothing() {
+    let sandbox = Sandbox::new();
+    let set = sandbox.run(&["preferences", "set", "language", "es", "--profile", "dev"]);
+    assert_eq!(set.status.code(), Some(0), "{}", stderr_of(&set));
+
+    missing(&sandbox, "s1", "eza-absent-xyz");
+    missing(&sandbox, "s1", "eza-absent-xyz");
+    let start = start_of(&sandbox, "s2");
+
+    assert!(start.starts_with("clawg: el idioma de la persona es el español."), "{start}");
+    assert!(!start.contains("clawg: estos programas") && !start.contains("eza-absent-xyz"), "two failures of one session are one: {start}");
+}
+
 #[tokio::test]
 async fn a_hook_usage_error_exits_1() {
     let sandbox = Sandbox::new();

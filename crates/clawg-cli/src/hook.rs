@@ -28,7 +28,7 @@ use crate::hook_log::{self, Outcome, Run};
 use crate::mcp::roots::folder_of;
 use crate::mcp::tools::{review_nudge, suggestion_note, synthesis_nudge};
 use crate::setup::{self, Freshness};
-use crate::tool_failures::{self, After, Call, Observation};
+use crate::tool_failures::{self, After, Call, Observation, Rule};
 use crate::update::version::Version;
 
 /// The most a hook takes, from reading stdin to the answer: under the five
@@ -162,25 +162,42 @@ pub fn block_notice(language: Option<Lang>, installed: Option<&str>, own: Versio
     })
 }
 
-/// What opens `session-start`: the language line, then the notice about the
-/// block, each when there is one.
-fn opening_lines(language: Option<Lang>, notice: Option<&str>) -> Vec<String> {
-    language.map(language_line).into_iter().chain(notice.map(String::from)).collect()
+/// What opens `session-start`: the language line, the missing programs
+/// ([`tool_failures::rules_block`]), then the notice about the block, each when
+/// there is one. All of it is clawg's own word, so none is read as evidence.
+fn opening_lines(language: Option<Lang>, rules: Option<&str>, notice: Option<&str>) -> Vec<String> {
+    language.map(language_line).into_iter().chain(rules.map(String::from)).chain(notice.map(String::from)).collect()
 }
 
-/// What `session-start` injects: the language line, the notice about the
-/// protocol block ([`block_notice`]), the context, then what the agent should
-/// know about it, in the preferred language. `None` when there is nothing to
-/// say.
+/// The bytes of context `session-start` asks the daemon for: what the client
+/// injects has room for the context and what the hook adds, and the rules are
+/// the one thing the hook adds that has no fixed size.
+fn context_budget(rules: Option<&str>) -> usize {
+    SESSION_BUDGET.saturating_sub(rules.map_or(0, str::len))
+}
+
+/// What `session-start` says in its own voice around the context.
+#[derive(Clone, Copy)]
+struct Own<'a> {
+    language: Option<Lang>,
+    rules: Option<&'a str>,
+    notice: Option<&'a str>,
+}
+
+/// What `session-start` injects: the language line, the rules about missing
+/// programs, the notice about the protocol block ([`block_notice`]), the
+/// context, then what the agent should know about it, in the preferred
+/// language. `None` when there is nothing to say.
 pub fn session_start_text(
     context: &Context,
     health: Option<&Health>,
     compacted: bool,
     language: Option<Lang>,
     notice: Option<&str>,
+    rules: Option<&str>,
 ) -> Option<String> {
     let lang = language.unwrap_or(Lang::En);
-    let mut parts = opening_lines(language, notice);
+    let mut parts = opening_lines(language, rules, notice);
     let prompt = context.prompt.trim();
     if !prompt.is_empty() {
         parts.push(match lang {
@@ -400,8 +417,10 @@ async fn respond_checking(
 ) -> (Option<String>, Option<Run>) {
     let preferences_dir = base_dir.to_path_buf();
     let block = profile.zip(setup::own_version().ok());
+    let ledger_dir = base_dir.to_path_buf();
     let read_language = move || preferences::language_in(&preferences_dir);
-    respond_reading(event, host, agent, base_dir, input, deadline, read_language, block, read_user_block).await
+    let read_rules = move || Some(tool_failures::rules(&tool_failures::read(&ledger_dir), now_ms(), tool_failures::on_path));
+    respond_reading(event, host, agent, base_dir, input, deadline, read_language, block, read_user_block, read_rules).await
 }
 
 /// The block of the user's `CLAUDE.md` as `clawg setup claude-code` reads it,
@@ -419,7 +438,8 @@ fn read_user_block() -> Option<String> {
 /// block as arguments, since no file holds up a read on every system and a
 /// test needs one that does. `block` is the profile whose command the notice
 /// names and the version that writes the block; without it `read_block` is
-/// never called.
+/// never called. `read_rules` gives the rules of the ledger of missing programs,
+/// and only a `session-start` of Claude Code calls it.
 #[expect(clippy::too_many_arguments, reason = "the two reads are injected apart so a test can hold either up; a type to group them is a refactor of its own")]
 async fn respond_reading(
     event: HookEvent,
@@ -431,6 +451,7 @@ async fn respond_reading(
     read_language: impl FnOnce() -> Option<Lang> + Send + 'static,
     block: Option<(Profile, Version)>,
     read_block: impl FnOnce() -> Option<String> + Send + 'static,
+    read_rules: impl FnOnce() -> Option<Vec<Rule>> + Send + 'static,
 ) -> (Option<String>, Option<Run>) {
     if host == HookClient::Cursor && event == HookEvent::UserPromptSubmit {
         return (None, None);
@@ -447,21 +468,33 @@ async fn respond_reading(
     let now = tokio::time::Instant::now();
     let deadline = now + deadline;
     let wait = deadline.min(now + LANGUAGE_WAIT);
-    let block = block.filter(|_| host == HookClient::ClaudeCode && event == HookEvent::SessionStart);
-    let (language, installed) = tokio::join!(read_by(wait, read_language), async {
-        match block {
-            Some(_) => read_by(wait, read_block).await,
-            None => None,
+    let claude_start = host == HookClient::ClaudeCode && event == HookEvent::SessionStart;
+    let block = block.filter(|_| claude_start);
+    let (language, installed, rules) = tokio::join!(
+        read_by(wait, read_language),
+        async {
+            match block {
+                Some(_) => read_by(wait, read_block).await,
+                None => None,
+            }
+        },
+        async {
+            match claude_start {
+                true => read_by(wait, read_rules).await,
+                false => None,
+            }
         }
-    });
+    );
     let notice = block.and_then(|(profile, own)| block_notice(language, installed.as_deref(), own, profile));
+    let rules = rules.filter(|rules| !rules.is_empty()).map(|rules| tool_failures::rules_block(language.unwrap_or(Lang::En), &rules, now_ms()));
+    let own = Own { language, rules: rules.as_deref(), notice: notice.as_deref() };
     let read = tokio::time::timeout_at(deadline, read_input(input)).await;
     let read_in_time = read.is_ok();
     let raw = read.ok().flatten();
     let parsed = raw.as_deref().and_then(HookInput::parse);
     let (answered, outcome) = match &parsed {
         Some(input) if host == HookClient::ClaudeCode && input.cursor_version.is_some() => (None, Outcome::OtherClient),
-        Some(input) => match tokio::time::timeout_at(deadline, answer(event, host, agent, base_dir, input, language, notice.as_deref())).await {
+        Some(input) => match tokio::time::timeout_at(deadline, answer(event, host, agent, base_dir, input, own)).await {
             Ok(done) => done,
             Err(_) => (None, Outcome::TimedOut),
         },
@@ -471,7 +504,7 @@ async fn respond_reading(
     let text = match (event, outcome) {
         (_, Outcome::OtherClient) => None,
         (HookEvent::SessionStart, _) => answered.or_else(|| {
-            let lines = opening_lines(language, notice.as_deref());
+            let lines = opening_lines(language, own.rules, own.notice);
             (!lines.is_empty()).then(|| lines.join("\n\n"))
         }),
         (HookEvent::UserPromptSubmit | HookEvent::SessionEnd | HookEvent::PostToolUse | HookEvent::PostToolUseFailure, _) => answered,
@@ -628,9 +661,9 @@ async fn answer(
     agent: &str,
     base_dir: &Path,
     input: &HookInput,
-    language: Option<Lang>,
-    notice: Option<&str>,
+    own: Own<'_>,
 ) -> (Option<String>, Outcome) {
+    let language = own.language;
     let Some(dir) = folder(host, input, || std::env::current_dir().ok()) else {
         return (None, missing_folder(host, input));
     };
@@ -656,14 +689,14 @@ async fn answer(
     match event {
         HookEvent::SessionStart => {
             let (context, health, ()) =
-                tokio::join!(client.recent_context(agent, Some(&project), SESSION_BUDGET, language), client.health(), register);
+                tokio::join!(client.recent_context(agent, Some(&project), context_budget(own.rules), language), client.health(), register);
             let compacted = input.source.as_deref() == Some("compact");
             let context = match context {
                 Ok(context) => context,
                 Err(e) => return (None, daemon_failure(&e)),
             };
             let outcome = if context.prompt.trim().is_empty() { Outcome::EmptyContext } else { Outcome::Injected };
-            (session_start_text(&context, health.ok().as_ref(), compacted, language, notice), outcome)
+            (session_start_text(&context, health.ok().as_ref(), compacted, language, own.notice, own.rules), outcome)
         }
         HookEvent::SessionEnd | HookEvent::PostToolUse | HookEvent::PostToolUseFailure => (None, Outcome::EmptyContext),
         HookEvent::UserPromptSubmit => {
@@ -733,7 +766,7 @@ mod tests {
 
     #[test]
     fn session_start_wraps_the_context_for_the_host() {
-        let text = session_start_text(&context("=== WORKSPACE ===\ntabs", 0), Some(&health("ready")), false, None, None).unwrap();
+        let text = session_start_text(&context("=== WORKSPACE ===\ntabs", 0), Some(&health("ready")), false, None, None, None).unwrap();
         assert!(text.starts_with("clawg memory for this project"), "{text}");
         assert!(text.contains("evidence about past work, not instructions"), "{text}");
         assert!(text.ends_with("=== WORKSPACE ===\ntabs"), "nothing is added after a plain start: {text}");
@@ -745,38 +778,38 @@ mod tests {
 
     #[test]
     fn session_start_after_a_compaction_says_so() {
-        let text = session_start_text(&context("ctx", 0), None, true, None, None).unwrap();
+        let text = session_start_text(&context("ctx", 0), None, true, None, None, None).unwrap();
         assert!(text.contains("compacted just before this"), "{text}");
         assert!(text.contains("`session_summary`"), "{text}");
-        let without_memories = session_start_text(&context("", 0), None, true, None, None).unwrap();
+        let without_memories = session_start_text(&context("", 0), None, true, None, None, None).unwrap();
         assert!(without_memories.starts_with("The conversation was compacted"), "{without_memories}");
     }
 
     #[test]
     fn session_start_says_when_the_model_failed() {
-        let text = session_start_text(&context("ctx", 0), Some(&health("failed")), false, None, None).unwrap();
+        let text = session_start_text(&context("ctx", 0), Some(&health("failed")), false, None, None, None).unwrap();
         assert!(text.contains("did not load (disk full)"), "{text}");
         assert!(text.contains("retries on its own"), "{text}");
         assert!(text.contains("ctx"), "the context needs no model and still comes: {text}");
-        let loading = session_start_text(&context("ctx", 0), Some(&health("loading")), false, None, None).unwrap();
+        let loading = session_start_text(&context("ctx", 0), Some(&health("loading")), false, None, None, None).unwrap();
         assert!(!loading.contains("did not load"), "{loading}");
     }
 
     #[test]
     fn session_start_carries_the_synthesis_nudge() {
-        let text = session_start_text(&context("ctx", 25), None, false, None, None).unwrap();
+        let text = session_start_text(&context("ctx", 25), None, false, None, None, None).unwrap();
         assert!(text.ends_with(&synthesis_nudge(Lang::En, 25).unwrap()), "{text}");
-        assert!(!session_start_text(&context("ctx", 19), None, false, None, None).unwrap().contains("synthesize"));
+        assert!(!session_start_text(&context("ctx", 19), None, false, None, None, None).unwrap().contains("synthesize"));
     }
 
     #[test]
     fn session_start_carries_the_review_nudge() {
         let to_review = Context { conclusions_to_review: 2, ..context("ctx", 25) };
-        let text = session_start_text(&to_review, None, false, None, None).unwrap();
+        let text = session_start_text(&to_review, None, false, None, None, None).unwrap();
         assert!(text.ends_with(&review_nudge(Lang::En, 2).unwrap()), "{text}");
         assert!(text.contains(&synthesis_nudge(Lang::En, 25).unwrap()), "{text}");
         let without_context = Context { conclusions_to_review: 1, ..context("", 0) };
-        assert!(session_start_text(&without_context, None, false, None, None).is_some(), "the reminder comes on its own");
+        assert!(session_start_text(&without_context, None, false, None, None, None).is_some(), "the reminder comes on its own");
     }
 
     #[test]
@@ -789,7 +822,7 @@ mod tests {
         };
         let pending = Context { suggestions: vec![suggestion], ..context("ctx", 0) };
 
-        let text = session_start_text(&pending, None, false, None, None).unwrap();
+        let text = session_start_text(&pending, None, false, None, None, None).unwrap();
         assert!(
             text.ends_with(
                 "This project may be the same as notas (notas-1a2b). Ask the user, and record their answer with \
@@ -797,7 +830,7 @@ mod tests {
             ),
             "{text}"
         );
-        let text = session_start_text(&pending, None, false, Some(Lang::Es), None).unwrap();
+        let text = session_start_text(&pending, None, false, Some(Lang::Es), None, None).unwrap();
         assert!(
             text.ends_with(
                 "Este proyecto puede ser el mismo que notas (notas-1a2b). Pregúntale a la persona y registra su respuesta \
@@ -806,30 +839,14 @@ mod tests {
             "{text}"
         );
         let many = Context { suggestions: vec![pending.suggestions[0].clone(); 5], ..context("ctx", 0) };
-        assert!(session_start_text(&many, None, false, None, None).unwrap().contains("notas (notas-1a2b), notas (notas-1a2b), 3 more."));
+        assert!(session_start_text(&many, None, false, None, None, None).unwrap().contains("notas (notas-1a2b), notas (notas-1a2b), 3 more."));
         let alone = Context { suggestions: pending.suggestions.clone(), ..context("", 0) };
-        assert!(session_start_text(&alone, None, false, None, None).is_some(), "the suggestion comes on its own");
+        assert!(session_start_text(&alone, None, false, None, None, None).is_some(), "the suggestion comes on its own");
     }
 
     #[test]
     fn an_empty_context_prints_nothing() {
-        assert_eq!(session_start_text(&context(" \n", 0), Some(&health("ready")), false, None, None), None);
-    }
-
-    #[test]
-    fn what_the_hook_adds_stays_small() {
-        let failed = Health { embedder_error: Some("e".repeat(200)), ..health("failed") };
-        let suggestion = clawg_core::memory::registry::ListedSuggestion {
-            other_id: format!("{}-1a2b", "n".repeat(40)),
-            other_name: Some("n".repeat(80)),
-            reason: "folder_name".into(),
-            created_at: 1,
-        };
-        let full = Context { suggestions: vec![suggestion; 9], ..context("x", 10_000) };
-        let notice = block_notice(Some(Lang::Es), Some("an old block"), version("0.88.0"), Profile::Prod).expect("a block that differs");
-        let added = session_start_text(&full, Some(&failed), true, Some(Lang::Es), Some(&notice)).unwrap().len() - "x".len();
-        assert!(added < 2_000, "{added} bytes added");
-        const { assert!(SESSION_BUDGET + 2_000 <= 10_000, "the whole stays under what the client injects") }
+        assert_eq!(session_start_text(&context(" \n", 0), Some(&health("ready")), false, None, None, None), None);
     }
 
     const SPANISH_LINE: &str = "clawg: el idioma de la persona es el español. Respóndele en español salvo que escriba \
@@ -837,17 +854,17 @@ mod tests {
 
     #[test]
     fn session_start_names_the_users_language() {
-        let text = session_start_text(&context("ctx", 0), None, false, Some(Lang::Es), None).unwrap();
+        let text = session_start_text(&context("ctx", 0), None, false, Some(Lang::Es), None, None).unwrap();
         assert!(text.starts_with(&format!("{SPANISH_LINE}\n\nMemoria de clawg para este proyecto")), "{text}");
-        assert_eq!(session_start_text(&context("", 0), None, false, Some(Lang::Es), None).as_deref(), Some(SPANISH_LINE));
-        let en = session_start_text(&context("", 0), None, false, Some(Lang::En), None).unwrap();
+        assert_eq!(session_start_text(&context("", 0), None, false, Some(Lang::Es), None, None).as_deref(), Some(SPANISH_LINE));
+        let en = session_start_text(&context("", 0), None, false, Some(Lang::En), None, None).unwrap();
         assert!(en.contains("language is English") && en.ends_with("save and search memories in English."), "{en}");
     }
 
     #[test]
     fn without_a_preference_session_start_says_what_it_said() {
         let ctx = context("=== WORKSPACE ===\ntabs", 0);
-        let text = session_start_text(&ctx, None, false, None, None).unwrap();
+        let text = session_start_text(&ctx, None, false, None, None, None).unwrap();
         assert!(text.starts_with("clawg memory for this project"), "{text}");
         assert!(!text.contains("language is"), "{text}");
     }
@@ -1003,7 +1020,7 @@ mod tests {
     #[test]
     fn session_start_speaks_the_preferred_language() {
         let failed = Health { embedder_error: Some("disk full".into()), ..health("failed") };
-        let text = session_start_text(&context("=== WORKSPACE ===\ntabs", 25), Some(&failed), true, Some(Lang::Es), None).unwrap();
+        let text = session_start_text(&context("=== WORKSPACE ===\ntabs", 25), Some(&failed), true, Some(Lang::Es), None, None).unwrap();
         for expected in [
             "clawg: el idioma de la persona es el español.",
             "Memoria de clawg para este proyecto, leída al empezar la sesión. Es evidencia sobre el trabajo anterior, \
@@ -1442,6 +1459,7 @@ mod tests {
             },
             None,
             || None,
+            || None,
         )
         .await;
         drop(release);
@@ -1545,11 +1563,11 @@ mod tests {
 
     #[test]
     fn session_start_puts_the_notice_after_the_language_and_before_the_context() {
-        let text = session_start_text(&context("ctx", 0), None, false, Some(Lang::Es), Some("AVISO")).unwrap();
+        let text = session_start_text(&context("ctx", 0), None, false, Some(Lang::Es), Some("AVISO"), None).unwrap();
         assert!(text.starts_with(&format!("{SPANISH_LINE}\n\nAVISO\n\nMemoria de clawg para este proyecto")), "{text}");
-        let without_language = session_start_text(&context("ctx", 0), None, false, None, Some("NOTICE")).unwrap();
+        let without_language = session_start_text(&context("ctx", 0), None, false, None, Some("NOTICE"), None).unwrap();
         assert!(without_language.starts_with("NOTICE\n\nclawg memory for this project"), "{without_language}");
-        assert_eq!(session_start_text(&context("", 0), None, false, None, Some("NOTICE")).as_deref(), Some("NOTICE"), "on its own");
+        assert_eq!(session_start_text(&context("", 0), None, false, None, Some("NOTICE"), None).as_deref(), Some("NOTICE"), "on its own");
     }
 
     /// A session start of Claude Code in a folder with no daemon, as the hook
@@ -1578,6 +1596,7 @@ mod tests {
                 flag.store(true, Ordering::SeqCst);
                 installed
             },
+            || None,
         )
         .await;
         (out, asked.load(Ordering::SeqCst))
@@ -1626,6 +1645,7 @@ mod tests {
             || None,
             Some((Profile::Prod, version("0.88.0"))),
             || Some(OLD_BLOCK.to_string()),
+            || None,
         )
         .await;
         assert_eq!(out, None);
@@ -1663,6 +1683,7 @@ mod tests {
                 || None,
                 Some((Profile::Prod, version("0.88.0"))),
                 read,
+                || None,
             )
         };
 
@@ -1932,5 +1953,151 @@ mod tests {
         }
         assert_eq!(ledger(dir.path()), [], "and nothing is kept");
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), before, "no file was made");
+    }
+
+    fn eza_rule() -> tool_failures::Rule {
+        tool_failures::Rule { tool: "Bash".into(), program: "eza".into(), sessions: 2, last_failure_ms: now_ms() - 24 * 60 * 60 * 1000 }
+    }
+
+    /// A session start of Claude Code that reads `rules` where the ledger would
+    /// be read, and whether it read them.
+    async fn start_with_rules(
+        host: HookClient,
+        event: HookEvent,
+        dir: &Path,
+        language: Option<Lang>,
+        rules: Option<Vec<tool_failures::Rule>>,
+    ) -> (Option<String>, bool) {
+        let asked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = asked.clone();
+        let input = if host == HookClient::Cursor { cursor_input(&[dir]) } else { hook_input(dir) };
+        let (out, _) = respond_reading(
+            event,
+            host,
+            "a",
+            dir,
+            input.as_bytes(),
+            HOOK_DEADLINE,
+            move || language,
+            Some((Profile::Prod, version("0.88.0"))),
+            || None,
+            move || {
+                flag.store(true, Ordering::SeqCst);
+                rules
+            },
+        )
+        .await;
+        (out, asked.load(Ordering::SeqCst))
+    }
+
+    #[test]
+    fn session_start_names_the_learned_rules_before_the_evidence() {
+        let text = session_start_text(&context("ctx", 0), None, false, Some(Lang::Es), Some("AVISO"), Some("REGLAS")).unwrap();
+        assert!(
+            text.starts_with(&format!("{SPANISH_LINE}\n\nREGLAS\n\nAVISO\n\nMemoria de clawg para este proyecto")),
+            "the language, then the rules, then the notice, then the evidence: {text}"
+        );
+        let without_language = session_start_text(&context("ctx", 0), None, false, None, None, Some("RULES")).unwrap();
+        assert!(without_language.starts_with("RULES\n\nclawg memory for this project"), "{without_language}");
+        assert_eq!(session_start_text(&context("", 0), None, false, None, None, Some("RULES")).as_deref(), Some("RULES"), "on their own");
+    }
+
+    #[tokio::test]
+    async fn the_rules_reach_the_session_with_or_without_a_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let (out, asked) = start_with_rules(HookClient::ClaudeCode, HookEvent::SessionStart, dir.path(), Some(Lang::Es), Some(vec![eza_rule()])).await;
+        assert!(asked);
+        let block = tool_failures::rules_block(Lang::Es, &[eza_rule()], now_ms());
+        assert_eq!(printed_context(out), format!("{SPANISH_LINE}\n\n{block}"), "no daemon: the language and the rules are all there is");
+        assert!(block.contains("`eza` (2 sesiones, último fallo ayer)"), "{block}");
+
+        use crate::client::tests::{publish, start_daemon};
+        let d = start_daemon().await;
+        publish(&d);
+        let client = DaemonClient::from_data_dir(d.dir.path()).expect("client");
+        let repo = tempfile::tempdir().unwrap();
+        let root = ProjectIdentity::resolve(repo.path()).root;
+        let project = client.register_project(&root, None, &[], false).await.unwrap().project_id;
+        let save = crate::client::SaveArgs {
+            content: "The deploy script lives in ops/deploy.sh".into(),
+            agent_id: "a".into(),
+            project_id: Some(project),
+            memory_type: Some("semantic_fact".into()),
+            importance: None,
+            derived_from: Vec::new(),
+            topic_key: None,
+            user_stated: false,
+        };
+        client.save(save).await.expect("save");
+        let input = serde_json::json!({ "cwd": root, "source": "startup" }).to_string();
+        let (out, _) = respond_reading(
+            HookEvent::SessionStart,
+            HookClient::ClaudeCode,
+            "a",
+            d.dir.path(),
+            input.as_bytes(),
+            HOOK_DEADLINE,
+            || Some(Lang::En),
+            None,
+            || None,
+            || Some(vec![eza_rule()]),
+        )
+        .await;
+        let out = printed_context(out);
+        let (rules, evidence) = (out.find("`eza` (2 sessions").expect("the rule"), out.find("ops/deploy.sh").expect("the context"));
+        assert!(out.starts_with("clawg: the user's language is English.") && rules < evidence, "the rules come before the evidence: {out}");
+    }
+
+    #[tokio::test]
+    async fn the_rules_come_out_of_the_context_budget() {
+        assert_eq!(context_budget(None), SESSION_BUDGET);
+        assert_eq!(context_budget(Some("12345")), SESSION_BUDGET - 5);
+        assert_eq!(context_budget(Some(&"x".repeat(SESSION_BUDGET + 1))), 0, "never below nothing");
+        let block = tool_failures::rules_block(Lang::Es, &[eza_rule()], now_ms());
+        assert!(context_budget(Some(&block)) + block.len() == SESSION_BUDGET, "what the context loses is what the rules take");
+    }
+
+    #[tokio::test]
+    async fn without_rules_session_start_says_what_it_said() {
+        let dir = tempfile::tempdir().unwrap();
+        spanish(dir.path());
+        let (none, _) = start_with_rules(HookClient::ClaudeCode, HookEvent::SessionStart, dir.path(), Some(Lang::Es), None).await;
+        let (empty, asked) = start_with_rules(HookClient::ClaudeCode, HookEvent::SessionStart, dir.path(), Some(Lang::Es), Some(Vec::new())).await;
+        assert!(asked);
+        assert_eq!(printed_context(none), SPANISH_LINE);
+        assert_eq!(printed_context(empty), SPANISH_LINE, "no rule is no line");
+
+        let (cursor, asked) = start_with_rules(HookClient::Cursor, HookEvent::SessionStart, dir.path(), None, Some(vec![eza_rule()])).await;
+        assert_eq!((cursor, asked), (None, false), "Cursor's session start does not read the ledger");
+        let (prompt, asked) = start_with_rules(HookClient::ClaudeCode, HookEvent::UserPromptSubmit, dir.path(), None, Some(vec![eza_rule()])).await;
+        assert_eq!((prompt, asked), (None, false), "only a session start says the rules");
+    }
+
+    #[test]
+    fn what_the_hook_adds_stays_small() {
+        let failed = Health { embedder_error: Some("e".repeat(200)), ..health("failed") };
+        let suggestion = clawg_core::memory::registry::ListedSuggestion {
+            other_id: format!("{}-1a2b", "n".repeat(40)),
+            other_name: Some("n".repeat(80)),
+            reason: "folder_name".into(),
+            created_at: 1,
+        };
+        let full = Context { suggestions: vec![suggestion; 9], ..context("x", 10_000) };
+        let notice = block_notice(Some(Lang::Es), Some("an old block"), version("0.88.0"), Profile::Prod).expect("a block that differs");
+        let worst: Vec<tool_failures::Rule> = (0..tool_failures::MAX_RULES)
+            .map(|i| tool_failures::Rule {
+                tool: "Bash".into(),
+                program: format!("{}{i}", "p".repeat(31)),
+                sessions: 100,
+                last_failure_ms: now_ms() - 30 * 24 * 60 * 60 * 1000,
+            })
+            .collect();
+        for language in [Lang::Es, Lang::En] {
+            let block = tool_failures::rules_block(language, &worst, now_ms());
+            let without = session_start_text(&full, Some(&failed), true, Some(language), Some(&notice), None).unwrap().len() - "x".len();
+            let with = session_start_text(&full, Some(&failed), true, Some(language), Some(&notice), Some(&block)).unwrap().len() - "x".len();
+            assert!(without < 2_000, "{without} bytes added without the rules");
+            assert!(context_budget(Some(&block)) + with <= 10_000, "{language:?}: {with} bytes added with a context of {}", context_budget(Some(&block)));
+        }
     }
 }

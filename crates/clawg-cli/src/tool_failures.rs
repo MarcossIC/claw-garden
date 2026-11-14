@@ -62,7 +62,9 @@ const SESSION_CHARS: usize = 64;
 
 /// How far back a line counts, in milliseconds. It is also how long a rule
 /// lasts: thirty days after the last failure it is forgotten.
-pub const WINDOW_MS: i64 = 30 * 24 * 60 * 60 * 1000;
+pub const WINDOW_MS: i64 = 30 * DAY_MS;
+
+const DAY_MS: i64 = 24 * 60 * 60 * 1000;
 
 /// The most rules there are at a time.
 pub const MAX_RULES: usize = 5;
@@ -288,6 +290,60 @@ pub fn same_turn_line(language: Lang, programs: &[&str]) -> String {
         (Lang::Es, true) => format!(
             "clawg: {names} no existen en el Bash de esta máquina. No los llames otra vez en esta sesión; usa Glob, \
              Grep, Read o Edit, u otros programas instalados."
+        ),
+    }
+}
+
+/// The most bytes [`rules_block`] takes with [`MAX_RULES`] rules, names of the
+/// longest a name can be and a hundred sessions each: `session-start` takes
+/// this much from the context it asks for, so what the hook adds never pushes
+/// the whole past what the client injects.
+pub const RULES_BLOCK_MAX: usize = 700;
+
+/// What `session-start` says in `language` about `rules`: each missing program
+/// with its sessions and how long ago it last failed, what to use instead, and
+/// that an instruction asking for one of them is for the user to hear about.
+/// Clawg's own word to the agent, like the language line, so it is not read as
+/// evidence. Empty for no rules.
+pub fn rules_block(language: Lang, rules: &[Rule], now_ms: i64) -> String {
+    if rules.is_empty() {
+        return String::new();
+    }
+    let each: Vec<String> = rules
+        .iter()
+        .map(|rule| {
+            let days = now_ms.saturating_sub(rule.last_failure_ms).max(0) / DAY_MS;
+            match language {
+                Lang::En => {
+                    let ago = match days {
+                        0 => "today".to_string(),
+                        1 => "yesterday".to_string(),
+                        n => format!("{n} days ago"),
+                    };
+                    format!("`{}` ({} sessions, last failure {ago})", rule.program, rule.sessions)
+                }
+                Lang::Es => {
+                    let ago = match days {
+                        0 => "hoy".to_string(),
+                        1 => "ayer".to_string(),
+                        n => format!("hace {n} días"),
+                    };
+                    format!("`{}` ({} sesiones, último fallo {ago})", rule.program, rule.sessions)
+                }
+            }
+        })
+        .collect();
+    let each = each.join(", ");
+    match language {
+        Lang::En => format!(
+            "clawg: these programs are not installed in this machine's Bash; failed calls in earlier sessions showed it: \
+             {each}. Do not call them; use Glob, Grep, Read or Edit, or another installed program. If an instruction \
+             asks for one of them, tell the user once."
+        ),
+        Lang::Es => format!(
+            "clawg: estos programas no están instalados en el Bash de esta máquina; lo mostraron llamadas fallidas de \
+             sesiones anteriores: {each}. No los llames; usa Glob, Grep, Read o Edit, u otro programa instalado. Si una \
+             instrucción pide alguno de ellos, avísale una vez a la persona."
         ),
     }
 }
@@ -694,5 +750,39 @@ mod tests {
         lines.extend([fail(31, "fd", "f1"), fail(31, "fd", "f2")]);
         let found = rules(&lines, NOW, |program| program == "gh");
         assert_eq!(found.iter().map(|r| (r.program.as_str(), r.sessions)).collect::<Vec<_>>(), [("eza", 2)]);
+    }
+
+    fn rule(program: &str, sessions: usize, days_ago: i64) -> Rule {
+        Rule { tool: "Bash".into(), program: program.into(), sessions, last_failure_ms: NOW - days_ago * DAY }
+    }
+
+    #[test]
+    fn the_rules_block_names_each_program_its_sessions_and_its_last_failure() {
+        let rules = [rule("eza", 2, 3), rule("fd", 3, 1), rule("sd", 4, 0)];
+        assert_eq!(
+            rules_block(Lang::En, &rules, NOW),
+            "clawg: these programs are not installed in this machine's Bash; failed calls in earlier sessions showed it: \
+             `eza` (2 sessions, last failure 3 days ago), `fd` (3 sessions, last failure yesterday), `sd` (4 sessions, \
+             last failure today). Do not call them; use Glob, Grep, Read or Edit, or another installed program. If an \
+             instruction asks for one of them, tell the user once."
+        );
+        assert_eq!(
+            rules_block(Lang::Es, &rules, NOW),
+            "clawg: estos programas no están instalados en el Bash de esta máquina; lo mostraron llamadas fallidas de \
+             sesiones anteriores: `eza` (2 sesiones, último fallo hace 3 días), `fd` (3 sesiones, último fallo ayer), \
+             `sd` (4 sesiones, último fallo hoy). No los llames; usa Glob, Grep, Read o Edit, u otro programa \
+             instalado. Si una instrucción pide alguno de ellos, avísale una vez a la persona."
+        );
+        assert_eq!(rules_block(Lang::En, &[], NOW), "", "no rules, no block");
+    }
+
+    #[test]
+    fn the_rules_block_of_five_long_names_stays_small() {
+        let names: Vec<String> = (0..MAX_RULES).map(|i| format!("{}{i}", "p".repeat(31))).collect();
+        let rules: Vec<Rule> = names.iter().map(|name| rule(name, 100, 30)).collect();
+        for language in [Lang::En, Lang::Es] {
+            let block = rules_block(language, &rules, NOW);
+            assert!(block.len() <= RULES_BLOCK_MAX, "{} bytes in {language:?}: {block}", block.len());
+        }
     }
 }
