@@ -271,7 +271,7 @@ pub(crate) async fn saves_already_paired(store: &MemoryStore, resumed: &[i64]) -
     let ids = resumed.to_vec();
     let read = store
         .conn
-        .call(move |c| -> rusqlite::Result<(Vec<(i64, i64)>, HashMap<i64, SaveLink>)> {
+        .call(move |c| -> rusqlite::Result<HashSet<SaveKey>> {
             let marks = vec!["?"; ids.len()].join(", ");
             let mut stmt = c.prepare(&format!(
                 "SELECT new_id, old_id FROM memory_conflict WHERE new_id IN ({marks}) OR old_id IN ({marks})"
@@ -282,11 +282,11 @@ pub(crate) async fn saves_already_paired(store: &MemoryStore, resumed: &[i64]) -
             let others: Vec<i64> =
                 pairs.iter().map(|&(new, old)| if ids.contains(&new) { old } else { new }).collect();
             let links = read_links(c, &others)?;
-            Ok((pairs, links))
+            Ok(saves_paired_with(&pairs, &ids, &links))
         })
         .await;
     match read {
-        Ok((pairs, links)) => saves_paired_with(&pairs, resumed, &links),
+        Ok(paired) => paired,
         Err(e) => {
             log::warn!("could not read the pairs of a resumed save: {e}");
             HashSet::new()
