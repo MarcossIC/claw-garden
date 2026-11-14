@@ -4217,7 +4217,7 @@ mod tests {
             .call(move |c| c.query_row("SELECT embedding FROM memory_vectors WHERE rowid = ?1", [last], |r| r.get(0)))
             .await
             .expect("vector");
-        let vector: Vec<f32> = vector.chunks_exact(4).map(|f| f32::from_le_bytes([f[0], f[1], f[2], f[3]])).collect();
+        let vector: Vec<f32> = vector.as_chunks::<4>().0.iter().map(|f| f32::from_le_bytes(*f)).collect();
         let near = at_distance(&vector, 0.3).await;
 
         let older = b.save_here("a", fact("the ledger settles balances every night")).await.unwrap();
