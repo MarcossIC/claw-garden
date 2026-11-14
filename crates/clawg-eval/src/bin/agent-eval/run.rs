@@ -243,6 +243,20 @@ pub enum ArtifactCause {
     AppliedEarly,
 }
 
+impl ArtifactCause {
+    /// The name `result.json` gives it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ArtifactCause::SessionFailed => "session_failed",
+            ArtifactCause::ServerNotConnected => "server_not_connected",
+            ArtifactCause::NotContinued => "not_continued",
+            ArtifactCause::ReadOutside => "read_outside",
+            ArtifactCause::CompactedEarly => "compacted_early",
+            ArtifactCause::AppliedEarly => "applied_early",
+        }
+    }
+}
+
 /// A cause and the session it happened in, from 1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Artifact {

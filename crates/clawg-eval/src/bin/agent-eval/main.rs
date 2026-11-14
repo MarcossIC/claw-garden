@@ -471,6 +471,10 @@ fn execute(command: Command) -> Result<(), String> {
             let named = report::load_named(&dir).map_err(|e| e.to_string())?;
             let results: Vec<run::RunResult> = named.iter().map(|(_, r)| r.clone()).collect();
             print!("{}", report::render(&report::aggregate(&results)));
+            let left_out = report::render_excluded(&report::excluded(&named));
+            if !left_out.is_empty() {
+                print!("\n{left_out}");
+            }
             let forks = report::render_pairs(&report::pairs(&named));
             if !forks.is_empty() {
                 print!("
