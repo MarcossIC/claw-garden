@@ -43,3 +43,7 @@ Informado por la implementación, sobre el último commit de código y en Window
 - El CI en verde en Linux y Windows.
 - Los tests usan vectores ubicados a mano o el embedder falso. Con el modelo real no se comprobó que un save largo real se corte y retome, y no deje dos pares con la misma vieja. Hay tres formas de cortarlo: una pausa del apagado, un proceso muerto a mitad del save, o `clawg outbox retry` de una fila `failed`. La comprobación: después del arranque siguiente, `memory_conflict` tiene a lo sumo un par entre el save y cada vieja, y `resolve_conflict` con el primer id no da `SeveralPairs`.
 - El fallo del cierre sólo se provoca con un trigger. No hay forma de verlo con un save real sin romper el store a propósito.
+
+## Arreglos después de la verificación
+
+El punto 3 de los matices se arregló en `c1653516`: `store_pieces` junta las claves nuevas y las suma a `paired` sólo después de `Insert::Inserted`, así que una pieza absorbida por un gemelo no marca su save como emparejado y la pieza siguiente anota el par. Lo fija `a_piece_absorbed_by_a_twin_does_not_mark_its_save_as_paired`, que restaura el gemelo de la pieza 0 mientras se calcula su vector.
