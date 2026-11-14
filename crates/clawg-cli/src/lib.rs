@@ -48,6 +48,7 @@ pub mod running;
 pub mod secrets;
 pub mod serve_log;
 pub mod setup;
+pub mod tool_failures;
 pub mod preferences;
 pub mod sharing;
 pub mod status;

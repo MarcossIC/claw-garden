@@ -38,18 +38,28 @@ pub const END_MARKER: &str = "<!-- END CLAWG MEMORY PROTOCOL -->";
 
 use clawg_core::preferences::{self, Lang};
 
-use crate::mcp::protocol;
+use crate::mcp::protocol::{self, Variant};
+use crate::update::version::Version;
 
 const SESSION_START_MATCHER: &str = "startup|resume|clear|compact";
+
+/// The tool whose calls the hooks after a tool see: the shell.
+const SHELL_TOOL_MATCHER: &str = "Bash";
 
 /// Seconds a hook may take before the client cancels it, above the three
 /// seconds `clawg hook` gives itself.
 const HOOK_TIMEOUT_SECS: u64 = 5;
 
 /// The client lifecycle events `clawg hook` answers, as the client names
-/// them and as `clawg hook` takes them.
-const HOOK_EVENTS: [(&str, &str); 3] =
-    [("SessionStart", "session-start"), ("UserPromptSubmit", "user-prompt-submit"), ("SessionEnd", "session-end")];
+/// them and as `clawg hook` takes them, with the matcher of the group that
+/// holds each one's hook: none runs it for everything.
+const HOOK_EVENTS: [(&str, &str, Option<&str>); 5] = [
+    ("SessionStart", "session-start", Some(SESSION_START_MATCHER)),
+    ("UserPromptSubmit", "user-prompt-submit", None),
+    ("SessionEnd", "session-end", None),
+    ("PostToolUse", "post-tool-use", Some(SHELL_TOOL_MATCHER)),
+    ("PostToolUseFailure", "post-tool-use-failure", Some(SHELL_TOOL_MATCHER)),
+];
 
 /// Copies of each file kept in `backups/setup`, the newest.
 const KEPT_COPIES: usize = 5;
@@ -85,10 +95,17 @@ pub struct State {
     pub instructions: File,
     /// The profile's preferred language, which the protocol's rules name.
     pub language: Option<Lang>,
+    /// The version of the binary that writes the block, which its stamp names.
+    pub version: Version,
+    /// The variant of the block the person asked for; `None` keeps the one
+    /// chosen before, or the default.
+    pub protocol: Option<Variant>,
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum SetupError {
+    #[error("the version of this clawg binary, {0:?}, is not of the form X.Y.Z")]
+    OwnVersion(String),
     #[error("the path of this clawg binary, {0}, is not absolute; run clawg by its full path")]
     RelativeExe(PathBuf),
     #[error("the path of this clawg binary, {0}, is not valid Unicode")]
@@ -112,6 +129,8 @@ pub enum SetupError {
          --path, nothing was changed"
     )]
     HomeFolder(PathBuf),
+    #[error("--protocol chooses the block of Claude Code's CLAUDE.md, and Cursor has no protocol block")]
+    ProtocolForCursor,
     #[error("--local and --path put Claude Code's hooks in one folder; `clawg setup cursor` installs Cursor's for the user")]
     FolderForCursor,
 }
@@ -208,6 +227,8 @@ pub struct Plan {
     pub hooks: HooksStep,
     pub settings: FileStep,
     pub block: BlockStep,
+    /// The variant the block holds once installed; `None` when removing.
+    pub variant: Option<Variant>,
     pub instructions: FileStep,
 }
 
@@ -236,16 +257,22 @@ pub fn plan(state: &State, mode: Mode) -> Result<Plan, SetupError> {
         Profile::Prod => Profile::Dev,
     };
     let other_registered = registered(other.mcp_server_name()).is_some_and(is_clawg_server);
-    let (block, instructions) = match mode {
-        Mode::Install => install_block(&state.instructions, state.language)?,
+    let (block, instructions, variant) = match mode {
+        Mode::Install => {
+            let (step, file, variant) = install_block(&state.instructions, state.language, state.version, state.protocol)?;
+            (step, file, Some(variant))
+        }
         Mode::Remove if other_registered => {
             find_block(&state.instructions)?;
-            (BlockStep::Kept, FileStep::Unchanged)
+            (BlockStep::Kept, FileStep::Unchanged, None)
         }
-        Mode::Remove => remove_block(&state.instructions)?,
+        Mode::Remove => {
+            let (step, file) = remove_block(&state.instructions)?;
+            (step, file, None)
+        }
     };
 
-    Ok(Plan { mode, server, server_step, hooks, settings: settings_step, block, instructions })
+    Ok(Plan { mode, server, server_step, hooks, settings: settings_step, block, variant, instructions })
 }
 
 /// The binary's path as the server and the hooks name it: absolute, and
@@ -439,6 +466,30 @@ fn is_clawg_hook(hook: &Value, event_arg: &str, profile: Profile) -> bool {
     hook_words(hook).is_some_and(|words| runs_clawg_hook(&words, event_arg, profile))
 }
 
+/// The events of the hooks after a shell call that `text`, a `settings.json`,
+/// lacks for `profile`, when it has the hook of `session-start` for it: an
+/// install from before them. A file without that hook, or that is not
+/// settings, lacks nothing: it is not an install of clawg to complete.
+pub(crate) fn missing_tool_hooks(text: &str, profile: Profile) -> Vec<&'static str> {
+    let Ok(Value::Object(settings)) = serde_json::from_str::<Value>(text) else { return Vec::new() };
+    let has = |event: &str, arg: &str| {
+        settings
+            .get("hooks")
+            .and_then(|hooks| hooks.get(event))
+            .and_then(Value::as_array)
+            .is_some_and(|groups| hooks_of(groups).any(|hook| is_clawg_hook(hook, arg, profile)))
+    };
+    if !has("SessionStart", "session-start") {
+        return Vec::new();
+    }
+    HOOK_EVENTS
+        .iter()
+        .filter(|(_, _, matcher)| *matcher == Some(SHELL_TOOL_MATCHER))
+        .filter(|(event, arg, _)| !has(event, arg))
+        .map(|(event, _, _)| *event)
+        .collect()
+}
+
 /// Whether a command's words run `clawg hook <event_arg>` for `profile`. One
 /// without `--profile` belongs to no profile.
 fn runs_clawg_hook(words: &[String], event_arg: &str, profile: Profile) -> bool {
@@ -500,7 +551,7 @@ fn event_groups<'a>(
 
 fn install_hooks(settings: &mut Map<String, Value>, exe: &str, profile: Profile, path: &Path) -> Result<HooksStep, SetupError> {
     let mut step = HooksStep::default();
-    for (event, arg) in HOOK_EVENTS {
+    for (event, arg, matcher) in HOOK_EVENTS {
         let planned = planned_hook(exe, arg, profile);
         // Checked before anything is created, so an unchanged file stays byte
         // for byte as it was.
@@ -527,8 +578,8 @@ fn install_hooks(settings: &mut Map<String, Value>, exe: &str, profile: Profile,
         } else {
             let groups = event_groups(settings, event, true, path, CLAUDE_LAYOUT)?.expect("created");
             let mut group = Map::new();
-            if event == "SessionStart" {
-                group.insert("matcher".into(), SESSION_START_MATCHER.into());
+            if let Some(matcher) = matcher {
+                group.insert("matcher".into(), matcher.into());
             }
             group.insert("hooks".into(), Value::Array(vec![planned]));
             groups.push(Value::Object(group));
@@ -563,7 +614,7 @@ fn migrate_hooks(groups: &mut Vec<Value>, planned: &Value, installed: bool, even
 
 fn remove_hooks(settings: &mut Map<String, Value>, profile: Profile, path: &Path) -> Result<HooksStep, SetupError> {
     let mut step = HooksStep::default();
-    for (event, arg) in HOOK_EVENTS {
+    for (event, arg, _) in HOOK_EVENTS {
         let Some(groups) = event_groups(settings, event, false, path, CLAUDE_LAYOUT)? else { continue };
         let mut removed = false;
         groups.retain_mut(|group| {
@@ -598,12 +649,99 @@ fn line_ending(text: &str) -> &'static str {
     }
 }
 
-/// The protocol for `language` ([`protocol::text`]) between its markers,
-/// without a final line ending.
-pub(crate) fn block(eol: &str, language: Option<Lang>) -> String {
-    let protocol = protocol::text(language).replace("\r\n", "\n");
-    let body = protocol.trim_end().replace('\n', eol);
-    format!("{BEGIN_MARKER}{eol}{body}{eol}{END_MARKER}")
+/// The line after the opening marker: the version of clawg that wrote the
+/// block, and the variant when the person chose one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Stamp {
+    pub version: Version,
+    pub choice: Option<Variant>,
+}
+
+impl Stamp {
+    /// The stamp a line spells, `None` for any other line.
+    pub(crate) fn parse(line: &str) -> Option<Stamp> {
+        let inner = line.strip_prefix("<!-- clawg ")?.strip_suffix(" -->")?;
+        let (version, choice) = match inner.split_once(' ') {
+            Some((version, rest)) => (version, Some(Variant::parse(rest.strip_prefix("protocol=")?)?)),
+            None => (inner, None),
+        };
+        Some(Stamp { version: Version::parse(version).ok()?, choice })
+    }
+
+    pub(crate) fn line(self) -> String {
+        match self.choice {
+            Some(choice) => format!("<!-- clawg {} protocol={} -->", self.version, choice.as_str()),
+            None => format!("<!-- clawg {} -->", self.version),
+        }
+    }
+}
+
+/// What the block holds when the person chose no variant: the whole protocol.
+pub const DEFAULT_VARIANT: Variant = Variant::Full;
+
+/// The protocol for `language` as `variant` has it ([`protocol::text`],
+/// [`protocol::short`] or nothing) between its markers, with `stamp` after the
+/// first, without a final line ending.
+pub(crate) fn block(eol: &str, language: Option<Lang>, variant: Variant, stamp: Stamp) -> String {
+    assemble(eol, language, variant, Some(stamp))
+}
+
+fn assemble(eol: &str, language: Option<Lang>, variant: Variant, stamp: Option<Stamp>) -> String {
+    let text = match variant {
+        Variant::Full => protocol::text(language).replace("\r\n", "\n"),
+        Variant::Short => protocol::short(language),
+        Variant::Off => String::new(),
+    };
+    let body = text.trim_end();
+    let lines = [Some(BEGIN_MARKER.to_string()), stamp.map(Stamp::line), (!body.is_empty()).then(|| body.to_string()), Some(END_MARKER.to_string())];
+    lines.into_iter().flatten().collect::<Vec<_>>().join("\n").replace('\n', eol)
+}
+
+/// The stamp of an installed block, if its second line is one.
+pub(crate) fn read_stamp(block: &str) -> Option<Stamp> {
+    split_stamp(block).0
+}
+
+/// The block with `\n` line endings, and its stamp taken out when it reads.
+fn split_stamp(block: &str) -> (Option<Stamp>, String) {
+    let text = block.replace("\r\n", "\n");
+    let Some((first, rest)) = text.split_once('\n') else { return (None, text) };
+    let (second, after) = rest.split_once('\n').unwrap_or((rest, ""));
+    match Stamp::parse(second) {
+        Some(stamp) => (Some(stamp), format!("{first}\n{after}")),
+        None => (None, text),
+    }
+}
+
+/// The block `block` writes, without its stamp, with `\n` line endings.
+fn unstamped(language: Option<Lang>, variant: Variant) -> String {
+    assemble("\n", language, variant, None)
+}
+
+/// How an installed block compares with what this binary writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Freshness {
+    Current,
+    /// Other text, written by a later version.
+    Newer,
+    /// Other text: written by an earlier version, edited, or from before the stamp.
+    Stale,
+}
+
+/// Whether `installed`, a block as found between the markers, is the text this
+/// binary (version `own`) writes for `language` and the variant its stamp
+/// says was chosen, or the default one. The stamp and the line endings do not
+/// count: the same text from another version is current.
+pub(crate) fn freshness(installed: &str, language: Option<Lang>, own: Version) -> Freshness {
+    let (stamp, body) = split_stamp(installed);
+    let variant = stamp.and_then(|s| s.choice).unwrap_or(DEFAULT_VARIANT);
+    if body == unstamped(language, variant) {
+        return Freshness::Current;
+    }
+    match stamp {
+        Some(stamp) if stamp.version > own => Freshness::Newer,
+        _ => Freshness::Stale,
+    }
 }
 
 /// Where the block is in the file: from its first marker to the end of its
@@ -625,18 +763,34 @@ pub(crate) fn find_block(file: &File) -> Result<Option<(usize, usize)>, SetupErr
     }
 }
 
-fn install_block(file: &File, language: Option<Lang>) -> Result<(BlockStep, FileStep), SetupError> {
+/// What happens to the block when installing, and the variant it holds then:
+/// the one asked for, else the one the installed stamp says was chosen, else
+/// the default. Only a variant that was asked for goes in the stamp.
+fn install_block(
+    file: &File,
+    language: Option<Lang>,
+    version: Version,
+    requested: Option<Variant>,
+) -> Result<(BlockStep, FileStep, Variant), SetupError> {
     let range = find_block(file)?;
+    let found = match (&file.text, range) {
+        (Some(text), Some((begin, end))) => Some(split_stamp(&text[begin..end])),
+        _ => None,
+    };
+    let kept = found.as_ref().and_then(|(stamp, _)| stamp.and_then(|s| s.choice));
+    let choice = requested.or(kept);
+    let variant = choice.unwrap_or(DEFAULT_VARIANT);
+    let stamp = Stamp { version, choice };
     let Some(text) = &file.text else {
-        return Ok((BlockStep::Added, FileStep::Write(block("\n", language) + "\n")));
+        return Ok((BlockStep::Added, FileStep::Write(block("\n", language, variant, stamp) + "\n"), variant));
     };
     let eol = line_ending(text);
-    let wanted = block(eol, language);
-    if let Some((begin, end)) = range {
-        if text[begin..end] == wanted {
-            return Ok((BlockStep::Unchanged, FileStep::Unchanged));
+    let wanted = block(eol, language, variant, stamp);
+    if let (Some((begin, end)), Some((_, body))) = (range, found) {
+        if body == unstamped(language, variant) && kept == choice {
+            return Ok((BlockStep::Unchanged, FileStep::Unchanged, variant));
         }
-        return Ok((BlockStep::Rewritten, FileStep::Write(format!("{}{wanted}{}", &text[..begin], &text[end..]))));
+        return Ok((BlockStep::Rewritten, FileStep::Write(format!("{}{wanted}{}", &text[..begin], &text[end..])), variant));
     }
     let mut out = text.clone();
     if !out.is_empty() {
@@ -647,7 +801,7 @@ fn install_block(file: &File, language: Option<Lang>) -> Result<(BlockStep, File
     }
     out.push_str(&wanted);
     out.push_str(eol);
-    Ok((BlockStep::Added, FileStep::Write(out)))
+    Ok((BlockStep::Added, FileStep::Write(out), variant))
 }
 
 fn remove_block(file: &File) -> Result<(BlockStep, FileStep), SetupError> {
@@ -682,6 +836,12 @@ pub fn locations(home: Option<&Path>, config_dir: Option<OsString>) -> Result<(P
     Ok((servers, dir.join("settings.json"), dir.join("CLAUDE.md")))
 }
 
+/// The version of this binary, as a block's stamp names it.
+pub fn own_version() -> Result<Version, SetupError> {
+    let text = clawg_core::build_info::version();
+    Version::parse(text).map_err(|_| SetupError::OwnVersion(text.to_string()))
+}
+
 fn read(path: PathBuf) -> Result<File, SetupError> {
     match std::fs::read_to_string(&path) {
         Ok(text) => Ok(File { path, text: Some(text) }),
@@ -690,13 +850,15 @@ fn read(path: PathBuf) -> Result<File, SetupError> {
     }
 }
 
-/// Reads what [`plan`] decides from, the preferred language from `data_dir`.
+/// Reads what [`plan`] decides from, the preferred language from `data_dir`;
+/// `protocol` is the variant the person asked for, if any.
 pub fn read_state(
     exe: PathBuf,
     profile: Profile,
     home: Option<&Path>,
     config_dir: Option<OsString>,
     data_dir: &Path,
+    protocol: Option<Variant>,
 ) -> Result<State, SetupError> {
     let (servers, settings, instructions) = locations(home, config_dir)?;
     Ok(State {
@@ -706,6 +868,8 @@ pub fn read_state(
         settings: read(settings)?,
         instructions: read(instructions)?,
         language: preferences::language_in(data_dir),
+        version: own_version()?,
+        protocol,
     })
 }
 
@@ -1030,9 +1194,10 @@ pub fn report(plan: &Plan, state: &State, applied: Option<&Applied>) -> (String,
         (BlockStep::Kept, Lang::Es) => "se mantiene, el servidor del otro perfil todavía lo usa".to_string(),
     };
     let instructions = state.instructions.path.display();
+    let variant = plan.variant.map(|v| format!(" (protocol={})", v.as_str())).unwrap_or_default();
     lines.push(match lang {
-        Lang::En => format!("memory protocol in {instructions}: {block}"),
-        Lang::Es => format!("protocolo de memoria en {instructions}: {block}"),
+        Lang::En => format!("memory protocol in {instructions}: {block}{variant}"),
+        Lang::Es => format!("protocolo de memoria en {instructions}: {block}{variant}"),
     });
 
     if let Some(applied) = applied {
@@ -1161,10 +1326,10 @@ pub fn run_in(
 /// `clawg setup claude-code` for `profile`, reading the process's
 /// environment: the running binary, the home directory, `CLAUDE_CONFIG_DIR`
 /// and the PATH.
-pub fn run(profile: Profile, mode: Mode, dry_run: bool) -> Result<(String, u8), SetupError> {
+pub fn run(profile: Profile, mode: Mode, dry_run: bool, protocol: Option<Variant>) -> Result<(String, u8), SetupError> {
     let base_dir = clawg_core::paths::data_dir(profile).map_err(|_| SetupError::NoHome)?;
     let home = clawg_core::paths::home_dir();
-    let state = read_state(current_exe()?, profile, home.as_deref(), std::env::var_os("CLAUDE_CONFIG_DIR"), &base_dir)?;
+    let state = read_state(current_exe()?, profile, home.as_deref(), std::env::var_os("CLAUDE_CONFIG_DIR"), &base_dir, protocol)?;
     let entries: Vec<PathBuf> = std::env::var_os("PATH").map(|raw| std::env::split_paths(&raw).collect()).unwrap_or_default();
     let claude = find_claude(&entries, Path::is_file);
     run_in(state, mode, dry_run, claude.as_deref(), &base_dir, now_ms())
@@ -1210,7 +1375,14 @@ mod tests {
             settings: file("settings.json", settings),
             instructions: file("CLAUDE.md", instructions),
             language: None,
+            version: v("0.88.0"),
+            protocol: None,
         }
+    }
+
+    /// The block as this binary writes it, in a file with LF line endings.
+    fn installed_block(language: Option<Lang>) -> String {
+        block("\n", language, Variant::Full, Stamp { version: v("0.88.0"), choice: None })
     }
 
     fn written(step: &FileStep) -> &str {
@@ -1267,20 +1439,173 @@ mod tests {
             plan.server.add_args(),
             ["mcp", "add", "--scope", "user", "clawg-dev", "--", exe().to_str().unwrap(), "mcp", "--profile", "dev", "--agent", "claude-code"]
         );
-        assert_eq!(plan.hooks.added, ["SessionStart", "UserPromptSubmit", "SessionEnd"]);
+        assert_eq!(plan.hooks.added, ["SessionStart", "UserPromptSubmit", "SessionEnd", "PostToolUse", "PostToolUseFailure"]);
         let settings: Value = serde_json::from_str(written(&plan.settings)).unwrap();
         assert_eq!(
             settings,
             serde_json::json!({ "hooks": {
                 "SessionStart": [{ "matcher": "startup|resume|clear|compact", "hooks": [hook("session-start")] }],
                 "UserPromptSubmit": [{ "hooks": [hook("user-prompt-submit")] }],
-                "SessionEnd": [{ "hooks": [hook("session-end")] }]
+                "SessionEnd": [{ "hooks": [hook("session-end")] }],
+                "PostToolUse": [{ "matcher": "Bash", "hooks": [hook("post-tool-use")] }],
+                "PostToolUseFailure": [{ "matcher": "Bash", "hooks": [hook("post-tool-use-failure")] }]
             }})
         );
         assert_eq!(plan.block, BlockStep::Added);
         let md = written(&plan.instructions);
-        assert!(md.starts_with(&format!("{BEGIN_MARKER}\n# Claw Garden memory protocol\n")), "{md}");
+        assert!(md.starts_with(&format!("{BEGIN_MARKER}\n<!-- clawg 0.88.0 -->\n# Claw Garden memory protocol\n")), "{md}");
         assert!(md.ends_with(&format!("{END_MARKER}\n")), "{md}");
+    }
+
+    fn v(text: &str) -> Version {
+        Version::parse(text).unwrap()
+    }
+
+    #[test]
+    fn the_block_carries_the_version_that_wrote_it() {
+        let s = State { version: v("0.88.0"), ..state(None, None, None) };
+        let plan_ = plan(&s, Mode::Install).unwrap();
+        let md = written(&plan_.instructions);
+        assert!(md.starts_with(&format!("{BEGIN_MARKER}\n<!-- clawg 0.88.0 -->\n# Claw Garden memory protocol\n")), "{md}");
+
+        let chosen = block("\n", None, Variant::Full, Stamp { version: v("0.88.0"), choice: Some(Variant::Short) });
+        assert!(chosen.starts_with(&format!("{BEGIN_MARKER}\n<!-- clawg 0.88.0 protocol=short -->\n")), "{chosen}");
+
+        let (begin, end) = find_block(&file("CLAUDE.md", Some(md))).unwrap().unwrap();
+        assert_eq!((begin, end), (0, md.len() - 1), "an earlier binary finds the stamped block by its markers");
+    }
+
+    #[test]
+    fn a_stamp_reads_its_version_and_its_choice() {
+        let plain = Stamp { version: v("0.88.0"), choice: None };
+        let chosen = Stamp { version: v("0.9.12"), choice: Some(Variant::Off) };
+        assert_eq!(Stamp::parse("<!-- clawg 0.88.0 -->"), Some(plain));
+        assert_eq!(Stamp::parse("<!-- clawg 0.9.12 protocol=off -->"), Some(chosen));
+        assert_eq!(plain.line(), "<!-- clawg 0.88.0 -->");
+        assert_eq!(chosen.line(), "<!-- clawg 0.9.12 protocol=off -->");
+        for unreadable in [
+            "<!-- clawg 0.88 -->",
+            "<!-- clawg 0.88.0 protocol=tiny -->",
+            "<!-- clawg 0.88.0 protocol= -->",
+            "<!-- clawg 0.88.0  -->",
+            "<!-- clawg -->",
+            "clawg 0.88.0",
+            "# Claw Garden memory protocol",
+        ] {
+            assert_eq!(Stamp::parse(unreadable), None, "{unreadable}");
+        }
+
+        let stamped = block("\n", None, Variant::Full, chosen);
+        assert_eq!(read_stamp(&stamped), Some(chosen));
+        assert_eq!(read_stamp(&stamped.replace('\n', "\r\n")), Some(chosen), "a file with CRLF line endings");
+        let before_stamps = format!("{BEGIN_MARKER}\n# Claw Garden memory protocol\n{END_MARKER}");
+        assert_eq!(read_stamp(&before_stamps), None, "a block of before the stamp has no version and no choice");
+        let misspelled = format!("{BEGIN_MARKER}\n<!-- clawg 0.88 -->\n# Claw Garden memory protocol\n{END_MARKER}");
+        assert_eq!(read_stamp(&misspelled), None);
+    }
+
+    #[test]
+    fn a_block_is_current_stale_or_newer() {
+        let own = v("0.88.0");
+        let older = block("\n", None, Variant::Full, Stamp { version: v("0.87.0"), choice: None });
+        assert_eq!(freshness(&older, None, own), Freshness::Current, "the same text of another version");
+        assert_eq!(freshness(&older.replace('\n', "\r\n"), None, own), Freshness::Current, "the same text with CRLF");
+        assert_eq!(freshness(&older, Some(Lang::Es), own), Freshness::Stale, "the other language is other text");
+        let spanish = block("\n", Some(Lang::Es), Variant::Full, Stamp { version: own, choice: None });
+        assert_eq!(freshness(&spanish, Some(Lang::Es), own), Freshness::Current);
+
+        let before_stamps = format!(
+            "{BEGIN_MARKER}\n# Claw Garden memory protocol\n\nJudge each with `resolve_conflict`: `compatible` or `scoped` if both hold.\n{END_MARKER}"
+        );
+        assert_eq!(freshness(&before_stamps, None, own), Freshness::Stale, "no stamp: written before the stamp");
+
+        let later = format!("{BEGIN_MARKER}\n<!-- clawg 0.90.0 -->\nanother text\n{END_MARKER}");
+        assert_eq!(freshness(&later, None, own), Freshness::Newer);
+        let same = format!("{BEGIN_MARKER}\n<!-- clawg 0.88.0 -->\nanother text\n{END_MARKER}");
+        assert_eq!(freshness(&same, None, own), Freshness::Stale, "this version's stamp over text it does not write");
+        let unreadable = format!("{BEGIN_MARKER}\n<!-- clawg 0.99 -->\nanother text\n{END_MARKER}");
+        assert_eq!(freshness(&unreadable, None, own), Freshness::Stale, "a stamp that does not read is no stamp");
+    }
+
+    #[test]
+    fn each_variant_is_its_block() {
+        let own = v("0.88.0");
+        let stamp = |choice| Stamp { version: own, choice };
+        for language in [None, Some(Lang::Es)] {
+            let full = block("\n", language, Variant::Full, stamp(None));
+            assert_eq!(full, installed_block(language));
+            assert!(full.contains(protocol::text(language).replace("\r\n", "\n").trim_end()), "the whole protocol");
+
+            let short = block("\n", language, Variant::Short, stamp(Some(Variant::Short)));
+            assert!(short.starts_with(&format!("{BEGIN_MARKER}\n<!-- clawg 0.88.0 protocol=short -->\n")), "{short}");
+            assert!(short.ends_with(&format!("\n{END_MARKER}")), "{short}");
+            assert!(short.contains(protocol::short(language).trim_end()));
+            assert!(short.len() < 2000 && short.len() < full.len() / 4, "{} bytes", short.len());
+
+            let off = block("\n", language, Variant::Off, stamp(Some(Variant::Off)));
+            assert_eq!(off, format!("{BEGIN_MARKER}\n<!-- clawg 0.88.0 protocol=off -->\n{END_MARKER}"));
+
+            for (text, choice) in [(&full, None), (&short, Some(Variant::Short)), (&off, Some(Variant::Off))] {
+                assert_eq!(freshness(text, language, own), Freshness::Current, "{choice:?} is what its own stamp asks for");
+                assert_eq!(read_stamp(text), Some(stamp(choice)));
+            }
+            let forgotten = short.replacen(" protocol=short", "", 1);
+            assert_eq!(freshness(&forgotten, language, own), Freshness::Stale, "a stamp without the choice means the default");
+        }
+        let short = block("\n", None, Variant::Short, stamp(Some(Variant::Short)));
+        assert_eq!(freshness(&short, Some(Lang::Es), own), Freshness::Stale, "the other language is other text");
+    }
+
+    fn asking_for(protocol: Option<Variant>, instructions: &str) -> State {
+        State { protocol, ..state(None, None, Some(instructions)) }
+    }
+
+    #[test]
+    fn the_protocol_option_writes_its_variant_and_a_run_without_it_keeps_it() {
+        let mine = |block: &str| format!("# Mine\n\nSome rules.\n\n{block}\n\nAfter.\n");
+        let before_stamps = mine(&unstamped(None, Variant::Full));
+
+        for variant in [Variant::Short, Variant::Off, Variant::Full] {
+            let chosen = plan(&asking_for(Some(variant), &before_stamps), Mode::Install).unwrap();
+            assert_eq!((chosen.block, chosen.variant), (BlockStep::Rewritten, Some(variant)), "{variant:?}");
+            let stamp = Stamp { version: v("0.88.0"), choice: Some(variant) };
+            let after = mine(&block("\n", None, variant, stamp));
+            assert_eq!(written(&chosen.instructions), after, "the text outside the markers stays");
+
+            let again = plan(&asking_for(None, &after), Mode::Install).unwrap();
+            assert_eq!((again.block, &again.instructions, again.variant), (BlockStep::Unchanged, &FileStep::Unchanged, Some(variant)));
+            let same = plan(&asking_for(Some(variant), &after), Mode::Install).unwrap();
+            assert_eq!(same.block, BlockStep::Unchanged, "asking for what is there changes nothing");
+        }
+
+        let from_short = mine(&block("\n", None, Variant::Short, Stamp { version: v("0.88.0"), choice: Some(Variant::Short) }));
+        let back = plan(&asking_for(Some(Variant::Full), &from_short), Mode::Install).unwrap();
+        assert!(written(&back.instructions).contains("<!-- clawg 0.88.0 protocol=full -->"), "a chosen variant is written even when it is the default");
+
+        let none = plan(&asking_for(None, &before_stamps), Mode::Install).unwrap();
+        assert_eq!((none.block, none.variant), (BlockStep::Unchanged, Some(Variant::Full)), "no choice, the default");
+
+        let fresh = plan(&State { protocol: Some(Variant::Short), ..state(None, None, None) }, Mode::Install).unwrap();
+        assert!(written(&fresh.instructions).starts_with(&format!("{BEGIN_MARKER}\n<!-- clawg 0.88.0 protocol=short -->\n# Claw Garden memory protocol\n")));
+        assert_eq!(plan(&state(None, None, None), Mode::Remove).unwrap().variant, None, "removing has no variant");
+
+        let s = State { protocol: Some(Variant::Short), ..state(None, None, Some(&before_stamps)) };
+        let (text, _) = report(&plan(&s, Mode::Install).unwrap(), &s, None);
+        assert!(text.contains("would update it (protocol=short)"), "{text}");
+        let (text, _) = report(&plan(&state(None, None, Some(&before_stamps)), Mode::Install).unwrap(), &state(None, None, None), None);
+        assert!(text.contains("up to date (protocol=full)"), "{text}");
+    }
+
+    #[test]
+    fn a_new_version_with_the_same_text_rewrites_nothing() {
+        for (choice, requested) in [(None, None), (Some(Variant::Short), None), (Some(Variant::Short), Some(Variant::Short)), (Some(Variant::Off), None)] {
+            let variant = choice.unwrap_or(Variant::Full);
+            let older = block("\n", None, variant, Stamp { version: v("0.87.0"), choice });
+            let plan_ = plan(&asking_for(requested, &older), Mode::Install).unwrap();
+            assert_eq!((plan_.block, &plan_.instructions), (BlockStep::Unchanged, &FileStep::Unchanged), "{choice:?} {requested:?}");
+        }
+        let crlf = block("\r\n", None, Variant::Full, Stamp { version: v("0.87.0"), choice: None }) + "\r\n";
+        assert_eq!(plan(&asking_for(None, &crlf), Mode::Install).unwrap().block, BlockStep::Unchanged);
     }
 
     #[test]
@@ -1322,7 +1647,7 @@ mod tests {
         let keys: Vec<&String> = value.as_object().unwrap().keys().collect();
         assert_eq!(keys, ["theme", "hooks", "model"]);
         let events: Vec<&String> = value["hooks"].as_object().unwrap().keys().collect();
-        assert_eq!(events, ["UserPromptSubmit", "PreToolUse", "SessionStart", "SessionEnd"]);
+        assert_eq!(events, ["UserPromptSubmit", "PreToolUse", "SessionStart", "SessionEnd", "PostToolUse", "PostToolUseFailure"]);
         let prompt = value["hooks"]["UserPromptSubmit"].as_array().unwrap();
         assert_eq!(prompt[0]["hooks"][0]["command"], "~/bin/remind.sh");
         assert_eq!(prompt[1]["hooks"][0], hook("user-prompt-submit"));
@@ -1334,14 +1659,14 @@ mod tests {
         let settings = r#"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"\"/old dir/clawg\" hook session-start --agent other --profile dev"}]}]}}"#;
         let plan = plan(&state(None, Some(settings), None), Mode::Install).unwrap();
         assert_eq!(plan.hooks.conflicts, [("SessionStart", "\"/old dir/clawg\" hook session-start --agent other --profile dev".to_string())]);
-        assert_eq!(plan.hooks.added, ["UserPromptSubmit", "SessionEnd"]);
+        assert_eq!(plan.hooks.added, ["UserPromptSubmit", "SessionEnd", "PostToolUse", "PostToolUseFailure"]);
         let value: Value = serde_json::from_str(written(&plan.settings)).unwrap();
         assert_eq!(value["hooks"]["SessionStart"].as_array().unwrap().len(), 1, "the conflicting hook is not replaced");
 
         let ended = shell_hook("/old/clawg hook session-end --agent other --profile dev");
         let ended = super::plan(&state(None, Some(&settings_with(&[("SessionEnd", ended)])), None), Mode::Install).unwrap();
         assert_eq!(ended.hooks.conflicts, [("SessionEnd", "/old/clawg hook session-end --agent other --profile dev".to_string())]);
-        assert_eq!(ended.hooks.added, ["SessionStart", "UserPromptSubmit"]);
+        assert_eq!(ended.hooks.added, ["SessionStart", "UserPromptSubmit", "PostToolUse", "PostToolUseFailure"]);
 
         let moved = serde_json::json!({ "type": "command", "command": "/old/clawg",
             "args": ["hook", "session-start", "--agent", "claude-code", "--profile", "dev"] });
@@ -1381,14 +1706,17 @@ mod tests {
         .to_string();
         let first = plan(&state(None, Some(&settings), None), Mode::Install).unwrap();
         assert_eq!(first.hooks.migrated, ["SessionStart", "UserPromptSubmit", "SessionEnd"]);
-        assert!(first.hooks.added.is_empty() && first.hooks.conflicts.is_empty(), "{:?}", first.hooks);
+        assert_eq!(first.hooks.added, ["PostToolUse", "PostToolUseFailure"], "the hooks of a later version are added, not migrated");
+        assert!(first.hooks.conflicts.is_empty(), "{:?}", first.hooks);
         let value: Value = serde_json::from_str(written(&first.settings)).unwrap();
         assert_eq!(
             value,
             serde_json::json!({ "theme": "dark", "hooks": {
                 "SessionStart": [{ "matcher": "startup|resume|clear|compact", "hooks": [hook("session-start")] }],
                 "UserPromptSubmit": [{ "hooks": [hook("user-prompt-submit")] }, { "hooks": [{ "type": "command", "command": "guard" }] }],
-                "SessionEnd": [{ "hooks": [hook("session-end")] }]
+                "SessionEnd": [{ "hooks": [hook("session-end")] }],
+                "PostToolUse": [{ "matcher": "Bash", "hooks": [hook("post-tool-use")] }],
+                "PostToolUseFailure": [{ "matcher": "Bash", "hooks": [hook("post-tool-use-failure")] }]
             }})
         );
         let s = state(None, Some(&settings), None);
@@ -1397,7 +1725,7 @@ mod tests {
         assert!(text.contains("would migrate SessionStart, UserPromptSubmit, SessionEnd to run without a shell"), "{text}");
 
         let second = plan(&state(None, after(Some(&settings), &first.settings).as_deref(), None), Mode::Install).unwrap();
-        assert_eq!(second.hooks.unchanged, ["SessionStart", "UserPromptSubmit", "SessionEnd"]);
+        assert_eq!(second.hooks.unchanged, ["SessionStart", "UserPromptSubmit", "SessionEnd", "PostToolUse", "PostToolUseFailure"]);
         assert_eq!(second.settings, FileStep::Unchanged);
 
         let both = settings_with(&[
@@ -1406,7 +1734,7 @@ mod tests {
         ]);
         let plan = plan(&state(None, Some(&both), None), Mode::Install).unwrap();
         assert_eq!(plan.hooks.migrated, ["SessionStart"]);
-        assert_eq!(plan.hooks.added, ["UserPromptSubmit", "SessionEnd"]);
+        assert_eq!(plan.hooks.added, ["UserPromptSubmit", "SessionEnd", "PostToolUse", "PostToolUseFailure"]);
         let value: Value = serde_json::from_str(written(&plan.settings)).unwrap();
         assert_eq!(value["hooks"]["SessionStart"], serde_json::json!([{ "hooks": [hook("session-start")] }]), "it would run twice");
     }
@@ -1450,7 +1778,7 @@ mod tests {
         let prod = "clawg hook session-start --agent claude-code --profile prod";
         let settings = format!(r#"{{"hooks":{{"SessionStart":[{{"hooks":[{{"type":"command","command":"{prod}"}}]}}]}}}}"#);
         let plan_ = plan(&state(None, Some(&settings), None), Mode::Install).unwrap();
-        assert_eq!(plan_.hooks.added, ["SessionStart", "UserPromptSubmit", "SessionEnd"]);
+        assert_eq!(plan_.hooks.added, ["SessionStart", "UserPromptSubmit", "SessionEnd", "PostToolUse", "PostToolUseFailure"]);
         let removing = plan(&state(None, Some(&settings), None), Mode::Remove).unwrap();
         assert_eq!(removing.settings, FileStep::Unchanged, "the prod hook stays");
     }
@@ -1462,20 +1790,20 @@ mod tests {
         let text = written(&plan_.instructions);
         assert!(text.contains("# Protocolo de memoria de Claw Garden"), "{text}");
         assert!(text.contains("Responde a la persona en español salvo que escriba en otro idioma"), "{text}");
-        assert_eq!(text, format!("{}\n", block("\n", Some(Lang::Es))));
-        assert_ne!(block("\n", Some(Lang::Es)), block("\n", None));
+        assert_eq!(text, format!("{}\n", installed_block(Some(Lang::Es))));
+        assert_ne!(installed_block(Some(Lang::Es)), installed_block(None));
     }
 
     #[test]
     fn the_setup_report_speaks_spanish() {
-        let installed = format!("# Mine\n\n{}\n", block("\n", None));
+        let installed = format!("# Mine\n\n{}\n", installed_block(None));
         let s = State { language: Some(Lang::Es), ..state(None, None, Some(&installed)) };
         let plan_ = plan(&s, Mode::Install).unwrap();
         let (dry, code) = report(&plan_, &s, None);
         assert_eq!(code, 0);
         for needed in [
             "servidor mcp clawg-dev: se registraría (claude mcp add --scope user clawg-dev -- ",
-            ": se agregarían SessionStart, UserPromptSubmit, SessionEnd",
+            ": se agregarían SessionStart, UserPromptSubmit, SessionEnd, PostToolUse, PostToolUseFailure",
             "protocolo de memoria en ",
             ": se actualizaría",
         ] {
@@ -1491,7 +1819,7 @@ mod tests {
         assert_eq!(code, 1, "the manual command is not done");
         for needed in [
             "servidor mcp clawg-dev: claude no está en el PATH; regístralo con:\n  claude mcp add --scope user clawg-dev -- ",
-            ": agregados SessionStart, UserPromptSubmit, SessionEnd",
+            ": agregados SessionStart, UserPromptSubmit, SessionEnd, PostToolUse, PostToolUseFailure",
             ": actualizado",
             "archivo anterior copiado a /b/settings.json.1",
             "copia más vieja borrada: /b/settings.json.0",
@@ -1509,12 +1837,12 @@ mod tests {
 
     #[test]
     fn another_language_rewrites_the_block() {
-        let installed = format!("# Mine\n\n{}\n", block("\n", None));
+        let installed = format!("# Mine\n\n{}\n", installed_block(None));
         assert_eq!(plan(&state(None, None, Some(&installed)), Mode::Install).unwrap().block, BlockStep::Unchanged);
         let spanish = State { language: Some(Lang::Es), ..state(None, None, Some(&installed)) };
         let plan_ = plan(&spanish, Mode::Install).unwrap();
         assert_eq!(plan_.block, BlockStep::Rewritten, "what a --dry-run reports, since it plans the same");
-        assert_eq!(written(&plan_.instructions), format!("# Mine\n\n{}\n", block("\n", Some(Lang::Es))));
+        assert_eq!(written(&plan_.instructions), format!("# Mine\n\n{}\n", installed_block(Some(Lang::Es))));
     }
 
     #[test]
@@ -1522,12 +1850,12 @@ mod tests {
         let mine = "# My rules\n\nUse tabs.\n";
         let plan_ = plan(&state(None, None, Some(mine)), Mode::Install).unwrap();
         let added = written(&plan_.instructions).to_string();
-        assert_eq!(added, format!("{mine}\n{}\n", block("\n", None)));
+        assert_eq!(added, format!("{mine}\n{}\n", installed_block(None)));
 
         let stale = format!("# My rules\n\n{BEGIN_MARKER}\nold protocol\n{END_MARKER}\n\nAfter.\n");
         let plan_ = plan(&state(None, None, Some(&stale)), Mode::Install).unwrap();
         assert_eq!(plan_.block, BlockStep::Rewritten);
-        assert_eq!(written(&plan_.instructions), format!("# My rules\n\n{}\n\nAfter.\n", block("\n", None)));
+        assert_eq!(written(&plan_.instructions), format!("# My rules\n\n{}\n\nAfter.\n", installed_block(None)));
 
         let crlf = "line one\r\nline two\r\n";
         let plan_ = plan(&state(None, None, Some(crlf)), Mode::Install).unwrap();
@@ -1574,7 +1902,7 @@ mod tests {
         );
         let second = plan(&s, Mode::Install).unwrap();
         assert_eq!(second.server_step, ServerStep::Unchanged);
-        assert_eq!(second.hooks.unchanged, ["SessionStart", "UserPromptSubmit", "SessionEnd"]);
+        assert_eq!(second.hooks.unchanged, ["SessionStart", "UserPromptSubmit", "SessionEnd", "PostToolUse", "PostToolUseFailure"]);
         assert_eq!((&second.settings, &second.instructions), (&FileStep::Unchanged, &FileStep::Unchanged));
         let (text, code) = report(&second, &s, Some(&Applied { server: ServerOutcome::NotRun, backups: vec![], pruned: vec![], failures: vec![] }));
         assert_eq!(code, 0);
@@ -1594,7 +1922,7 @@ mod tests {
         );
         let s = state(Some(&planned_server_json()), Some(&earlier), None);
         let plan = plan(&s, Mode::Install).unwrap();
-        assert_eq!(plan.hooks.added, ["SessionEnd"]);
+        assert_eq!(plan.hooks.added, ["SessionEnd", "PostToolUse", "PostToolUseFailure"]);
         assert_eq!(plan.hooks.unchanged, ["SessionStart", "UserPromptSubmit"]);
         assert!(plan.hooks.migrated.is_empty() && plan.hooks.conflicts.is_empty(), "{:?}", plan.hooks);
 
@@ -1607,7 +1935,68 @@ mod tests {
 
         let (report, code) = report(&plan, &s, None);
         assert_eq!(code, 0, "{report}");
-        assert!(report.contains("would add SessionEnd; SessionStart, UserPromptSubmit already there"), "{report}");
+        assert!(report.contains("would add SessionEnd, PostToolUse, PostToolUseFailure; SessionStart, UserPromptSubmit already there"), "{report}");
+    }
+
+    #[test]
+    fn a_run_over_an_install_without_the_tool_hooks_adds_only_them() {
+        let earlier = settings_text(
+            serde_json::json!({ "theme": "dark", "hooks": {
+                "SessionStart": [{ "matcher": "startup|resume|clear|compact", "hooks": [hook("session-start")] }],
+                "UserPromptSubmit": [{ "hooks": [hook("user-prompt-submit")] }],
+                "SessionEnd": [{ "hooks": [hook("session-end")] }]
+            }})
+            .as_object()
+            .unwrap()
+            .clone(),
+        );
+        let s = state(Some(&planned_server_json()), Some(&earlier), None);
+        let plan = plan(&s, Mode::Install).unwrap();
+        assert_eq!(plan.hooks.added, ["PostToolUse", "PostToolUseFailure"]);
+        assert_eq!(plan.hooks.unchanged, ["SessionStart", "UserPromptSubmit", "SessionEnd"]);
+        assert!(plan.hooks.migrated.is_empty() && plan.hooks.conflicts.is_empty(), "{:?}", plan.hooks);
+
+        let text = written(&plan.settings);
+        let kept = earlier.strip_suffix("\n  }\n}\n").expect("the end of the hooks and of the file");
+        let added = text.strip_prefix(kept).unwrap_or_else(|| panic!("what was there is as it was, byte for byte:\n{text}"));
+        assert!(added.starts_with(",\n    \"PostToolUse\": ["), "{added}");
+
+        let (report, code) = report(&plan, &s, None);
+        assert_eq!(code, 0, "{report}");
+        assert!(report.contains("would add PostToolUse, PostToolUseFailure; SessionStart, UserPromptSubmit, SessionEnd already there"), "{report}");
+    }
+
+    #[test]
+    fn the_tool_hooks_match_bash_only() {
+        let plan = plan(&state(None, None, None), Mode::Install).unwrap();
+        let value: Value = serde_json::from_str(written(&plan.settings)).unwrap();
+        for (event, arg) in [("PostToolUse", "post-tool-use"), ("PostToolUseFailure", "post-tool-use-failure")] {
+            assert_eq!(value["hooks"][event], serde_json::json!([{ "matcher": "Bash", "hooks": [hook(arg)] }]), "{event}");
+        }
+        assert_eq!(value["hooks"]["SessionStart"][0]["matcher"], "startup|resume|clear|compact");
+        for event in ["UserPromptSubmit", "SessionEnd"] {
+            assert!(value["hooks"][event][0].get("matcher").is_none(), "{event} runs for everything");
+        }
+
+        let other = shell_hook("/old/clawg hook post-tool-use --agent other --profile dev");
+        let conflicting = super::plan(&state(None, Some(&settings_with(&[("PostToolUse", other)])), None), Mode::Install).unwrap();
+        assert_eq!(conflicting.hooks.conflicts, [("PostToolUse", "/old/clawg hook post-tool-use --agent other --profile dev".to_string())]);
+        assert!(conflicting.hooks.added.contains(&"PostToolUseFailure"), "{:?}", conflicting.hooks);
+    }
+
+    #[test]
+    fn remove_takes_the_tool_hooks_too() {
+        let foreign = serde_json::json!({ "type": "command", "command": "echo hi" });
+        let settings = serde_json::json!({ "hooks": {
+            "SessionStart": [{ "matcher": "startup|resume|clear|compact", "hooks": [hook("session-start")] }],
+            "PostToolUse": [{ "matcher": "Bash", "hooks": [hook("post-tool-use")] }, { "matcher": "Edit", "hooks": [foreign.clone()] }],
+            "PostToolUseFailure": [{ "matcher": "Bash", "hooks": [hook("post-tool-use-failure")] }]
+        }})
+        .to_string();
+        let plan = plan(&state(None, Some(&settings), None), Mode::Remove).unwrap();
+        assert_eq!(plan.hooks.removed, ["SessionStart", "PostToolUse", "PostToolUseFailure"]);
+        let value: Value = serde_json::from_str(written(&plan.settings)).unwrap();
+        assert_eq!(value, serde_json::json!({ "hooks": { "PostToolUse": [{ "matcher": "Edit", "hooks": [foreign] }] } }));
     }
 
     #[test]
@@ -1621,7 +2010,7 @@ mod tests {
         let (text, code) = run_in(s, Mode::Install, true, Some(Path::new("/nonexistent/claude")), dir.path(), 0).unwrap();
         assert_eq!(code, 0);
         assert!(text.contains("would register it"), "{text}");
-        assert!(text.contains("would add SessionStart, UserPromptSubmit, SessionEnd"), "{text}");
+        assert!(text.contains("would add SessionStart, UserPromptSubmit, SessionEnd, PostToolUse, PostToolUseFailure"), "{text}");
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 
@@ -1651,7 +2040,7 @@ mod tests {
             );
             let removed = plan(&s, Mode::Remove).unwrap();
             assert_eq!(removed.server_step, ServerStep::Remove);
-            assert_eq!(removed.hooks.removed, ["SessionStart", "UserPromptSubmit", "SessionEnd"]);
+            assert_eq!(removed.hooks.removed, ["SessionStart", "UserPromptSubmit", "SessionEnd", "PostToolUse", "PostToolUseFailure"]);
             let settings_back = after(s.settings.text.as_deref(), &removed.settings);
             let expected_settings = match settings {
                 None | Some("{}") => Some("{}\n".to_string()),
@@ -1666,7 +2055,7 @@ mod tests {
     #[test]
     fn remove_keeps_the_block_while_the_other_profile_is_registered() {
         let both = r#"{"mcpServers":{"clawg":{"command":"/opt/clawg/clawg","args":["mcp","--profile","prod"]},"clawg-dev":{"command":"/x/clawg","args":["mcp"]}}}"#;
-        let md = format!("{}\n", block("\n", None));
+        let md = format!("{}\n", installed_block(None));
         let plan = plan(&state(Some(both), None, Some(&md)), Mode::Remove).unwrap();
         assert_eq!(plan.server_step, ServerStep::Remove);
         assert_eq!((plan.block, &plan.instructions), (BlockStep::Kept, &FileStep::Unchanged));

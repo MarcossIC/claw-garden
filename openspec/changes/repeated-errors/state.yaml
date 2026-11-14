@@ -1,0 +1,14 @@
+change: repeated-errors
+objective: "1, 5"
+depends_on: [agent-eval-sessions]  # sólo la tarea 9 y la campaña; el producto (tareas 1 a 8) no depende de nada
+phase: apply
+artifacts:
+  exploration: done  # la evidencia es docs/completed-impl/hipotesis/A2/informe.md
+  proposal: done  # B, A y D; C, los rechazos de clawg y Cursor quedan afuera
+  spec: done  # RE1 a RE9
+  design: done  # D1 a D9
+  tasks: done  # siete commits del producto, la verificación local y uno del arnés
+  apply: partial  # tareas 1 a 7 hechas; falta la 9, el brazo a3-notools, que espera a 129 y a arm.rs
+  verify: pending
+  archive: pending
+updated: 2026-11-14

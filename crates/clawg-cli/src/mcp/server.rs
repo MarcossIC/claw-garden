@@ -4166,6 +4166,106 @@ mod tests {
         assert!(is_error(&r) && text(&r).contains("reason"), "text was: {}", text(&r));
     }
 
+    /// A unit vector at L2 distance `chord` from the unit vector `from`, as
+    /// the bytes the store keeps.
+    async fn at_distance(from: &[f32], chord: f32) -> Vec<u8> {
+        use clawg_core::memory::embedder::{EmbedRole, Embedder, FakeEmbedder};
+        use clawg_core::memory::vector::to_unit;
+        let other = FakeEmbedder::default().embed_with_role("another direction", EmbedRole::Passage).await.expect("embed");
+        let other = to_unit(&other).expect("unit");
+        let along: f32 = from.iter().zip(&other).map(|(x, y)| x * y).sum();
+        let across = to_unit(&other.iter().zip(from).map(|(y, x)| y - along * x).collect::<Vec<_>>()).expect("unit");
+        let angle = 2.0 * (chord / 2.0).asin();
+        from.iter()
+            .zip(&across)
+            .map(|(x, y)| x * angle.cos() + y * angle.sin())
+            .flat_map(|f| f.to_le_bytes())
+            .collect()
+    }
+
+    fn ids_in(answer: &str) -> Vec<i64> {
+        answer
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .split('#')
+            .skip(1)
+            .filter_map(|part| part.split(|c: char| !c.is_ascii_digit()).next()?.parse().ok())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_long_save_is_judged_through_the_first_id_it_answers() {
+        let (b, _d, store) = bridge_with_store(test_project()).await;
+        let (_other, other) = elsewhere();
+        let long = format!(
+            "Notes on clawg-ledger, the crate that settles balances. {}",
+            (0..1000).map(|i| format!("w{i:05}")).collect::<Vec<_>>().join(" ")
+        );
+        let fact = |content: &str| SaveMemoryArgs { memory_type: Some("semantic_fact".into()), ..save_args(content) };
+
+        // A copy outside the bridge's project gives the vector of the last
+        // piece, which a save of the same text there cannot reach.
+        let copy = b
+            .save_here("a", SaveMemoryArgs { project_path: Some(other.root.display().to_string()), ..fact(&long) })
+            .await
+            .unwrap();
+        assert!(!is_error(&copy), "{}", text(&copy));
+        let last = *ids_in(&text(&copy)).last().expect("the pieces of the copy");
+        let vector: Vec<u8> = store
+            .conn_for_test()
+            .call(move |c| c.query_row("SELECT embedding FROM memory_vectors WHERE rowid = ?1", [last], |r| r.get(0)))
+            .await
+            .expect("vector");
+        let vector: Vec<f32> = vector.as_chunks::<4>().0.iter().map(|f| f32::from_le_bytes(*f)).collect();
+        let near = at_distance(&vector, 0.3).await;
+
+        let older = b.save_here("a", fact("the ledger settles balances every night")).await.unwrap();
+        let older = ids_in(&text(&older))[0];
+        store
+            .conn_for_test()
+            .call(move |c| {
+                c.execute("UPDATE memory_vectors SET embedding = ?2 WHERE rowid = ?1", rusqlite::params![older, near])
+            })
+            .await
+            .expect("place");
+
+        let saved = b.save_here("a", fact(&long)).await.unwrap();
+
+        let answer = text(&saved);
+        assert!(!is_error(&saved), "{answer}");
+        let pieces = ids_in(&answer);
+        assert!(pieces.len() >= 3, "the text splits into pieces: {answer}");
+        assert!(answer.contains(&format!("close to earlier memories: #{older} ")), "{answer}");
+        let paired: Vec<i64> = store
+            .conn_for_test()
+            .call(move |c| {
+                let mut stmt = c.prepare("SELECT new_id FROM memory_conflict WHERE old_id = ?1")?;
+                let rows = stmt.query_map([older], |r| r.get(0))?.collect();
+                rows
+            })
+            .await
+            .expect("pairs");
+        assert_eq!(paired.len(), 1, "{paired:?}");
+        assert!(pieces.contains(&paired[0]) && paired[0] != pieces[0], "the pair is of a later piece: {paired:?} in {pieces:?}");
+
+        let judged = b
+            .resolve_conflict_impl(
+                "a",
+                ResolveConflictArgs { keep: pieces[0], other: older, verdict: "supersedes".into(), reason: None, user_answered: false },
+            )
+            .await
+            .unwrap();
+
+        assert!(!is_error(&judged), "{}", text(&judged));
+        let status: String = store
+            .conn_for_test()
+            .call(move |c| c.query_row("SELECT status FROM memory WHERE id = ?1", [older], |r| r.get(0)))
+            .await
+            .expect("status");
+        assert_eq!(status, "superseded");
+    }
+
     #[test]
     fn save_outcome_text_names_related_memories() {
         let related = |id, escalated| RelatedMemory { id, escalated, excerpt: format!("claim {id}") };

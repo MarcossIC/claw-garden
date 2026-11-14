@@ -83,15 +83,38 @@ pub fn seeded(task: &[SeedMemory], noise: &[SeedMemory]) -> Vec<SeedMemory> {
     all
 }
 
-/// `memories` as a native memory file: one section per memory, its text whole.
+/// `memories`, as [`seeded`] orders them, as a native memory file: one section
+/// per memory, its text whole, from the oldest to the newest as an agent that
+/// appends its notes leaves it.
 pub fn native_memory(memories: &[SeedMemory]) -> String {
+    let mut oldest_first: Vec<&SeedMemory> = memories.iter().collect();
+    // Stable, so at one age the noise stays before the task's memory.
+    oldest_first.sort_by_key(|m| std::cmp::Reverse(m.age_days));
     let mut out = String::from("# Memory\n");
-    for memory in memories {
+    for memory in oldest_first {
         out.push('\n');
         out.push_str(memory.content.trim_end());
         out.push('\n');
     }
     out
+}
+
+/// How many lines of a native memory file the client loads at startup.
+const NATIVE_LOADED_LINES: usize = 200;
+
+/// How many bytes of it, when they come before those lines.
+const NATIVE_LOADED_BYTES: usize = 25_000;
+
+/// What the client puts in the context of a session of a native memory file
+/// `text`: its first 200 lines or its first 25,000 bytes, whichever it reaches
+/// first, as the client documents it.
+pub fn native_loaded(text: &str) -> &str {
+    let by_lines = text.match_indices('\n').nth(NATIVE_LOADED_LINES - 1).map_or(text.len(), |(at, _)| at + 1);
+    let mut end = by_lines.min(NATIVE_LOADED_BYTES);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
 }
 
 /// The directory name the client keeps a project's native memory under: the
@@ -173,6 +196,39 @@ mod tests {
     fn the_native_memory_holds_every_text_whole() {
         let text = native_memory(&[memory("Staging uses port 48213\nbecause 8080 is taken.", "semantic_fact", 0, 1), memory("Chose SQLite", "architectural_decision", 0, 1)]);
         assert_eq!(text, "# Memory\n\nStaging uses port 48213\nbecause 8080 is taken.\n\nChose SQLite\n");
+    }
+
+    #[test]
+    fn the_native_memory_goes_from_the_oldest_memory_to_the_newest() {
+        let task = [memory("task old", "semantic_fact", 120, 1), memory("task new", "semantic_fact", 10, 1)];
+        let noise = [memory("noise mid", "semantic_fact", 60, 1), memory("noise new", "semantic_fact", 10, 1), memory("noise oldest", "semantic_fact", 200, 1)];
+        let text = native_memory(&seeded(&task, &noise));
+        let order: Vec<&str> = text.lines().filter(|l| !l.is_empty() && *l != "# Memory").collect();
+        assert_eq!(order, ["noise oldest", "task old", "noise mid", "noise new", "task new"], "at one age the noise goes first");
+    }
+
+    #[test]
+    fn the_client_loads_the_first_200_lines_or_25_kb_of_the_native_memory() {
+        let lines = |n: usize| (1..=n).map(|i| format!("line {i}\n")).collect::<String>();
+        assert_eq!(native_loaded("# Memory\n\nshort\n"), "# Memory\n\nshort\n");
+        assert_eq!(native_loaded(""), "");
+
+        let long = lines(900);
+        let loaded = native_loaded(&long);
+        assert_eq!(loaded.lines().count(), 200, "the lines cut first");
+        assert!(loaded.ends_with("line 200\n") && !loaded.contains("line 201\n"));
+        assert!(long.starts_with(loaded));
+        let exact = lines(200);
+        assert_eq!(native_loaded(&exact), exact, "200 lines are all loaded");
+
+        let wide = format!("{}\n{}", "x".repeat(24_000), "y".repeat(5_000));
+        let loaded = native_loaded(&wide);
+        assert_eq!(loaded.len(), 25_000, "the bytes cut first: a line is cut where the limit falls");
+        assert!(loaded.ends_with('y'));
+
+        let euros = "€".repeat(9_000);
+        let loaded = native_loaded(&euros);
+        assert_eq!(loaded.len(), 24_999, "never in the middle of a character");
     }
 
     #[test]

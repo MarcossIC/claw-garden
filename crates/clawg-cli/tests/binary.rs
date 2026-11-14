@@ -70,6 +70,8 @@ impl Sandbox {
             .env("CLAWG_TEST_EMBEDDER", "fake")
             .env_remove("CLAWG_PROFILE")
             .env_remove("CLAWG_TEST_DEFAULT_PORT")
+            // Never the configuration of the Claude Code the tests run under.
+            .env_remove("CLAUDE_CONFIG_DIR")
             .env("RUST_LOG", "info")
             .current_dir(&self.home)
             .stdin(Stdio::null())
@@ -1754,6 +1756,55 @@ async fn session_start_without_a_daemon_still_names_the_language() {
 }
 
 #[tokio::test]
+async fn session_start_names_an_old_protocol_block() {
+    let sandbox = Sandbox::new();
+    let claude = sandbox.home.join(".claude");
+    std::fs::create_dir_all(&claude).unwrap();
+    let md = claude.join("CLAUDE.md");
+    let old = "# Mine\n\n<!-- BEGIN CLAWG MEMORY PROTOCOL -->\nJudge each with `resolve_conflict`.\n<!-- END CLAWG MEMORY PROTOCOL -->\n";
+    std::fs::write(&md, old).unwrap();
+    let input = json!({ "cwd": sandbox.home, "source": "startup" }).to_string();
+    let start = || hook(&sandbox, &["session-start", "--agent", "claude-code", "--profile", "dev"], &input);
+    let context = |out: &Output| {
+        assert_eq!(out.status.code(), Some(0), "{}", stderr_of(out));
+        let printed: Value = serde_json::from_str(&stdout_of(out)).expect("the hook's envelope");
+        printed["hookSpecificOutput"]["additionalContext"].as_str().unwrap_or_default().to_string()
+    };
+
+    let notice = context(&start());
+    assert!(notice.starts_with("clawg: the memory protocol block in the user CLAUDE.md is not the one this clawg ("), "{notice}");
+    assert!(notice.contains(env!("CARGO_PKG_VERSION")), "{notice}");
+    assert!(notice.ends_with("Tell the user once that `clawg setup claude-code --profile dev` rewrites it."), "{notice}");
+    assert!(!sandbox.data_dir().join("daemon.json").exists(), "no daemon was started");
+    assert_eq!(std::fs::read_to_string(&md).unwrap(), old, "the hook writes nothing of the user's");
+
+    let set = sandbox.run(&["preferences", "set", "language", "es", "--profile", "dev"]);
+    assert_eq!(set.status.code(), Some(0), "{}", stderr_of(&set));
+    let spanish = context(&start());
+    assert!(spanish.starts_with("clawg: el idioma de la persona es el español."), "{spanish}");
+    assert!(spanish.contains("\n\nclawg: el bloque del protocolo de memoria del CLAUDE.md del usuario no es el que escribe este clawg"), "{spanish}");
+    assert!(spanish.ends_with("`clawg setup claude-code --profile dev` lo reescribe."), "{spanish}");
+
+    let prompt = hook(&sandbox, &["user-prompt-submit", "--agent", "claude-code", "--profile", "dev"], &input);
+    assert_eq!((prompt.status.code(), stdout_of(&prompt)), (Some(0), String::new()), "only the session's start says it");
+    let cursor = hook_in(&sandbox, &dot_cursor(&sandbox), &["session-start", "--agent", "cursor", "--client", "cursor", "--profile", "dev"], &cursor_session_start(&[&sandbox.home]));
+    assert!(!stdout_of(&cursor).contains("CLAUDE.md"), "Cursor has no block: {}", stdout_of(&cursor));
+
+    // Once `setup` has rewritten the block, the hook has nothing to say about it.
+    let empty = sandbox.home.join("empty-path");
+    std::fs::create_dir_all(&empty).unwrap();
+    let out = sandbox
+        .command(&["setup", "claude-code", "--profile", "dev"])
+        .env("CLAUDE_CONFIG_DIR", &claude)
+        .env("PATH", &empty)
+        .output()
+        .expect("run clawg setup");
+    assert!(std::fs::read_to_string(&md).unwrap().contains("<!-- clawg "), "{}", stderr_of(&out));
+    let current = context(&start());
+    assert!(!current.contains("CLAUDE.md"), "{current}");
+}
+
+#[tokio::test]
 async fn a_hook_with_input_that_is_not_json_prints_nothing() {
     let sandbox = Sandbox::new();
     let _daemon = sandbox.serve().await;
@@ -1762,6 +1813,111 @@ async fn a_hook_with_input_that_is_not_json_prints_nothing() {
         assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
         assert_eq!(stdout_of(&out), "");
     }
+}
+
+/// What the shell says when a program is not installed.
+const NOT_FOUND: &str = "Exit code 127\n/usr/bin/bash: line 1: eza: command not found";
+
+/// What Claude Code sends to the hook after a Bash call failed.
+fn bash_failed(session: &str, command: &str, error: &str) -> String {
+    json!({
+        "session_id": session, "hook_event_name": "PostToolUseFailure", "tool_name": "Bash",
+        "tool_input": { "command": command }, "tool_use_id": "t1", "error": error,
+    })
+    .to_string()
+}
+
+/// What it sends after a Bash call that ended well, with `response` as the
+/// tool's answer.
+fn bash_ended(session: &str, command: &str, response: Value) -> String {
+    json!({
+        "session_id": session, "hook_event_name": "PostToolUse", "tool_name": "Bash",
+        "tool_input": { "command": command }, "tool_use_id": "t2", "tool_response": response,
+    })
+    .to_string()
+}
+
+fn context_of(out: &Output) -> String {
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(out));
+    let printed: Value = serde_json::from_str(&stdout_of(out)).expect("the hook's envelope");
+    printed["hookSpecificOutput"]["additionalContext"].as_str().unwrap_or_default().to_string()
+}
+
+#[tokio::test]
+async fn a_post_tool_hook_answers_without_a_daemon_and_leaves_the_store_alone() {
+    let sandbox = Sandbox::new();
+    let set = sandbox.run(&["preferences", "set", "language", "es", "--profile", "dev"]);
+    assert_eq!(set.status.code(), Some(0), "{}", stderr_of(&set));
+    let args = |event: &'static str| [event, "--agent", "claude-code", "--profile", "dev"];
+
+    let failed = hook(&sandbox, &args("post-tool-use-failure"), &bash_failed("s1", "eza -la src", NOT_FOUND));
+    let printed: Value = serde_json::from_str(&stdout_of(&failed)).expect("the hook's envelope");
+    assert_eq!(printed["hookSpecificOutput"]["hookEventName"], "PostToolUseFailure");
+    let line = context_of(&failed);
+    assert!(line.contains("`eza` no existe en el Bash de esta máquina"), "{line}");
+
+    let response = json!({ "stdout": "", "stderr": "/usr/bin/bash: line 1: fd: command not found", "interrupted": false });
+    let piped = hook(&sandbox, &args("post-tool-use"), &bash_ended("s1", "fd -e rs | head", response));
+    let printed: Value = serde_json::from_str(&stdout_of(&piped)).expect("the hook's envelope");
+    assert_eq!(printed["hookSpecificOutput"]["hookEventName"], "PostToolUse");
+    assert!(context_of(&piped).contains("`fd` no existe"), "a failure that ended with code 0");
+
+    let fine = hook(&sandbox, &args("post-tool-use"), &bash_ended("s1", "rg todo", json!({ "stdout": "a.rs:1: todo" })));
+    assert_eq!((fine.status.code(), stdout_of(&fine)), (Some(0), String::new()), "a call that went well says nothing");
+
+    let data = sandbox.data_dir();
+    assert!(!data.join("memory.db").exists() && !data.join("daemon.json").exists(), "no store, no daemon");
+    assert!(!data.join(clawg_cli::hook_log::FILE).exists(), "these events leave no run");
+    let ledger = std::fs::read_to_string(data.join(clawg_cli::tool_failures::FILE)).expect("the ledger");
+    assert_eq!(ledger.lines().count(), 2, "one line for each failure and none for the call that went well: {ledger}");
+}
+
+/// A Bash call that failed because `program` is not installed, in `session`.
+fn missing(sandbox: &Sandbox, session: &str, program: &str) {
+    let said = format!("Exit code 127\n/usr/bin/bash: line 1: {program}: command not found");
+    let out = hook(sandbox, &["post-tool-use-failure", "--agent", "claude-code", "--profile", "dev"], &bash_failed(session, program, &said));
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+}
+
+/// What `session-start` prints for `session`, with no daemon.
+fn start_of(sandbox: &Sandbox, session: &str) -> String {
+    let input = json!({ "session_id": session, "cwd": sandbox.home, "source": "startup" }).to_string();
+    context_of(&hook(sandbox, &["session-start", "--agent", "claude-code", "--profile", "dev"], &input))
+}
+
+#[tokio::test]
+async fn two_sessions_teach_the_third() {
+    let sandbox = Sandbox::new();
+    let set = sandbox.run(&["preferences", "set", "language", "es", "--profile", "dev"]);
+    assert_eq!(set.status.code(), Some(0), "{}", stderr_of(&set));
+    // A name no machine has, so that a PATH with the program cannot silence it.
+    let program = "eza-absent-xyz";
+
+    missing(&sandbox, "s1", program);
+    missing(&sandbox, "s2", program);
+    let start = start_of(&sandbox, "s3");
+
+    assert!(start.starts_with("clawg: el idioma de la persona es el español."), "{start}");
+    assert!(start.contains("\n\nclawg: estos programas no están instalados en el Bash de esta máquina;"), "{start}");
+    assert!(start.contains(&format!("`{program}` (2 sesiones, último fallo hoy)")), "{start}");
+    assert!(!sandbox.data_dir().join("daemon.json").exists(), "no daemon was needed");
+
+    std::fs::remove_file(sandbox.data_dir().join(clawg_cli::tool_failures::FILE)).unwrap();
+    assert!(!start_of(&sandbox, "s4").contains(program), "forgetting the ledger forgets the rule");
+}
+
+#[tokio::test]
+async fn one_session_teaches_nothing() {
+    let sandbox = Sandbox::new();
+    let set = sandbox.run(&["preferences", "set", "language", "es", "--profile", "dev"]);
+    assert_eq!(set.status.code(), Some(0), "{}", stderr_of(&set));
+
+    missing(&sandbox, "s1", "eza-absent-xyz");
+    missing(&sandbox, "s1", "eza-absent-xyz");
+    let start = start_of(&sandbox, "s2");
+
+    assert!(start.starts_with("clawg: el idioma de la persona es el español."), "{start}");
+    assert!(!start.contains("clawg: estos programas") && !start.contains("eza-absent-xyz"), "two failures of one session are one: {start}");
 }
 
 #[tokio::test]
@@ -2287,6 +2443,43 @@ async fn doctor_says_when_the_installed_hook_has_no_runs() {
 }
 
 #[tokio::test]
+async fn doctor_names_what_the_ledger_learned_and_the_hooks_that_are_missing() {
+    let sandbox = Sandbox::new();
+    let program = "eza-absent-xyz";
+    std::fs::create_dir_all(sandbox.data_dir()).unwrap();
+    missing(&sandbox, "s1", program);
+    missing(&sandbox, "s2", program);
+    let ledger = sandbox.data_dir().join(clawg_cli::tool_failures::FILE);
+    let learned = std::fs::read(&ledger).expect("the ledger");
+    let claude = sandbox.home.join(".claude");
+    std::fs::create_dir_all(&claude).unwrap();
+    std::fs::write(claude.join("CLAUDE.md"), format!("Use {program} instead of ls.\n")).unwrap();
+    let hook = json!({ "type": "command", "command": BIN,
+        "args": ["hook", "session-start", "--agent", "claude-code", "--profile", "dev"], "timeout": 5 });
+    std::fs::write(claude.join("settings.json"), json!({ "hooks": { "SessionStart": [{ "hooks": [hook] }] } }).to_string()).unwrap();
+
+    let (output, report) = doctor(&sandbox);
+
+    assert_eq!(output.status.code(), Some(0), "neither finding fails the command: {report}");
+    assert_eq!(findings(&report, "tool_rules"), [("info", "learned")]);
+    let rules = report["checks"].as_array().unwrap().iter().find(|f| f["check_id"] == "tool_rules").unwrap();
+    let rule = &rules["evidence"]["rules"][0];
+    assert_eq!((rule["program"].as_str(), rule["sessions"].as_u64()), (Some(program), Some(2)), "{rules}");
+    assert_eq!(rule["named_in"], json!([claude.join("CLAUDE.md")]), "{rules}");
+    assert_eq!(findings(&report, "tool_hooks"), [("info", "not_installed")]);
+    let hooks = report["checks"].as_array().unwrap().iter().find(|f| f["check_id"] == "tool_hooks").unwrap();
+    assert_eq!(hooks["safe_next_step"], "clawg setup claude-code --profile dev");
+    assert_eq!(std::fs::read(&ledger).unwrap(), learned, "doctor does not write the ledger");
+}
+
+#[tokio::test]
+async fn doctor_has_nothing_to_say_without_rules_or_an_install() {
+    let sandbox = Sandbox::new();
+    let (_, report) = doctor(&sandbox);
+    assert_eq!((findings(&report, "tool_rules"), findings(&report, "tool_hooks")), (vec![], vec![]));
+}
+
+#[tokio::test]
 async fn doctor_reads_a_running_daemons_store_without_changing_it() {
     let sandbox = Sandbox::new();
     let daemon = sandbox.serve().await;
@@ -2392,6 +2585,47 @@ async fn doctor_names_a_broken_preferences_file() {
     let (_, report) = doctor(&sandbox);
     assert_eq!(findings(&report, "preferences"), [("ok", "healthy")]);
     assert_eq!(findings(&report, "protocol_block"), [("info", "not_installed")], "{report}");
+}
+
+#[tokio::test]
+async fn doctor_marks_an_old_block_stale_without_a_preference() {
+    let sandbox = Sandbox::new();
+    let claude = sandbox.home.join(".claude");
+    std::fs::create_dir_all(&claude).expect("claude dir");
+    let md = claude.join("CLAUDE.md");
+
+    std::fs::write(&md, "# Mine\n").expect("write");
+    let (_, report) = doctor(&sandbox);
+    assert!(findings(&report, "protocol_block").is_empty(), "no block and no preference: {report}");
+
+    let old = "# Mine\n\n<!-- BEGIN CLAWG MEMORY PROTOCOL -->\nJudge each with `resolve_conflict`: `compatible` if both hold.\n<!-- END CLAWG MEMORY PROTOCOL -->\n";
+    std::fs::write(&md, old).expect("write");
+    let (_, report) = doctor(&sandbox);
+    assert_eq!(findings(&report, "protocol_block"), [("warn", "stale")], "{report}");
+    let finding = report["checks"].as_array().unwrap().iter().find(|f| f["check_id"] == "protocol_block").unwrap();
+    assert_eq!(finding["safe_next_step"], "clawg setup claude-code --profile dev");
+    assert_eq!(finding["evidence"]["written_by"], Value::Null);
+    assert_eq!(finding["evidence"]["this_version"], env!("CARGO_PKG_VERSION"));
+
+    let later = old.replace("<!-- BEGIN CLAWG MEMORY PROTOCOL -->\n", "<!-- BEGIN CLAWG MEMORY PROTOCOL -->\n<!-- clawg 99.0.0 -->\n");
+    std::fs::write(&md, later).expect("write");
+    let (_, report) = doctor(&sandbox);
+    assert_eq!(findings(&report, "protocol_block"), [("info", "newer")], "{report}");
+
+    // What `setup` writes is what `doctor` holds the block to, whichever variant was chosen.
+    let empty = sandbox.home.join("empty-path");
+    for choice in [&[][..], &["--protocol", "short"], &["--protocol", "off"], &["--protocol", "full"]] {
+        std::fs::write(&md, old).expect("write");
+        let out = sandbox
+            .command(&[&["setup", "claude-code", "--profile", "dev"], choice].concat())
+            .env("CLAUDE_CONFIG_DIR", &claude)
+            .env("PATH", &empty)
+            .output()
+            .expect("run clawg setup");
+        assert!(std::fs::read_to_string(&md).unwrap().contains(&format!("<!-- clawg {}", env!("CARGO_PKG_VERSION"))), "{}", stderr_of(&out));
+        let (_, report) = doctor(&sandbox);
+        assert_eq!(findings(&report, "protocol_block"), [("ok", "healthy")], "{choice:?}: {report}");
+    }
 }
 
 /// Every finding but its message, so two reports of the same facts compare.
@@ -3467,7 +3701,7 @@ async fn setup_dry_run_writes_nothing() {
     assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
     let text = stdout_of(&out);
     assert!(text.contains("mcp server clawg-dev: would register it"), "{text}");
-    assert!(text.contains("would add SessionStart, UserPromptSubmit, SessionEnd"), "{text}");
+    assert!(text.contains("would add SessionStart, UserPromptSubmit, SessionEnd, PostToolUse, PostToolUseFailure"), "{text}");
     assert!(!sandbox.home.join("claude-config").exists());
     assert!(!sandbox.data_dir().exists());
 }
@@ -3596,6 +3830,10 @@ async fn setup_local_installs_in_the_folder_and_remove_undoes_it() {
     assert_eq!(hook["args"], json!(["hook", "session-start", "--agent", "claude-code", "--profile", "dev"]), "{settings}");
     assert_eq!(settings["hooks"]["UserPromptSubmit"][0]["hooks"][0]["args"][1], "user-prompt-submit", "{settings}");
     assert_eq!(settings["hooks"]["SessionEnd"][0]["hooks"][0]["args"][1], "session-end", "{settings}");
+    for (event, arg) in [("PostToolUse", "post-tool-use"), ("PostToolUseFailure", "post-tool-use-failure")] {
+        assert_eq!(settings["hooks"][event][0]["matcher"], "Bash", "{settings}");
+        assert_eq!(settings["hooks"][event][0]["hooks"][0]["args"][1], arg, "{settings}");
+    }
     assert!(!config.exists(), "the user's settings, server and protocol are not touched");
 
     let elsewhere = local(&["--path", "work/app", "--remove"], &sandbox.home);
@@ -3623,6 +3861,41 @@ async fn setup_cursor_refuses_a_folder() {
         assert!(stderr_of(&out).contains("`clawg setup cursor` installs Cursor's for the user"), "{}", stderr_of(&out));
     }
     assert!(!sandbox.home.join(".cursor").exists() && !sandbox.home.join(".claude").exists());
+}
+
+#[tokio::test]
+async fn setup_cursor_refuses_a_protocol() {
+    let sandbox = Sandbox::new();
+    let out = sandbox.run(&["setup", "cursor", "--profile", "dev", "--protocol", "short"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stdout_of(&out));
+    assert!(stderr_of(&out).contains("Cursor has no protocol block"), "{}", stderr_of(&out));
+    assert!(!sandbox.home.join(".cursor").exists(), "a refusal writes nothing");
+}
+
+#[tokio::test]
+async fn setup_protocol_short_writes_the_short_block() {
+    let sandbox = Sandbox::new();
+    let empty = sandbox.home.join("empty-path");
+    std::fs::create_dir_all(&empty).unwrap();
+    let md_path = sandbox.home.join("claude-config").join("CLAUDE.md");
+
+    // No `claude` on the PATH: the server is left to the person, and the files are written.
+    let out = setup(&sandbox, &["--protocol", "short"], &empty);
+    assert_eq!(out.status.code(), Some(1), "{}{}", stdout_of(&out), stderr_of(&out));
+    assert!(stdout_of(&out).contains("added (protocol=short)"), "{}", stdout_of(&out));
+    let md = std::fs::read_to_string(&md_path).unwrap();
+    let opening = format!("<!-- BEGIN CLAWG MEMORY PROTOCOL -->\n<!-- clawg {} protocol=short -->\n# Claw Garden memory protocol\n", env!("CARGO_PKG_VERSION"));
+    assert!(md.starts_with(&opening), "{md}");
+    assert!(md.contains("## Session summary") && md.contains("## After a compaction"), "{md}");
+    assert!(!md.contains("## How to write a save"), "{md}");
+
+    let again = setup(&sandbox, &[], &empty);
+    assert!(stdout_of(&again).contains("up to date (protocol=short)"), "a run without the option keeps the choice: {}", stdout_of(&again));
+    assert_eq!(std::fs::read_to_string(&md_path).unwrap(), md);
+
+    let local = setup(&sandbox, &["--local", "--protocol", "off"], &empty);
+    assert_eq!(local.status.code(), Some(2), "a usage error: {}", stderr_of(&local));
+    assert_eq!(std::fs::read_to_string(&md_path).unwrap(), md, "and it writes nothing");
 }
 
 /// The line `setup cursor` installs, run through `sh -c` in `~/.cursor` with

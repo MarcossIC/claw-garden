@@ -28,6 +28,30 @@ const OPENING_RULE: &str = "Write memories and search queries in English, whatev
 const SAVE_RULE: &str = "Write it in English, and search in English too. A memory saved in one language and \
                          searched in another is often missed.";
 
+/// How much of the protocol `clawg setup` writes into the user's `CLAUDE.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Variant {
+    Full,
+    Short,
+    Off,
+}
+
+impl Variant {
+    pub const ALL: [Variant; 3] = [Variant::Full, Variant::Short, Variant::Off];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Variant::Full => "full",
+            Variant::Short => "short",
+            Variant::Off => "off",
+        }
+    }
+
+    pub fn parse(name: &str) -> Option<Variant> {
+        Variant::ALL.into_iter().find(|v| v.as_str() == name)
+    }
+}
+
 /// The paragraphs between the title and the first section, each on one line:
 /// the file is wrapped for reading, and a host shows instructions as prose.
 pub fn opening(protocol: &str) -> String {
@@ -72,6 +96,43 @@ pub fn text(language: Option<Lang>) -> Cow<'static, str> {
     );
     let text = replace_spaced(PROTOCOL, OPENING_RULE, &opening_rule);
     Cow::Owned(replace_spaced(&text, SAVE_RULE, &save_rule))
+}
+
+/// What the short block says of the rest, in place of the rules the server's
+/// instructions and the tools' descriptions already carry.
+const SHORT_LEAD: &str = "The rules for clawg's tools come with its server's instructions; this block keeps only what they leave out.";
+
+const SHORT_LEAD_ES: &str = "Las reglas de las herramientas de clawg vienen con las instrucciones de su servidor; este bloque guarda sólo lo que les falta.";
+
+/// The sections of the protocol that neither the opening nor the tools'
+/// descriptions say: the shape of a `session_summary`, and what to do after a
+/// compaction.
+const SHORT_SECTIONS: [&str; 2] = ["Session summary", "After a compaction"];
+
+const SHORT_SECTIONS_ES: [&str; 2] = ["Resumen de sesión", "Después de una compactación"];
+
+/// The short protocol for `language`: the title of the protocol, a line on
+/// where its rules are, and the two sections of [`SHORT_SECTIONS`] as the
+/// protocol has them, with `\n` line endings. The file in English for any
+/// language but Spanish.
+pub fn short(language: Option<Lang>) -> String {
+    let (protocol, lead, sections) = match language {
+        Some(Lang::Es) => (PROTOCOL_ES, SHORT_LEAD_ES, SHORT_SECTIONS_ES),
+        _ => (PROTOCOL, SHORT_LEAD, SHORT_SECTIONS),
+    };
+    let protocol = protocol.replace("\r\n", "\n");
+    let mut parts = vec![protocol.lines().next().unwrap_or_default().to_string(), lead.to_string()];
+    parts.extend(sections.iter().filter_map(|heading| section(&protocol, heading)));
+    parts.join("\n\n")
+}
+
+/// The `## {heading}` section of `protocol` (`\n` line endings), heading
+/// included, up to the next section.
+fn section(protocol: &str, heading: &str) -> Option<String> {
+    let start = protocol.find(&format!("\n## {heading}\n"))? + 1;
+    let rest = &protocol[start..];
+    let end = rest.find("\n## ").unwrap_or(rest.len());
+    Some(rest[..end].trim_end().to_string())
 }
 
 /// `text` with every match of `anchor` ([`find_spaced`]) replaced.
@@ -224,6 +285,57 @@ mod tests {
                 assert!(opening.contains(name), "the opening names {name} for a save's project:\n{opening}");
             }
         }
+    }
+
+    #[test]
+    fn the_short_protocol_keeps_the_session_summary_in_both_languages() {
+        let en = short(None);
+        assert_eq!(short(Some(Lang::En)), en, "the English file, whichever way it is asked for");
+        assert!(en.starts_with(
+            "# Claw Garden memory protocol\n\nThe rules for clawg's tools come with its server's instructions; \
+             this block keeps only what they leave out.\n\n## Session summary\n"
+        ));
+        for kept in ["- Goal:", "- Instructions:", "- Discoveries:", "- Accomplished:", "- Next steps:", "- Relevant files:", "- Validation:"] {
+            assert!(en.contains(kept), "{kept} in:\n{en}");
+        }
+        assert!(en.contains("\n## After a compaction\n\nSave the summary of what was compacted"), "{en}");
+        assert!(!en.contains("## How to write a save") && !en.contains("## Conclusions"), "{en}");
+
+        let es = short(Some(Lang::Es));
+        assert!(es.starts_with(
+            "# Protocolo de memoria de Claw Garden\n\nLas reglas de las herramientas de clawg vienen con las \
+             instrucciones de su servidor; este bloque guarda sólo lo que les falta.\n\n## Resumen de sesión\n"
+        ));
+        for kept in ["- Objetivo:", "- Instrucciones:", "- Descubrimientos:", "- Logrado:", "- Próximos pasos:", "- Archivos relevantes:", "- Validación:"] {
+            assert!(es.contains(kept), "{kept} in:\n{es}");
+        }
+        assert!(es.contains("\n## Después de una compactación\n\nGuarda el resumen de lo compactado"), "{es}");
+        assert!(!es.contains("## Cómo escribir un save") && !es.contains("## Conclusiones"), "{es}");
+
+        for text in [&en, &es] {
+            assert!(text.len() < 2000, "{} bytes", text.len());
+            assert!(!text.contains('\r'));
+        }
+    }
+
+    #[test]
+    fn the_short_protocol_has_no_opening() {
+        for language in [None, Some(Lang::En), Some(Lang::Es)] {
+            let short = short(language);
+            for paragraph in opening(&text(language)).split("\n\n") {
+                assert!(!short.contains(paragraph), "{language:?} repeats: {paragraph}");
+            }
+            assert!(!short.contains("`search_memory`"), "{language:?}:\n{short}");
+        }
+    }
+
+    #[test]
+    fn a_variant_is_named_by_its_option() {
+        for variant in Variant::ALL {
+            assert_eq!(Variant::parse(variant.as_str()), Some(variant));
+        }
+        assert_eq!(Variant::parse("tiny"), None);
+        assert_eq!(Variant::parse("Full"), None);
     }
 
     #[test]

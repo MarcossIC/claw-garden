@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use clawg_core::paths::Profile;
 use clawg_core::preferences::Lang;
 
-use crate::arm::{Arm, Layout, Options};
+use crate::arm::{Arm, Layout, Options, Shape};
 use crate::run::Client;
 
 const HELP_TEXT: &str = "\
@@ -26,14 +26,18 @@ agent-eval run RUN_OPTIONS (--replay STREAM | --max-budget-usd N --claude-versio
 agent-eval score --run DIR
 agent-eval report --runs DIR
 agent-eval costs --runs DIR
-agent-eval replay-client STREAM
+agent-eval calls --runs DIR
+agent-eval replay-client STREAM [--mcp-config FILE]
 agent-eval hook-context FILE
 agent-eval hook-log FILE
 
   tasks          reads every task in DIR/tasks/*.json, checks each one and
-                 that no tracer is in a file of its fixture, and lists them;
-                 then checks DIR/noise.json, rules of other topics, and that
-                 none of them holds a tracer.
+                 that no tracer is in a file of its fixture, and lists them,
+                 with the number of sessions of those that have several;
+                 then checks every noise, DIR/noise.json
+                 and DIR/noise-NAME.json, rules of other topics, and that
+                 none of them holds a tracer, and lists how many rules each
+                 has.
   prepare        lays out one run of a task under an arm in --out: the
                  fixture copied as the working directory, the client's
                  configuration, the seed (the task's memories and the noise,
@@ -67,32 +71,74 @@ agent-eval hook-log FILE
                  home through the system, so an arm with clawg needs a
                  `testing` build of it, which reads CLAWG_TEST_HOME; any
                  other is refused.
-  score          scores a run directory again from its stream.jsonl.
+  score          scores a run directory again from the streams of its sessions
+                 (stream.jsonl, or stream-K.jsonl for a task of several): each
+                 session on its own, with the path of every fact born in a
+                 session, and the run as a whole. A run that a session stopped
+                 is scored with the sessions that ran, and did not end.
   report         reads the result.json of every directory up to 3 levels
-                 below DIR and prints a Markdown table by task and arm: runs,
-                 successes, runs that did not end, mean cost, turns, seconds
-                 and clawg calls, the tracer fates summed, a totals line and
-                 the tokens of every model summed.
+                 below DIR and prints a Markdown table by task, arm and shape
+                 (split, joined): runs, successes, runs that did not end, mean
+                 cost, turns, seconds (of the whole run, the sum of its
+                 sessions) and clawg calls, the tracer fates summed, the first
+                 request tokens, the sessions per run, the median context of
+                 every request, the median relay overhead and the facts born
+                 in a session summed by what became of them, a totals line
+                 (the first session of a fork counted once) and the tokens of
+                 every model summed. Then, for the runs that forked, a table by
+                 task and arm with their pairs: how many each branch passed,
+                 how many the continued one passed and the new one failed, the
+                 median context at the fork and the median saving in cost of
+                 the new session over the continued one, of the pairs whose
+                 continuation read 80 % of its first request from the cache.
   costs          reads the same results and prints a CSV with a line per
                  session and model: when the session started and ended
                  (UTC), the credential that paid, the tokens by kind, the
-                 main loop's cache writes for 5 minutes and for 1 hour, and
-                 the client's estimate of the cost.
+                 main loop's cache writes for 5 minutes and for 1 hour, the
+                 client's estimate of the cost, and the number of the
+                 session and the shape of its run.
+  calls          reads the stream of every session below DIR and prints a
+                 table by tool: its calls, those that carry tokens of their
+                 own (alone in their message and followed by another request),
+                 and the median and p90 of the tokens they add to the context.
+                 A tool of a server whose median passes 1500 is noted as a
+                 candidate for a diet.
   replay-client  the client a dry run starts: prints STREAM after making
-                 its file changes in the current directory.
+                 its file changes in the current directory. With the
+                 --mcp-config of a run that has a server, each call of STREAM
+                 to a tool of that server is made to it, started as the file
+                 names it, and STREAM is printed with what the server
+                 answered in place of the results it recorded; the other
+                 calls stay as recorded. A call the server cannot answer
+                 fails the client, naming the tool.
   hook-context   the startup hook of the arms l1 and l2: prints FILE as the
                  context a SessionStart hook adds.
   hook-log       the hook of every arm on InstructionsLoaded: appends the
                  input it gets to FILE, one line each.
 
 RUN_OPTIONS:
-  --task ID --arm a0|a2|a3|a3-eager|a4|b|l0|l1|l2 --out DIR --clawg PATH --model M
+  --task ID --arm a0|a2|a3|a3-eager|a3-short|a3-notools|a4|b|l0|l1|l2 --out DIR --clawg PATH --model M
   [--effort E] [--max-budget-usd N] [--claude-version V] [--profile dev|prod]
-  [--lang en|es] [--data DIR]
+  [--lang en|es] [--data DIR] [--sessions split|joined|both] [--noise NAME]
 
   --clawg is the absolute path of the clawg binary the arms with clawg run;
   --profile (dev by default) picks its data directory under the run's home.
   --data defaults to this crate's data/agent-tasks.
+  --noise names the rules of other topics every arm with memory is seeded
+  with besides the task's: DIR/NAME.json, where NAME is noise (the default) or
+  noise-NAME. An l1 or l2 run refuses one whose rules at startup pass the 10000
+  characters the client injects from a hook.
+  --sessions says how a task of several sessions is played: split (the
+  default) starts a conversation for each session, joined continues the
+  conversation of the one before with --continue, and both plays the second
+  session of a task of two sessions each way from the same first one: after the
+  first session the working directory, the client's configuration and the data
+  of clawg (without its models) are copied to fork/, the second session is
+  played continued, everything is put back and it is played again as a new one.
+  Each branch is left in joined/ or split/ with its stream, its working
+  directory and its own result.json, and the run has none of its own. A replay
+  of a fork is a directory with session-1.jsonl, joined-2.jsonl and
+  split-2.jsonl. A task of one session takes only split.
 
 Exit 0 done, 1 a task, file or run could not be used, 2 bad arguments.";
 
@@ -113,6 +159,8 @@ struct RunArgs {
     claude_version: Option<String>,
     profile: Profile,
     lang: Option<Lang>,
+    shape: Shape,
+    noise: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -124,7 +172,8 @@ enum Command {
     Score { dir: PathBuf },
     Report { dir: PathBuf },
     Costs { dir: PathBuf },
-    ReplayClient { stream: PathBuf },
+    Calls { dir: PathBuf },
+    ReplayClient { stream: PathBuf, mcp_config: Option<PathBuf> },
     HookContext { file: PathBuf },
     HookLog { file: PathBuf },
 }
@@ -156,7 +205,8 @@ fn required(flags: &mut Vec<(String, String)>, name: &str) -> Result<String, Str
     take(flags, name).ok_or_else(|| format!("--{name} is required"))
 }
 
-const RUN_FLAGS: [&str; 11] = ["task", "arm", "out", "clawg", "model", "effort", "max-budget-usd", "claude-version", "profile", "lang", "data"];
+const RUN_FLAGS: [&str; 13] =
+    ["task", "arm", "out", "clawg", "model", "effort", "max-budget-usd", "claude-version", "profile", "lang", "data", "sessions", "noise"];
 
 fn run_args(f: &mut Vec<(String, String)>) -> Result<RunArgs, String> {
     let arm_name = required(f, "arm")?;
@@ -178,6 +228,12 @@ fn run_args(f: &mut Vec<(String, String)>) -> Result<RunArgs, String> {
         Some(code) => Some(Lang::parse(&code).ok_or_else(|| format!("unknown language {code}"))?),
         None => None,
     };
+    let shape = match take(f, "sessions") {
+        Some(name) => Shape::parse(&name).ok_or_else(|| format!("unknown shape {name}"))?,
+        None => Shape::Split,
+    };
+    let noise = take(f, "noise").unwrap_or_else(|| task::DEFAULT_NOISE.to_owned());
+    task::check_noise_name(&noise).map_err(|e| format!("--noise {e}"))?;
     Ok(RunArgs {
         data: take(f, "data").map_or_else(default_data, PathBuf::from),
         task: required(f, "task")?,
@@ -190,6 +246,8 @@ fn run_args(f: &mut Vec<(String, String)>) -> Result<RunArgs, String> {
         claude_version: take(f, "claude-version"),
         profile,
         lang,
+        shape,
+        noise,
     })
 }
 
@@ -224,9 +282,15 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Command>, Str
         "score" => Command::Score { dir: PathBuf::from(required(&mut flags(rest, &["run"])?, "run")?) },
         "report" => Command::Report { dir: PathBuf::from(required(&mut flags(rest, &["runs"])?, "runs")?) },
         "costs" => Command::Costs { dir: PathBuf::from(required(&mut flags(rest, &["runs"])?, "runs")?) },
+        "calls" => Command::Calls { dir: PathBuf::from(required(&mut flags(rest, &["runs"])?, "runs")?) },
         "replay-client" => {
-            let [stream]: [String; 1] = rest.collect::<Vec<_>>().try_into().map_err(|_| "replay-client takes one stream file")?;
-            Command::ReplayClient { stream: PathBuf::from(stream) }
+            let rest: Vec<String> = rest.collect();
+            let (stream, mcp_config) = match rest.as_slice() {
+                [stream] => (stream, None),
+                [stream, flag, config] if flag == "--mcp-config" => (stream, Some(PathBuf::from(config))),
+                _ => return Err("replay-client takes one stream file and, optionally, --mcp-config FILE".into()),
+            };
+            Command::ReplayClient { stream: PathBuf::from(stream), mcp_config }
         }
         "hook-context" | "hook-log" => {
             let [file]: [String; 1] = rest.collect::<Vec<_>>().try_into().map_err(|_| format!("{kind} takes one file"))?;
@@ -244,24 +308,30 @@ fn now_ms() -> i64 {
 
 fn list_tasks(data: &Path) -> Result<(), String> {
     let tasks = task::load(data).map_err(|e| e.to_string())?;
-    let noise = task::load_noise(data, &tasks).map_err(|e| e.to_string())?;
+    let mut noises = Vec::new();
+    for name in task::noise_names(data).map_err(|e| e.to_string())? {
+        noises.push((task::load_noise(data, &name, &tasks).map_err(|e| e.to_string())?.len(), name));
+    }
     let mut leaks = Vec::new();
     for t in &tasks {
         let mut files = Vec::new();
         read_files(&task::fixture_dir(data, t), "", &mut files).map_err(|e| e.to_string())?;
         leaks.extend(task::leaked_tracers(t, &files).into_iter().map(|l| format!("{}: {l}", t.id)));
+        let several = if t.sessions.is_empty() { String::new() } else { format!(" sessions={}", t.sessions.len()) };
         println!(
-            "{} {} fixture={} memories={} tracers={} checks={}{}",
+            "{} {} fixture={} memories={} tracers={} checks={}{several}{}",
             t.id,
             t.category,
             t.fixture,
             t.memories.len(),
-            t.tracers.len(),
-            t.checks.len(),
+            t.every_tracer().count(),
+            t.checks.len() + t.sessions.iter().map(|s| s.checks.len()).sum::<usize>(),
             if t.example { " example" } else { "" }
         );
     }
-    println!("noise rules={}", noise.len());
+    for (rules, name) in noises {
+        println!("{name} rules={rules}");
+    }
     if leaks.is_empty() {
         Ok(())
     } else {
@@ -287,8 +357,15 @@ fn read_files(dir: &Path, prefix: &str, out: &mut Vec<(String, String)>) -> std:
 /// The task of the run and the noise every arm with memory is seeded with.
 fn load_task(args: &RunArgs) -> Result<(task::Task, Vec<task::SeedMemory>), String> {
     let tasks = task::load(&args.data).map_err(|e| e.to_string())?;
-    let noise = task::load_noise(&args.data, &tasks).map_err(|e| e.to_string())?;
-    Ok((task::find(tasks, &args.task).map_err(|e| e.to_string())?, noise))
+    let noise = task::load_noise(&args.data, &args.noise, &tasks).map_err(|e| e.to_string())?;
+    let task = task::find(tasks, &args.task).map_err(|e| e.to_string())?;
+    check_shape(&task, args.shape)?;
+    Ok((task, noise))
+}
+
+/// Why `task` cannot be played the way `shape` says, if it cannot.
+fn check_shape(task: &task::Task, shape: Shape) -> Result<(), String> {
+    shape.check(task.prompts().len())
 }
 
 fn prepare(args: &RunArgs, t: &task::Task, noise: Vec<task::SeedMemory>, client: &Client) -> Result<Layout, String> {
@@ -304,20 +381,45 @@ fn prepare(args: &RunArgs, t: &task::Task, noise: Vec<task::SeedMemory>, client:
         claude_version: args.claude_version.clone(),
         now_ms: now_ms(),
         noise,
+        noise_name: args.noise.clone(),
+        shape: args.shape,
         agent_eval,
     };
     run::prepare(t, args.arm, &task::fixture_dir(&args.data, t), &layout, &options, client).map_err(|e| e.to_string())?;
     Ok(layout)
 }
 
-/// The absolute path of a stream to replay, which must be a file.
-fn replay_file(stream: &Path) -> Result<PathBuf, String> {
-    let stream = std::path::absolute(stream).map_err(|e| format!("{}: {e}", stream.display()))?;
-    match std::fs::metadata(&stream) {
-        Ok(m) if m.is_file() => Ok(stream),
-        Ok(_) => Err(format!("--replay {} is not a file", stream.display())),
-        Err(e) => Err(format!("--replay {}: {e}", stream.display())),
+/// The streams a replay of `sessions` sessions played as `shape` needs, by file name.
+fn replay_streams(sessions: usize, shape: Shape) -> Vec<String> {
+    if shape == Shape::Both {
+        return ["session-1.jsonl", "joined-2.jsonl", "split-2.jsonl"].map(String::from).to_vec();
     }
+    (1..=sessions).map(|k| format!("session-{k}.jsonl")).collect()
+}
+
+/// The absolute path of what to replay: a stream, for a task of one session, or
+/// a directory that holds exactly the streams the sessions need.
+fn replay_source(stream: &Path, sessions: usize, shape: Shape) -> Result<PathBuf, String> {
+    let stream = std::path::absolute(stream).map_err(|e| format!("{}: {e}", stream.display()))?;
+    let said = |why: String| format!("--replay {} {why}", stream.display());
+    let meta = std::fs::metadata(&stream).map_err(|e| format!("--replay {}: {e}", stream.display()))?;
+    let expected = replay_streams(sessions, shape);
+    if meta.is_file() {
+        return if sessions == 1 {
+            Ok(stream)
+        } else {
+            Err(said(format!("is a file, and the task has {sessions} sessions: give a directory with {}", expected.join(", "))))
+        };
+    }
+    let mut present = Vec::new();
+    for entry in std::fs::read_dir(&stream).map_err(|e| format!("--replay {}: {e}", stream.display()))? {
+        let entry = entry.map_err(|e| format!("--replay {}: {e}", stream.display()))?;
+        present.push(entry.file_name().to_string_lossy().into_owned());
+    }
+    let lacks = expected.iter().filter(|name| !present.contains(name)).map(|name| format!("lacks {name}"));
+    let extra = present.iter().filter(|name| !expected.contains(name)).map(|name| format!("holds {name}, which no session plays"));
+    let problems: Vec<String> = lacks.chain(extra).collect();
+    if problems.is_empty() { Ok(stream) } else { Err(said(problems.join("; "))) }
 }
 
 fn execute(command: Command) -> Result<(), String> {
@@ -330,33 +432,53 @@ fn execute(command: Command) -> Result<(), String> {
             Ok(())
         }
         Command::Run { args, replay } => {
+            run::check_isolation(cfg!(windows), args.arm, &args.clawg).map_err(|e| e.to_string())?;
+            let (t, noise) = load_task(&args)?;
             let client = match replay {
-                Some(stream) => Client::Replay(replay_file(&stream)?),
+                Some(stream) => Client::Replay(replay_source(&stream, t.prompts().len(), args.shape)?),
                 None => Client::Claude,
             };
-            run::check_isolation(cfg!(windows), args.arm, &args.clawg).map_err(|e| e.to_string())?;
+            if client == Client::Claude {
+                run::check_read_block(args.claude_version.as_deref()).map_err(|e| e.to_string())?;
+            }
             if let (Client::Claude, Some(version)) = (&client, &args.claude_version) {
                 run::check_client_version(arm::CLIENT, version).map_err(|e| e.to_string())?;
             }
-            let (t, noise) = load_task(&args)?;
             if client == Client::Claude {
                 run::check_paid_run(&args.out, &t).map_err(|e| e.to_string())?;
             }
             let layout = prepare(&args, &t, noise, &client)?;
             let exe = std::env::current_exe().map_err(|e| format!("cannot locate agent-eval: {e}"))?;
-            run::execute(&layout.root, &exe).map_err(|e| e.to_string())?;
-            let result = run::score_dir(&layout.root).map_err(|e| e.to_string())?;
-            println!("{}", run::summary(&result));
+            if let Err(failed) = run::execute(&layout.root, &exe) {
+                // Every session that left a stream is still a result: it was paid for.
+                for result in run::score_dir(&layout.root).unwrap_or_default() {
+                    println!("{}", run::summary(&result));
+                }
+                return Err(failed.to_string());
+            }
+            for result in run::score_dir(&layout.root).map_err(|e| e.to_string())? {
+                println!("{}", run::summary(&result));
+            }
             Ok(())
         }
         Command::Score { dir } => {
-            let result = run::score_dir(&dir).map_err(|e| e.to_string())?;
-            println!("{}", run::summary(&result));
+            for result in run::score_dir(&dir).map_err(|e| e.to_string())? {
+                println!("{}", run::summary(&result));
+            }
             Ok(())
         }
         Command::Report { dir } => {
-            let results = report::load(&dir).map_err(|e| e.to_string())?;
+            let named = report::load_named(&dir).map_err(|e| e.to_string())?;
+            let results: Vec<run::RunResult> = named.iter().map(|(_, r)| r.clone()).collect();
             print!("{}", report::render(&report::aggregate(&results)));
+            let left_out = report::render_excluded(&report::excluded(&named));
+            if !left_out.is_empty() {
+                print!("\n{left_out}");
+            }
+            let forks = report::render_pairs(&report::pairs(&named));
+            if !forks.is_empty() {
+                print!("\n{forks}");
+            }
             Ok(())
         }
         Command::Costs { dir } => {
@@ -364,9 +486,14 @@ fn execute(command: Command) -> Result<(), String> {
             print!("{}", report::costs(&runs));
             Ok(())
         }
-        Command::ReplayClient { stream } => {
+        Command::Calls { dir } => {
+            let streams = report::load_streams(&dir).map_err(|e| e.to_string())?;
+            print!("{}", report::calls(&streams));
+            Ok(())
+        }
+        Command::ReplayClient { stream, mcp_config } => {
             let cwd = std::env::current_dir().map_err(|e| format!("cannot read the current directory: {e}"))?;
-            replay::run(&stream, &cwd)
+            replay::run(&stream, &cwd, mcp_config.as_deref())
         }
         Command::HookContext { file } => {
             let text = std::fs::read_to_string(&file).map_err(|e| format!("{}: {e}", file.display()))?;
@@ -453,7 +580,12 @@ mod tests {
     fn the_other_commands_parse() {
         assert_eq!(parse_args(args(&["tasks"])), Ok(Some(Command::Tasks { data: default_data() })));
         assert_eq!(parse_args(args(&["score", "--run", "r"])), Ok(Some(Command::Score { dir: "r".into() })));
-        assert_eq!(parse_args(args(&["replay-client", "s"])), Ok(Some(Command::ReplayClient { stream: "s".into() })));
+        assert_eq!(parse_args(args(&["replay-client", "s"])), Ok(Some(Command::ReplayClient { stream: "s".into(), mcp_config: None })));
+        assert_eq!(
+            parse_args(args(&["replay-client", "s", "--mcp-config", "m.json"])),
+            Ok(Some(Command::ReplayClient { stream: "s".into(), mcp_config: Some("m.json".into()) }))
+        );
+        assert!(parse_args(args(&["replay-client", "s", "--other", "m"])).unwrap_err().contains("--mcp-config"));
         assert_eq!(parse_args(args(&["report", "--runs", "d"])), Ok(Some(Command::Report { dir: "d".into() })));
         assert_eq!(parse_args(args(&["costs", "--runs", "d"])), Ok(Some(Command::Costs { dir: "d".into() })));
         assert!(parse_args(args(&["costs"])).unwrap_err().contains("--runs is required"));
@@ -464,11 +596,89 @@ mod tests {
     }
 
     #[test]
+    fn the_noise_of_a_run_parses() {
+        let base = ["prepare", "--task", "t", "--arm", "a3", "--out", "r", "--clawg", clawg(), "--model", "m"];
+        let with = |extra: &[&str]| parse_args(args(&[&base[..], extra].concat()));
+        let noise = |extra: &[&str]| match with(extra) {
+            Ok(Some(Command::Prepare(run))) => run.noise,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(noise(&[]), "noise");
+        assert_eq!(noise(&["--noise", "noise-300"]), "noise-300");
+        assert_eq!(noise(&["--noise", "noise"]), "noise");
+        for refused in ["tasks", "other", "noise-", "../noise"] {
+            let said = with(&["--noise", refused]).unwrap_err();
+            assert!(said.contains("is not a noise") && said.contains(refused), "{refused}: {said}");
+        }
+        assert!(HELP_TEXT.contains("--noise NAME"));
+        let run = parse_args(args(&["run", "--task", "t", "--arm", "a3", "--out", "r", "--clawg", clawg(), "--model", "m", "--noise", "noise-300", "--replay", "s"]));
+        assert!(matches!(run, Ok(Some(Command::Run { args, .. })) if args.noise == "noise-300"));
+    }
+
+    #[test]
+    fn the_calls_command_parses() {
+        assert_eq!(parse_args(args(&["calls", "--runs", "d"])), Ok(Some(Command::Calls { dir: "d".into() })));
+        assert!(parse_args(args(&["calls"])).unwrap_err().contains("--runs is required"));
+        assert!(parse_args(args(&["calls", "--run", "d"])).unwrap_err().contains("unknown argument --run"));
+        assert!(HELP_TEXT.contains("agent-eval calls --runs DIR"));
+    }
+
+    #[test]
+    fn the_shape_of_a_run_parses_and_is_refused_where_the_task_cannot_take_it() {
+        let base = ["prepare", "--task", "t", "--arm", "a3", "--out", "r", "--clawg", clawg(), "--model", "m"];
+        let with = |extra: &[&str]| parse_args(args(&[&base[..], extra].concat()));
+        let shape = |extra: &[&str]| match with(extra) {
+            Ok(Some(Command::Prepare(run))) => run.shape,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(shape(&[]), Shape::Split);
+        assert_eq!(shape(&["--sessions", "joined"]), Shape::Joined);
+        assert_eq!(shape(&["--sessions", "both"]), Shape::Both);
+        assert!(with(&["--sessions", "sideways"]).unwrap_err().contains("unknown shape sideways"));
+        assert!(HELP_TEXT.contains("--sessions split|joined|both"));
+
+        let one = task::parse(r#"{"id": "t", "category": "K1", "fixture": "f", "prompt": "p", "checks": [{"kind": "answer_contains", "text": "x"}]}"#).unwrap();
+        assert_eq!(check_shape(&one, Shape::Split), Ok(()));
+        for refused in [Shape::Joined, Shape::Both] {
+            assert!(check_shape(&one, refused).unwrap_err().contains("one session"), "{refused:?}");
+        }
+    }
+
+    #[test]
     fn the_hook_commands_parse() {
         assert_eq!(parse_args(args(&["hook-context", "f.md"])), Ok(Some(Command::HookContext { file: "f.md".into() })));
         assert_eq!(parse_args(args(&["hook-log", "l.jsonl"])), Ok(Some(Command::HookLog { file: "l.jsonl".into() })));
         assert!(parse_args(args(&["hook-log"])).unwrap_err().contains("hook-log takes one file"));
         assert!(parse_args(args(&["hook-context", "a", "b"])).unwrap_err().contains("hook-context takes one file"));
+    }
+
+    #[test]
+    fn a_replay_is_a_stream_or_a_directory_with_one_per_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("s.jsonl");
+        std::fs::write(&file, "").unwrap();
+        assert_eq!(replay_source(&file, 1, Shape::Split), Ok(file.clone()));
+        let said = replay_source(&file, 2, Shape::Split).unwrap_err();
+        assert!(said.contains("--replay") && said.contains("2 sessions") && said.contains("session-1.jsonl"), "{said}");
+
+        let streams = dir.path().join("streams");
+        std::fs::create_dir(&streams).unwrap();
+        let put = |name: &str| std::fs::write(streams.join(name), "").unwrap();
+        put("session-1.jsonl");
+        let said = replay_source(&streams, 2, Shape::Joined).unwrap_err();
+        assert!(said.contains("--replay") && said.contains("lacks session-2.jsonl"), "{said}");
+        put("session-2.jsonl");
+        assert_eq!(replay_source(&streams, 2, Shape::Joined), Ok(streams.clone()));
+        put("session-3.jsonl");
+        let said = replay_source(&streams, 2, Shape::Split).unwrap_err();
+        assert!(said.contains("holds session-3.jsonl, which no session plays"), "{said}");
+        assert_eq!(replay_source(&streams, 3, Shape::Split), Ok(streams.clone()));
+
+        assert_eq!(replay_streams(2, Shape::Split), ["session-1.jsonl", "session-2.jsonl"]);
+        assert_eq!(replay_streams(1, Shape::Split), ["session-1.jsonl"]);
+        assert_eq!(replay_streams(2, Shape::Both), ["session-1.jsonl", "joined-2.jsonl", "split-2.jsonl"]);
+        let missing = dir.path().join("missing");
+        assert!(replay_source(&missing, 1, Shape::Split).unwrap_err().contains(&format!("--replay {}", missing.display())));
     }
 
     #[test]
@@ -487,6 +697,8 @@ mod tests {
             claude_version: None,
             profile: Profile::Dev,
             lang: None,
+            shape: Shape::Split,
+            noise: "noise".into(),
         };
         for replay in [dir.path().join("missing.jsonl"), dir.path().to_path_buf()] {
             let err = execute(Command::Run { args: args.clone(), replay: Some(replay.clone()) }).unwrap_err();
