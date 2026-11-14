@@ -566,6 +566,11 @@ pub enum RunError {
     ClientVersion { program: String, expected: String, found: Option<String> },
     #[error("a paid run would be skewed: {}", join_leaks(.0))]
     PaidRun(Vec<Leak>),
+    #[error(
+        "a paid run needs Claude Code {READ_BLOCK_FROM} or later, the first version that denies the reads outside the working directory, and --claude-version is {}",
+        .found.as_ref().map_or_else(|| "no version".to_owned(), |v| format!("{v:?}"))
+    )]
+    ReadBlock { found: Option<String> },
 }
 
 /// What would reach a paid session from outside the run, or keep it from running.
@@ -792,6 +797,24 @@ pub fn check_client_version(program: &str, expected: &str) -> Result<(), RunErro
     } else {
         Err(RunError::ClientVersion { program: program.to_owned(), expected: expected.to_owned(), found: found.map(str::to_owned) })
     }
+}
+
+/// The first version of the client that denies the reads outside its working
+/// directories when `permissions.blockReadsOutsideWorkingDirectories` is set.
+pub const READ_BLOCK_FROM: &str = "2.1.257";
+
+/// The three numbers of a version such as `2.1.300`.
+fn version_numbers(version: &str) -> Option<[u64; 3]> {
+    let mut parts = version.split('.').map(|part| if part.chars().all(|c| c.is_ascii_digit()) { part.parse().ok() } else { None });
+    let numbers = [parts.next()??, parts.next()??, parts.next()??];
+    parts.next().is_none().then_some(numbers)
+}
+
+/// Refuses a paid run pinned to a client older than [`READ_BLOCK_FROM`]: with it
+/// the sessions could read what the run keeps outside their working directory.
+pub fn check_read_block(version: Option<&str>) -> Result<(), RunError> {
+    let enough = version.and_then(version_numbers).zip(version_numbers(READ_BLOCK_FROM)).is_some_and(|(found, minimum)| found >= minimum);
+    if enough { Ok(()) } else { Err(RunError::ReadBlock { found: version.map(str::to_owned) }) }
 }
 
 /// The plan `prepare` left in `root`'s `run.json`, and its client.
@@ -1481,6 +1504,19 @@ mod tests {
             [Leak::NoApiKey, Leak::AuthToken, Leak::EffortLevel]
         );
         assert_eq!(leaks(Some("k"), Some(""), Some(""), out, &ancestors, &[], &t), [], "an empty variable sets nothing");
+    }
+
+    #[test]
+    fn a_paid_run_refuses_a_client_without_the_read_block() {
+        for version in ["2.1.257", "2.1.258", "2.1.300", "2.1.1000", "2.2.0", "2.10.0", "3.0.0"] {
+            assert!(check_read_block(Some(version)).is_ok(), "{version}");
+        }
+        for version in ["2.1.256", "2.1.99", "2.0.999", "1.9.9", "2.1", "latest", ""] {
+            let said = check_read_block(Some(version)).unwrap_err().to_string();
+            assert!(said.contains("2.1.257") && said.contains(&format!("{version:?}")), "{version}: {said}");
+        }
+        let said = check_read_block(None).unwrap_err().to_string();
+        assert!(said.contains("2.1.257") && said.contains("no version"), "{said}");
     }
 
     #[test]

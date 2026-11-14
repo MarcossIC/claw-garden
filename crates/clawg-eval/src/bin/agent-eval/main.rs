@@ -438,6 +438,9 @@ fn execute(command: Command) -> Result<(), String> {
                 Some(stream) => Client::Replay(replay_source(&stream, t.prompts().len(), args.shape)?),
                 None => Client::Claude,
             };
+            if client == Client::Claude {
+                run::check_read_block(args.claude_version.as_deref()).map_err(|e| e.to_string())?;
+            }
             if let (Client::Claude, Some(version)) = (&client, &args.claude_version) {
                 run::check_client_version(arm::CLIENT, version).map_err(|e| e.to_string())?;
             }

@@ -654,3 +654,31 @@ fn a_run_with_claude_refuses_another_version_before_laying_out_the_run() {
     assert!(stderr(&output).contains("claude 2.1.300") && stderr(&output).contains("no version"), "{}", stderr(&output));
     assert!(!out.exists(), "nothing of the run was laid out");
 }
+
+#[test]
+fn a_paid_run_with_a_client_that_cannot_block_reads_is_refused_before_anything_else() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("run");
+    let output = agent_eval(&[
+        "run",
+        "--task",
+        "example-staging-port",
+        "--arm",
+        "a3",
+        "--out",
+        out.to_str().unwrap(),
+        "--clawg",
+        clawg().to_str().unwrap(),
+        "--model",
+        "some-model",
+        "--max-budget-usd",
+        "0.5",
+        "--claude-version",
+        "2.1.256",
+    ]);
+
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    let said = stderr(&output);
+    assert!(said.contains("2.1.257") && said.contains("2.1.256") && !said.contains("no version"), "the minimum is named before `claude` is asked: {said}");
+    assert!(!out.exists(), "nothing of the run was laid out");
+}

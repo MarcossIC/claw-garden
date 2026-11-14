@@ -340,9 +340,9 @@ pub fn plan(task: &Task, arm: Arm, layout: &Layout, options: &Options) -> Result
         }
         after.push(Step { program: clawg, args: ["stop", "--profile", options.profile.as_str()].map(String::from).to_vec() });
     }
+    let native_dir = layout.config_dir().join("projects").join(seed::project_slug(&workdir)).join("memory");
     if arm == Arm::A4 && !memories.is_empty() {
-        let dir = layout.config_dir().join("projects").join(seed::project_slug(&workdir)).join("memory");
-        files.push((dir.join("MEMORY.md"), seed::native_memory(&memories)));
+        files.push((native_dir.join("MEMORY.md"), seed::native_memory(&memories)));
     }
     let harness = text(&options.agent_eval)?;
     if let Some(by_file) = arm.rules_by_file() {
@@ -359,6 +359,13 @@ pub fn plan(task: &Task, arm: Arm, layout: &Layout, options: &Options) -> Result
         }
     }
     add_hook(&mut settings, "InstructionsLoaded", harness_hook(&harness, "hook-log", &text(&layout.instructions_log())?));
+    // What the run keeps beside the working directory (the task with its checks, the streams of the
+    // sessions before, the other branch of a fork) is readable with the file tools unless the client
+    // denies it. The native memory is a working directory of its arm, or the block would deny it its notes.
+    settings["permissions"]["blockReadsOutsideWorkingDirectories"] = json!(true);
+    if arm == Arm::A4 {
+        settings["permissions"]["additionalDirectories"] = json!([text(&native_dir)?]);
+    }
     files.push((layout.config_dir().join("settings.json"), serde_json::to_string_pretty(&settings).expect("JSON serializes") + "\n"));
     files.push((layout.mcp_config(), serde_json::to_string_pretty(&json!({ "mcpServers": servers })).expect("JSON serializes") + "\n"));
 
@@ -640,6 +647,48 @@ mod tests {
             assert_eq!(settings["hooks"]["InstructionsLoaded"], logged, "{}", arm.as_str());
             let with_setup = matches!(arm, Arm::A3 | Arm::A3Eager | Arm::A3Short | Arm::B | Arm::L0 | Arm::L1 | Arm::L2);
             assert_eq!(settings["hooks"]["UserPromptSubmit"].is_array(), with_setup, "setup's hooks stay: {}", arm.as_str());
+        }
+    }
+
+    #[test]
+    fn every_arm_blocks_the_reads_outside_its_working_directory() {
+        for arm in ARMS {
+            let plan = plan(&task(true), arm, &layout(), &options(None)).unwrap();
+            assert_eq!(settings(&plan)["permissions"]["blockReadsOutsideWorkingDirectories"], json!(true), "{}", arm.as_str());
+        }
+        let a3 = plan(&task(true), Arm::A3, &layout(), &options(None)).unwrap();
+        let state = State {
+            exe: options(None).clawg,
+            profile: Profile::Dev,
+            servers: setup::File { path: layout().config_dir().join(".claude.json"), text: None },
+            settings: setup::File { path: layout().config_dir().join("settings.json"), text: None },
+            instructions: setup::File { path: layout().config_dir().join("CLAUDE.md"), text: None },
+            language: None,
+            version: setup::own_version().unwrap(),
+            protocol: None,
+        };
+        let FileStep::Write(body) = setup::plan(&state, Mode::Install).unwrap().settings else { panic!("setup writes its settings") };
+        let installed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let settings = settings(&a3);
+        for (key, value) in installed.as_object().unwrap().iter().filter(|(key, _)| *key != "hooks") {
+            assert_eq!(&settings[key], value, "{key} of setup stays");
+        }
+        for (event, groups) in installed["hooks"].as_object().unwrap() {
+            assert_eq!(&settings["hooks"][event], groups, "the {event} hooks of setup stay");
+        }
+    }
+
+    #[test]
+    fn the_native_memory_is_a_working_directory_of_a4_only() {
+        for arm in ARMS {
+            let plan = plan(&task(true), arm, &layout(), &options(None)).unwrap();
+            let permissions = settings(&plan)["permissions"].clone();
+            if arm == Arm::A4 {
+                let memory = plan.files.iter().find(|(p, _)| p.ends_with("memory/MEMORY.md")).map(|(p, _)| p.parent().unwrap().to_str().unwrap().to_owned()).unwrap();
+                assert_eq!(permissions["additionalDirectories"], json!([memory]), "the only one is where the client keeps its notes");
+            } else {
+                assert!(permissions.get("additionalDirectories").is_none(), "{} has no directory but its working directory", arm.as_str());
+            }
         }
     }
 
