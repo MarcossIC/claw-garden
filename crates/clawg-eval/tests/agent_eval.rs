@@ -123,7 +123,8 @@ fn files_below(dir: &Path, out: &mut Vec<PathBuf>) {
 fn the_task_data_keeps_lf_line_endings_on_every_system() {
     let mut files = Vec::new();
     files_below(&data(), &mut files);
-    let with_cr: Vec<_> = files.iter().filter(|p| std::fs::read(p).unwrap().contains(&b'\r')).collect();
+    // A batch file keeps the line endings of its source: .gitattributes leaves it as it is.
+    let with_cr: Vec<_> = files.iter().filter(|p| p.extension().is_none_or(|e| e != "bat")).filter(|p| std::fs::read(p).unwrap().contains(&b'\r')).collect();
     assert!(with_cr.is_empty(), "files with CR: {with_cr:?}");
 }
 
@@ -386,6 +387,67 @@ fn a_branch_of_a_fork_does_not_see_what_the_other_did() {
     assert!(result_of(&run, "joined", "toolu_5").contains("7719"), "the continued session finds what it saved: {}", result_of(&run, "joined", "toolu_5"));
     assert!(!result_of(&run, "split", "toolu_2").contains("7719"), "the new session never meets it: {}", result_of(&run, "split", "toolu_2"));
     assert!(result_of(&run, "split", "toolu_1").contains("48213"), "but it finds what the first session saved: {}", result_of(&run, "split", "toolu_1"));
+}
+
+#[test]
+fn the_tasks_of_several_sessions_are_listed_with_their_sessions() {
+    let output = agent_eval(&["tasks"]);
+    ok(&output);
+    let listed = stdout(&output);
+    for line in [
+        "requests-timeout-decision-relay R fixture=psf-requests memories=0 tracers=2 checks=5 sessions=2",
+        "requests-redact-decision-revised D fixture=psf-requests memories=0 tracers=2 checks=4 sessions=3",
+        "requests-history-owner-convention K2 fixture=psf-requests memories=1 tracers=1 checks=2",
+        "shelf-eza-missing E fixture=shelf-notes memories=0 tracers=0 checks=2 sessions=3",
+        "example-relay-port R fixture=example-tally memories=0 tracers=1 checks=3 sessions=2 example",
+        "example-missing-command E fixture=example-tally memories=0 tracers=0 checks=2 sessions=2 example",
+    ] {
+        assert!(listed.lines().any(|l| l == line), "{line} is not listed in:
+{listed}");
+    }
+}
+
+#[test]
+fn the_replayed_relay_example_follows_its_fact_to_the_second_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let (output, run) = replay_of(dir.path(), "example-relay-port", "a3", &relay_replays(), clawg());
+    ok(&output);
+    let r = result(&run);
+    assert_eq!(r["facts"], serde_json::json!([{"tracer": "48213", "born": 1, "class": "used"}]), "{r:#}");
+    assert_eq!(r["sessions"][0]["saved"], serde_json::json!(["48213"]), "the first session wrote it to a memory");
+    let followed = &r["sessions"][1]["followed"][0];
+    assert_eq!((&followed["tracer"], &followed["fate"]), (&Value::from("48213"), &Value::from("used")));
+    assert!(followed["brought_by"].as_array().unwrap().iter().any(|t| t == "search_memory"), "the search of the second session brought it: {followed}");
+    assert!(stdout(&output).contains("facts not_saved 0 saved_not_reached 0 reached_not_used 0 used 1"), "{}", stdout(&output));
+}
+
+#[test]
+fn the_replayed_missing_command_example_counts_its_failures() {
+    let dir = tempfile::tempdir().unwrap();
+    let streams = data().join("replays").join("example-missing-command.a0");
+    let (output, run) = replay_of(dir.path(), "example-missing-command", "a0", &streams, clawg());
+    ok(&output);
+    let r = result(&run);
+    assert_eq!(r["score"]["success"], true, "the failure of the first session is not charged to the check of the second: {r:#}");
+    assert_eq!(r["sessions"].as_array().unwrap().len(), 2);
+
+    let repeated = dir.path().join("repeated");
+    std::fs::create_dir_all(&repeated).unwrap();
+    std::fs::copy(streams.join("session-1.jsonl"), repeated.join("session-1.jsonl")).unwrap();
+    let second = std::fs::read_to_string(streams.join("session-2.jsonl")).unwrap();
+    std::fs::write(
+        repeated.join("session-2.jsonl"),
+        second.replace("ls -p | grep -v /", "eza -f").replace("README.md\\ntally.py","bash: line 1: eza: command not found"),
+    )
+    .unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let (output, again) = replay_of(other.path(), "example-missing-command", "a0", &repeated, clawg());
+    ok(&output);
+    let r = result(&again);
+    assert_eq!(r["score"]["success"], false, "{r:#}");
+    let failed: Vec<&str> = r["score"]["checks"].as_array().unwrap().iter().filter(|c| c["passed"] == false).map(|c| c["check"].as_str().unwrap()).collect();
+    assert_eq!(failed, ["session 2: Bash failed at most 0 times with \"eza: command not found\""]);
+    assert!(stdout(&output).contains("failure"), "{}", stdout(&output));
 }
 
 #[test]

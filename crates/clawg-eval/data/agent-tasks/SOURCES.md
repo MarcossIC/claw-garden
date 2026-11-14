@@ -1,6 +1,6 @@
 # Sources of the agent tasks
 
-The fixtures and the seeded memories below come from other projects, read at the commit named. Everything a task adds (subject lines, file names in a prompt, checks, ages) is written here, and each entry says which part is whose. A fixture is copied unchanged, because everything inside a fixture directory is what the agent sees and what `search_project` indexes. This file and the licenses stay outside the fixture directories.
+The fixtures and the seeded memories below come from other projects, read at the commit named. Everything a task adds (subject lines, file names in a prompt, checks, ages) is written here, and each entry says which part is whose. A fixture is copied unchanged, because everything inside a fixture directory is what the agent sees and what `search_project` indexes. This file and the licenses stay outside the fixture directories, and `fixtures/.ignore` keeps the fixtures out of the documentation index and of searches made from the repository root.
 
 `LICENSE-APACHE-2.0` is the license of the Apache-2.0 sources.
 
@@ -11,6 +11,8 @@ The fixtures and the seeded memories below come from other projects, read at the
 | `letta-simple-edit` | `examples/letta-code-simple-edit/init_sandbox/` of https://github.com/letta-ai/letta-evals at `95cef361e33a67d5116598b7be699ea1a0ef04ec` | Apache-2.0 |
 | `amb-ts-ignore-gen` | `tasks/ts-ignore-gen/tree/` of https://github.com/GiulioDER/agent-memory-bench at `c1b15726f1153b02dda0490ca1936bb86a809514` | Apache-2.0 |
 | `amb-ts-semver-pin` | `tasks/ts-semver-pin/tree/` of the same repository and commit | Apache-2.0 |
+| `psf-requests` | https://github.com/psf/requests at `3c7baaa05ab4aa49cc819ce3a819d260de19c157`: the directories `src/`, `tests/` and `docs/`, and the files `HISTORY.md`, `README.md`, `pyproject.toml`, `LICENSE` and `NOTICE`. Left out: `tests/certs/`, which holds symbolic links, and `docs/_static/`, which holds images. 64 files, 601855 bytes, copied byte for byte (`.gitattributes` keeps the line endings of `docs/make.bat`) | Apache-2.0, its own `LICENSE` and `NOTICE` are in the fixture |
+| `shelf-notes` | Written here: a small notes shelf in Python, with a `CLAUDE.md` that tells the agent to list files with `eza`, 9 files in `src/` and 7 in `docs/` | Written here |
 
 ## Tasks
 
@@ -25,6 +27,16 @@ The fixtures and the seeded memories below come from other projects, read at the
 **`amb-ts-semver-pin-conflict` (C).** Prompt from `tasks/ts-semver-pin/task.json`; the older memory is line 6 of `corpus/plants/ts-semver-pin/stale_compatible_release.jsonl` and the newer one line 7 of `corpus/sessions/ts-semver-pin/p01.jsonl`, both of agent-memory-bench at the commit above. Both are seeded live and without a topic key, as two saves the detector did not pair. The checks follow `tasks/ts-semver-pin/checker.py`, with `==` written without spaces. Written here: the subject lines and the ages.
 
 **`letta-simple-edit-task1` (N).** Prompt from the first line of `examples/letta-code-simple-edit/dataset.jsonl` of letta-evals at the commit above, without `sandbox/` and without its second sentence, which only served its grader. Its grader runs the file; the check here reads it.
+
+**`requests-timeout-decision-relay` (R).** Only the fixture is from `psf-requests`. The prompts, the decision (the constant `FORK_DEFAULT_TIMEOUT` and its value) and the checks are written here. The decision is told in the first session and never in the second, so the second gets it from a memory, from `TIMEOUTS.md` or not at all.
+
+**`requests-redact-decision-revised` (D).** Only the fixture is from `psf-requests`. The three prompts, the two masks (the first, revised in the second session) and the checks are written here.
+
+**`requests-history-owner-convention` (K2).** Only the fixture is from `psf-requests`. The prompt, the convention of its `HISTORY.md` (every entry of the fork ends with its owner), the age of its memory and the checks are written here.
+
+**`shelf-eza-missing` (E).** The fixture, the prompts and the checks are written here. It seeds no memory: it measures whether a session repeats a command that does not exist. A run allows only the shell commands `eza` and `ls`, and a paid run refuses to start where `eza` is on the `PATH`.
+
+**`example-relay-port` and `example-missing-command`.** Written here, on the fixture `example-tally`, with the streams in `replays/` that test the harness in CI: a fact told in a first session and found by a second, and a command that does not exist.
 
 ## Rules and noise
 

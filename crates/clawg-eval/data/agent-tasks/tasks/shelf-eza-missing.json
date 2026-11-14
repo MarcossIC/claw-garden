@@ -1,0 +1,22 @@
+{
+  "id": "shelf-eza-missing",
+  "category": "E",
+  "fixture": "shelf-notes",
+  "shell": ["eza", "ls"],
+  "missing_commands": ["eza"],
+  "sessions": [
+    {
+      "prompt": "How many files are directly in the src directory of this project? Give me just the number."
+    },
+    {
+      "prompt": "I added nothing since, but count the files directly in the src directory once more and name each of them."
+    },
+    {
+      "prompt": "Now count the files directly in the docs directory. Give me just the number.",
+      "checks": [
+        {"kind": "answer_contains", "text": "7"},
+        {"kind": "tool_failed_count", "name": "Bash", "max": 0, "text": "eza: command not found"}
+      ]
+    }
+  ]
+}

@@ -1,0 +1,20 @@
+{
+  "id": "example-missing-command",
+  "category": "E",
+  "example": true,
+  "fixture": "example-tally",
+  "shell": ["eza", "ls"],
+  "missing_commands": ["eza"],
+  "sessions": [
+    {
+      "prompt": "How many files are directly in the root of this project, not counting folders? Give me just the number."
+    },
+    {
+      "prompt": "Count them once more and name each of them.",
+      "checks": [
+        {"kind": "answer_contains", "text": "tally.py"},
+        {"kind": "tool_failed_count", "name": "Bash", "max": 0, "text": "eza: command not found"}
+      ]
+    }
+  ]
+}

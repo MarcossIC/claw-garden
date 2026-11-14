@@ -1,0 +1,20 @@
+{
+  "id": "requests-history-owner-convention",
+  "category": "K2",
+  "fixture": "psf-requests",
+  "prompt": "Add a to_curl() method to PreparedRequest in src/requests/models.py that returns the equivalent curl command as a string. Document it for users in docs/user/advanced.rst and add a note about it to HISTORY.md, with the conventions of this fork.",
+  "memories": [
+    {
+      "content": "HISTORY.md entries of this fork name their owner\nEvery entry this fork adds to HISTORY.md ends with (owner: resilience-guild).",
+      "memory_type": "user_preference",
+      "user_stated": true,
+      "age_days": 40,
+      "rule": {"paths": ["HISTORY.md"]}
+    }
+  ],
+  "tracers": ["resilience-guild"],
+  "checks": [
+    {"kind": "file_contains", "path": "src/requests/models.py", "text": "def to_curl"},
+    {"kind": "file_contains", "path": "HISTORY.md", "text": "resilience-guild"}
+  ]
+}

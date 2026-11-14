@@ -32,7 +32,8 @@ agent-eval hook-context FILE
 agent-eval hook-log FILE
 
   tasks          reads every task in DIR/tasks/*.json, checks each one and
-                 that no tracer is in a file of its fixture, and lists them;
+                 that no tracer is in a file of its fixture, and lists them,
+                 with the number of sessions of those that have several;
                  then checks every noise, DIR/noise.json
                  and DIR/noise-NAME.json, rules of other topics, and that
                  none of them holds a tracer, and lists how many rules each
@@ -316,14 +317,15 @@ fn list_tasks(data: &Path) -> Result<(), String> {
         let mut files = Vec::new();
         read_files(&task::fixture_dir(data, t), "", &mut files).map_err(|e| e.to_string())?;
         leaks.extend(task::leaked_tracers(t, &files).into_iter().map(|l| format!("{}: {l}", t.id)));
+        let several = if t.sessions.is_empty() { String::new() } else { format!(" sessions={}", t.sessions.len()) };
         println!(
-            "{} {} fixture={} memories={} tracers={} checks={}{}",
+            "{} {} fixture={} memories={} tracers={} checks={}{several}{}",
             t.id,
             t.category,
             t.fixture,
             t.memories.len(),
-            t.tracers.len(),
-            t.checks.len(),
+            t.every_tracer().count(),
+            t.checks.len() + t.sessions.iter().map(|s| s.checks.len()).sum::<usize>(),
             if t.example { " example" } else { "" }
         );
     }
