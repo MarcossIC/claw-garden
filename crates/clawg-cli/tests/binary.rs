@@ -2443,6 +2443,43 @@ async fn doctor_says_when_the_installed_hook_has_no_runs() {
 }
 
 #[tokio::test]
+async fn doctor_names_what_the_ledger_learned_and_the_hooks_that_are_missing() {
+    let sandbox = Sandbox::new();
+    let program = "eza-absent-xyz";
+    std::fs::create_dir_all(sandbox.data_dir()).unwrap();
+    missing(&sandbox, "s1", program);
+    missing(&sandbox, "s2", program);
+    let ledger = sandbox.data_dir().join(clawg_cli::tool_failures::FILE);
+    let learned = std::fs::read(&ledger).expect("the ledger");
+    let claude = sandbox.home.join(".claude");
+    std::fs::create_dir_all(&claude).unwrap();
+    std::fs::write(claude.join("CLAUDE.md"), format!("Use {program} instead of ls.\n")).unwrap();
+    let hook = json!({ "type": "command", "command": BIN,
+        "args": ["hook", "session-start", "--agent", "claude-code", "--profile", "dev"], "timeout": 5 });
+    std::fs::write(claude.join("settings.json"), json!({ "hooks": { "SessionStart": [{ "hooks": [hook] }] } }).to_string()).unwrap();
+
+    let (output, report) = doctor(&sandbox);
+
+    assert_eq!(output.status.code(), Some(0), "neither finding fails the command: {report}");
+    assert_eq!(findings(&report, "tool_rules"), [("info", "learned")]);
+    let rules = report["checks"].as_array().unwrap().iter().find(|f| f["check_id"] == "tool_rules").unwrap();
+    let rule = &rules["evidence"]["rules"][0];
+    assert_eq!((rule["program"].as_str(), rule["sessions"].as_u64()), (Some(program), Some(2)), "{rules}");
+    assert_eq!(rule["named_in"], json!([claude.join("CLAUDE.md")]), "{rules}");
+    assert_eq!(findings(&report, "tool_hooks"), [("info", "not_installed")]);
+    let hooks = report["checks"].as_array().unwrap().iter().find(|f| f["check_id"] == "tool_hooks").unwrap();
+    assert_eq!(hooks["safe_next_step"], "clawg setup claude-code --profile dev");
+    assert_eq!(std::fs::read(&ledger).unwrap(), learned, "doctor does not write the ledger");
+}
+
+#[tokio::test]
+async fn doctor_has_nothing_to_say_without_rules_or_an_install() {
+    let sandbox = Sandbox::new();
+    let (_, report) = doctor(&sandbox);
+    assert_eq!((findings(&report, "tool_rules"), findings(&report, "tool_hooks")), (vec![], vec![]));
+}
+
+#[tokio::test]
 async fn doctor_reads_a_running_daemons_store_without_changing_it() {
     let sandbox = Sandbox::new();
     let daemon = sandbox.serve().await;

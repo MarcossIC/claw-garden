@@ -5,7 +5,7 @@
 //! sentence; the rest of a finding is the same in every language, so a script
 //! reads it alike whatever the user chose.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use clawg_core::memory::backup::{parse_snapshot_time, ProbeState, SchemaPlan, StoreProbe};
 use clawg_core::memory::bootstrap::is_pooling_upgrade;
@@ -28,6 +28,7 @@ use crate::daemon::socket::SocketError;
 use crate::hook_log::{Outcome, Run};
 use crate::mcp::server::FALLBACK_AGENT_ID;
 use crate::setup::Freshness;
+use crate::tool_failures::Rule;
 use crate::update::version::Version;
 
 /// Days the newest snapshot may age before `backup.age` warns. A starting
@@ -1097,6 +1098,116 @@ pub fn hook_runs(lang: Lang, runs: &[Run], hook_installed: bool, now_ms: i64, pr
     vec![Finding::new("hooks.runs", Severity::Info, "recent", message).evidence(evidence)]
 }
 
+/// The programs the ledger of missing programs has turned into rules, each
+/// with its sessions and how long ago it last failed, and the instruction
+/// files (`instructions`: path and text) that name it as a word of their own,
+/// since an instruction that asks for a program the machine lacks is where the
+/// failures come from. Always `info`: clawg already tells the agent. Nothing
+/// without rules.
+pub fn tool_rules(lang: Lang, rules: &[Rule], instructions: &[(PathBuf, String)], now_ms: i64) -> Vec<Finding> {
+    if rules.is_empty() {
+        return Vec::new();
+    }
+    let named: Vec<Vec<&Path>> = rules
+        .iter()
+        .map(|rule| instructions.iter().filter(|(_, text)| names_word(text, &rule.program)).map(|(path, _)| path.as_path()).collect())
+        .collect();
+    let heading = match lang {
+        Lang::En => "clawg learned that these programs are missing from this machine's Bash, and says so to the agent when a session starts:",
+        Lang::Es => "clawg aprendió que estos programas no existen en el Bash de esta máquina, y se lo dice al agente cuando empieza una sesión:",
+    };
+    let lines = rules.iter().zip(&named).map(|(rule, files)| {
+        let ago = age(lang, now_ms.saturating_sub(rule.last_failure_ms));
+        let (sessions, last) = match lang {
+            Lang::En => ("sessions", "last failure"),
+            Lang::Es => ("sesiones", "último fallo"),
+        };
+        let mut line = format!("`{}`: {} {sessions}, {last} {ago}", rule.program, rule.sessions);
+        if !files.is_empty() {
+            let paths = files.iter().map(|path| path.display().to_string()).collect::<Vec<_>>().join(", ");
+            let ask = match (lang, files.len()) {
+                (Lang::En, 1) => "asks for it: install it or take it out of there",
+                (Lang::En, _) => "ask for it: install it or take it out of there",
+                (Lang::Es, 1) => "lo pide: conviene instalarlo o sacarlo de ahí",
+                (Lang::Es, _) => "lo piden: conviene instalarlo o sacarlo de ahí",
+            };
+            line.push_str(&format!("; {paths} {ask}"));
+        }
+        line
+    });
+    let forget = match lang {
+        Lang::En => "Deleting tool-failures.jsonl and tool-failures.1.jsonl in the data directory forgets all of it.",
+        Lang::Es => "Borrar tool-failures.jsonl y tool-failures.1.jsonl del directorio de datos olvida todo.",
+    };
+    let message = std::iter::once(heading.to_string()).chain(lines).chain([forget.to_string()]).collect::<Vec<_>>().join("\n");
+    let evidence: Vec<_> = rules
+        .iter()
+        .zip(&named)
+        .map(|(rule, files)| {
+            json!({
+                "program": rule.program, "tool": rule.tool, "sessions": rule.sessions,
+                "last_failure_ms": rule.last_failure_ms, "named_in": files,
+            })
+        })
+        .collect();
+    vec![Finding::new("tool_rules", Severity::Info, "learned", message).evidence(json!({ "rules": evidence }))]
+}
+
+/// Whether `text` holds `word` as a word of its own: ASCII letters, digits, `_`
+/// and `-` before or after it make it part of another (`fd` is not in `fdisk`
+/// or in `fd-find`), and the case is exact.
+fn names_word(text: &str, word: &str) -> bool {
+    let is_word = |byte: u8| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-');
+    let bytes = text.as_bytes();
+    text.match_indices(word).any(|(at, _)| {
+        let before = at.checked_sub(1).map(|i| bytes[i]);
+        let after = bytes.get(at + word.len()).copied();
+        !before.is_some_and(is_word) && !after.is_some_and(is_word)
+    })
+}
+
+/// A `settings.json` of Claude Code as it was read: the user's, or the one
+/// `--local` writes in a folder.
+pub struct SettingsFile {
+    pub path: PathBuf,
+    pub text: String,
+    /// The `.claude/settings.local.json` of a folder.
+    pub local: bool,
+}
+
+/// Each of `files` that runs clawg at session start for `profile` and lacks the
+/// hook of `PostToolUse` or of `PostToolUseFailure`: `clawg update` does not run
+/// `setup`, so an install from before them keeps seeing no failed call. Always
+/// `info`; the next step is the setup that adds only what is missing.
+pub fn tool_hooks(lang: Lang, files: &[SettingsFile], profile: Profile) -> Vec<Finding> {
+    files
+        .iter()
+        .filter_map(|file| {
+            let missing = crate::setup::missing_tool_hooks(&file.text, profile);
+            if missing.is_empty() {
+                return None;
+            }
+            let step = with_profile(if file.local { "clawg setup claude-code --local" } else { "clawg setup claude-code" }, profile);
+            let (path, list) = (file.path.display(), missing.join(", "));
+            let message = match lang {
+                Lang::En => format!(
+                    "{path} runs clawg when a session starts but has no hook for {list}: clawg does not see the programs \
+                     that fail in Bash until `{step}` adds them"
+                ),
+                Lang::Es => format!(
+                    "{path} corre clawg al empezar una sesión pero no tiene el hook de {list}: clawg no ve los programas \
+                     que fallan en Bash hasta que `{step}` los agregue"
+                ),
+            };
+            Some(
+                Finding::new("tool_hooks", Severity::Info, "not_installed", message)
+                    .step(step)
+                    .evidence(json!({ "path": file.path, "missing": missing })),
+            )
+        })
+        .collect()
+}
+
 /// How long ago, in words, for a clock that may have gone back.
 fn age(lang: Lang, elapsed_ms: i64) -> String {
     let minutes = elapsed_ms.max(0) / 60_000;
@@ -2029,5 +2140,111 @@ mod tests {
         assert!(!es[0].message.contains("no está corriendo"), "{}", es[0].message);
         let with_runs_and_no_hook = hook_runs(L, &[hook_run(1, Outcome::Injected)], false, NOW, P);
         assert_eq!(kinds(&with_runs_and_no_hook), [("hooks.runs", Severity::Info, "recent")]);
+    }
+
+    fn rule(program: &str, sessions: usize, days_ago: i64) -> Rule {
+        Rule { tool: "Bash".into(), program: program.into(), sessions, last_failure_ms: NOW - days_ago * DAY_MS }
+    }
+
+    #[test]
+    fn the_learned_rules_are_listed_with_the_files_that_ask_for_them() {
+        let rules = [rule("eza", 2, 3), rule("fd", 3, 1), rule("bat", 2, 5)];
+        let user = PathBuf::from("/home/u/.claude/CLAUDE.md");
+        let project = PathBuf::from("/work/app/CLAUDE.md");
+        let instructions = [
+            (user.clone(), "Use `eza` instead of ls. Run fdisk -l to list disks. Never use rm.".to_string()),
+            (project.clone(), "Search with fd, not find. Both eza and fd are installed on my machines.".to_string()),
+        ];
+
+        let found = tool_rules(L, &rules, &instructions, NOW);
+
+        assert_eq!(kinds(&found), [("tool_rules", Severity::Info, "learned")]);
+        let finding = &found[0];
+        assert_eq!(finding.safe_next_step, None);
+        let lines: Vec<&str> = finding.message.lines().collect();
+        assert!(lines[0].starts_with("clawg learned that these programs are missing from this machine's Bash"), "{}", finding.message);
+        assert_eq!(
+            lines[1],
+            "`eza`: 2 sessions, last failure 3 days ago; /home/u/.claude/CLAUDE.md, /work/app/CLAUDE.md ask for it: install it or take it out of there"
+        );
+        assert_eq!(
+            lines[2],
+            "`fd`: 3 sessions, last failure 1 day ago; /work/app/CLAUDE.md asks for it: install it or take it out of there",
+            "fdisk does not name fd"
+        );
+        assert_eq!(lines[3], "`bat`: 2 sessions, last failure 5 days ago", "no file asks for it");
+        assert!(lines[4].contains("tool-failures.jsonl") && lines[4].contains("tool-failures.1.jsonl") && lines[4].contains("forgets all"), "{}", lines[4]);
+        assert_eq!(
+            finding.evidence,
+            json!({ "rules": [
+                { "program": "eza", "tool": "Bash", "sessions": 2, "last_failure_ms": NOW - 3 * DAY_MS, "named_in": [user, project] },
+                { "program": "fd", "tool": "Bash", "sessions": 3, "last_failure_ms": NOW - DAY_MS, "named_in": [project] },
+                { "program": "bat", "tool": "Bash", "sessions": 2, "last_failure_ms": NOW - 5 * DAY_MS, "named_in": [] },
+            ]})
+        );
+
+        let spanish = tool_rules(Lang::Es, &rules[..1], &instructions[..1], NOW);
+        let lines: Vec<&str> = spanish[0].message.lines().collect();
+        assert!(lines[0].starts_with("clawg aprendió que estos programas no existen en el Bash de esta máquina"), "{}", spanish[0].message);
+        assert_eq!(
+            lines[1],
+            "`eza`: 2 sesiones, último fallo hace 3 días; /home/u/.claude/CLAUDE.md lo pide: conviene instalarlo o sacarlo de ahí"
+        );
+        assert!(lines[2].contains("Borrar tool-failures.jsonl y tool-failures.1.jsonl"), "{}", lines[2]);
+    }
+
+    #[test]
+    fn no_rules_no_finding() {
+        assert_eq!(tool_rules(L, &[], &[(PathBuf::from("/home/u/CLAUDE.md"), "use eza".to_string())], NOW), []);
+    }
+
+    fn settings_of(hooks: serde_json::Value) -> String {
+        json!({ "theme": "dark", "hooks": hooks }).to_string()
+    }
+
+    fn clawg_hook(event_arg: &str, profile: &str) -> serde_json::Value {
+        json!({ "type": "command", "command": "/opt/clawg/clawg",
+            "args": ["hook", event_arg, "--agent", "claude-code", "--profile", profile], "timeout": 5 })
+    }
+
+    fn settings(path: &str, local: bool, text: String) -> SettingsFile {
+        SettingsFile { path: PathBuf::from(path), text, local }
+    }
+
+    #[test]
+    fn a_session_start_hook_without_the_tool_hooks_is_reported() {
+        let old = settings_of(json!({
+            "SessionStart": [{ "hooks": [clawg_hook("session-start", "dev")] }],
+            "UserPromptSubmit": [{ "hooks": [clawg_hook("user-prompt-submit", "dev")] }]
+        }));
+        let found = tool_hooks(L, &[settings("/home/u/.claude/settings.json", false, old.clone())], P);
+        assert_eq!(kinds(&found), [("tool_hooks", Severity::Info, "not_installed")]);
+        assert_eq!(found[0].safe_next_step.as_deref(), Some("clawg setup claude-code --profile dev"));
+        assert!(!found[0].requires_confirmation);
+        assert!(found[0].message.contains("/home/u/.claude/settings.json") && found[0].message.contains("PostToolUse, PostToolUseFailure"), "{}", found[0].message);
+        assert_eq!(found[0].evidence, json!({ "path": "/home/u/.claude/settings.json", "missing": ["PostToolUse", "PostToolUseFailure"] }));
+
+        let local = tool_hooks(L, &[settings("/work/app/.claude/settings.local.json", true, old)], P);
+        assert_eq!(local[0].safe_next_step.as_deref(), Some("clawg setup claude-code --local --profile dev"));
+        let es = tool_hooks(Lang::Es, &[settings("/home/u/.claude/settings.json", false, settings_of(json!({ "SessionStart": [{ "hooks": [clawg_hook("session-start", "dev")] }] })))], P);
+        assert!(es[0].message.contains("no tiene el hook de PostToolUse, PostToolUseFailure"), "{}", es[0].message);
+
+        let half = settings_of(json!({
+            "SessionStart": [{ "hooks": [clawg_hook("session-start", "dev")] }],
+            "PostToolUse": [{ "matcher": "Bash", "hooks": [clawg_hook("post-tool-use", "dev")] }]
+        }));
+        let half = tool_hooks(L, &[settings("s.json", false, half)], P);
+        assert_eq!(half[0].evidence["missing"], json!(["PostToolUseFailure"]));
+
+        let complete = settings_of(json!({
+            "SessionStart": [{ "hooks": [clawg_hook("session-start", "dev")] }],
+            "PostToolUse": [{ "matcher": "Bash", "hooks": [clawg_hook("post-tool-use", "dev")] }],
+            "PostToolUseFailure": [{ "matcher": "Bash", "hooks": [clawg_hook("post-tool-use-failure", "dev")] }]
+        }));
+        let other_profile = settings_of(json!({ "SessionStart": [{ "hooks": [clawg_hook("session-start", "prod")] }] }));
+        let no_session_start = settings_of(json!({ "UserPromptSubmit": [{ "hooks": [clawg_hook("user-prompt-submit", "dev")] }] }));
+        for quiet in [complete, other_profile, no_session_start, "not json".to_string(), "{}".to_string()] {
+            assert_eq!(tool_hooks(L, &[settings("s.json", false, quiet.clone())], P), [], "{quiet}");
+        }
     }
 }

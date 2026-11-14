@@ -466,6 +466,30 @@ fn is_clawg_hook(hook: &Value, event_arg: &str, profile: Profile) -> bool {
     hook_words(hook).is_some_and(|words| runs_clawg_hook(&words, event_arg, profile))
 }
 
+/// The events of the hooks after a shell call that `text`, a `settings.json`,
+/// lacks for `profile`, when it has the hook of `session-start` for it: an
+/// install from before them. A file without that hook, or that is not
+/// settings, lacks nothing: it is not an install of clawg to complete.
+pub(crate) fn missing_tool_hooks(text: &str, profile: Profile) -> Vec<&'static str> {
+    let Ok(Value::Object(settings)) = serde_json::from_str::<Value>(text) else { return Vec::new() };
+    let has = |event: &str, arg: &str| {
+        settings
+            .get("hooks")
+            .and_then(|hooks| hooks.get(event))
+            .and_then(Value::as_array)
+            .is_some_and(|groups| hooks_of(groups).any(|hook| is_clawg_hook(hook, arg, profile)))
+    };
+    if !has("SessionStart", "session-start") {
+        return Vec::new();
+    }
+    HOOK_EVENTS
+        .iter()
+        .filter(|(_, _, matcher)| *matcher == Some(SHELL_TOOL_MATCHER))
+        .filter(|(event, arg, _)| !has(event, arg))
+        .map(|(event, _, _)| *event)
+        .collect()
+}
+
 /// Whether a command's words run `clawg hook <event_arg>` for `profile`. One
 /// without `--profile` belongs to no profile.
 fn runs_clawg_hook(words: &[String], event_arg: &str, profile: Profile) -> bool {

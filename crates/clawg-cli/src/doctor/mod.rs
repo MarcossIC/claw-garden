@@ -216,6 +216,11 @@ pub fn run(profile: Profile) -> Result<Report, DoctorError> {
     let runs = crate::hook_log::read_runs(&data_dir);
     let cursor_hook = crate::setup::cursor::hook_installed(clawg_core::paths::home_dir().as_deref(), profile);
     found.extend(checks::hook_runs(lang, &runs, cursor_hook, now_ms(), profile));
+    let now = now_ms();
+    let rules = crate::tool_failures::rules(&crate::tool_failures::read(&data_dir), now, crate::tool_failures::on_path);
+    let instructions = if rules.is_empty() { Vec::new() } else { instruction_files() };
+    found.extend(checks::tool_rules(lang, &rules, &instructions, now));
+    found.extend(checks::tool_hooks(lang, &settings_files(), profile));
 
     let summary = Summary::of(&found);
     Ok(Report {
@@ -269,6 +274,40 @@ fn present(dir: &Path, name: &str) -> Option<PathBuf> {
 /// The lines of a file, counted and never kept: they are someone's saves.
 fn lines_in(path: &Path) -> usize {
     std::fs::read(path).map(|b| b.split(|&c| c == b'\n').filter(|l| !l.is_empty()).count()).unwrap_or(0)
+}
+
+/// The instruction files of Claude Code that can ask for a program, as far as
+/// they read: the user's `CLAUDE.md`, and the `CLAUDE.md` and the
+/// `.claude/CLAUDE.md` of the current folder.
+fn instruction_files() -> Vec<(PathBuf, String)> {
+    let home = clawg_core::paths::home_dir();
+    let user = crate::setup::locations(home.as_deref(), std::env::var_os("CLAUDE_CONFIG_DIR")).ok().map(|(_, _, md)| md);
+    let here = std::env::current_dir().ok().into_iter().flat_map(|dir| [dir.join("CLAUDE.md"), dir.join(".claude").join("CLAUDE.md")]);
+    let mut seen: Vec<PathBuf> = Vec::new();
+    let mut files = Vec::new();
+    for path in user.into_iter().chain(here) {
+        if seen.contains(&path) {
+            continue;
+        }
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            files.push((path.clone(), text));
+        }
+        seen.push(path);
+    }
+    files
+}
+
+/// The `settings.json` of Claude Code that hold clawg's hooks, as far as they
+/// read: the user's, and the `.claude/settings.local.json` of the current
+/// folder, which `--local` writes.
+fn settings_files() -> Vec<checks::SettingsFile> {
+    let home = clawg_core::paths::home_dir();
+    let user = crate::setup::locations(home.as_deref(), std::env::var_os("CLAUDE_CONFIG_DIR")).ok().map(|(_, settings, _)| (settings, false));
+    let here = std::env::current_dir().ok().map(|dir| (dir.join(".claude").join("settings.local.json"), true));
+    user.into_iter()
+        .chain(here)
+        .filter_map(|(path, local)| std::fs::read_to_string(&path).ok().map(|text| checks::SettingsFile { path, text, local }))
+        .collect()
 }
 
 /// The protocol block of the user `CLAUDE.md` `clawg setup claude-code`
