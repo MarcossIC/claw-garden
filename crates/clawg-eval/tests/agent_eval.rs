@@ -414,6 +414,7 @@ fn the_replayed_relay_example_follows_its_fact_to_the_second_session() {
     ok(&output);
     let r = result(&run);
     assert_eq!(r["facts"], serde_json::json!([{"tracer": "48213", "born": 1, "class": "used"}]), "{r:#}");
+    assert_eq!(r["artifacts"], serde_json::json!([]), "the example is a run that counts: {r:#}");
     assert_eq!(r["sessions"][0]["saved"], serde_json::json!(["48213"]), "the first session wrote it to a memory");
     let followed = &r["sessions"][1]["followed"][0];
     assert_eq!((&followed["tracer"], &followed["fate"]), (&Value::from("48213"), &Value::from("used")));

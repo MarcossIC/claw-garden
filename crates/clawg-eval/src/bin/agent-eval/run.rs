@@ -187,6 +187,9 @@ pub struct RunResult {
     /// [`rereads`], for a run of two sessions.
     #[serde(default)]
     pub rereads: Option<Rereads>,
+    /// What makes the run unfit to be counted, named without interpreting it.
+    #[serde(default)]
+    pub artifacts: Vec<Artifact>,
     /// The other branch of the fork this run is one of.
     #[serde(default)]
     pub paired: Option<String>,
@@ -220,6 +223,64 @@ pub struct SessionResult {
     /// How many `Write` and `Edit` went to the directory of the native memory.
     pub native_memory_writes: usize,
     pub saves: Vec<SaveMarks>,
+}
+
+/// Why a run, or a branch of a fork, is left out of what the report reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactCause {
+    /// The session has no result, or its result is an error.
+    SessionFailed,
+    /// The run has clawg and its server was not `connected` when the session began.
+    ServerNotConnected,
+    /// A session that continues the conversation began with less context than the one before ended with.
+    NotContinued,
+    /// A call read outside the working directory and the client did not deny it.
+    ReadOutside,
+    /// The client compacted the context in a session that is not the last.
+    CompactedEarly,
+    /// The session did what the task asked it to leave untouched.
+    AppliedEarly,
+}
+
+/// A cause and the session it happened in, from 1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Artifact {
+    pub cause: ArtifactCause,
+    pub session: usize,
+}
+
+/// The artifacts of a run of `shape` that played `sessions`, in order of session
+/// and then of cause, each cause once per session. `server` is the MCP server of
+/// the arm, when it has clawg. A compaction in the last session is none: it is
+/// what a session that goes on does, and it counts for the cost and the success.
+pub fn artifacts(sessions: &[SessionResult], shape: Shape, server: Option<&str>) -> Vec<Artifact> {
+    let mut found = Vec::new();
+    for (i, s) in sessions.iter().enumerate() {
+        let record = &s.session;
+        let mut causes = Vec::new();
+        if record.outcome.as_ref().is_none_or(|o| o.is_error) {
+            causes.push(ArtifactCause::SessionFailed);
+        }
+        if server.is_some_and(|name| !record.mcp_servers.iter().any(|(n, status)| n == name && status == "connected")) {
+            causes.push(ArtifactCause::ServerNotConnected);
+        }
+        let before = i.checked_sub(1).and_then(|j| sessions[j].session.request_tokens.last());
+        if shape == Shape::Joined && matches!((before, record.first_request_tokens), (Some(before), Some(first)) if first < *before) {
+            causes.push(ArtifactCause::NotContinued);
+        }
+        if record.outside_reads.iter().any(|read| !read.denied) {
+            causes.push(ArtifactCause::ReadOutside);
+        }
+        if record.compactions > 0 && i + 1 < sessions.len() {
+            causes.push(ArtifactCause::CompactedEarly);
+        }
+        if record.untouched.iter().any(|entry| entry.present) {
+            causes.push(ArtifactCause::AppliedEarly);
+        }
+        found.extend(causes.into_iter().map(|cause| Artifact { cause, session: i + 1 }));
+    }
+    found
 }
 
 /// Where a fact born in a session ended up in the last one, told by what the
@@ -363,6 +424,8 @@ pub fn evaluate(task: &Task, info: &RunInfo, played: &[Played], read_file: impl 
         })
         .collect();
     let last = sessions.last().expect("a run has its first session");
+    let server = Arm::parse(info.arm).filter(|arm| arm.has_clawg()).map(|_| info.profile.mcp_server_name());
+    let unfit = artifacts(&sessions, info.shape, server);
     let reread = (played.len() == 2).then(|| rereads(&played[0].transcript, &played[1].transcript, info.workdir, info.native_dir));
     let relay = reread.filter(|_| info.shape != Shape::Joined).map(|r| overhead(&played[0].transcript, &played[1].transcript, r.again));
     RunResult {
@@ -381,6 +444,7 @@ pub fn evaluate(task: &Task, info: &RunInfo, played: &[Played], read_file: impl 
         noise_rules: info.noise_rules,
         overhead: relay,
         rereads: reread,
+        artifacts: unfit,
         paired: None,
     }
 }
@@ -2210,10 +2274,13 @@ mod tests {
         assert_eq!(rereads(&first, &second, Path::new(WORKDIR), None), Rereads { again: 600, to_edit: 0 }, "the note the first session left is what a memory replaces");
     }
 
-    /// The calls of a session that began as `session_id`, each with its tool, its input and whether
-    /// its result came back marked as an error; the first of them is a subagent's.
-    fn calls_of(session_id: &str, calls: &[(&str, Value, bool)]) -> Vec<ToolCall> {
-        let mut stream = format!("{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"{session_id}\"}}\n");
+    /// The stream of a session that began as `session_id` with the clawg server connected, and
+    /// made `calls`, each with its tool, its input and whether its result came back marked as an
+    /// error; the first of them is a subagent's.
+    fn stream_of(session_id: &str, calls: &[(&str, Value, bool)]) -> String {
+        let mut stream = format!(
+            "{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"{session_id}\",\"mcp_servers\":[{{\"name\":\"clawg-dev\",\"status\":\"connected\"}}]}}\n"
+        );
         for (i, (name, input, denied)) in calls.iter().enumerate() {
             let mut event = json!({"type": "assistant", "message": {"content": [{"type": "tool_use", "id": format!("c{i}"), "name": name, "input": input}]}});
             if i == 0 {
@@ -2223,7 +2290,12 @@ mod tests {
             let result = json!({"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": format!("c{i}"), "is_error": denied, "content": "x"}]}});
             stream.push_str(&format!("{result}\n"));
         }
-        stream::parse(&stream).calls
+        stream.push_str("{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"ok\"}\n");
+        stream
+    }
+
+    fn calls_of(session_id: &str, calls: &[(&str, Value, bool)]) -> Vec<ToolCall> {
+        stream::parse(&stream_of(session_id, calls)).calls
     }
 
     #[test]
@@ -2296,6 +2368,27 @@ mod tests {
                 OutsideRead { tool: "Grep".into(), path: "/runs/r/fork".into(), denied: true },
             ]
         );
+
+        let stream = stream_of(
+            "s1",
+            &[
+                ("Read", json!({"file_path": "../run.json"}), false),
+                ("Grep", json!({"pattern": "x", "path": "/runs/r/fork"}), true),
+                ("Read", json!({"file_path": "src/a.py"}), false),
+            ],
+        );
+        let r = evaluate(&task(), &info("a3", Profile::Dev), &[played(&stream)], |_| None);
+        assert_eq!(r.artifacts, [Artifact { cause: ArtifactCause::ReadOutside, session: 1 }], "only the read that returned content");
+        let flipped = stream_of(
+            "s1",
+            &[
+                ("Read", json!({"file_path": "../run.json"}), true),
+                ("Grep", json!({"pattern": "x", "path": "/runs/r/fork"}), false),
+                ("Read", json!({"file_path": "src/a.py"}), false),
+            ],
+        );
+        let r = evaluate(&task(), &info("a3", Profile::Dev), &[played(&flipped)], |_| None);
+        assert_eq!(r.artifacts, [Artifact { cause: ArtifactCause::ReadOutside, session: 1 }], "now it is the grep of fork/ that came back with content");
     }
 
     #[test]
@@ -2306,6 +2399,73 @@ mod tests {
         let other = outside_reads(&calls, Path::new(WORKDIR), &[], Some("session-xyz"));
         assert_eq!(other.len(), 2, "the file of another session is outside: {other:?}");
         assert_eq!(outside_reads(&calls, Path::new(WORKDIR), &[], None).len(), 2, "a session that never said its id");
+    }
+
+    /// A session that ended well, connected to clawg, with nothing else to report.
+    fn healthy() -> SessionResult {
+        let mut s = walked(&[], &[]);
+        s.session.mcp_servers = vec![("clawg-dev".to_owned(), "connected".to_owned())];
+        s.session.outcome = Some(Outcome { subtype: "success".to_owned(), ..Outcome::default() });
+        s
+    }
+
+    #[test]
+    fn the_artifacts_of_a_run_are_named_with_their_session() {
+        let outside = |denied: bool| OutsideRead { tool: "Read".into(), path: "../run.json".into(), denied };
+        let mut first = healthy();
+        first.session.mcp_servers = vec![("clawg-dev".to_owned(), "failed".to_owned())];
+        first.session.compactions = 1;
+        first.session.request_tokens = vec![100, 200];
+        first.session.untouched = vec![UntouchedEntry { path: "a.py".into(), text: "x".into(), present: true }, UntouchedEntry { path: "b.py".into(), text: "x".into(), present: false }];
+        let mut second = healthy();
+        second.session.first_request_tokens = Some(150);
+        second.session.outside_reads = vec![outside(false), outside(true), outside(false)];
+        let mut third = healthy();
+        third.session.compactions = 2;
+        third.session.outside_reads = vec![outside(true)];
+        third.session.outcome = Some(Outcome { is_error: true, ..Outcome::default() });
+        let mut fourth = healthy();
+        fourth.session.outcome = None;
+        let sessions = [first, second, third, fourth];
+        let found = |shape: Shape, server: Option<&str>, n: usize| artifacts(&sessions[..n], shape, server);
+        let at = |cause: ArtifactCause, session: usize| Artifact { cause, session };
+
+        assert_eq!(
+            found(Shape::Joined, Some("clawg-dev"), 4),
+            [
+                at(ArtifactCause::ServerNotConnected, 1),
+                at(ArtifactCause::CompactedEarly, 1),
+                at(ArtifactCause::AppliedEarly, 1),
+                at(ArtifactCause::NotContinued, 2),
+                at(ArtifactCause::ReadOutside, 2),
+                at(ArtifactCause::SessionFailed, 3),
+                at(ArtifactCause::CompactedEarly, 3),
+                at(ArtifactCause::SessionFailed, 4),
+            ],
+            "in order of session and then of cause; a read that was denied and a compaction in the last session are none, and a read found twice counts once"
+        );
+        assert_eq!(
+            found(Shape::Split, None, 2),
+            [at(ArtifactCause::CompactedEarly, 1), at(ArtifactCause::AppliedEarly, 1), at(ArtifactCause::ReadOutside, 2)],
+            "an arm without clawg has no server to miss, and a new session starts with less context"
+        );
+        assert_eq!(serde_json::to_value(at(ArtifactCause::NotContinued, 2)).unwrap(), json!({"cause": "not_continued", "session": 2}));
+        assert_eq!(found(Shape::Joined, Some("clawg-dev"), 0), [], "a run with no session has none");
+    }
+
+    #[test]
+    fn a_compaction_in_the_last_session_is_no_artifact() {
+        let stream = |compacted: bool| {
+            let boundary = if compacted { "{\"type\":\"system\",\"subtype\":\"compact_boundary\"}\n" } else { "" };
+            let mut text = stream_of("s", &[]);
+            text.insert_str(text.find("{\"type\":\"result\"").unwrap(), boundary);
+            text
+        };
+        let info = RunInfo { shape: Shape::Joined, ..info("a3", Profile::Dev) };
+        let run = |first: bool, second: bool| evaluate(&two_sessions(), &info, &[played(&stream(first)), played(&stream(second))], |_| None);
+        assert_eq!(run(false, true).artifacts, [], "it is what a session that goes on does, and it counts for the cost and the success");
+        assert_eq!(run(true, false).artifacts, [Artifact { cause: ArtifactCause::CompactedEarly, session: 1 }]);
+        assert_eq!(run(true, true).artifacts, [Artifact { cause: ArtifactCause::CompactedEarly, session: 1 }]);
     }
 
     #[test]

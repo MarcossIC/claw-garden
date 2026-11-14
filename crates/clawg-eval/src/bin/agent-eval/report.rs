@@ -637,6 +637,7 @@ mod tests {
             facts: vec![],
             overhead: None,
             rereads: None,
+            artifacts: vec![],
             paired: None,
         }
     }
