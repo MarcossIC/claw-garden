@@ -329,14 +329,37 @@ fn prepare(args: &RunArgs, t: &task::Task, noise: Vec<task::SeedMemory>, client:
     Ok(layout)
 }
 
-/// The absolute path of a stream to replay, which must be a file.
-fn replay_file(stream: &Path) -> Result<PathBuf, String> {
-    let stream = std::path::absolute(stream).map_err(|e| format!("{}: {e}", stream.display()))?;
-    match std::fs::metadata(&stream) {
-        Ok(m) if m.is_file() => Ok(stream),
-        Ok(_) => Err(format!("--replay {} is not a file", stream.display())),
-        Err(e) => Err(format!("--replay {}: {e}", stream.display())),
+/// The streams a replay of `sessions` sessions played as `shape` needs, by file name.
+fn replay_streams(sessions: usize, shape: Shape) -> Vec<String> {
+    if shape == Shape::Both {
+        return ["session-1.jsonl", "joined-2.jsonl", "split-2.jsonl"].map(String::from).to_vec();
     }
+    (1..=sessions).map(|k| format!("session-{k}.jsonl")).collect()
+}
+
+/// The absolute path of what to replay: a stream, for a task of one session, or
+/// a directory that holds exactly the streams the sessions need.
+fn replay_source(stream: &Path, sessions: usize, shape: Shape) -> Result<PathBuf, String> {
+    let stream = std::path::absolute(stream).map_err(|e| format!("{}: {e}", stream.display()))?;
+    let said = |why: String| format!("--replay {} {why}", stream.display());
+    let meta = std::fs::metadata(&stream).map_err(|e| format!("--replay {}: {e}", stream.display()))?;
+    let expected = replay_streams(sessions, shape);
+    if meta.is_file() {
+        return if sessions == 1 {
+            Ok(stream)
+        } else {
+            Err(said(format!("is a file, and the task has {sessions} sessions: give a directory with {}", expected.join(", "))))
+        };
+    }
+    let mut present = Vec::new();
+    for entry in std::fs::read_dir(&stream).map_err(|e| format!("--replay {}: {e}", stream.display()))? {
+        let entry = entry.map_err(|e| format!("--replay {}: {e}", stream.display()))?;
+        present.push(entry.file_name().to_string_lossy().into_owned());
+    }
+    let lacks = expected.iter().filter(|name| !present.contains(name)).map(|name| format!("lacks {name}"));
+    let extra = present.iter().filter(|name| !expected.contains(name)).map(|name| format!("holds {name}, which no session plays"));
+    let problems: Vec<String> = lacks.chain(extra).collect();
+    if problems.is_empty() { Ok(stream) } else { Err(said(problems.join("; "))) }
 }
 
 fn execute(command: Command) -> Result<(), String> {
@@ -349,15 +372,15 @@ fn execute(command: Command) -> Result<(), String> {
             Ok(())
         }
         Command::Run { args, replay } => {
+            run::check_isolation(cfg!(windows), args.arm, &args.clawg).map_err(|e| e.to_string())?;
+            let (t, noise) = load_task(&args)?;
             let client = match replay {
-                Some(stream) => Client::Replay(replay_file(&stream)?),
+                Some(stream) => Client::Replay(replay_source(&stream, t.prompts().len(), args.shape)?),
                 None => Client::Claude,
             };
-            run::check_isolation(cfg!(windows), args.arm, &args.clawg).map_err(|e| e.to_string())?;
             if let (Client::Claude, Some(version)) = (&client, &args.claude_version) {
                 run::check_client_version(arm::CLIENT, version).map_err(|e| e.to_string())?;
             }
-            let (t, noise) = load_task(&args)?;
             if client == Client::Claude {
                 run::check_paid_run(&args.out, &t).map_err(|e| e.to_string())?;
             }
@@ -509,6 +532,35 @@ mod tests {
         assert_eq!(parse_args(args(&["hook-log", "l.jsonl"])), Ok(Some(Command::HookLog { file: "l.jsonl".into() })));
         assert!(parse_args(args(&["hook-log"])).unwrap_err().contains("hook-log takes one file"));
         assert!(parse_args(args(&["hook-context", "a", "b"])).unwrap_err().contains("hook-context takes one file"));
+    }
+
+    #[test]
+    fn a_replay_is_a_stream_or_a_directory_with_one_per_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("s.jsonl");
+        std::fs::write(&file, "").unwrap();
+        assert_eq!(replay_source(&file, 1, Shape::Split), Ok(file.clone()));
+        let said = replay_source(&file, 2, Shape::Split).unwrap_err();
+        assert!(said.contains("--replay") && said.contains("2 sessions") && said.contains("session-1.jsonl"), "{said}");
+
+        let streams = dir.path().join("streams");
+        std::fs::create_dir(&streams).unwrap();
+        let put = |name: &str| std::fs::write(streams.join(name), "").unwrap();
+        put("session-1.jsonl");
+        let said = replay_source(&streams, 2, Shape::Joined).unwrap_err();
+        assert!(said.contains("--replay") && said.contains("lacks session-2.jsonl"), "{said}");
+        put("session-2.jsonl");
+        assert_eq!(replay_source(&streams, 2, Shape::Joined), Ok(streams.clone()));
+        put("session-3.jsonl");
+        let said = replay_source(&streams, 2, Shape::Split).unwrap_err();
+        assert!(said.contains("holds session-3.jsonl, which no session plays"), "{said}");
+        assert_eq!(replay_source(&streams, 3, Shape::Split), Ok(streams.clone()));
+
+        assert_eq!(replay_streams(2, Shape::Split), ["session-1.jsonl", "session-2.jsonl"]);
+        assert_eq!(replay_streams(1, Shape::Split), ["session-1.jsonl"]);
+        assert_eq!(replay_streams(2, Shape::Both), ["session-1.jsonl", "joined-2.jsonl", "split-2.jsonl"]);
+        let missing = dir.path().join("missing");
+        assert!(replay_source(&missing, 1, Shape::Split).unwrap_err().contains(&format!("--replay {}", missing.display())));
     }
 
     #[test]

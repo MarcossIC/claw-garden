@@ -55,7 +55,8 @@ const STATUS_POLL: Duration = Duration::from_millis(250);
 pub enum Client {
     /// The client the plan starts, [`crate::arm::CLIENT`]: a paid session.
     Claude,
-    /// A recorded stream, replayed by `agent-eval replay-client`.
+    /// A recorded stream, replayed by `agent-eval replay-client`, or a
+    /// directory with a stream for each session.
     Replay(PathBuf),
 }
 
@@ -67,15 +68,15 @@ impl Client {
         }
     }
 
-    /// The command that starts it: the plan's own, or `agent_eval` replaying
-    /// the stream.
-    fn step(&self, planned: &Step, agent_eval: &Path) -> Step {
+    /// The command that starts session `k`: the plan's own, or `agent_eval`
+    /// replaying its stream.
+    fn step(&self, planned: &Step, agent_eval: &Path, k: usize) -> Step {
         match self {
             Client::Claude => planned.clone(),
-            Client::Replay(stream) => Step {
-                program: agent_eval.to_string_lossy().into_owned(),
-                args: vec!["replay-client".into(), stream.to_string_lossy().into_owned()],
-            },
+            Client::Replay(stream) => {
+                let stream = if stream.is_dir() { stream.join(format!("session-{k}.jsonl")) } else { stream.clone() };
+                Step { program: agent_eval.to_string_lossy().into_owned(), args: vec!["replay-client".into(), stream.to_string_lossy().into_owned()] }
+            }
         }
     }
 }
@@ -241,6 +242,8 @@ pub enum RunError {
     Step { command: String, code: Option<i32>, said: String, log: PathBuf },
     #[error("the client exited with {code:?}; see {}", .log.display())]
     Client { code: Option<i32>, log: PathBuf },
+    #[error("session {k} did not end: {why}; see {}", .log.display())]
+    Session { k: usize, why: String, log: PathBuf },
     #[error("the run asks for {program} {expected}, and `{program} --version` reports {}", .found.as_deref().unwrap_or("no version"))]
     ClientVersion { program: String, expected: String, found: Option<String> },
     #[error("a paid run would be skewed: {}", join_leaks(.0))]
@@ -481,17 +484,17 @@ fn read_record(root: &Path) -> Result<Value, RunError> {
     serde_json::from_str(&text).map_err(|e| RunError::NotARun(root.to_owned(), e.to_string()))
 }
 
-/// Runs the session `prepare` laid out in `root`, as its `run.json` plans it:
-/// with clawg, the daemon of the run's home first, then the commands before
-/// the session, the client and the commands after it, which also run when the
-/// seed or the client failed. A seed that does not load starts no client.
-/// `agent_eval`, this binary, is the replay client.
+/// Runs the sessions `prepare` laid out in `root`, as its `run.json` plans
+/// them: with clawg, the daemon of the run's home first, then the commands
+/// before the sessions, the sessions in order on one working directory and the
+/// commands after them, which also run when the seed or a session failed. A
+/// seed that does not load starts no client, and a session that does not end
+/// lets no other begin. `agent_eval`, this binary, is the replay client.
 pub fn execute(root: &Path, agent_eval: &Path) -> Result<(), RunError> {
     let (plan, client) = read_run(root)?;
-    let client = &client.step(&plan.client, agent_eval);
     let layout = Layout { root: root.to_owned() };
     let Some(daemon) = &plan.daemon else {
-        return client_ran(start_client(&plan, &layout, client)?, root);
+        return play(&plan, &client, &layout, agent_eval);
     };
     let served = Served::start(daemon, &plan.env, root)?;
     served.listening(&daemon.state_file)?;
@@ -500,7 +503,7 @@ pub fn execute(root: &Path, agent_eval: &Path) -> Result<(), RunError> {
     let session = served
         .ready(&daemon.status, &plan.env, root, &mut log, &log_path)
         .and_then(|()| plan.before.iter().try_for_each(|step| run_step(step, &plan.env, root, &mut log, &log_path)))
-        .and_then(|()| client_ran(start_client(&plan, &layout, client)?, root));
+        .and_then(|()| play(&plan, &client, &layout, agent_eval));
     let stopped = plan.after.iter().try_for_each(|step| run_step(step, &plan.env, root, &mut log, &log_path));
     let gone = served.gone_within(EXIT_BUDGET);
     session?;
@@ -512,11 +515,51 @@ pub fn execute(root: &Path, agent_eval: &Path) -> Result<(), RunError> {
     }
 }
 
-fn client_ran(code: Option<i32>, root: &Path) -> Result<(), RunError> {
-    if code == Some(0) {
-        Ok(())
-    } else {
-        Err(RunError::Client { code, log: root.join(CLIENT_LOG) })
+/// Plays the sessions of `plan` in order. Before each, the native memory the
+/// agent finds is copied to `memory-before-K.md`; after each of a run of
+/// several, the instruction files the client loaded move to
+/// `instructions-K.jsonl`, so each session has its own.
+fn play(plan: &RunPlan, client: &Client, layout: &Layout, agent_eval: &Path) -> Result<(), RunError> {
+    let sessions = plan.sessions();
+    let of = sessions.len();
+    for (i, planned) in sessions.into_iter().enumerate() {
+        let k = i + 1;
+        if let Some(memory) = native_memory_file(plan).filter(|m| m.is_file()) {
+            let copy = layout.root.join(format!("memory-before-{k}.md"));
+            std::fs::copy(memory, &copy).map_err(io(&copy))?;
+        }
+        let code = start_client(plan, layout, &client.step(planned, agent_eval, k), k)?;
+        let (stream_name, log_name) = session_files(k, of);
+        let log = layout.root.join(log_name);
+        if code != Some(0) {
+            return Err(RunError::Client { code, log });
+        }
+        if k < of {
+            let stream_path = layout.root.join(stream_name);
+            let stream = std::fs::read_to_string(&stream_path).map_err(io(&stream_path))?;
+            ended(&stream).map_err(|why| RunError::Session { k, why, log })?;
+        }
+        let instructions = layout.instructions_log();
+        if of > 1 && instructions.is_file() {
+            let moved = layout.root.join(instructions_file(k, of));
+            std::fs::rename(&instructions, &moved).map_err(io(&moved))?;
+        }
+    }
+    Ok(())
+}
+
+/// The native memory file of the plan, when its arm has one.
+fn native_memory_file(plan: &RunPlan) -> Option<&Path> {
+    plan.files.iter().map(|(path, _)| path.as_path()).find(|path| path.ends_with("memory/MEMORY.md"))
+}
+
+/// Whether a session whose stream is `stream` ended with a result that is not
+/// an error, so the next may begin; if not, why.
+fn ended(stream: &str) -> Result<(), String> {
+    match stream::parse(stream).result {
+        None => Err("its stream has no result".to_owned()),
+        Some(result) if result.is_error => Err("its result is an error".to_owned()),
+        Some(_) => Ok(()),
     }
 }
 
@@ -708,8 +751,8 @@ impl Drop for Served {
 /// Starts `client` in the working directory with the plan's variables, its
 /// stdout into `stream.jsonl` and its stderr into `client.log`. The exit code,
 /// `None` when it was killed.
-pub fn start_client(plan: &RunPlan, layout: &Layout, client: &Step) -> Result<Option<i32>, RunError> {
-    let (stream_name, log_name) = session_files(1, plan.sessions().len());
+pub fn start_client(plan: &RunPlan, layout: &Layout, client: &Step, k: usize) -> Result<Option<i32>, RunError> {
+    let (stream_name, log_name) = session_files(k, plan.sessions().len());
     let stream = layout.root.join(stream_name);
     let log = layout.root.join(log_name);
     let status = Command::new(&client.program)
@@ -730,6 +773,11 @@ pub fn session_files(k: usize, of: usize) -> (String, String) {
     if of == 1 { (STREAM_FILE.to_owned(), CLIENT_LOG.to_owned()) } else { (format!("stream-{k}.jsonl"), format!("client-{k}.log")) }
 }
 
+/// The name of the log of the instruction files session `k` of `of` loaded.
+fn instructions_file(k: usize, of: usize) -> String {
+    if of == 1 { "instructions.jsonl".to_owned() } else { format!("instructions-{k}.jsonl") }
+}
+
 /// Scores the run in `root` from its `run.json`, `stream.jsonl`, the log of
 /// the instruction files the client loaded and the working directory, and
 /// writes `result.json`.
@@ -745,13 +793,14 @@ pub fn score_dir(root: &Path) -> Result<RunResult, RunError> {
         _ => return Err(not_a_run("no profile")),
     };
     let lang = record["lang"].as_str().and_then(Lang::parse);
-    let stream_path = root.join(STREAM_FILE);
+    let plan: RunPlan = serde_json::from_value(record["plan"].clone()).map_err(|e| not_a_run(&e.to_string()))?;
+    let of = plan.sessions().len();
+    let stream_path = root.join(session_files(of, of).0);
     let stream = std::fs::read_to_string(&stream_path).map_err(io(&stream_path))?;
     let workdir = Layout { root: root.to_owned() }.workdir();
     let read_file = |rel: &str| task::is_relative_inside(rel).then(|| std::fs::read_to_string(workdir.join(rel)).ok()).flatten();
     let mut result = evaluate(&task, &arm, client.name(), profile, lang, &stream::parse(&stream), read_file);
-    let plan: RunPlan = serde_json::from_value(record["plan"].clone()).map_err(|e| not_a_run(&e.to_string()))?;
-    let log_path = Layout { root: root.to_owned() }.instructions_log();
+    let log_path = root.join(instructions_file(of, of));
     let loaded = match std::fs::read_to_string(&log_path) {
         Ok(text) => hooks::read_log(&text),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
@@ -960,12 +1009,29 @@ mod tests {
     fn the_client_is_claude_as_planned_or_a_replay_of_a_stream() {
         let planned = Step { program: "claude".into(), args: vec!["-p".into(), "Which port?".into()] };
         let exe = Path::new("/bin/agent-eval");
-        assert_eq!(Client::Claude.step(&planned, exe), planned);
+        assert_eq!(Client::Claude.step(&planned, exe, 1), planned);
+
+        let dir = tempfile::tempdir().unwrap();
+        let streams = Client::Replay(dir.path().to_owned());
+        assert_eq!(
+            streams.step(&planned, exe, 2).args,
+            ["replay-client", dir.path().join("session-2.jsonl").to_str().unwrap()],
+            "a directory holds a stream for each session"
+        );
         let replay = Client::Replay(PathBuf::from("/runs/s.jsonl"));
-        assert_eq!(replay.step(&planned, exe), Step { program: "/bin/agent-eval".into(), args: vec!["replay-client".into(), "/runs/s.jsonl".into()] });
+        assert_eq!(replay.step(&planned, exe, 1), Step { program: "/bin/agent-eval".into(), args: vec!["replay-client".into(), "/runs/s.jsonl".into()] });
         assert_eq!((Client::Claude.name(), replay.name()), ("claude", "replay"));
         assert_eq!(serde_json::to_value(&Client::Claude).unwrap(), json!("claude"));
         assert_eq!(serde_json::to_value(&replay).unwrap(), json!({ "replay": "/runs/s.jsonl" }));
+    }
+
+    #[test]
+    fn a_session_that_ends_in_an_error_starts_no_other() {
+        let result = |fields: &str| format!(r#"{{"type":"result","subtype":"success",{fields},"result":"x"}}"#);
+        assert_eq!(ended(&result(r#""is_error":false"#)), Ok(()));
+        assert!(ended(&result(r#""is_error":true"#)).unwrap_err().contains("error"));
+        assert!(ended(r#"{"type":"assistant","message":{"content":[]}}"#).unwrap_err().contains("no result"));
+        assert!(ended("").unwrap_err().contains("no result"));
     }
 
     #[test]

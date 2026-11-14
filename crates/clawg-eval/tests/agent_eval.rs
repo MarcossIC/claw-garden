@@ -200,6 +200,55 @@ fn a_replayed_edit_changes_the_working_directory_the_checks_read() {
     assert_eq!(result(&run)["score"], r["score"]);
 }
 
+fn relay_replays() -> PathBuf {
+    data().join("replays").join("example-relay-port.a3")
+}
+
+#[test]
+fn a_replayed_run_of_two_sessions_shares_its_daemon_and_its_working_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let (output, run) = replay_of(dir.path(), "example-relay-port", "a3", &relay_replays(), clawg());
+    ok(&output);
+
+    let log = clawg_log(&run);
+    assert_eq!(log.matches(" import --from clawg").count(), 1, "the seed loads once:\n{log}");
+    assert_eq!(log.matches(" stop --profile dev").count(), 1, "the daemon stops once:\n{log}");
+    assert!(log.find(" import --from clawg").unwrap() < log.find(" stop --profile dev").unwrap(), "{log}");
+    assert!(!run.join("home").join(".clawg-dev").join("daemon.json").exists(), "clawg stop ended the daemon");
+    assert!(run.join("stream-1.jsonl").is_file() && run.join("stream-2.jsonl").is_file() && !run.join("stream.jsonl").exists());
+    assert!(run.join("client-1.log").is_file() && run.join("client-2.log").is_file());
+    assert_eq!(
+        std::fs::read_to_string(run.join("work").join("notes.md")).unwrap(),
+        "staging port: 48213\nconfirmed in a later session\n",
+        "the second session edited the file the first one wrote"
+    );
+    let r = result(&run);
+    assert_eq!(r["score"]["success"], true, "{r:#}");
+    assert_eq!(r["session"]["session_id"], "replay-relay-port-2", "the result is the last session's");
+    assert_eq!(serde_json::from_str::<Value>(&std::fs::read_to_string(run.join("run.json")).unwrap()).unwrap()["shape"], "split");
+}
+
+#[test]
+fn a_session_that_fails_stops_the_run_and_still_stops_the_daemon() {
+    let dir = tempfile::tempdir().unwrap();
+    let replays = dir.path().join("replays");
+    std::fs::create_dir_all(&replays).unwrap();
+    for name in ["session-1.jsonl", "session-2.jsonl"] {
+        let text = std::fs::read_to_string(relay_replays().join(name)).unwrap();
+        std::fs::write(replays.join(name), text.replace("\"is_error\":false", "\"is_error\":true")).unwrap();
+    }
+
+    let (output, run) = replay_of(dir.path(), "example-relay-port", "a3", &replays, clawg());
+
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(stderr(&output).contains("session 1") && stderr(&output).contains("client-1.log"), "{}", stderr(&output));
+    assert!(run.join("stream-1.jsonl").is_file() && !run.join("stream-2.jsonl").exists(), "the second session never started");
+    assert_eq!(std::fs::read_to_string(run.join("work").join("notes.md")).unwrap(), "staging port: 48213\n");
+    let log = clawg_log(&run);
+    assert!(log.contains(&imported(noise())) && log.contains(" stop --profile dev"), "{log}");
+    assert!(!run.join("home").join(".clawg-dev").join("daemon.json").exists(), "clawg stop ended the daemon");
+}
+
 #[test]
 fn the_harness_hooks_print_the_context_and_log_their_input() {
     let dir = tempfile::tempdir().unwrap();
