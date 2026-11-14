@@ -112,7 +112,7 @@ Con `--client claude-code`, `session-start` MUST leer el libro y calcular las re
 - MUST imprimir un bloque después de la línea del idioma (R7) y antes del contexto que se presenta como evidencia.
 - El bloque abre con `clawg:`, nombra cada programa con sus sesiones y su último fallo, ofrece las herramientas del cliente y dice que, si una instrucción pide esos programas, se le avise a la persona.
 - El bloque MUST imprimirse aunque no haya daemon, o aunque el daemon falle o no responda a tiempo, como la línea del idioma.
-- El contexto MUST pedirse con `SESSION_BUDGET` menos los bytes del bloque, así lo que el hook agrega sigue debajo de 1500 bytes y el total debajo de 10.000.
+- El contexto MUST pedirse con `SESSION_BUDGET` menos los bytes del bloque, así lo que el hook agrega sin el bloque sigue debajo de 2000 bytes y el total debajo de 10.000. El bloque pesa como mucho 700 bytes (`RULES_BLOCK_MAX`).
 
 Sin reglas, la salida MUST ser byte a byte la de antes. `--client cursor` MUST NOT leer el libro.
 

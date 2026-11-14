@@ -2,6 +2,12 @@
 
 Las decisiones de fondo están en la [propuesta](proposal.md#decisiones) y no se reabren. Acá van las de implementación, con lo que se descartó. Las citas son `ruta:línea` de `develop` en `8a2f3723`.
 
+Después de esa cita [protocol-block](../protocol-block/proposal.md) cambió `hook.rs`, `setup.rs` y el doctor, así que las líneas de esos tres archivos se corrieron y vale el nombre de la función. Lo que cambió y toca a este diseño:
+
+- `session-start` ya trae una línea más de la palabra de clawg, el aviso del bloque del protocolo viejo (`block_notice`), que va después de la línea del idioma. Las reglas de este cambio van entre las dos: idioma, reglas, aviso del bloque, contexto.
+- `respond_reading` ya lee el idioma y el bloque del `CLAUDE.md` a la vez, con la misma espera. Las reglas se leen en el mismo `join`, con una lectura inyectada como las otras dos.
+- El tope de lo que suma el hook pasó de 1500 a 2000 bytes (`what_the_hook_adds_stays_small`), con `SESSION_BUDGET` en 8000 y los 10.000 caracteres del cliente.
+
 ## D1. Un módulo nuevo, `tool_failures`, con el núcleo puro y la E/S separados
 
 `crates/clawg-cli/src/tool_failures.rs`, hermano de `hook_log.rs`, en tres partes.
@@ -82,7 +88,9 @@ Un éxito pide una condición extra: el comando no tiene `2>`, `&>` ni `||` en n
 
 Si el daemon no está o falla, el texto de respaldo es la línea del idioma y el bloque, en lugar de la línea sola (`hook.rs:360-364`). Nada cambia para `user-prompt-submit`.
 
-El tope del bloque es de 5 reglas con nombres de hasta 32 caracteres. La cabecera, las líneas y el cierre en español, el idioma más largo, quedan por debajo de 600 bytes. `what_the_hook_adds_stays_small` (`hook.rs:655-667`) se amplía con ese peor caso y conserva su aserción de 1500 bytes.
+El tope del bloque es de 5 reglas con nombres de hasta 32 caracteres. Medido, el peor caso (cinco nombres de 32 caracteres, cien sesiones cada uno y el último fallo a 30 días) pesa 671 bytes en español, el idioma más largo, y 630 en inglés: no queda por debajo de los ~600 que se estimaron. El tope es `RULES_BLOCK_MAX` = 700 y un test lo fija.
+
+El bloque se descuenta del contexto (`context_budget`), así que lo que importa no es que el bloque sea chico sino que el resto de lo que suma el hook siga bajo 2000 bytes y que el contexto pedido más todo lo que se agrega no pase de 10.000. `what_the_hook_adds_stays_small` (`hook.rs`) lo comprueba con el peor caso de todo junto, en los dos idiomas: lo que suma el hook sin las reglas (`< 2000`, el tope de antes) y, con las reglas, `context_budget + agregado ≤ 10.000`. Una aserción de `agregado < 2000` incluyendo el bloque sería más estricta de lo necesario, porque el bloque no suma encima sino que ocupa lugar del contexto; no se usa y ningún tope se pasó.
 
 **Descartado:** que el bloque sume encima del contexto. Con el contexto lleno, la línea del idioma, los avisos y el bloque pasarían de 10.000 caracteres, y el cliente corta.
 

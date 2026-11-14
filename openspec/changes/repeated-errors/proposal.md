@@ -51,7 +51,7 @@ B, A y D, en ese orden. C queda afuera.
    - Se corta a los 300 ms (`POST_TOOL_DEADLINE`), por debajo de los 5 s con los que se configura.
    - No deja línea en `hook-runs.jsonl`.
    - Puerta en la verificación, en Windows y con el binario publicado: p95 ≤ 60 ms de reloj en 200 corridas desde Git Bash con una entrada sin firma. Hoy `clawg --version` tarda 38 a 43 ms ahí, y el proceso vacío 28 ms. Si no pasa, no se publica con `PostToolUse` instalado.
-7. **El texto del arranque entra en el tope del cliente.** El bloque de reglas, de a lo sumo ~600 bytes, se descuenta del presupuesto que el hook le pide al daemon (`SESSION_BUDGET`, `hook.rs:65`). Así el total sigue debajo de los 10.000 caracteres (`hook.rs:655-667`).
+7. **El texto del arranque entra en el tope del cliente.** El bloque de reglas, de a lo sumo 700 bytes (el peor caso medido son 671), se descuenta del presupuesto que el hook le pide al daemon (`SESSION_BUDGET`, `hook.rs:65`). Así el total sigue debajo de los 10.000 caracteres (`hook.rs:655-667`).
 8. **Sin dependencias nuevas.** La firma se reconoce a mano, línea por línea (`: command not found` y las formas de `sh` y `zsh`). Un `regex` en `clawg-cli` costaría su compilación en cada proceso de hook. La búsqueda en el PATH reusa `doctor::analyze` (`crates/clawg-cli/src/doctor/mod.rs:61`).
 
 ## Qué cambia para quien ya instaló
