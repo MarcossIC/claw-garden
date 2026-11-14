@@ -3664,7 +3664,7 @@ async fn setup_dry_run_writes_nothing() {
     assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
     let text = stdout_of(&out);
     assert!(text.contains("mcp server clawg-dev: would register it"), "{text}");
-    assert!(text.contains("would add SessionStart, UserPromptSubmit, SessionEnd"), "{text}");
+    assert!(text.contains("would add SessionStart, UserPromptSubmit, SessionEnd, PostToolUse, PostToolUseFailure"), "{text}");
     assert!(!sandbox.home.join("claude-config").exists());
     assert!(!sandbox.data_dir().exists());
 }
@@ -3793,6 +3793,10 @@ async fn setup_local_installs_in_the_folder_and_remove_undoes_it() {
     assert_eq!(hook["args"], json!(["hook", "session-start", "--agent", "claude-code", "--profile", "dev"]), "{settings}");
     assert_eq!(settings["hooks"]["UserPromptSubmit"][0]["hooks"][0]["args"][1], "user-prompt-submit", "{settings}");
     assert_eq!(settings["hooks"]["SessionEnd"][0]["hooks"][0]["args"][1], "session-end", "{settings}");
+    for (event, arg) in [("PostToolUse", "post-tool-use"), ("PostToolUseFailure", "post-tool-use-failure")] {
+        assert_eq!(settings["hooks"][event][0]["matcher"], "Bash", "{settings}");
+        assert_eq!(settings["hooks"][event][0]["hooks"][0]["args"][1], arg, "{settings}");
+    }
     assert!(!config.exists(), "the user's settings, server and protocol are not touched");
 
     let elsewhere = local(&["--path", "work/app", "--remove"], &sandbox.home);
