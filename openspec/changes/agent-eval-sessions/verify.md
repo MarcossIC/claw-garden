@@ -95,3 +95,76 @@ Veredicto: **la plomería cumple la spec, pero tres puntos sesgan lo que la regl
 7. WARNING 4: el canario contra `a4` con 15, con su umbral.
 8. WARNING 5: la comprobación de `fork/work/`, automática o en la guía.
 9. En la guía: los topes por tarea, el texto de `eza` (WARNING 6) y el listado de `home/` (WARNING 7) en el humo.
+
+## Tercera verificación
+
+Sobre las enmiendas, las tareas 15 a 27 (`1843c2d3..e871c4d5`).
+
+### Qué se corrió
+
+En Windows, sobre `e871c4d5`, en `target-test`:
+
+- `cargo test --workspace --target-dir target-test`: pasa.
+- `cargo clippy --workspace --all-targets --target-dir target-test -- -D warnings`: pasa.
+- `cargo clippy -p clawg-cli --target-dir target-test -- -D warnings`: pasa.
+- `agent-eval tasks`: sale con 0, da válidas las catorce tareas y lista `noise rules=15` y `noise-300 rules=300`. `untouched` está en `requests-timeout-decision-relay` (sesión 1), `requests-redact-decision-revised` (sesiones 1 y 2) y `example-relay-port`; `command_runs`, en `shelf-eza-missing` y `example-missing-command`.
+
+Además, una lectura independiente del código, sin `cargo` y sin sesiones, contra AS13 a AS22 y D14 a D22.
+
+### Cada tarea
+
+| Tarea | Veredicto | Evidencia |
+| --- | --- | --- |
+| 15 | Cumple | `run.rs:475` mira `sessions[i..sessions.len() - 1]`; `a_fact_saved_only_by_the_last_session_is_not_saved` |
+| 16 | Cumple, con W4 | `rereads` pura (`run.rs:594-618`); `overhead` en `None` en `joined`; rutas resueltas desde el `work/` donde corrió el cliente |
+| 17 | Cumple | `score::invocations` con comillas, `$(`, la comilla invertida, asignaciones y rutas; `the_runs_of_a_command_are_counted_in_every_part_of_a_shell_line` |
+| 18 | Cumple, con W3 | `play_session` escribe `untouched-K.json` antes de `Save` (`run.rs:1069-1075`) |
+| 19 | Cumple | el bloqueo en todo brazo y `additionalDirectories` sólo en `a4` (`arm.rs:358`, `:380-382`); `check_read_block` antes de preparar (`main.rs:441-443`) |
+| 20 | Cumple, con W2 | `outside_reads` (`run.rs:552-590`) |
+| 21 | Cumple | `artifacts`, pura, con las seis causas (`run.rs:271-299`) |
+| 22 | Cumple, con W5 | `main.rs:452-457` puntúa siempre; `fork` aplica `Keep` de la rama que falló al jugar (`run.rs:1174-1183`) |
+| 23 | Cumple | `save_state` y `restore_state` con el home entero menos `<datos>/models` (`run.rs:1254-1299`) |
+| 24 | Cumple | el ruido en la clave, las excluidas y `PairRow` (`report.rs:170-261`, `:363-411`) |
+| 25 | Cumple | la mediana del resultado entre 4 (`report.rs:530-559`) |
+| 26 | Cumple | `report.rs:612-613`, `main.rs:476`, `:480` |
+| 27 | Cumple | `docs/reference/testing.md` y la fila 129 de `openspec/README.md` |
+
+Ningún `#[allow]`, comentario de más ni texto que nombre una fase o una persona en lo que cambió.
+
+### Cada punto de «Antes de la campaña paga»
+
+| Punto | Lo cierra |
+| --- | --- |
+| 1. CRITICAL 1 | Tarea 15 |
+| 2. CRITICAL 2 | Tarea 16 y H1 de la propuesta |
+| 3. CRITICAL 3 | Tareas 19, 20 y 21 |
+| 4. WARNING 1 | Tarea 24 |
+| 5. WARNING 2 | Tareas 21 y 24, y la regla de la compactación (f) en la propuesta |
+| 6. WARNING 3 | Tarea 22, con el hueco de W5 abajo |
+| 7. WARNING 4, el canario | La guía: Δ entre N bajo `a4` con 300 y con 15 reglas, entre 500 y 3.000 tokens |
+| 8. WARNING 5 | Tarea 18, con el hueco de W3 abajo |
+| 9. Topes por tarea | La guía |
+| 9. El texto de `eza` | Tarea 17: H6 lee los intentos; el texto se anota en el humo |
+| 9. El listado de `home/` | Tarea 23, que restaura el home entero |
+
+De las sugerencias, S1 la cierra la tarea 23, S2 las 16 y 24, S3 la 25 y S6 la 26. S4 es una regla de lectura de H3, y S5 va a la guía.
+
+### Hallazgos
+
+**CRITICAL 1. El `a3` de la fase 4 ya trae los hooks de 131.** Desde `cca60fb7`, `setup` instala `PostToolUse` y `PostToolUseFailure` para Bash, y sólo `a3-notools` no los tiene (`arm.rs:325`). `shelf-eza-missing` deja correr Bash con `eza`. Bajo `a3`, las sesiones 1 y 2 enseñan `eza` al libro de fallos y la sesión 3 empieza con la regla, así que H6 leería «la memoria de hoy ya lo evita» por lo que agrega 131, y 131 se quedaría sin línea base. Las demás tareas niegan Bash. **Resuelto en la propuesta:** H6 y la fase 4 leen `a3-notools` como la memoria de hoy, con el mismo costo, y el `a3` de ahora lo corre la campaña de 131.
+
+**W1. `score --run` con una ruta relativa marca todo como artefacto.** `main.rs:465` no la hace absoluta (`run` sí, `main.rs:372`), así que cada `Read` del stream cae fuera y sale `read_outside`. Tarea 32. Hasta entonces, la guía puntúa siempre con rutas absolutas y no mueve las corridas.
+
+**W2. Falsos `read_outside`.** `Grep` toma como ruta un `pattern` que empieza con `/` (`run.rs:556`), `Bash` toma `/dev/null`, y en Windows `/c/Users/…` no coincide con `c:/users/…`. Cada uno excluye un par, y una R cuesta hasta 3,60 USD repetirla. Tarea 29.
+
+**W3. `untouched` de R no cubre todo archivo que puede llevar la decisión.** Faltan `FORK_DEFAULT_TIMEOUT` en `docs/user/advanced.rst`, `4.5, 41` en `adapters.py` y `HISTORY.md`, y los módulos donde se puede aplicar (`sessions.py`, `api.py`). Una sesión 1 que escribe la constante en la documentación («no toques el código todavía») aprueba la rama nueva sin relevo. Tarea 30.
+
+**W4. `again` cuenta lo que se lee con memoria y no lo que se redescubre con `Grep` o `Glob`.** Las respuestas de `search_memory` suman bajo `a3`, y lo que `a0` vuelve a encontrar con `Grep` no. La comparación «su sobrecosto no supera al de `a0`» queda inclinada hacia `a0`. La regla de H1 no cambia, porque se fijó antes de correr: la revisión informa `again` por herramienta junto al veredicto.
+
+**W5. Un `Stop` que falla después del `Play` de una rama no aplica su `Keep`** (`run.rs:1180`): su `stream-2.jsonl` queda en la raíz, `costs` no la cuenta y la rama se puntúa con una sesión. Tarea 31.
+
+**Sugerencias.** `not_continued` compara con `<` estricto: la revisión mira cuánto bajó el contexto antes de excluir por (c). La exención por `session_id` vale sólo para la sesión propia. `score_dir(...).unwrap_or_default()` (`main.rs:454`) calla un error al puntuar (tarea 32). `PairRow` agrupa sin el ruido, que en R es uno solo.
+
+### Lo que queda para la guía
+
+Los topes de `--max-budget-usd` por tarea y la cuenta contra el tope de la campaña, que pasó a 30 USD; `--claude-version` 2.1.257 o posterior; el canario; una sesión del humo que intenta leer fuera y sale negada, y la lista de `outside_reads` de cada corrida del humo; el texto de `eza` y el primer pedido de las sesiones de E bajo `a0`; que H6 se lee en el check `command_runs` de cada `result.json`, porque el reporte no muestra los intentos; y que `again` se informa por herramienta.

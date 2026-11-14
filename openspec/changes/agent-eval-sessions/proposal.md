@@ -140,7 +140,9 @@ Por herramienta de clawg: llamadas, cuántas se pudieron medir solas, la mediana
 Sobre `shelf-eza-missing`, 3 corridas por brazo. Un **intento** es una llamada a `Bash` cuyo comando invoca `eza` en cualquiera de sus partes (`command_runs`), haya dicho lo que haya dicho la salida: así H6 no depende de que el shell del cliente escriba `eza: command not found`. Ese texto se cuenta aparte (`tool_failed_count` con `text`) y se informa.
 
 - **Hay efecto:** bajo `a0`, la sesión 3 intenta `eza` al menos una vez en al menos 2 de 3.
-- **La memoria de hoy ya lo evita**, para `a3` o `a4`: 0 intentos en la sesión 3 en 3 de 3.
+- **La memoria de hoy ya lo evita**, para `a3-notools` o `a4`: 0 intentos en la sesión 3 en 3 de 3.
+
+La memoria de hoy es la de antes de [repeated-errors](../repeated-errors/proposal.md) (131): `a3-notools`. Desde 131, `a3` trae los hooks de Bash que aprenden el programa que falta, así que bajo `a3` la sesión 3 llega a 0 intentos por lo que 131 agrega, y la fase 4 mediría a 131 en lugar de su línea base. El `a3` de ahora lo corre la campaña de 131.
 
 Si hay efecto y ninguna memoria lo evita, 131 tiene su línea base y su meta, 0 intentos en 3 de 3. Si no hay efecto, la tarea no mide lo que 131 necesita y 131 la cambia en su propuesta.
 
@@ -174,7 +176,7 @@ Con Sonnet 5.5 y los precios de la exploración. Una sesión corta costó de 0,0
 | 0. Ensayo sin pago: todas las tareas en seco, con el modelo falso en CI y con el real en local | — | 0 |
 | 1. Humo y canarios: R bifurcada bajo `a3`; D partida bajo `a3`; la K larga bajo `a3` con 300; E bajo `a0`; N bajo `a4` con 300 y con 15 (el canario) | 6 | 2,18 |
 | 2. Relevo y ciclo de vida: R bifurcada bajo `a0`, `a3` y `a4`, 3 cada una; D continua bajo `a0`, 2, y partida bajo `a0`, `a3` y `a4`, 3 cada una | 20 | 16,10 |
-| 4. Error repetido: E bajo `a0`, `a3` y `a4`, 3 cada una | 9 | 1,08 |
+| 4. Error repetido: E bajo `a0`, `a3-notools` y `a4`, 3 cada una | 9 | 1,08 |
 | 3. Escala: las seis del piloto con 300 bajo `a3`, `l0` y `a4`, 2 cada una; las seis bajo `a4` con 15 y el orden corregido, 2 cada una; la K larga bajo `a3` y `a4` con 15 y con 300, 3 cada una | 60 | 5,04 |
 | **Total** | **95** | **24,40** |
 
@@ -182,10 +184,10 @@ Las fases corren en el orden de la tabla: la 4 antes que la 3, que es la que men
 
 **Los topes de cada proceso.** `--max-budget-usd` es un argumento de la corrida, y el cliente lo aplica a cada proceso sin contar lo gastado antes de continuar: vale por sesión, no por corrida. Se fija por tarea: 1,20 para R (la primera parte estimada en 0,65 y una segunda continua que arranca sobre 150.000 tokens), 0,50 para D y la K larga, 0,15 para E y las del piloto. El peor caso de una corrida es su número de procesos por su tope: 3,60 una R bifurcada, 1,50 una D, 0,50 la K larga, 0,45 una E y 0,15 una del piloto.
 
-- **Tope: 25 USD, duro.** Una corrida empieza sólo si lo gastado hasta ahí, sumado con `agent-eval costs` sobre todas las corridas de la campaña (las que fallaron incluidas), más su peor caso, no pasa de 25. Si lo gastado más el estimado de lo que falta pasa de 25, se aplica el orden de recorte antes de seguir.
-- Las corridas del humo cuentan en su celda si después del humo no cambia ni la tarea ni el arnés: las seis son celdas de las fases 2, 3 y 4, y entonces el total baja a 22,22. Con 24,40 el margen para repetir artefactos es de 0,60 USD (una D, no una R); con 22,22, de 2,78.
+- **Tope: 30 USD, duro.** Una corrida empieza sólo si lo gastado hasta ahí, sumado con `agent-eval costs` sobre todas las corridas de la campaña (las que fallaron incluidas), más su peor caso, no pasa de 30. Si lo gastado más el estimado de lo que falta pasa de 30, se aplica el orden de recorte antes de seguir. El tope era 25, que con 24,40 estimados no dejaba repetir una R; pasó a 30 antes de la primera corrida paga.
+- Las corridas del humo cuentan en su celda si después del humo no cambia ni la tarea ni el arnés: las seis son celdas de las fases 2, 3 y 4, y entonces el total baja a 22,22. Con 24,40 el margen para repetir artefactos es de 5,60 USD (una R y una D); con 22,22, de 7,78.
 - **El humo es una puerta.** La campaña no sigue si la primera parte de R cuesta más de 1,00 USD; si la rama continua de R tiene el artefacto (c) o la sesión 1 compactó (f); o si alguna corrida del humo tiene el artefacto (e), porque el bloqueo de lecturas no funcionó. **El canario** es una puerta sólo de la fase 3: si Δ no está entre 500 y 3.000 tokens ([H2](#h2-la-escala)), la fase 3 no empieza hasta que el modelo de carga se corrige y se vuelven a puntuar sus corridas. Las fases 2 y 4 siguen, porque con 15 reglas el `MEMORY.md` de toda tarea tiene de 46 a 52 líneas y lo carga entero cualquier modelo.
-- **Orden de recorte**, si el costo medio de una fase pasa del estimado en más de la mitad, o si lo gastado más lo que falta pasa de 25: la K larga baja a 2 corridas por celda; después D continua baja a 1; después las del piloto con 300 corren sólo bajo `a3` y `a4`. R no se recorta.
+- **Orden de recorte**, si el costo medio de una fase pasa del estimado en más de la mitad, o si lo gastado más lo que falta pasa de 30: la K larga baja a 2 corridas por celda; después D continua baja a 1; después las del piloto con 300 corren sólo bajo `a3` y `a4`. R no se recorta.
 - La fase 3 es la que menos decide, porque parte de su resultado es por construcción: sin ella el total es 19,36.
 
 ## Cómo se ensaya sin pagar
