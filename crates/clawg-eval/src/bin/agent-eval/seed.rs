@@ -83,10 +83,15 @@ pub fn seeded(task: &[SeedMemory], noise: &[SeedMemory]) -> Vec<SeedMemory> {
     all
 }
 
-/// `memories` as a native memory file: one section per memory, its text whole.
+/// `memories`, as [`seeded`] orders them, as a native memory file: one section
+/// per memory, its text whole, from the oldest to the newest as an agent that
+/// appends its notes leaves it.
 pub fn native_memory(memories: &[SeedMemory]) -> String {
+    let mut oldest_first: Vec<&SeedMemory> = memories.iter().collect();
+    // Stable, so at one age the noise stays before the task's memory.
+    oldest_first.sort_by_key(|m| std::cmp::Reverse(m.age_days));
     let mut out = String::from("# Memory\n");
-    for memory in memories {
+    for memory in oldest_first {
         out.push('\n');
         out.push_str(memory.content.trim_end());
         out.push('\n');
@@ -173,6 +178,15 @@ mod tests {
     fn the_native_memory_holds_every_text_whole() {
         let text = native_memory(&[memory("Staging uses port 48213\nbecause 8080 is taken.", "semantic_fact", 0, 1), memory("Chose SQLite", "architectural_decision", 0, 1)]);
         assert_eq!(text, "# Memory\n\nStaging uses port 48213\nbecause 8080 is taken.\n\nChose SQLite\n");
+    }
+
+    #[test]
+    fn the_native_memory_goes_from_the_oldest_memory_to_the_newest() {
+        let task = [memory("task old", "semantic_fact", 120, 1), memory("task new", "semantic_fact", 10, 1)];
+        let noise = [memory("noise mid", "semantic_fact", 60, 1), memory("noise new", "semantic_fact", 10, 1), memory("noise oldest", "semantic_fact", 200, 1)];
+        let text = native_memory(&seeded(&task, &noise));
+        let order: Vec<&str> = text.lines().filter(|l| !l.is_empty() && *l != "# Memory").collect();
+        assert_eq!(order, ["noise oldest", "task old", "noise mid", "noise new", "task new"], "at one age the noise goes first");
     }
 
     #[test]

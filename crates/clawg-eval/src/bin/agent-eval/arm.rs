@@ -505,7 +505,7 @@ mod tests {
                 Arm::A0 => assert!(seed.is_none() && native.is_none()),
                 Arm::A4 => {
                     let native = native.unwrap();
-                    assert!(native.find("Go errors").unwrap() < native.find("48213").unwrap(), "the newer memory goes first:\n{native}");
+                    assert!(native.find("48213").unwrap() < native.find("Go errors").unwrap(), "the oldest memory goes first:\n{native}");
                 }
                 _ => {
                     let seed = seed.unwrap();
