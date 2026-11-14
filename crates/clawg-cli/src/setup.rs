@@ -88,6 +88,9 @@ pub struct State {
     pub language: Option<Lang>,
     /// The version of the binary that writes the block, which its stamp names.
     pub version: Version,
+    /// The variant of the block the person asked for; `None` keeps the one
+    /// chosen before, or the default.
+    pub protocol: Option<Variant>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -117,6 +120,8 @@ pub enum SetupError {
          --path, nothing was changed"
     )]
     HomeFolder(PathBuf),
+    #[error("--protocol chooses the block of Claude Code's CLAUDE.md, and Cursor has no protocol block")]
+    ProtocolForCursor,
     #[error("--local and --path put Claude Code's hooks in one folder; `clawg setup cursor` installs Cursor's for the user")]
     FolderForCursor,
 }
@@ -213,6 +218,8 @@ pub struct Plan {
     pub hooks: HooksStep,
     pub settings: FileStep,
     pub block: BlockStep,
+    /// The variant the block holds once installed; `None` when removing.
+    pub variant: Option<Variant>,
     pub instructions: FileStep,
 }
 
@@ -241,16 +248,22 @@ pub fn plan(state: &State, mode: Mode) -> Result<Plan, SetupError> {
         Profile::Prod => Profile::Dev,
     };
     let other_registered = registered(other.mcp_server_name()).is_some_and(is_clawg_server);
-    let (block, instructions) = match mode {
-        Mode::Install => install_block(&state.instructions, state.language, state.version)?,
+    let (block, instructions, variant) = match mode {
+        Mode::Install => {
+            let (step, file, variant) = install_block(&state.instructions, state.language, state.version, state.protocol)?;
+            (step, file, Some(variant))
+        }
         Mode::Remove if other_registered => {
             find_block(&state.instructions)?;
-            (BlockStep::Kept, FileStep::Unchanged)
+            (BlockStep::Kept, FileStep::Unchanged, None)
         }
-        Mode::Remove => remove_block(&state.instructions)?,
+        Mode::Remove => {
+            let (step, file) = remove_block(&state.instructions)?;
+            (step, file, None)
+        }
     };
 
-    Ok(Plan { mode, server, server_step, hooks, settings: settings_step, block, instructions })
+    Ok(Plan { mode, server, server_step, hooks, settings: settings_step, block, variant, instructions })
 }
 
 /// The binary's path as the server and the hooks name it: absolute, and
@@ -723,19 +736,34 @@ pub(crate) fn find_block(file: &File) -> Result<Option<(usize, usize)>, SetupErr
     }
 }
 
-fn install_block(file: &File, language: Option<Lang>, version: Version) -> Result<(BlockStep, FileStep), SetupError> {
+/// What happens to the block when installing, and the variant it holds then:
+/// the one asked for, else the one the installed stamp says was chosen, else
+/// the default. Only a variant that was asked for goes in the stamp.
+fn install_block(
+    file: &File,
+    language: Option<Lang>,
+    version: Version,
+    requested: Option<Variant>,
+) -> Result<(BlockStep, FileStep, Variant), SetupError> {
     let range = find_block(file)?;
-    let stamp = Stamp { version, choice: None };
+    let found = match (&file.text, range) {
+        (Some(text), Some((begin, end))) => Some(split_stamp(&text[begin..end])),
+        _ => None,
+    };
+    let kept = found.as_ref().and_then(|(stamp, _)| stamp.and_then(|s| s.choice));
+    let choice = requested.or(kept);
+    let variant = choice.unwrap_or(DEFAULT_VARIANT);
+    let stamp = Stamp { version, choice };
     let Some(text) = &file.text else {
-        return Ok((BlockStep::Added, FileStep::Write(block("\n", language, DEFAULT_VARIANT, stamp) + "\n")));
+        return Ok((BlockStep::Added, FileStep::Write(block("\n", language, variant, stamp) + "\n"), variant));
     };
     let eol = line_ending(text);
-    let wanted = block(eol, language, DEFAULT_VARIANT, stamp);
-    if let Some((begin, end)) = range {
-        if without_stamp(&text[begin..end]) == unstamped(language, DEFAULT_VARIANT) {
-            return Ok((BlockStep::Unchanged, FileStep::Unchanged));
+    let wanted = block(eol, language, variant, stamp);
+    if let (Some((begin, end)), Some((_, body))) = (range, found) {
+        if body == unstamped(language, variant) && kept == choice {
+            return Ok((BlockStep::Unchanged, FileStep::Unchanged, variant));
         }
-        return Ok((BlockStep::Rewritten, FileStep::Write(format!("{}{wanted}{}", &text[..begin], &text[end..]))));
+        return Ok((BlockStep::Rewritten, FileStep::Write(format!("{}{wanted}{}", &text[..begin], &text[end..])), variant));
     }
     let mut out = text.clone();
     if !out.is_empty() {
@@ -746,7 +774,7 @@ fn install_block(file: &File, language: Option<Lang>, version: Version) -> Resul
     }
     out.push_str(&wanted);
     out.push_str(eol);
-    Ok((BlockStep::Added, FileStep::Write(out)))
+    Ok((BlockStep::Added, FileStep::Write(out), variant))
 }
 
 fn remove_block(file: &File) -> Result<(BlockStep, FileStep), SetupError> {
@@ -795,13 +823,15 @@ fn read(path: PathBuf) -> Result<File, SetupError> {
     }
 }
 
-/// Reads what [`plan`] decides from, the preferred language from `data_dir`.
+/// Reads what [`plan`] decides from, the preferred language from `data_dir`;
+/// `protocol` is the variant the person asked for, if any.
 pub fn read_state(
     exe: PathBuf,
     profile: Profile,
     home: Option<&Path>,
     config_dir: Option<OsString>,
     data_dir: &Path,
+    protocol: Option<Variant>,
 ) -> Result<State, SetupError> {
     let (servers, settings, instructions) = locations(home, config_dir)?;
     Ok(State {
@@ -812,6 +842,7 @@ pub fn read_state(
         instructions: read(instructions)?,
         language: preferences::language_in(data_dir),
         version: own_version()?,
+        protocol,
     })
 }
 
@@ -1136,9 +1167,10 @@ pub fn report(plan: &Plan, state: &State, applied: Option<&Applied>) -> (String,
         (BlockStep::Kept, Lang::Es) => "se mantiene, el servidor del otro perfil todavía lo usa".to_string(),
     };
     let instructions = state.instructions.path.display();
+    let variant = plan.variant.map(|v| format!(" (protocol={})", v.as_str())).unwrap_or_default();
     lines.push(match lang {
-        Lang::En => format!("memory protocol in {instructions}: {block}"),
-        Lang::Es => format!("protocolo de memoria en {instructions}: {block}"),
+        Lang::En => format!("memory protocol in {instructions}: {block}{variant}"),
+        Lang::Es => format!("protocolo de memoria en {instructions}: {block}{variant}"),
     });
 
     if let Some(applied) = applied {
@@ -1267,10 +1299,10 @@ pub fn run_in(
 /// `clawg setup claude-code` for `profile`, reading the process's
 /// environment: the running binary, the home directory, `CLAUDE_CONFIG_DIR`
 /// and the PATH.
-pub fn run(profile: Profile, mode: Mode, dry_run: bool) -> Result<(String, u8), SetupError> {
+pub fn run(profile: Profile, mode: Mode, dry_run: bool, protocol: Option<Variant>) -> Result<(String, u8), SetupError> {
     let base_dir = clawg_core::paths::data_dir(profile).map_err(|_| SetupError::NoHome)?;
     let home = clawg_core::paths::home_dir();
-    let state = read_state(current_exe()?, profile, home.as_deref(), std::env::var_os("CLAUDE_CONFIG_DIR"), &base_dir)?;
+    let state = read_state(current_exe()?, profile, home.as_deref(), std::env::var_os("CLAUDE_CONFIG_DIR"), &base_dir, protocol)?;
     let entries: Vec<PathBuf> = std::env::var_os("PATH").map(|raw| std::env::split_paths(&raw).collect()).unwrap_or_default();
     let claude = find_claude(&entries, Path::is_file);
     run_in(state, mode, dry_run, claude.as_deref(), &base_dir, now_ms())
@@ -1317,6 +1349,7 @@ mod tests {
             instructions: file("CLAUDE.md", instructions),
             language: None,
             version: v("0.88.0"),
+            protocol: None,
         }
     }
 
@@ -1492,6 +1525,58 @@ mod tests {
         }
         let short = block("\n", None, Variant::Short, stamp(Some(Variant::Short)));
         assert_eq!(freshness(&short, Some(Lang::Es), own), Freshness::Stale, "the other language is other text");
+    }
+
+    fn asking_for(protocol: Option<Variant>, instructions: &str) -> State {
+        State { protocol, ..state(None, None, Some(instructions)) }
+    }
+
+    #[test]
+    fn the_protocol_option_writes_its_variant_and_a_run_without_it_keeps_it() {
+        let mine = |block: &str| format!("# Mine\n\nSome rules.\n\n{block}\n\nAfter.\n");
+        let before_stamps = mine(&unstamped(None, Variant::Full));
+
+        for variant in [Variant::Short, Variant::Off, Variant::Full] {
+            let chosen = plan(&asking_for(Some(variant), &before_stamps), Mode::Install).unwrap();
+            assert_eq!((chosen.block, chosen.variant), (BlockStep::Rewritten, Some(variant)), "{variant:?}");
+            let stamp = Stamp { version: v("0.88.0"), choice: Some(variant) };
+            let after = mine(&block("\n", None, variant, stamp));
+            assert_eq!(written(&chosen.instructions), after, "the text outside the markers stays");
+
+            let again = plan(&asking_for(None, &after), Mode::Install).unwrap();
+            assert_eq!((again.block, &again.instructions, again.variant), (BlockStep::Unchanged, &FileStep::Unchanged, Some(variant)));
+            let same = plan(&asking_for(Some(variant), &after), Mode::Install).unwrap();
+            assert_eq!(same.block, BlockStep::Unchanged, "asking for what is there changes nothing");
+        }
+
+        let from_short = mine(&block("\n", None, Variant::Short, Stamp { version: v("0.88.0"), choice: Some(Variant::Short) }));
+        let back = plan(&asking_for(Some(Variant::Full), &from_short), Mode::Install).unwrap();
+        assert!(written(&back.instructions).contains("<!-- clawg 0.88.0 protocol=full -->"), "a chosen variant is written even when it is the default");
+
+        let none = plan(&asking_for(None, &before_stamps), Mode::Install).unwrap();
+        assert_eq!((none.block, none.variant), (BlockStep::Unchanged, Some(Variant::Full)), "no choice, the default");
+
+        let fresh = plan(&State { protocol: Some(Variant::Short), ..state(None, None, None) }, Mode::Install).unwrap();
+        assert!(written(&fresh.instructions).starts_with(&format!("{BEGIN_MARKER}\n<!-- clawg 0.88.0 protocol=short -->\n# Claw Garden memory protocol\n")));
+        assert_eq!(plan(&state(None, None, None), Mode::Remove).unwrap().variant, None, "removing has no variant");
+
+        let s = State { protocol: Some(Variant::Short), ..state(None, None, Some(&before_stamps)) };
+        let (text, _) = report(&plan(&s, Mode::Install).unwrap(), &s, None);
+        assert!(text.contains("would update it (protocol=short)"), "{text}");
+        let (text, _) = report(&plan(&state(None, None, Some(&before_stamps)), Mode::Install).unwrap(), &state(None, None, None), None);
+        assert!(text.contains("up to date (protocol=full)"), "{text}");
+    }
+
+    #[test]
+    fn a_new_version_with_the_same_text_rewrites_nothing() {
+        for (choice, requested) in [(None, None), (Some(Variant::Short), None), (Some(Variant::Short), Some(Variant::Short)), (Some(Variant::Off), None)] {
+            let variant = choice.unwrap_or(Variant::Full);
+            let older = block("\n", None, variant, Stamp { version: v("0.87.0"), choice });
+            let plan_ = plan(&asking_for(requested, &older), Mode::Install).unwrap();
+            assert_eq!((plan_.block, &plan_.instructions), (BlockStep::Unchanged, &FileStep::Unchanged), "{choice:?} {requested:?}");
+        }
+        let crlf = block("\r\n", None, Variant::Full, Stamp { version: v("0.87.0"), choice: None }) + "\r\n";
+        assert_eq!(plan(&asking_for(None, &crlf), Mode::Install).unwrap().block, BlockStep::Unchanged);
     }
 
     #[test]

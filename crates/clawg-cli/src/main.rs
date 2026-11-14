@@ -275,12 +275,15 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, CliError> {
             Ok(ExitCode::SUCCESS)
         }
 
-        Command::Setup { client, dry_run, remove, local, path, profile } => {
+        Command::Setup { client, dry_run, remove, local, path, protocol, profile } => {
             let profile = profile.resolve()?;
             let mode = if remove { setup::Mode::Remove } else { setup::Mode::Install };
             let folder = path.or_else(|| local.then(|| PathBuf::from(".")));
+            if client == SetupClient::Cursor && protocol.is_some() {
+                return Err(setup::SetupError::ProtocolForCursor.into());
+            }
             let (text, code) = match (client, folder) {
-                (SetupClient::ClaudeCode, None) => setup::run(profile, mode, dry_run)?,
+                (SetupClient::ClaudeCode, None) => setup::run(profile, mode, dry_run, protocol)?,
                 (SetupClient::ClaudeCode, Some(folder)) => setup::local::run(profile, mode, dry_run, &folder)?,
                 (SetupClient::Cursor, None) => setup::cursor::run(profile, mode, dry_run)?,
                 (SetupClient::Cursor, Some(_)) => return Err(setup::SetupError::FolderForCursor.into()),

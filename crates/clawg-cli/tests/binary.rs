@@ -3625,6 +3625,41 @@ async fn setup_cursor_refuses_a_folder() {
     assert!(!sandbox.home.join(".cursor").exists() && !sandbox.home.join(".claude").exists());
 }
 
+#[tokio::test]
+async fn setup_cursor_refuses_a_protocol() {
+    let sandbox = Sandbox::new();
+    let out = sandbox.run(&["setup", "cursor", "--profile", "dev", "--protocol", "short"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stdout_of(&out));
+    assert!(stderr_of(&out).contains("Cursor has no protocol block"), "{}", stderr_of(&out));
+    assert!(!sandbox.home.join(".cursor").exists(), "a refusal writes nothing");
+}
+
+#[tokio::test]
+async fn setup_protocol_short_writes_the_short_block() {
+    let sandbox = Sandbox::new();
+    let empty = sandbox.home.join("empty-path");
+    std::fs::create_dir_all(&empty).unwrap();
+    let md_path = sandbox.home.join("claude-config").join("CLAUDE.md");
+
+    // No `claude` on the PATH: the server is left to the person, and the files are written.
+    let out = setup(&sandbox, &["--protocol", "short"], &empty);
+    assert_eq!(out.status.code(), Some(1), "{}{}", stdout_of(&out), stderr_of(&out));
+    assert!(stdout_of(&out).contains("added (protocol=short)"), "{}", stdout_of(&out));
+    let md = std::fs::read_to_string(&md_path).unwrap();
+    let opening = format!("<!-- BEGIN CLAWG MEMORY PROTOCOL -->\n<!-- clawg {} protocol=short -->\n# Claw Garden memory protocol\n", env!("CARGO_PKG_VERSION"));
+    assert!(md.starts_with(&opening), "{md}");
+    assert!(md.contains("## Session summary") && md.contains("## After a compaction"), "{md}");
+    assert!(!md.contains("## How to write a save"), "{md}");
+
+    let again = setup(&sandbox, &[], &empty);
+    assert!(stdout_of(&again).contains("up to date (protocol=short)"), "a run without the option keeps the choice: {}", stdout_of(&again));
+    assert_eq!(std::fs::read_to_string(&md_path).unwrap(), md);
+
+    let local = setup(&sandbox, &["--local", "--protocol", "off"], &empty);
+    assert_eq!(local.status.code(), Some(2), "a usage error: {}", stderr_of(&local));
+    assert_eq!(std::fs::read_to_string(&md_path).unwrap(), md, "and it writes nothing");
+}
+
 /// The line `setup cursor` installs, run through `sh -c` in `~/.cursor` with
 /// what Cursor hands it: the quoting and `--client cursor` reach the hook.
 #[cfg(unix)]

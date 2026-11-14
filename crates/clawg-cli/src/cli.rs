@@ -12,6 +12,7 @@ use clawg_core::paths::{Profile, ProfileError};
 use clawg_core::preferences::Lang;
 
 use crate::client::{DeleteRequest, MergeRequest, MoveRequest};
+use crate::mcp::protocol::Variant;
 
 /// `clawg` — local-first memory for coding agents.
 #[derive(Debug, Parser)]
@@ -23,6 +24,10 @@ pub struct Cli {
 
 /// Trims an `--agent` value, refusing one with nothing left: a blank id
 /// would be an agent no client could ever name again.
+fn parse_protocol(raw: &str) -> Result<Variant, String> {
+    Variant::parse(raw).ok_or_else(|| format!("`{raw}` is not a protocol variant; use full, short or off"))
+}
+
 fn parse_agent(raw: &str) -> Result<String, String> {
     let agent = raw.trim();
     if agent.is_empty() {
@@ -302,6 +307,12 @@ pub enum Command {
         /// Like `--local`, for the folder at DIR.
         #[arg(long, value_name = "DIR")]
         path: Option<PathBuf>,
+        /// Claude Code only: how much of the memory protocol the block in the
+        /// user's `CLAUDE.md` holds, `full` (what setup writes unless told
+        /// otherwise), `short` or `off`. Without it, setup keeps the variant
+        /// chosen before.
+        #[arg(long, value_name = "VARIANT", value_parser = parse_protocol, conflicts_with_all = ["remove", "local", "path"])]
+        protocol: Option<Variant>,
         #[command(flatten)]
         profile: ProfileArg,
     },
@@ -1524,6 +1535,7 @@ mod tests {
                 remove: false,
                 local: false,
                 path: None,
+                protocol: None,
                 profile: ProfileArg { profile: None }
             }
         );
@@ -1535,6 +1547,7 @@ mod tests {
                 remove: true,
                 local: false,
                 path: None,
+                protocol: None,
                 profile: ProfileArg { profile: Some("dev".into()) }
             }
         );
@@ -1546,6 +1559,7 @@ mod tests {
                 remove: false,
                 local: false,
                 path: None,
+                protocol: None,
                 profile: ProfileArg { profile: Some("dev".into()) }
             }
         );
@@ -1565,6 +1579,28 @@ mod tests {
         assert_eq!(setup(&["--path", "../app", "--remove"]), (false, Some(PathBuf::from("../app")), true));
         let both = Cli::try_parse_from(["clawg", "setup", "claude-code", "--local", "--path", "x"]);
         assert!(both.is_err(), "one folder or the other");
+    }
+
+    #[test]
+    fn the_protocol_option_parses_and_excludes_local_remove_and_cursor() {
+        let protocol = |args: &[&str]| match parse(&[&["clawg", "setup", "claude-code"], args].concat()).command {
+            Command::Setup { protocol, .. } => protocol,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(protocol(&[]), None, "no choice unless one is given");
+        assert_eq!(protocol(&["--protocol", "full"]), Some(Variant::Full));
+        assert_eq!(protocol(&["--protocol", "short", "--dry-run"]), Some(Variant::Short));
+        assert_eq!(protocol(&["--protocol=off"]), Some(Variant::Off));
+        for bad in [&["--protocol", "tiny"][..], &["--protocol", "Full"], &["--protocol"]] {
+            assert!(Cli::try_parse_from([&["clawg", "setup", "claude-code"], bad].concat()).is_err(), "{bad:?}");
+        }
+        for with in ["--remove", "--local"] {
+            let both = Cli::try_parse_from(["clawg", "setup", "claude-code", "--protocol", "short", with]);
+            assert!(both.is_err(), "{with} writes no block, so there is none to choose");
+        }
+        assert!(Cli::try_parse_from(["clawg", "setup", "claude-code", "--protocol", "short", "--path", "x"]).is_err());
+        // `setup cursor` has no block either: it parses, and the command refuses it before it reads anything.
+        assert!(Cli::try_parse_from(["clawg", "setup", "cursor", "--protocol", "short"]).is_ok());
     }
 
     #[test]
