@@ -29,6 +29,7 @@ use crate::memory::ingest::store_insert::{deliberate_importance, NewMemoryRecord
 use crate::memory::revision::topic::{inherit, unkeyed_revision, Replaced, Revision, TopicScope};
 use crate::memory::domain::clock::TimestampMs;
 use crate::memory::store::db::MemoryStore;
+use crate::memory::store::error::MemoryError;
 use crate::metrics::{Recorder, Unit};
 
 /// What happened to one chunk that reached the store.
@@ -687,7 +688,8 @@ async fn process_event(
 /// Ingests `evt` and, when it finished, links its pieces and applies its
 /// revision; for an event with an outbox row, those and the row's removal go
 /// in one transaction. A failure leaves the row, with the pieces stored so far
-/// noted in it, and replaces nothing.
+/// noted in it, and replaces nothing; a failure of that transaction itself
+/// leaves the report without the pairs it found.
 #[expect(clippy::too_many_arguments, reason = "the parameters have no type that groups them; adding one is a refactor of its own")]
 async fn process_tracked(
     evt: &MemoryEvent,
@@ -737,15 +739,25 @@ async fn process_tracked(
     report.revision_candidate = unkeyed_revision(evt.topic(), &report.related);
     let warned = report.revision_candidate;
     let started = Instant::now();
-    report.replaced = match row {
+    let finished = match row {
         // A failure here leaves the row with every piece noted: the next start
         // only finishes it.
-        Some(row) => store.outbox_finish(row, pieces, revision, warned).await.unwrap_or_else(|e| {
+        Some(row) => store.outbox_finish(row, pieces, revision, warned).await.inspect_err(|e| {
             log::warn!("could not finish outbox row {row}: {e}; the next start finishes it");
-            Vec::new()
         }),
         None => finish_save(store, pieces, revision, warned).await,
     };
+    match finished {
+        Ok(replaced) => report.replaced = replaced,
+        // The pieces are stored but not linked, and the revision and the mark
+        // were rolled back. A pair names only the piece that holds it, which
+        // no agent can judge through the first id of the answer until the
+        // link exists, and a warning would point at a mark nobody wrote.
+        Err(_) => {
+            report.related.clear();
+            report.revision_candidate = None;
+        }
+    }
     record_stage(store.metrics(), "link", started);
     report
 }
@@ -1165,14 +1177,13 @@ async fn finish_save(
     pieces: Vec<StoredPiece>,
     revision: Option<Revision>,
     warned: Option<i64>,
-) -> Vec<Replaced> {
+) -> Result<Vec<Replaced>, MemoryError> {
     if pieces.len() < 2 && revision.is_none() && warned.is_none() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let count = pieces.len();
-    store.finish_save(pieces, revision, warned).await.unwrap_or_else(|e| {
+    store.finish_save(pieces, revision, warned).await.inspect_err(|e| {
         log::warn!("could not finish a save of {count} pieces: {e}; they stay unlinked and replace nothing");
-        Vec::new()
     })
 }
 
@@ -4203,6 +4214,54 @@ mod tests {
             pairs(&store).await,
             vec![(held, older, "pending".to_string()), (last, older, "pending".to_string())]
         );
+    }
+
+    #[tokio::test]
+    async fn a_save_whose_finish_fails_names_no_pairs() {
+        use crate::memory::revision::dispute::{judge_pair, Verdict};
+
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let older = PlacedEmbedder { vectors: vec![turned(2, 0.2)] };
+        let older = process_with(Arc::new(older), &store, &explicit_fact("the build uses cargo")).await.memories[0].id;
+        let content = long_save();
+        let pieces = chunk_count(&content);
+        assert!(pieces >= 3, "fixture must split into three pieces or more");
+        // Only the second piece sits in the band of the older row.
+        let place = |i: usize| if i == 1 { turned(1, 0.0) } else { turned(3, 1.5) };
+        let row = record_event(&store, explicit_fact(&content)).await;
+        let event = store.outbox_pending().await.unwrap().remove(0).1;
+        store
+            .conn
+            .call(|c| {
+                c.execute_batch(
+                    "CREATE TEMP TRIGGER no_links BEFORE INSERT ON memory_piece \
+                     BEGIN SELECT RAISE(ABORT, 'links are refused'); END",
+                )
+            })
+            .await
+            .unwrap();
+        let (reply, answer) = oneshot::channel();
+        let request = IngestRequest { event, reply: Some(reply), outbox: Some(row) };
+
+        run_worker(&store, PiecesAt::new(&content, None, place), Replay::rows(Vec::new()), vec![request]).await;
+
+        let report = answer.await.unwrap();
+        assert_eq!(report.failure, None);
+        assert_eq!(report.memories.len(), pieces);
+        assert!(report.related.is_empty(), "{:?}", report.related);
+        assert!(report.replaced.is_empty() && report.revision_candidate.is_none());
+        let (state, _, _, progress) = outbox_row(&store, row).await.expect("the row stays");
+        assert_eq!((state.as_str(), progress.len()), ("pending", pieces));
+        assert!(piece_links(&store).await.is_empty());
+
+        store.conn.call(|c| c.execute_batch("DROP TRIGGER no_links")).await.unwrap();
+        replay_pending(&store, PiecesAt::new(&content, None, place)).await;
+
+        assert_eq!(outbox_row(&store, row).await, None);
+        let rows = rows_of_the_save(&store).await;
+        assert_eq!(rows.len(), pieces);
+        assert_eq!(pairs(&store).await, vec![(rows[1], older, "pending".to_string())]);
+        judge_pair(&store, rows[0], older, Verdict::Supersedes, None, false, None).await.unwrap();
     }
 
     #[tokio::test]
