@@ -92,3 +92,14 @@ Ninguno.
   - la puerta de latencia de la decisión 6: p95 ≤ 60 ms en 200 corridas sin firma, desde Git Bash y con el binario publicado. La tanda con firma también se anota, y W3 pide juzgarla;
   - el `verify.md` de esa verificación, o una sección más en este.
 - **Después del cambio**: la campaña paga (`shelf-eza-missing` y la tarea N, brazos `a3-notools` y `a3`), y correr otra vez `clawg setup claude-code` en cada cliente ya configurado. `doctor` lo avisa con `tool_hooks` mientras falte.
+
+## Arreglos después de la verificación
+
+| Hallazgo | Commit | Lo fija |
+| --- | --- | --- |
+| W1, el corte entre comillas y la firma en la salida normal | `77f7bd6d` | `command_words` no corta dentro de `'…'` ni de `"…"`; con `stderr` en `tool_response`, la firma se busca sólo ahí, salvo con `2>&1` o `\|&` (`response_texts`). Tests `a_separator_inside_quotes_starts_no_command`, `the_signature_is_read_only_where_the_shell_reports_it` y `a_signature_a_program_printed_is_no_missing_program` |
+| S1, éxitos falsos | `60e7aa0c` | un `Bash` con `run_in_background` no cuenta como éxito, y `\|&` esconde errores. Tests `a_command_in_the_background_is_no_success` y el caso `eza \|& true` |
+| W2, el nombre del test | `60f1e295` | `only_a_program_that_never_worked_and_is_missing_is_a_rule` |
+| S4 y S5, visibilidad y comentarios | `5e6d7052` | `pub(crate)` en lo que sólo usa `clawg-cli`; `RULES_BLOCK_MAX` en el módulo de tests; los comentarios de `INPUT_LIMIT` y de `respond_reading` |
+
+Quedan abiertos W3 (el p95 de la tanda con firma, que juzga la puerta de latencia) y S2, S3, S6, S7 y S8. Con W1 arreglado, una respuesta con `stderr` vacío y la firma en `stdout`, sin `2>&1`, cuenta como llamada sin firma: un shell no escribe ahí su `command not found`, así que es lo buscado.
