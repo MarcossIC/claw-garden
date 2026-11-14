@@ -43,6 +43,10 @@ Se publica lo anterior y se instalan los hooks de Claude Code en un repositorio 
 
 [agent-eval-sessions](changes/agent-eval-sessions/proposal.md) (129) va acá porque mide y no toca el producto: cambia sólo `crates/clawg-eval`, que ningún binario publicado enlaza, y no abre `memory.db`. Su código va en la nube, con la corrida en seco y el modelo falso. Su campaña paga es local, pide autorización de gasto (estimada en 23,90 USD, con tope de 25) y decide qué se construye después: el relevo entre sesiones, y la línea base de repeated-errors (131). Tiene las tareas escritas y está sin aplicar ([tareas](changes/agent-eval-sessions/tasks.md)).
 
+[protocol-block](changes/protocol-block/proposal.md) (132) va en la nube: el sello del bloque, `doctor`, el aviso de `session-start`, `--protocol` y el brazo `a3-short` se prueban en Linux con el embedder falso y no tocan `memory.db`. Va ahora porque corrige un daño de cada sesión: el bloque viejo sigue pidiendo veredictos `compatible`, el 97 % de los `resolve_conflict`. Cambiar el valor por defecto del bloque espera la campaña paga en local sobre las tareas largas de agent-eval-sessions (129), con la regla ya fijada.
+
+[repeated-errors](changes/repeated-errors/proposal.md) (131) va en la nube salvo su verificación: no toca `memory.db` ni el daemon, y sus tareas 1 a 7 se prueban en Linux con el embedder falso. La puerta de latencia y la entrada real de los hooks quedan en local, en Windows; la campaña, después de 129. Quien ya instaló corre `clawg setup` otra vez para tener los dos hooks nuevos.
+
 ## Corte (una noche local, con el piloto aprobado)
 
 La reimportación del historial ya se hizo, el 2026-11-08 y antes del piloto ([history-reimport](changes/archive/2026-11-12-history-reimport/verify.md#el-corte-en-prod)). Queda:
@@ -72,7 +76,7 @@ La reimportación del historial ya se hizo, el 2026-11-08 y antes del piloto ([h
 
 **Instalación y distribución:** [claude-code-plugin](changes/claude-code-plugin/exploration.md), que decide si servidor y hooks se distribuyen como plugin de Claude Code y si el bloque de protocolo de `CLAUDE.md` sobra. Acerca la meta, pero el piloto corre con `--local`: sube si instalar a mano en el segundo repositorio resulta engorroso.
 
-**Calidad de lo guardado:** memory-anchors, y una política de olvido para `memory`, que hoy no existe y todavía no tiene cambio.
+**Calidad de lo guardado:** memory-anchors, y una política de olvido para `memory`, que hoy no existe y todavía no tiene cambio. [save-pairs](changes/save-pairs/proposal.md) (130) cierra los dos casos en que el primer id de un save largo todavía da 409: un save reanudado que se empareja dos veces y un cierre fallido que nombra pares sin enlazar. Es chico, no toca datos y no espera al piloto.
 
 **Organización de los proyectos:** [project-groups](changes/project-groups/exploration.md) (123), que agrupa proyectos en un árbol para guardar y leer a nivel de grupo. Agrega una columna a `project`, así que va después del corte, cuando los datos ya se tocaron.
 
