@@ -6,44 +6,44 @@ Antes de empezar: `cargo clean --workspace --target-dir target-test`, porque es 
 
 ## 1. El orden del `MEMORY.md` (AS1)
 
-- [ ] RED: `the_native_memory_goes_from_the_oldest_memory_to_the_newest` (`seed.rs`); en `every_arm_with_memory_seeds_the_noise_with_the_task` (`arm.rs`), la aserción de `a4` pasa a pedir la memoria más vieja primero.
-- [ ] GREEN: `seed::native_memory` escribe en el orden inverso al de `seed::seeded`; `seeded` no cambia.
+- [x] RED: `the_native_memory_goes_from_the_oldest_memory_to_the_newest` (`seed.rs`); en `every_arm_with_memory_seeds_the_noise_with_the_task` (`arm.rs`), la aserción de `a4` pasa a pedir la memoria más vieja primero.
+- [x] GREEN: `seed::native_memory` escribe en el orden inverso al de `seed::seeded`; `seeded` no cambia.
 - Commit: `fix(agent-eval): write the native memory from the oldest note to the newest`
 
 ## 2. Una tarea de varias sesiones (AS2)
 
-- [ ] RED: `a_task_has_one_prompt_or_a_list_of_sessions`, `a_tracer_of_a_session_is_born_in_its_prompt_and_told_nowhere_else`, `a_check_of_a_session_reads_only_the_stream`, `a_task_written_before_sessions_still_reads`, `the_noise_holds_no_tracer_born_in_a_session` (`task.rs`); `a_working_directory_that_names_a_tracer_of_a_session_is_named` (`run.rs`).
-- [ ] GREEN: `SessionSpec`, `Task::sessions` y `Task::prompts`; las reglas nuevas de `problems`, `load_noise` y `leaked_tracers`; `leaks` con los trazadores de sesión; `arm::plan` y `list_tasks` leen el prompt por `prompts()` y siguen planeando una sesión.
+- [x] RED: `a_task_has_one_prompt_or_a_list_of_sessions`, `a_tracer_of_a_session_is_born_in_its_prompt_and_told_nowhere_else`, `a_check_of_a_session_reads_only_the_stream`, `a_task_written_before_sessions_still_reads`, `the_noise_holds_no_tracer_born_in_a_session` (`task.rs`); `a_working_directory_that_names_a_tracer_of_a_session_is_named` (`run.rs`).
+- [x] GREEN: `SessionSpec`, `Task::sessions` y `Task::prompts`; las reglas nuevas de `problems`, `load_noise` y `leaked_tracers`; `leaks` con los trazadores de sesión; `arm::plan` y `list_tasks` leen el prompt por `prompts()` y siguen planeando una sesión.
 - Commit: `feat(agent-eval): read a task of several sessions and the facts born in them`
 
 ## 3. Los fallos de una herramienta y el shell de una tarea (AS3)
 
-- [ ] RED: `the_failed_calls_of_a_tool_are_those_marked_or_those_that_hold_a_text` (`score.rs`); `a_task_names_the_shell_commands_it_allows_and_those_that_must_be_missing`, `e_is_a_category` (`task.rs`); `a_task_with_a_shell_allows_its_commands_and_no_other` (`arm.rs`); `a_paid_run_refuses_a_command_that_should_be_missing` (`run.rs`).
-- [ ] GREEN: `Check::ToolFailedCount`; `Task::shell` y `Task::missing_commands` con su validación; `E` en `CATEGORIES`; los argumentos de permiso en `arm::plan`; `Leak::Present` y la búsqueda en el `PATH` en `check_paid_run`, con la decisión en `leaks`.
+- [x] RED: `the_failed_calls_of_a_tool_are_those_marked_or_those_that_hold_a_text` (`score.rs`); `a_task_names_the_shell_commands_it_allows_and_those_that_must_be_missing`, `e_is_a_category` (`task.rs`); `a_task_with_a_shell_allows_its_commands_and_no_other` (`arm.rs`); `a_paid_run_refuses_a_command_that_should_be_missing` (`run.rs`).
+- [x] GREEN: `Check::ToolFailedCount`; `Task::shell` y `Task::missing_commands` con su validación; `E` en `CATEGORIES`; los argumentos de permiso en `arm::plan`; `Leak::Present` y la búsqueda en el `PATH` en `check_paid_run`, con la decisión en `leaks`.
 - Commit: `feat(agent-eval): count the failed calls of a tool and let a task allow named shell commands`
 
 ## 4. El plan de varias sesiones y su forma (AS4)
 
-- [ ] RED: `a_task_of_one_session_plans_what_it_planned_before`, `each_session_has_its_prompt_and_a_joined_one_continues_the_conversation`, `a_plan_of_several_sessions_reads_back_and_an_older_plan_reads_as_one` (`arm.rs`); `the_shape_of_a_run_parses_and_is_refused_where_the_task_cannot_take_it` (`main.rs`); `the_files_of_a_session_carry_its_number_only_when_there_are_several` (`run.rs`).
-- [ ] GREEN: `Shape`, `Options::shape`, `RunPlan::later` y `RunPlan::sessions()`; `--sessions` en `RUN_FLAGS` y en la ayuda; la forma en `run.json`; `run::session_files`.
+- [x] RED: `a_task_of_one_session_plans_what_it_planned_before`, `each_session_has_its_prompt_and_a_joined_one_continues_the_conversation`, `a_plan_of_several_sessions_reads_back_and_an_older_plan_reads_as_one` (`arm.rs`); `the_shape_of_a_run_parses_and_is_refused_where_the_task_cannot_take_it` (`main.rs`); `the_files_of_a_session_carry_its_number_only_when_there_are_several` (`run.rs`).
+- [x] GREEN: `Shape`, `Options::shape`, `RunPlan::later` y `RunPlan::sessions()`; `--sessions` en `RUN_FLAGS` y en la ayuda; la forma en `run.json`; `run::session_files`.
 - Commit: `feat(agent-eval): plan every session of a run, split or joined`
 
 ## 5. El corredor de varias sesiones (AS5, y de AS7 el directorio de streams)
 
-- [ ] RED: `a_session_that_ends_in_an_error_starts_no_other` (`run.rs`); `a_replay_is_a_stream_or_a_directory_with_one_per_session` (`main.rs`); `a_replayed_run_of_two_sessions_shares_its_daemon_and_its_working_directory`, `a_session_that_fails_stops_the_run_and_still_stops_the_daemon` (`tests/agent_eval.rs`), sobre una tarea de ejemplo de dos sesiones y sus streams, que se agregan en este commit a `data/agent-tasks/`.
-- [ ] GREEN: el bucle de sesiones dentro de `execute`, con sus archivos por sesión, la copia de `MEMORY.md` y el movimiento del registro de instrucciones; `Client::Replay` con un directorio; `score_dir` puntúa por ahora la última sesión y no falla con varias.
+- [x] RED: `a_session_that_ends_in_an_error_starts_no_other` (`run.rs`); `a_replay_is_a_stream_or_a_directory_with_one_per_session` (`main.rs`); `a_replayed_run_of_two_sessions_shares_its_daemon_and_its_working_directory`, `a_session_that_fails_stops_the_run_and_still_stops_the_daemon` (`tests/agent_eval.rs`), sobre una tarea de ejemplo de dos sesiones y sus streams, que se agregan en este commit a `data/agent-tasks/`.
+- [x] GREEN: el bucle de sesiones dentro de `execute`, con sus archivos por sesión, la copia de `MEMORY.md` y el movimiento del registro de instrucciones; `Client::Replay` con un directorio; `score_dir` puntúa por ahora la última sesión y no falla con varias.
 - Commit: `feat(agent-eval): run the sessions of a task on one daemon and working directory`
 
 ## 6. El cliente reproducido llama al servidor (AS7)
 
-- [ ] RED: `a_replayed_call_to_the_server_of_the_run_carries_what_the_server_answered`, `a_call_to_any_other_tool_stays_as_recorded` (`replay.rs`); `the_second_replayed_session_finds_what_the_first_one_saved` (`tests/agent_eval.rs`).
-- [ ] GREEN: `replay::server_calls` y `replay::with_results`, puros; el proceso del servidor por stdio en `replay::run`; `replay-client STREAM [--mcp-config FILE]` y `Client::step` que lo pasa en los brazos con clawg.
+- [x] RED: `a_replayed_call_to_the_server_of_the_run_carries_what_the_server_answered`, `a_call_to_any_other_tool_stays_as_recorded` (`replay.rs`); `the_second_replayed_session_finds_what_the_first_one_saved` (`tests/agent_eval.rs`).
+- [x] GREEN: `replay::server_calls` y `replay::with_results`, puros; el proceso del servidor por stdio en `replay::run`; `replay-client STREAM [--mcp-config FILE]` y `Client::step` que lo pasa en los brazos con clawg.
 - Commit: `feat(agent-eval): replay the calls to the run's server against the server`
 
 ## 7. Los tokens de cada pedido y de cada llamada (AS8)
 
-- [ ] RED: `each_request_of_the_main_loop_is_read_once_with_its_context`, `a_call_alone_in_its_message_adds_what_the_next_request_grew`, `calls_that_share_a_message_have_no_tokens_of_their_own` (`stream.rs`).
-- [ ] GREEN: `Transcript::requests`, `ToolCall::added_tokens`; `first_request_tokens` sale del primer pedido.
+- [x] RED: `each_request_of_the_main_loop_is_read_once_with_its_context`, `a_call_alone_in_its_message_adds_what_the_next_request_grew`, `calls_that_share_a_message_have_no_tokens_of_their_own` (`stream.rs`).
+- [x] GREEN: `Transcript::requests`, `ToolCall::added_tokens`; `first_request_tokens` sale del primer pedido.
 - Commit: `feat(agent-eval): read the tokens of every request and what each call adds`
 
 ## 8. El puntaje de cada sesión y el camino de un hecho (AS9)
