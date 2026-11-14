@@ -1815,6 +1815,63 @@ async fn a_hook_with_input_that_is_not_json_prints_nothing() {
     }
 }
 
+/// What the shell says when a program is not installed.
+const NOT_FOUND: &str = "Exit code 127\n/usr/bin/bash: line 1: eza: command not found";
+
+/// What Claude Code sends to the hook after a Bash call failed.
+fn bash_failed(session: &str, command: &str, error: &str) -> String {
+    json!({
+        "session_id": session, "hook_event_name": "PostToolUseFailure", "tool_name": "Bash",
+        "tool_input": { "command": command }, "tool_use_id": "t1", "error": error,
+    })
+    .to_string()
+}
+
+/// What it sends after a Bash call that ended well, with `response` as the
+/// tool's answer.
+fn bash_ended(session: &str, command: &str, response: Value) -> String {
+    json!({
+        "session_id": session, "hook_event_name": "PostToolUse", "tool_name": "Bash",
+        "tool_input": { "command": command }, "tool_use_id": "t2", "tool_response": response,
+    })
+    .to_string()
+}
+
+fn context_of(out: &Output) -> String {
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(out));
+    let printed: Value = serde_json::from_str(&stdout_of(out)).expect("the hook's envelope");
+    printed["hookSpecificOutput"]["additionalContext"].as_str().unwrap_or_default().to_string()
+}
+
+#[tokio::test]
+async fn a_post_tool_hook_answers_without_a_daemon_and_leaves_the_store_alone() {
+    let sandbox = Sandbox::new();
+    let set = sandbox.run(&["preferences", "set", "language", "es", "--profile", "dev"]);
+    assert_eq!(set.status.code(), Some(0), "{}", stderr_of(&set));
+    let args = |event: &'static str| [event, "--agent", "claude-code", "--profile", "dev"];
+
+    let failed = hook(&sandbox, &args("post-tool-use-failure"), &bash_failed("s1", "eza -la src", NOT_FOUND));
+    let printed: Value = serde_json::from_str(&stdout_of(&failed)).expect("the hook's envelope");
+    assert_eq!(printed["hookSpecificOutput"]["hookEventName"], "PostToolUseFailure");
+    let line = context_of(&failed);
+    assert!(line.contains("`eza` no existe en el Bash de esta máquina"), "{line}");
+
+    let response = json!({ "stdout": "", "stderr": "/usr/bin/bash: line 1: fd: command not found", "interrupted": false });
+    let piped = hook(&sandbox, &args("post-tool-use"), &bash_ended("s1", "fd -e rs | head", response));
+    let printed: Value = serde_json::from_str(&stdout_of(&piped)).expect("the hook's envelope");
+    assert_eq!(printed["hookSpecificOutput"]["hookEventName"], "PostToolUse");
+    assert!(context_of(&piped).contains("`fd` no existe"), "a failure that ended with code 0");
+
+    let fine = hook(&sandbox, &args("post-tool-use"), &bash_ended("s1", "rg todo", json!({ "stdout": "a.rs:1: todo" })));
+    assert_eq!((fine.status.code(), stdout_of(&fine)), (Some(0), String::new()), "a call that went well says nothing");
+
+    let data = sandbox.data_dir();
+    assert!(!data.join("memory.db").exists() && !data.join("daemon.json").exists(), "no store, no daemon");
+    assert!(!data.join(clawg_cli::hook_log::FILE).exists(), "these events leave no run");
+    let ledger = std::fs::read_to_string(data.join(clawg_cli::tool_failures::FILE)).expect("the ledger");
+    assert_eq!(ledger.lines().count(), 2, "one line for each failure and none for the call that went well: {ledger}");
+}
+
 #[tokio::test]
 async fn a_hook_usage_error_exits_1() {
     let sandbox = Sandbox::new();

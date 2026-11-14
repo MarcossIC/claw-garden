@@ -964,6 +964,11 @@ pub enum HookEvent {
     UserPromptSubmit,
     /// The session ended: nothing is printed, the daemon is told.
     SessionEnd,
+    /// A tool call ended well. Never reaches the daemon: it reads and writes
+    /// the ledger of missing programs and warns in the same turn.
+    PostToolUse,
+    /// A tool call failed. The same as [`HookEvent::PostToolUse`].
+    PostToolUseFailure,
 }
 
 /// The clients whose hook input and output `clawg hook` speaks: Claude
@@ -1837,6 +1842,29 @@ mod tests {
                 profile: ProfileArg { profile: None },
             }
         );
+    }
+
+    #[test]
+    fn hook_takes_the_post_tool_events() {
+        assert_eq!(
+            parse(&["clawg", "hook", "post-tool-use", "--agent", "claude-code", "--profile", "dev"]).command,
+            Command::Hook {
+                event: HookEvent::PostToolUse,
+                agent: "claude-code".into(),
+                client: HookClient::ClaudeCode,
+                profile: ProfileArg { profile: Some("dev".into()) },
+            }
+        );
+        assert_eq!(
+            parse(&["clawg", "hook", "post-tool-use-failure", "--agent", "claude-code"]).command,
+            Command::Hook {
+                event: HookEvent::PostToolUseFailure,
+                agent: "claude-code".into(),
+                client: HookClient::ClaudeCode,
+                profile: ProfileArg { profile: None },
+            }
+        );
+        assert!(Cli::try_parse_from(["clawg", "hook", "pre-tool-use", "--agent", "a"]).is_err(), "only the events it answers");
     }
 
     #[test]

@@ -15,6 +15,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use clawg_core::memory::redact::redact;
+use clawg_core::preferences::Lang;
 use serde::{Deserialize, Serialize};
 
 use crate::hook_log;
@@ -249,6 +250,60 @@ pub fn to_write(call: &Call, observations: &[Observation], ledger: &[Line]) -> V
             session: hook_log::cut(call.session, SESSION_CHARS),
         })
         .collect()
+}
+
+/// The programs `observed` says are missing that the ledger has not seen work
+/// in the [`WINDOW_MS`] before `now_ms`: a program that has worked lately fails
+/// now probably for a reason of the moment, and saying it does not exist
+/// would be wrong.
+pub fn to_warn<'a>(tool: &str, observed: &'a [Observation], ledger: &[Line], now_ms: i64) -> Vec<&'a str> {
+    let since = now_ms.saturating_sub(WINDOW_MS);
+    observed
+        .iter()
+        .filter(|o| o.kind == Kind::Fail)
+        .filter(|o| !ledger.iter().any(|l| l.event == Kind::Ok && l.tool == tool && l.program == o.program && l.at_ms >= since))
+        .map(|o| o.program.as_str())
+        .collect()
+}
+
+/// What the hook after a call says to the agent in `language`, in one line,
+/// when the call showed that `programs` are not in the shell of this machine.
+/// Like the language line it is clawg's own word to the agent, not a memory.
+pub fn same_turn_line(language: Lang, programs: &[&str]) -> String {
+    let names = list(language, programs);
+    let many = programs.len() > 1;
+    match (language, many) {
+        (Lang::En, false) => format!(
+            "clawg: {names} is not installed in this machine's Bash. Do not call it again in this session; use Glob, \
+             Grep, Read or Edit, or another program that is installed."
+        ),
+        (Lang::En, true) => format!(
+            "clawg: {names} are not installed in this machine's Bash. Do not call them again in this session; use \
+             Glob, Grep, Read or Edit, or other programs that are installed."
+        ),
+        (Lang::Es, false) => format!(
+            "clawg: {names} no existe en el Bash de esta máquina. No lo llames otra vez en esta sesión; usa Glob, Grep, \
+             Read o Edit, u otro programa instalado."
+        ),
+        (Lang::Es, true) => format!(
+            "clawg: {names} no existen en el Bash de esta máquina. No los llames otra vez en esta sesión; usa Glob, \
+             Grep, Read o Edit, u otros programas instalados."
+        ),
+    }
+}
+
+/// `programs` between backticks, joined as the language joins a list.
+fn list(language: Lang, programs: &[&str]) -> String {
+    let quoted: Vec<String> = programs.iter().map(|program| format!("`{program}`")).collect();
+    let and = match language {
+        Lang::En => "and",
+        Lang::Es => "y",
+    };
+    match quoted.as_slice() {
+        [] => String::new(),
+        [only] => only.clone(),
+        [rest @ .., last] => format!("{} {and} {last}", rest.join(", ")),
+    }
 }
 
 fn newest(ledger: &[Line], tool: &str, program: &str) -> Option<Kind> {

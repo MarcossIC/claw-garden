@@ -28,6 +28,7 @@ use crate::hook_log::{self, Outcome, Run};
 use crate::mcp::roots::folder_of;
 use crate::mcp::tools::{review_nudge, suggestion_note, synthesis_nudge};
 use crate::setup::{self, Freshness};
+use crate::tool_failures::{self, After, Call, Observation};
 use crate::update::version::Version;
 
 /// The most a hook takes, from reading stdin to the answer: under the five
@@ -38,11 +39,17 @@ pub const HOOK_DEADLINE: Duration = Duration::from_secs(3);
 /// end a second and a half between them, at an exit and at a `/clear`.
 pub const SESSION_END_DEADLINE: Duration = Duration::from_secs(1);
 
+/// The most a hook after a tool call takes: the client runs one after every
+/// call of the shell, and what it reads is a file or two that are not on the
+/// path of the agent's next request.
+pub const POST_TOOL_DEADLINE: Duration = Duration::from_millis(300);
+
 /// How long the hook of `event` may take.
 pub fn deadline_of(event: HookEvent) -> Duration {
     match event {
         HookEvent::SessionStart | HookEvent::UserPromptSubmit => HOOK_DEADLINE,
         HookEvent::SessionEnd => SESSION_END_DEADLINE,
+        HookEvent::PostToolUse | HookEvent::PostToolUseFailure => POST_TOOL_DEADLINE,
     }
 }
 
@@ -93,6 +100,20 @@ pub struct HookInput {
     /// Why the session ended, as the client says it at its end.
     #[serde(default)]
     pub reason: Option<String>,
+    /// The tool a call after a tool is about.
+    #[serde(default)]
+    pub tool_name: Option<String>,
+    /// What the tool was asked: for the shell tool, `{"command": ...}`.
+    #[serde(default)]
+    pub tool_input: Option<serde_json::Value>,
+    /// What the tool answered after a call that ended well. The client does
+    /// not type it, so any JSON value is taken.
+    #[serde(default)]
+    pub tool_response: Option<serde_json::Value>,
+    /// Why the call failed. It is text, kept as a value so that an odd shape
+    /// costs the hint and not the whole input.
+    #[serde(default)]
+    pub error: Option<serde_json::Value>,
 }
 
 impl HookInput {
@@ -247,6 +268,8 @@ pub fn envelope(host: HookClient, event: HookEvent, text: &str) -> String {
         HookEvent::SessionStart => "SessionStart",
         HookEvent::UserPromptSubmit => "UserPromptSubmit",
         HookEvent::SessionEnd => "SessionEnd",
+        HookEvent::PostToolUse => "PostToolUse",
+        HookEvent::PostToolUseFailure => "PostToolUseFailure",
     };
     match host {
         HookClient::ClaudeCode => {
@@ -341,7 +364,7 @@ pub async fn respond_and_record(
     let end = tokio::time::Instant::now() + deadline;
     let to_answer = match event {
         HookEvent::SessionStart => deadline.saturating_sub(RECORD_RESERVE),
-        HookEvent::UserPromptSubmit | HookEvent::SessionEnd => deadline,
+        HookEvent::UserPromptSubmit | HookEvent::SessionEnd | HookEvent::PostToolUse | HookEvent::PostToolUseFailure => deadline,
     };
     let (out, run) = respond_checking(event, host, agent, base_dir, input, to_answer, profile).await;
     if let Some(run) = run {
@@ -416,6 +439,9 @@ async fn respond_reading(
         let _ = tokio::time::timeout(deadline, end_session(host, base_dir, input)).await;
         return (None, None);
     }
+    if matches!(event, HookEvent::PostToolUse | HookEvent::PostToolUseFailure) {
+        return (after_tool(event, host, base_dir, input, tokio::time::Instant::now() + deadline).await, None);
+    }
     let started = std::time::Instant::now();
     let at_ms = now_ms();
     let now = tokio::time::Instant::now();
@@ -448,7 +474,7 @@ async fn respond_reading(
             let lines = opening_lines(language, notice.as_deref());
             (!lines.is_empty()).then(|| lines.join("\n\n"))
         }),
-        (HookEvent::UserPromptSubmit | HookEvent::SessionEnd, _) => answered,
+        (HookEvent::UserPromptSubmit | HookEvent::SessionEnd | HookEvent::PostToolUse | HookEvent::PostToolUseFailure, _) => answered,
     };
     let printed = text.map(|t| envelope(host, event, &t));
     let run = (event == HookEvent::SessionStart).then(|| Run {
@@ -530,6 +556,54 @@ async fn end_session(host: HookClient, base_dir: &Path, input: impl AsyncRead + 
     let _ = client.end_session(session, input.reason.as_deref()).await;
 }
 
+/// What a call to a tool leaves and says: the ledger of missing programs is
+/// read and written, and a line for the agent is printed when the call showed a
+/// program that is not there. Neither the daemon nor `memory.db` is touched, no
+/// model wakes up, and the language is read only when there is a line to speak.
+/// Cursor, a hook installed for Claude Code that Cursor runs, input that is not
+/// the client's, and any tool but the shell give nothing.
+async fn after_tool(
+    event: HookEvent,
+    host: HookClient,
+    base_dir: &Path,
+    input: impl AsyncRead + Unpin,
+    deadline: tokio::time::Instant,
+) -> Option<String> {
+    let raw = tokio::time::timeout_at(deadline, read_input(input)).await.ok().flatten()?;
+    let input = HookInput::parse(&raw)?;
+    if host == HookClient::Cursor || input.cursor_version.is_some() {
+        return None;
+    }
+    let tool = input.tool_name.as_deref()?;
+    let (after, output) = match event {
+        HookEvent::PostToolUse => (After::Success, &input.tool_response),
+        _ => (After::Failure, &input.error),
+    };
+    let outputs = output.as_ref().map(tool_failures::texts).unwrap_or_default();
+    let command = input.tool_input.as_ref().and_then(|asked| asked["command"].as_str()).unwrap_or_default();
+    let observed = tool_failures::observe(tool, command, &outputs, after);
+    if observed.is_empty() {
+        return None;
+    }
+    let (dir, tool, session) = (base_dir.to_path_buf(), tool.to_string(), input.session_id.unwrap_or_default());
+    let line = read_by(deadline, move || remember(&dir, &tool, &session, &observed)).await?;
+    Some(envelope(host, event, &line))
+}
+
+/// Keeps what `observed` is worth in the ledger of `dir` and gives the line to
+/// say, if any: the programs that failed and have not worked in the window.
+fn remember(dir: &Path, tool: &str, session: &str, observed: &[Observation]) -> Option<String> {
+    let at_ms = now_ms();
+    let ledger = tool_failures::read(dir);
+    tool_failures::append(dir, &tool_failures::to_write(&Call { at_ms, tool, session }, observed, &ledger));
+    let programs = tool_failures::to_warn(tool, observed, &ledger, at_ms);
+    if programs.is_empty() {
+        return None;
+    }
+    let language = preferences::language_in(dir).unwrap_or(Lang::En);
+    Some(tool_failures::same_turn_line(language, &programs))
+}
+
 /// The project the daemon gives the root of `cwd`, registered without
 /// letting the daemon read its files. A daemon that cannot register reads as
 /// the id derived from the root, as the bridge reads it; one from before
@@ -570,7 +644,9 @@ async fn answer(
     // `session-end` never gets here: `respond_reading` answers it first.
     let reported = match event {
         HookEvent::SessionStart => SessionEvent { event: "start", source: input.source.as_deref(), client: client_name(host) },
-        HookEvent::UserPromptSubmit | HookEvent::SessionEnd => SessionEvent { event: "prompt", source: None, client: client_name(host) },
+        HookEvent::UserPromptSubmit | HookEvent::SessionEnd | HookEvent::PostToolUse | HookEvent::PostToolUseFailure => {
+            SessionEvent { event: "prompt", source: None, client: client_name(host) }
+        }
     };
     let register = async {
         if let Some(session) = input.session_id.as_deref() {
@@ -589,7 +665,7 @@ async fn answer(
             let outcome = if context.prompt.trim().is_empty() { Outcome::EmptyContext } else { Outcome::Injected };
             (session_start_text(&context, health.ok().as_ref(), compacted, language, notice), outcome)
         }
-        HookEvent::SessionEnd => (None, Outcome::EmptyContext),
+        HookEvent::SessionEnd | HookEvent::PostToolUse | HookEvent::PostToolUseFailure => (None, Outcome::EmptyContext),
         HookEvent::UserPromptSubmit => {
             let args = ListArgs {
                 kind: Some("memory".into()),
@@ -1690,5 +1766,171 @@ mod tests {
         }
         assert!(written.contains("user_email") && written.contains("prompt"), "the names are kept: {written}");
         assert_eq!((run.roots, run.folder), (Some(2), None));
+    }
+
+    const NOT_FOUND: &str = "Exit code 127\n/usr/bin/bash: line 1: eza: command not found";
+
+    fn bash_failed(session: &str, command: &str, error: &str) -> String {
+        serde_json::json!({
+            "session_id": session, "hook_event_name": "PostToolUseFailure", "tool_name": "Bash",
+            "tool_input": { "command": command }, "tool_use_id": "t1", "error": error,
+        })
+        .to_string()
+    }
+
+    fn bash_ended(session: &str, command: &str, response: serde_json::Value) -> String {
+        serde_json::json!({
+            "session_id": session, "hook_event_name": "PostToolUse", "tool_name": "Bash",
+            "tool_input": { "command": command }, "tool_use_id": "t2", "tool_response": response,
+        })
+        .to_string()
+    }
+
+    /// What the hook after a tool prints for `input`, as `host` runs it.
+    async fn after(event: HookEvent, host: HookClient, dir: &Path, input: &str) -> Option<String> {
+        respond(event, host, "claude-code", dir, input.as_bytes(), POST_TOOL_DEADLINE).await
+    }
+
+    fn line_of(printed: Option<String>) -> String {
+        let out: serde_json::Value = serde_json::from_str(&printed.expect("a line was printed")).unwrap();
+        out["hookSpecificOutput"]["additionalContext"].as_str().unwrap().to_string()
+    }
+
+    fn ledger(dir: &Path) -> Vec<(tool_failures::Kind, String)> {
+        tool_failures::read(dir).into_iter().map(|l| (l.event, l.program)).collect()
+    }
+
+    #[test]
+    fn the_hook_input_reads_the_tool_fields() {
+        let input = HookInput::parse(bash_failed("s1", "eza -la", NOT_FOUND).as_bytes()).unwrap();
+        assert_eq!(input.tool_name.as_deref(), Some("Bash"));
+        assert_eq!(input.tool_input.as_ref().and_then(|i| i["command"].as_str()), Some("eza -la"));
+        assert_eq!(input.error.as_ref().and_then(|e| e.as_str()), Some(NOT_FOUND));
+        assert_eq!(input.session_id.as_deref(), Some("s1"));
+
+        let response = serde_json::json!({ "stdout": "", "stderr": "x", "interrupted": false });
+        let input = HookInput::parse(bash_ended("s1", "ls", response.clone()).as_bytes()).unwrap();
+        assert_eq!(input.tool_response, Some(response), "any JSON value");
+        let text = HookInput::parse(br#"{"tool_name":"Bash","tool_response":"just text","error":{"odd":1}}"#).unwrap();
+        assert_eq!(text.tool_response, Some(serde_json::json!("just text")));
+        assert!(text.error.is_some(), "an odd error costs the hint and not the whole input");
+        let none = HookInput::parse(b"{}").unwrap();
+        assert_eq!((none.tool_name, none.tool_input, none.tool_response, none.error), (None, None, None, None));
+    }
+
+    #[tokio::test]
+    async fn cursor_and_other_tools_get_nothing_after_a_tool() {
+        let dir = tempfile::tempdir().unwrap();
+        let failed = bash_failed("s1", "eza -la", NOT_FOUND);
+        for event in [HookEvent::PostToolUse, HookEvent::PostToolUseFailure] {
+            assert_eq!(after(event, HookClient::Cursor, dir.path(), &failed).await, None, "{event:?}: Cursor's shell is another one");
+            let mut from_cursor: serde_json::Value = serde_json::from_str(&failed).unwrap();
+            from_cursor["cursor_version"] = "3.28.0".into();
+            assert_eq!(after(event, HookClient::ClaudeCode, dir.path(), &from_cursor.to_string()).await, None, "{event:?}");
+            for tool in ["Edit", "Read", "PowerShell"] {
+                let mut other: serde_json::Value = serde_json::from_str(&failed).unwrap();
+                other["tool_name"] = tool.into();
+                assert_eq!(after(event, HookClient::ClaudeCode, dir.path(), &other.to_string()).await, None, "{event:?} {tool}");
+            }
+            let mut nameless: serde_json::Value = serde_json::from_str(&failed).unwrap();
+            nameless.as_object_mut().unwrap().remove("tool_name");
+            assert_eq!(after(event, HookClient::ClaudeCode, dir.path(), &nameless.to_string()).await, None);
+            assert_eq!(after(event, HookClient::ClaudeCode, dir.path(), "not json").await, None);
+            assert_eq!(after(event, HookClient::ClaudeCode, dir.path(), "").await, None);
+            let mut huge = failed.clone().into_bytes();
+            huge.resize(INPUT_LIMIT as usize + 1, b' ');
+            assert_eq!(respond(event, HookClient::ClaudeCode, "a", dir.path(), &huge[..], POST_TOOL_DEADLINE).await, None, "{event:?}: over the limit");
+        }
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0, "nothing was written");
+
+        let (_writer, silent) = tokio::io::duplex(64);
+        let started = std::time::Instant::now();
+        let out = respond(HookEvent::PostToolUse, HookClient::ClaudeCode, "a", dir.path(), silent, Duration::from_millis(100)).await;
+        assert_eq!(out, None);
+        assert!(started.elapsed() < Duration::from_secs(2), "the deadline ends the wait for an input that never comes");
+        assert!(POST_TOOL_DEADLINE <= Duration::from_millis(300), "well under the seconds a hook is configured with");
+    }
+
+    #[tokio::test]
+    async fn the_same_turn_line_names_the_program_in_the_users_language() {
+        let dir = tempfile::tempdir().unwrap();
+        let english = line_of(after(HookEvent::PostToolUseFailure, HookClient::ClaudeCode, dir.path(), &bash_failed("s1", "eza -la src", NOT_FOUND)).await);
+        assert_eq!(
+            english,
+            "clawg: `eza` is not installed in this machine's Bash. Do not call it again in this session; use Glob, \
+             Grep, Read or Edit, or another program that is installed."
+        );
+        let out = after(HookEvent::PostToolUseFailure, HookClient::ClaudeCode, dir.path(), &bash_failed("s1", "eza", NOT_FOUND)).await;
+        let out: serde_json::Value = serde_json::from_str(&out.unwrap()).unwrap();
+        assert_eq!(out["hookSpecificOutput"]["hookEventName"], "PostToolUseFailure");
+
+        spanish(dir.path());
+        let line = line_of(after(HookEvent::PostToolUseFailure, HookClient::ClaudeCode, dir.path(), &bash_failed("s2", "eza -la src", NOT_FOUND)).await);
+        assert_eq!(
+            line,
+            "clawg: `eza` no existe en el Bash de esta máquina. No lo llames otra vez en esta sesión; usa Glob, Grep, \
+             Read o Edit, u otro programa instalado."
+        );
+
+        let two = "bash: line 1: eza: command not found\nbash: line 1: fd: command not found";
+        let response = serde_json::json!({ "stdout": "", "stderr": two });
+        let line = line_of(after(HookEvent::PostToolUse, HookClient::ClaudeCode, dir.path(), &bash_ended("s3", "eza | fd x", response)).await);
+        assert_eq!(
+            line,
+            "clawg: `eza` y `fd` no existen en el Bash de esta máquina. No los llames otra vez en esta sesión; usa \
+             Glob, Grep, Read o Edit, u otros programas instalados."
+        );
+        let out = after(HookEvent::PostToolUse, HookClient::ClaudeCode, dir.path(), &bash_ended("s3", "eza", serde_json::json!(NOT_FOUND))).await;
+        let out: serde_json::Value = serde_json::from_str(&out.unwrap()).unwrap();
+        assert_eq!(out["hookSpecificOutput"]["hookEventName"], "PostToolUse");
+
+        assert!(!dir.path().join(crate::hook_log::FILE).exists(), "no line in the record of session starts");
+        let failures = ledger(dir.path()).iter().filter(|(kind, program)| *kind == tool_failures::Kind::Fail && program == "eza").count();
+        assert_eq!(failures, 5, "every failure is kept");
+    }
+
+    #[tokio::test]
+    async fn a_program_that_worked_recently_gets_no_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let day = 24 * 60 * 60 * 1000;
+        let ok_at = |ago: i64| tool_failures::Line {
+            at_ms: now_ms() - ago,
+            event: tool_failures::Kind::Ok,
+            tool: "Bash".into(),
+            program: "rg".into(),
+            session: "s0".into(),
+        };
+        let said = serde_json::json!({ "stderr": "/usr/bin/bash: line 1: rg: command not found" });
+        let call = bash_ended("s1", "rg todo | head", said);
+
+        tool_failures::append(dir.path(), &[ok_at(day)]);
+        assert_eq!(after(HookEvent::PostToolUse, HookClient::ClaudeCode, dir.path(), &call).await, None, "a failure that is probably transient");
+        let kept = [(tool_failures::Kind::Ok, "rg".to_string()), (tool_failures::Kind::Fail, "rg".to_string())];
+        assert_eq!(ledger(dir.path()), kept, "the failure is still kept");
+
+        let old = tempfile::tempdir().unwrap();
+        tool_failures::append(old.path(), &[ok_at(31 * day)]);
+        let line = line_of(after(HookEvent::PostToolUse, HookClient::ClaudeCode, old.path(), &call).await);
+        assert!(line.contains("`rg`"), "a success older than the window does not silence it: {line}");
+    }
+
+    #[tokio::test]
+    async fn a_call_without_a_signature_prints_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        spanish(dir.path());
+        let before = std::fs::read_dir(dir.path()).unwrap().count();
+        for input in [
+            bash_ended("s1", "rg todo src", serde_json::json!({ "stdout": "a.rs:1: todo", "stderr": "" })),
+            bash_ended("s1", "cargo build 2>&1", serde_json::json!({ "stdout": "error: could not compile" })),
+            bash_ended("s1", "ls", serde_json::json!(null)),
+        ] {
+            assert_eq!(after(HookEvent::PostToolUse, HookClient::ClaudeCode, dir.path(), &input).await, None, "{input}");
+        }
+        for error in ["Exit code 127", "Exit code 1\nthe test failed", "'eza' is not recognized as an internal or external command"] {
+            let input = bash_failed("s1", "eza", error);
+            assert_eq!(after(HookEvent::PostToolUseFailure, HookClient::ClaudeCode, dir.path(), &input).await, None, "{error}");
+        }
+        assert_eq!(ledger(dir.path()), [], "and nothing is kept");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), before, "no file was made");
     }
 }
