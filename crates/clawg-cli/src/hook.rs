@@ -612,8 +612,8 @@ async fn after_tool(
         HookEvent::PostToolUse => (After::Success, &input.tool_response),
         _ => (After::Failure, &input.error),
     };
-    let outputs = output.as_ref().map(tool_failures::texts).unwrap_or_default();
     let command = input.tool_input.as_ref().and_then(|asked| asked["command"].as_str()).unwrap_or_default();
+    let outputs = output.as_ref().map(|value| tool_failures::response_texts(value, command)).unwrap_or_default();
     let observed = tool_failures::observe(tool, command, &outputs, after);
     if observed.is_empty() {
         return None;
@@ -1933,6 +1933,22 @@ mod tests {
         tool_failures::append(old.path(), &[ok_at(31 * day)]);
         let line = line_of(after(HookEvent::PostToolUse, HookClient::ClaudeCode, old.path(), &call).await);
         assert!(line.contains("`rg`"), "a success older than the window does not silence it: {line}");
+    }
+
+    #[tokio::test]
+    async fn a_signature_a_program_printed_is_no_missing_program() {
+        let dir = tempfile::tempdir().unwrap();
+        let printed = serde_json::json!({ "stdout": NOT_FOUND, "stderr": "" });
+        let call = bash_ended("s1", "rg \"eza|bat\" notas.log", printed.clone());
+        assert_eq!(after(HookEvent::PostToolUse, HookClient::ClaudeCode, dir.path(), &call).await, None);
+        let call = bash_ended("s1", "rg \"command not found\" build.log", printed.clone());
+        assert_eq!(after(HookEvent::PostToolUse, HookClient::ClaudeCode, dir.path(), &call).await, None);
+        let observed: Vec<_> = ledger(dir.path()).into_iter().filter(|(kind, _)| *kind == tool_failures::Kind::Fail).collect();
+        assert_eq!(observed, [], "no failure was kept");
+
+        let merged = bash_ended("s1", "eza 2>&1", printed);
+        let line = line_of(after(HookEvent::PostToolUse, HookClient::ClaudeCode, dir.path(), &merged).await);
+        assert!(line.contains("`eza`"), "a redirect puts the shell's words in stdout: {line}");
     }
 
     #[tokio::test]

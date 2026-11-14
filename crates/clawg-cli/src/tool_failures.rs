@@ -86,6 +86,20 @@ pub fn texts(value: &serde_json::Value) -> Vec<&str> {
     }
 }
 
+/// The texts of a shell tool's `response` where the shell's own words can be.
+/// When the response has a `stderr`, the shell reports a missing program
+/// there; its `stdout` is what the programs printed, and a program that reads
+/// a log can print the signature without any program missing. Only a command
+/// that sends one stream to the other (`2>&1`, `|&`) puts the shell's words in
+/// `stdout`, and then every text counts.
+pub fn response_texts<'a>(response: &'a serde_json::Value, command: &str) -> Vec<&'a str> {
+    let merged = command.contains("2>&1") || command.contains("|&");
+    match response.get("stderr").and_then(serde_json::Value::as_str) {
+        Some(stderr) if !merged => vec![stderr],
+        _ => texts(response),
+    }
+}
+
 /// The programs a text says are missing, in order and once each, as the shell
 /// wrote them and before any check of the name: `bash` and `sh` end a line in
 /// `: command not found` (with `line N: ` before the name or not), `dash` says
@@ -132,14 +146,31 @@ fn has_program_shape(name: &str) -> bool {
 }
 
 /// The first word of each segment of `command`, which a `|`, `||`, `&&`, `;`,
-/// `&`, a new line or a `(` starts, past assignments and the words that run
+/// `&`, a new line or a `(` outside quotes starts, past assignments and the words that run
 /// the next one. The command is not read further than this, and a mistake
 /// here can only cost an observation, never invent one.
 pub fn command_words(command: &str) -> Vec<&str> {
     let bytes = command.as_bytes();
     let mut words = Vec::new();
     let mut start = 0;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
     for (at, c) in command.char_indices() {
+        if let Some(open) = quote {
+            // Inside `'…'` nothing escapes; inside `"…"` a backslash does.
+            if escaped {
+                escaped = false;
+            } else if c == '\\' && open == '"' {
+                escaped = true;
+            } else if c == open {
+                quote = None;
+            }
+            continue;
+        }
+        if c == '"' || c == '\'' {
+            quote = Some(c);
+            continue;
+        }
         let separator = match c {
             '|' | ';' | '\n' | '(' => true,
             // `2>&1` and `&>` redirect: they do not start a command.
@@ -507,6 +538,30 @@ mod tests {
             ["cd", "eza", "head", "fd", "bat", "sd"]
         );
         assert_eq!(command_words("echo $(eza) || true"), ["echo", "eza", "true"]);
+    }
+
+    #[test]
+    fn a_separator_inside_quotes_starts_no_command() {
+        assert_eq!(command_words("rg \"eza|bat\" notas.log"), ["rg"]);
+        assert_eq!(command_words("rg 'a;b && c' x | head"), ["rg", "head"]);
+        assert_eq!(command_words("echo \"a \\\" | b\"; eza"), ["echo", "eza"], "an escaped quote does not close the string");
+        let named = observe("Bash", "rg \"eza|bat\" notas.log", &["/usr/bin/bash: line 1: bat: command not found"], After::Failure);
+        assert_eq!(named, [], "a word inside quotes is no command");
+    }
+
+    #[test]
+    fn the_signature_is_read_only_where_the_shell_reports_it() {
+        let response = serde_json::json!({ "stdout": BASH, "stderr": "", "interrupted": false });
+        assert_eq!(response_texts(&response, "rg \"command not found\" build.log"), [""], "stdout is the program's output, not the shell's");
+        for redirected in ["eza 2>&1", "eza |& head"] {
+            assert!(response_texts(&response, redirected).contains(&BASH), "{redirected}: the redirect carries the shell's words to stdout");
+        }
+        let on_stderr = serde_json::json!({ "stdout": "", "stderr": BASH });
+        assert_eq!(response_texts(&on_stderr, "eza | head"), [BASH]);
+        let plain = serde_json::json!(BASH);
+        assert_eq!(response_texts(&plain, "eza"), [BASH], "a response that is only text has no stream to choose");
+        let no_stderr = serde_json::json!({ "output": BASH });
+        assert_eq!(response_texts(&no_stderr, "eza"), [BASH], "without a stderr there is nothing to prefer");
     }
 
     #[test]
