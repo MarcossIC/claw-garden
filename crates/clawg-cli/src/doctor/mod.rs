@@ -286,13 +286,15 @@ fn protocol_block(language: Lang, profile: Profile) -> Vec<Finding> {
         Ok(text) => {
             let file = crate::setup::File { path: path.clone(), text: Some(text) };
             match crate::setup::find_block(&file) {
-                Ok(Some((begin, end))) => checks::BlockState::Installed(file.text.unwrap_or_default()[begin..end].to_string()),
+                Ok(Some((begin, end))) => {
+                    checks::BlockState::Installed(crate::setup::without_stamp(&file.text.unwrap_or_default()[begin..end]))
+                }
                 Ok(None) => checks::BlockState::Missing,
                 Err(e) => checks::BlockState::Unreadable(e.to_string()),
             }
         }
     };
-    checks::protocol_block(language, &state, &crate::setup::block("\n", Some(language)), &path, profile)
+    checks::protocol_block(language, &state, &crate::setup::unstamped(Some(language)), &path, profile)
 }
 
 /// Claude Code's registration of this profile's server, from the file

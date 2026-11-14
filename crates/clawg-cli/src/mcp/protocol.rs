@@ -28,6 +28,30 @@ const OPENING_RULE: &str = "Write memories and search queries in English, whatev
 const SAVE_RULE: &str = "Write it in English, and search in English too. A memory saved in one language and \
                          searched in another is often missed.";
 
+/// How much of the protocol `clawg setup` writes into the user's `CLAUDE.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Variant {
+    Full,
+    Short,
+    Off,
+}
+
+impl Variant {
+    pub const ALL: [Variant; 3] = [Variant::Full, Variant::Short, Variant::Off];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Variant::Full => "full",
+            Variant::Short => "short",
+            Variant::Off => "off",
+        }
+    }
+
+    pub fn parse(name: &str) -> Option<Variant> {
+        Variant::ALL.into_iter().find(|v| v.as_str() == name)
+    }
+}
+
 /// The paragraphs between the title and the first section, each on one line:
 /// the file is wrapped for reading, and a host shows instructions as prose.
 pub fn opening(protocol: &str) -> String {

@@ -299,6 +299,7 @@ pub fn plan(task: &Task, arm: Arm, layout: &Layout, options: &Options) -> Result
             settings: setup::File { path: layout.config_dir().join("settings.json"), text: None },
             instructions: setup::File { path: layout.config_dir().join("CLAUDE.md"), text: None },
             language: options.lang,
+            version: setup::own_version()?,
         };
         let setup_plan = setup::plan(&state, Mode::Install)?;
         servers.insert(

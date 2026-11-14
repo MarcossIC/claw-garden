@@ -38,7 +38,8 @@ pub const END_MARKER: &str = "<!-- END CLAWG MEMORY PROTOCOL -->";
 
 use clawg_core::preferences::{self, Lang};
 
-use crate::mcp::protocol;
+use crate::mcp::protocol::{self, Variant};
+use crate::update::version::Version;
 
 const SESSION_START_MATCHER: &str = "startup|resume|clear|compact";
 
@@ -85,10 +86,14 @@ pub struct State {
     pub instructions: File,
     /// The profile's preferred language, which the protocol's rules name.
     pub language: Option<Lang>,
+    /// The version of the binary that writes the block, which its stamp names.
+    pub version: Version,
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum SetupError {
+    #[error("the version of this clawg binary, {0:?}, is not of the form X.Y.Z")]
+    OwnVersion(String),
     #[error("the path of this clawg binary, {0}, is not absolute; run clawg by its full path")]
     RelativeExe(PathBuf),
     #[error("the path of this clawg binary, {0}, is not valid Unicode")]
@@ -237,7 +242,7 @@ pub fn plan(state: &State, mode: Mode) -> Result<Plan, SetupError> {
     };
     let other_registered = registered(other.mcp_server_name()).is_some_and(is_clawg_server);
     let (block, instructions) = match mode {
-        Mode::Install => install_block(&state.instructions, state.language)?,
+        Mode::Install => install_block(&state.instructions, state.language, state.version)?,
         Mode::Remove if other_registered => {
             find_block(&state.instructions)?;
             (BlockStep::Kept, FileStep::Unchanged)
@@ -598,12 +603,95 @@ fn line_ending(text: &str) -> &'static str {
     }
 }
 
+/// The line after the opening marker: the version of clawg that wrote the
+/// block, and the variant when the person chose one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Stamp {
+    pub version: Version,
+    pub choice: Option<Variant>,
+}
+
+impl Stamp {
+    /// The stamp a line spells, `None` for any other line.
+    pub(crate) fn parse(line: &str) -> Option<Stamp> {
+        let inner = line.strip_prefix("<!-- clawg ")?.strip_suffix(" -->")?;
+        let (version, choice) = match inner.split_once(' ') {
+            Some((version, rest)) => (version, Some(Variant::parse(rest.strip_prefix("protocol=")?)?)),
+            None => (inner, None),
+        };
+        Some(Stamp { version: Version::parse(version).ok()?, choice })
+    }
+
+    pub(crate) fn line(self) -> String {
+        match self.choice {
+            Some(choice) => format!("<!-- clawg {} protocol={} -->", self.version, choice.as_str()),
+            None => format!("<!-- clawg {} -->", self.version),
+        }
+    }
+}
+
 /// The protocol for `language` ([`protocol::text`]) between its markers,
-/// without a final line ending.
-pub(crate) fn block(eol: &str, language: Option<Lang>) -> String {
+/// with `stamp` after the first, without a final line ending.
+pub(crate) fn block(eol: &str, language: Option<Lang>, stamp: Stamp) -> String {
+    assemble(eol, language, Some(stamp))
+}
+
+fn assemble(eol: &str, language: Option<Lang>, stamp: Option<Stamp>) -> String {
     let protocol = protocol::text(language).replace("\r\n", "\n");
     let body = protocol.trim_end().replace('\n', eol);
-    format!("{BEGIN_MARKER}{eol}{body}{eol}{END_MARKER}")
+    let stamp = stamp.map(|s| format!("{}{eol}", s.line())).unwrap_or_default();
+    format!("{BEGIN_MARKER}{eol}{stamp}{body}{eol}{END_MARKER}")
+}
+
+/// The stamp of an installed block, if its second line is one.
+pub(crate) fn read_stamp(block: &str) -> Option<Stamp> {
+    split_stamp(block).0
+}
+
+/// The block with `\n` line endings, and its stamp taken out when it reads.
+fn split_stamp(block: &str) -> (Option<Stamp>, String) {
+    let text = block.replace("\r\n", "\n");
+    let Some((first, rest)) = text.split_once('\n') else { return (None, text) };
+    let (second, after) = rest.split_once('\n').unwrap_or((rest, ""));
+    match Stamp::parse(second) {
+        Some(stamp) => (Some(stamp), format!("{first}\n{after}")),
+        None => (None, text),
+    }
+}
+
+/// The block `block` writes, without its stamp, with `\n` line endings.
+pub(crate) fn unstamped(language: Option<Lang>) -> String {
+    assemble("\n", language, None)
+}
+
+/// An installed block as [`unstamped`] writes it: its stamp taken out when it
+/// reads, and `\n` line endings.
+pub(crate) fn without_stamp(block: &str) -> String {
+    split_stamp(block).1
+}
+
+/// How an installed block compares with what this binary writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Freshness {
+    Current,
+    /// Other text, written by a later version.
+    Newer,
+    /// Other text: written by an earlier version, edited, or from before the stamp.
+    Stale,
+}
+
+/// Whether `installed`, a block as found between the markers, is the text this
+/// binary (version `own`) writes for `language`. The stamp and the line
+/// endings do not count: the same text from another version is current.
+pub(crate) fn freshness(installed: &str, language: Option<Lang>, own: Version) -> Freshness {
+    let (stamp, body) = split_stamp(installed);
+    if body == unstamped(language) {
+        return Freshness::Current;
+    }
+    match stamp {
+        Some(stamp) if stamp.version > own => Freshness::Newer,
+        _ => Freshness::Stale,
+    }
 }
 
 /// Where the block is in the file: from its first marker to the end of its
@@ -625,15 +713,16 @@ pub(crate) fn find_block(file: &File) -> Result<Option<(usize, usize)>, SetupErr
     }
 }
 
-fn install_block(file: &File, language: Option<Lang>) -> Result<(BlockStep, FileStep), SetupError> {
+fn install_block(file: &File, language: Option<Lang>, version: Version) -> Result<(BlockStep, FileStep), SetupError> {
     let range = find_block(file)?;
+    let stamp = Stamp { version, choice: None };
     let Some(text) = &file.text else {
-        return Ok((BlockStep::Added, FileStep::Write(block("\n", language) + "\n")));
+        return Ok((BlockStep::Added, FileStep::Write(block("\n", language, stamp) + "\n")));
     };
     let eol = line_ending(text);
-    let wanted = block(eol, language);
+    let wanted = block(eol, language, stamp);
     if let Some((begin, end)) = range {
-        if text[begin..end] == wanted {
+        if without_stamp(&text[begin..end]) == unstamped(language) {
             return Ok((BlockStep::Unchanged, FileStep::Unchanged));
         }
         return Ok((BlockStep::Rewritten, FileStep::Write(format!("{}{wanted}{}", &text[..begin], &text[end..]))));
@@ -682,6 +771,12 @@ pub fn locations(home: Option<&Path>, config_dir: Option<OsString>) -> Result<(P
     Ok((servers, dir.join("settings.json"), dir.join("CLAUDE.md")))
 }
 
+/// The version of this binary, as a block's stamp names it.
+pub fn own_version() -> Result<Version, SetupError> {
+    let text = clawg_core::build_info::version();
+    Version::parse(text).map_err(|_| SetupError::OwnVersion(text.to_string()))
+}
+
 fn read(path: PathBuf) -> Result<File, SetupError> {
     match std::fs::read_to_string(&path) {
         Ok(text) => Ok(File { path, text: Some(text) }),
@@ -706,6 +801,7 @@ pub fn read_state(
         settings: read(settings)?,
         instructions: read(instructions)?,
         language: preferences::language_in(data_dir),
+        version: own_version()?,
     })
 }
 
@@ -1210,7 +1306,13 @@ mod tests {
             settings: file("settings.json", settings),
             instructions: file("CLAUDE.md", instructions),
             language: None,
+            version: v("0.88.0"),
         }
+    }
+
+    /// The block as this binary writes it, in a file with LF line endings.
+    fn installed_block(language: Option<Lang>) -> String {
+        block("\n", language, Stamp { version: v("0.88.0"), choice: None })
     }
 
     fn written(step: &FileStep) -> &str {
@@ -1279,8 +1381,78 @@ mod tests {
         );
         assert_eq!(plan.block, BlockStep::Added);
         let md = written(&plan.instructions);
-        assert!(md.starts_with(&format!("{BEGIN_MARKER}\n# Claw Garden memory protocol\n")), "{md}");
+        assert!(md.starts_with(&format!("{BEGIN_MARKER}\n<!-- clawg 0.88.0 -->\n# Claw Garden memory protocol\n")), "{md}");
         assert!(md.ends_with(&format!("{END_MARKER}\n")), "{md}");
+    }
+
+    fn v(text: &str) -> Version {
+        Version::parse(text).unwrap()
+    }
+
+    #[test]
+    fn the_block_carries_the_version_that_wrote_it() {
+        let s = State { version: v("0.88.0"), ..state(None, None, None) };
+        let plan_ = plan(&s, Mode::Install).unwrap();
+        let md = written(&plan_.instructions);
+        assert!(md.starts_with(&format!("{BEGIN_MARKER}\n<!-- clawg 0.88.0 -->\n# Claw Garden memory protocol\n")), "{md}");
+
+        let chosen = block("\n", None, Stamp { version: v("0.88.0"), choice: Some(Variant::Short) });
+        assert!(chosen.starts_with(&format!("{BEGIN_MARKER}\n<!-- clawg 0.88.0 protocol=short -->\n")), "{chosen}");
+
+        let (begin, end) = find_block(&file("CLAUDE.md", Some(md))).unwrap().unwrap();
+        assert_eq!((begin, end), (0, md.len() - 1), "an earlier binary finds the stamped block by its markers");
+    }
+
+    #[test]
+    fn a_stamp_reads_its_version_and_its_choice() {
+        let plain = Stamp { version: v("0.88.0"), choice: None };
+        let chosen = Stamp { version: v("0.9.12"), choice: Some(Variant::Off) };
+        assert_eq!(Stamp::parse("<!-- clawg 0.88.0 -->"), Some(plain));
+        assert_eq!(Stamp::parse("<!-- clawg 0.9.12 protocol=off -->"), Some(chosen));
+        assert_eq!(plain.line(), "<!-- clawg 0.88.0 -->");
+        assert_eq!(chosen.line(), "<!-- clawg 0.9.12 protocol=off -->");
+        for unreadable in [
+            "<!-- clawg 0.88 -->",
+            "<!-- clawg 0.88.0 protocol=tiny -->",
+            "<!-- clawg 0.88.0 protocol= -->",
+            "<!-- clawg 0.88.0  -->",
+            "<!-- clawg -->",
+            "clawg 0.88.0",
+            "# Claw Garden memory protocol",
+        ] {
+            assert_eq!(Stamp::parse(unreadable), None, "{unreadable}");
+        }
+
+        let stamped = block("\n", None, chosen);
+        assert_eq!(read_stamp(&stamped), Some(chosen));
+        assert_eq!(read_stamp(&stamped.replace('\n', "\r\n")), Some(chosen), "a file with CRLF line endings");
+        let before_stamps = format!("{BEGIN_MARKER}\n# Claw Garden memory protocol\n{END_MARKER}");
+        assert_eq!(read_stamp(&before_stamps), None, "a block of before the stamp has no version and no choice");
+        let misspelled = format!("{BEGIN_MARKER}\n<!-- clawg 0.88 -->\n# Claw Garden memory protocol\n{END_MARKER}");
+        assert_eq!(read_stamp(&misspelled), None);
+    }
+
+    #[test]
+    fn a_block_is_current_stale_or_newer() {
+        let own = v("0.88.0");
+        let older = block("\n", None, Stamp { version: v("0.87.0"), choice: None });
+        assert_eq!(freshness(&older, None, own), Freshness::Current, "the same text of another version");
+        assert_eq!(freshness(&older.replace('\n', "\r\n"), None, own), Freshness::Current, "the same text with CRLF");
+        assert_eq!(freshness(&older, Some(Lang::Es), own), Freshness::Stale, "the other language is other text");
+        let spanish = block("\n", Some(Lang::Es), Stamp { version: own, choice: None });
+        assert_eq!(freshness(&spanish, Some(Lang::Es), own), Freshness::Current);
+
+        let before_stamps = format!(
+            "{BEGIN_MARKER}\n# Claw Garden memory protocol\n\nJudge each with `resolve_conflict`: `compatible` or `scoped` if both hold.\n{END_MARKER}"
+        );
+        assert_eq!(freshness(&before_stamps, None, own), Freshness::Stale, "no stamp: written before the stamp");
+
+        let later = format!("{BEGIN_MARKER}\n<!-- clawg 0.90.0 -->\nanother text\n{END_MARKER}");
+        assert_eq!(freshness(&later, None, own), Freshness::Newer);
+        let same = format!("{BEGIN_MARKER}\n<!-- clawg 0.88.0 -->\nanother text\n{END_MARKER}");
+        assert_eq!(freshness(&same, None, own), Freshness::Stale, "this version's stamp over text it does not write");
+        let unreadable = format!("{BEGIN_MARKER}\n<!-- clawg 0.99 -->\nanother text\n{END_MARKER}");
+        assert_eq!(freshness(&unreadable, None, own), Freshness::Stale, "a stamp that does not read is no stamp");
     }
 
     #[test]
@@ -1462,13 +1634,13 @@ mod tests {
         let text = written(&plan_.instructions);
         assert!(text.contains("# Protocolo de memoria de Claw Garden"), "{text}");
         assert!(text.contains("Responde a la persona en español salvo que escriba en otro idioma"), "{text}");
-        assert_eq!(text, format!("{}\n", block("\n", Some(Lang::Es))));
-        assert_ne!(block("\n", Some(Lang::Es)), block("\n", None));
+        assert_eq!(text, format!("{}\n", installed_block(Some(Lang::Es))));
+        assert_ne!(installed_block(Some(Lang::Es)), installed_block(None));
     }
 
     #[test]
     fn the_setup_report_speaks_spanish() {
-        let installed = format!("# Mine\n\n{}\n", block("\n", None));
+        let installed = format!("# Mine\n\n{}\n", installed_block(None));
         let s = State { language: Some(Lang::Es), ..state(None, None, Some(&installed)) };
         let plan_ = plan(&s, Mode::Install).unwrap();
         let (dry, code) = report(&plan_, &s, None);
@@ -1509,12 +1681,12 @@ mod tests {
 
     #[test]
     fn another_language_rewrites_the_block() {
-        let installed = format!("# Mine\n\n{}\n", block("\n", None));
+        let installed = format!("# Mine\n\n{}\n", installed_block(None));
         assert_eq!(plan(&state(None, None, Some(&installed)), Mode::Install).unwrap().block, BlockStep::Unchanged);
         let spanish = State { language: Some(Lang::Es), ..state(None, None, Some(&installed)) };
         let plan_ = plan(&spanish, Mode::Install).unwrap();
         assert_eq!(plan_.block, BlockStep::Rewritten, "what a --dry-run reports, since it plans the same");
-        assert_eq!(written(&plan_.instructions), format!("# Mine\n\n{}\n", block("\n", Some(Lang::Es))));
+        assert_eq!(written(&plan_.instructions), format!("# Mine\n\n{}\n", installed_block(Some(Lang::Es))));
     }
 
     #[test]
@@ -1522,12 +1694,12 @@ mod tests {
         let mine = "# My rules\n\nUse tabs.\n";
         let plan_ = plan(&state(None, None, Some(mine)), Mode::Install).unwrap();
         let added = written(&plan_.instructions).to_string();
-        assert_eq!(added, format!("{mine}\n{}\n", block("\n", None)));
+        assert_eq!(added, format!("{mine}\n{}\n", installed_block(None)));
 
         let stale = format!("# My rules\n\n{BEGIN_MARKER}\nold protocol\n{END_MARKER}\n\nAfter.\n");
         let plan_ = plan(&state(None, None, Some(&stale)), Mode::Install).unwrap();
         assert_eq!(plan_.block, BlockStep::Rewritten);
-        assert_eq!(written(&plan_.instructions), format!("# My rules\n\n{}\n\nAfter.\n", block("\n", None)));
+        assert_eq!(written(&plan_.instructions), format!("# My rules\n\n{}\n\nAfter.\n", installed_block(None)));
 
         let crlf = "line one\r\nline two\r\n";
         let plan_ = plan(&state(None, None, Some(crlf)), Mode::Install).unwrap();
@@ -1666,7 +1838,7 @@ mod tests {
     #[test]
     fn remove_keeps_the_block_while_the_other_profile_is_registered() {
         let both = r#"{"mcpServers":{"clawg":{"command":"/opt/clawg/clawg","args":["mcp","--profile","prod"]},"clawg-dev":{"command":"/x/clawg","args":["mcp"]}}}"#;
-        let md = format!("{}\n", block("\n", None));
+        let md = format!("{}\n", installed_block(None));
         let plan = plan(&state(Some(both), None, Some(&md)), Mode::Remove).unwrap();
         assert_eq!(plan.server_step, ServerStep::Remove);
         assert_eq!((plan.block, &plan.instructions), (BlockStep::Kept, &FileStep::Unchanged));
