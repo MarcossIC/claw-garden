@@ -477,8 +477,7 @@ fn execute(command: Command) -> Result<(), String> {
             }
             let forks = report::render_pairs(&report::pairs(&named));
             if !forks.is_empty() {
-                print!("
-{forks}");
+                print!("\n{forks}");
             }
             Ok(())
         }

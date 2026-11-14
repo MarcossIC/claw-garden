@@ -609,8 +609,8 @@ fn is_stream_file(name: &str) -> bool {
     name == crate::run::STREAM_FILE || name.strip_prefix("stream-").and_then(|rest| rest.strip_suffix(".jsonl")).is_some_and(|k| k.parse::<usize>().is_ok())
 }
 
-/// The stream of every session below `dir`, down to a branch of a fork of a run
-/// of a phase: one more level than the results [`find`] looks for.
+/// The stream of every session below `dir`, down to a branch of a fork: one
+/// more level than the results [`find`] looks for.
 fn find_streams(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) -> Result<(), ReportError> {
     let mut entries: Vec<_> = std::fs::read_dir(dir).map_err(|source| ReportError::Io { path: dir.to_owned(), source })?.collect::<Result<_, _>>().map_err(|source| ReportError::Io { path: dir.to_owned(), source })?;
     entries.sort_by_key(std::fs::DirEntry::file_name);
