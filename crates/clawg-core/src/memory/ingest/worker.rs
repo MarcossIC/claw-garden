@@ -1101,14 +1101,20 @@ async fn store_pieces(to: &PieceStore<'_>, absorbed: &mut u64, gated: &mut Gated
         // KNN, and its result (which existing rows this chunk is close to)
         // must be attached to the record before it is written, not after.
         let mut record = NewMemoryRecord::from_event_and_chunk(evt, &chunk);
-        record.candidates = crate::memory::revision::contradiction::detect_contradiction(
+        let found = crate::memory::revision::contradiction::detect_contradiction(
             store, &vec, &chunk.text, saver, evt.project_id.as_deref(), record.memory_type, &siblings,
         )
-        .await
-        .into_iter()
-        .filter(|(save, _)| paired.insert(*save))
-        .map(|(_, candidate)| candidate)
-        .collect();
+        .await;
+        // The saves are marked as paired only once the piece is stored: a piece a twin absorbs writes none
+        // of its candidates, and a later piece must still be able to hold the pair.
+        let mut fresh: Vec<SaveKey> = Vec::new();
+        record.candidates = Vec::new();
+        for (save, candidate) in found {
+            if !paired.contains(&save) && !fresh.contains(&save) {
+                fresh.push(save);
+                record.candidates.push(candidate);
+            }
+        }
         let candidates = record.candidates.clone();
         let note = note_for(track, noted, position, &content_hash, true, context(position));
         let absorbed_note = note_for(track, noted, position, &content_hash, false, "");
@@ -1130,6 +1136,7 @@ async fn store_pieces(to: &PieceStore<'_>, absorbed: &mut u64, gated: &mut Gated
                 return Stored::Failed(IngestFailure::Failed(format!("store insert failed: {e}")));
             }
         };
+        paired.extend(fresh);
         if track.is_some() {
             noted.push(NotedPiece {
                 position,
@@ -2586,6 +2593,54 @@ mod tests {
         assert_eq!(found[0].0, later.memories[0].id);
         assert!(earlier.memories.iter().any(|m| m.id == found[0].1), "{found:?}");
         assert_eq!(later.related.len(), 1, "{:?}", later.related);
+    }
+
+    /// A piece absorbed by a twin that came back while the save was embedded
+    /// writes none of its candidates, so the save is not yet paired with their
+    /// saves: a later piece still holds the pair.
+    #[tokio::test]
+    async fn a_piece_absorbed_by_a_twin_does_not_mark_its_save_as_paired() {
+        struct RestoringEmbedder {
+            store: Arc<MemoryStore>,
+            twin: i64,
+            vectors: Vec<Vec<f32>>,
+        }
+        #[async_trait::async_trait]
+        impl Embedder for RestoringEmbedder {
+            async fn embed_with_role(&self, _text: &str, _role: EmbedRole) -> Result<Vec<f32>, EmbedError> {
+                Ok(self.vectors[0].clone())
+            }
+            async fn embed_batch(&self, texts: &[String], _role: EmbedRole) -> Result<Vec<Vec<f32>>, EmbedError> {
+                let twin = self.twin;
+                self.store.conn.call(move |c| c.execute("UPDATE memory SET deleted_at = NULL WHERE id = ?1", [twin])).await.unwrap();
+                Ok(self.vectors[..texts.len()].to_vec())
+            }
+            fn dimensions(&self) -> usize { 384 }
+            fn model_id(&self) -> &str { "restoring" }
+            fn query_prefix(&self) -> &str { "" }
+            fn passage_prefix(&self) -> &str { "" }
+        }
+
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let content = distinct_text(400);
+        let chunks = chunk_count(&content);
+        assert!(chunks >= 3, "fixture must split into several chunks, got {chunks}");
+
+        // The same text saved once and deleted: its first piece is the twin that comes back.
+        let apart = PlacedEmbedder { vectors: vec![turned(3, 1.5); chunks] };
+        let first_run = process_with(Arc::new(apart), &store, &explicit_fact(&content)).await;
+        assert_eq!(first_run.failure, None);
+        let twin = first_run.memories[0].id;
+        store.conn.call(|c| c.execute("UPDATE memory SET deleted_at = 1", [])).await.unwrap();
+        let older = PlacedEmbedder { vectors: vec![turned(2, 0.2)] };
+        let older = process_with(Arc::new(older), &store, &explicit_fact("the build uses cargo")).await.memories[0].id;
+
+        let near = RestoringEmbedder { store: store.clone(), twin, vectors: (0..chunks).map(|i| turned(1, 0.01 * i as f32)).collect() };
+        let report = process_with(Arc::new(near), &store, &explicit_fact(&content)).await;
+
+        assert_eq!(report.failure, None);
+        assert_eq!(report.memories[0], SavedChunk { id: twin, outcome: ChunkOutcome::Reinforced }, "the first piece was absorbed");
+        assert_eq!(pairs(&store).await, vec![(report.memories[1].id, older, "pending".to_string())], "the next piece holds the pair");
     }
 
     #[tokio::test]
