@@ -2,6 +2,8 @@
 
 Amplía el arnés de [agent-eval](../agent-eval/spec.md) (AE1 a AE9) y la sección «`agent-eval`: las reglas, el ruido y los brazos de entrega» de [`specs/eval`](../../specs/eval/spec.md) (MD1 a MD7), de la que modifica MD3. Ninguna spec del producto cambia. Origen: [proposal](proposal.md); decisiones en [design](design.md). Los tests corren con la suite, sin modelo real, red ni `claude`, y no dejan nada en el temporal; los que juegan una corrida usan el `clawg` `testing` que la suite construye, con el modelo falso. Los archivos de código están en `crates/clawg-eval/src/bin/agent-eval/` y los de integración en `crates/clawg-eval/tests/agent_eval.rs`.
 
+AS13 a AS22 son las enmiendas que pidió la [segunda verificación](verify.md#segunda-verificación) antes de la campaña paga. Modifican: la clasificación de un hecho de AS9 (AS13), el sobrecosto del relevo de AS9 (AS14), las sesiones de AS2 (AS15), los checks de AS3 (AS18), el corredor de AS5 (AS19), la bifurcación de AS6 (AS20) y el reporte de AS10 (AS22); AS16, AS17 y AS21 son nuevos. Donde una de ellas y una anterior digan otra cosa, vale la enmienda.
+
 ## AS1. El orden del `MEMORY.md` (modifica MD3)
 
 El `MEMORY.md` de `a4` MUST ir de la memoria más vieja a la más nueva y, a igual edad, el ruido antes que la tarea: el orden en que lo deja un agente que agrega notas al final. El export y las reglas de `l1` y `l2` MUST seguir de la más nueva a la más vieja, como pide MD3.
@@ -116,9 +118,9 @@ En un brazo con clawg, el cliente reproducido MUST mandar cada llamada del strea
 
 En cada sesión, cada trazador de la tarea y cada trazador nacido en una sesión anterior MUST salir con su destino (AE5) y con lo que lo trajo: el nombre de cada herramienta cuyo resultado lo mostró, `hook`, o `context` cuando llegó sin pasar por el stream. Llegó sin pasar por el stream lo de MD6 y además: en la forma continua, lo que dicen los prompts de las sesiones anteriores; y en un brazo con memoria nativa, lo que el cliente carga del `MEMORY.md` que había antes de esa sesión, las primeras 200 líneas o los primeros 25.000 bytes, lo que llegue antes. Sin la copia de antes de la sesión vale el archivo del plan, cortado igual.
 
-Cada trazador nacido en una sesión MUST clasificarse, sobre la última sesión: `not_saved` si ninguna sesión desde la suya lo escribió en la entrada de `save_memory` o `update_memory` ni en un `Write` o `Edit` al directorio de la memoria nativa; si no, `saved_not_reached`, `reached_not_used` o `used`, según su destino.
+Cada trazador nacido en una sesión MUST clasificarse, sobre la última sesión (con la ventana de guardado que fija AS13): `not_saved` si ninguna sesión desde la suya lo escribió en la entrada de `save_memory` o `update_memory` ni en un `Write` o `Edit` al directorio de la memoria nativa; si no, `saved_not_reached`, `reached_not_used` o `used`, según su destino.
 
-Una corrida de dos sesiones MUST llevar el sobrecosto del relevo: lo que el primer pedido de la sesión 2 tiene de más sobre el de la sesión 1, sin bajar de 0, más los bytes entre 4 de los resultados de la sesión 2 que releen, que son los `Read` de un archivo que la sesión 1 ya leyó, las llamadas a `search_memory`, `recall_context`, `read_memory` y `list_memories` y los `Read` del directorio de la memoria nativa.
+Una corrida de dos sesiones MUST llevar el sobrecosto del relevo (reemplazado por AS14): lo que el primer pedido de la sesión 2 tiene de más sobre el de la sesión 1, sin bajar de 0, más los bytes entre 4 de los resultados de la sesión 2 que releen, que son los `Read` de un archivo que la sesión 1 ya leyó, las llamadas a `search_memory`, `recall_context`, `read_memory` y `list_memories` y los `Read` del directorio de la memoria nativa.
 
 #### Escenario: un hecho que no se guardó
 - GIVEN una corrida `split` bajo `a3` cuya sesión 1 no llama a `save_memory` y cuya sesión 2 no muestra el trazador de la sesión 1
@@ -160,3 +162,143 @@ Una corrida de dos sesiones MUST llevar el sobrecosto del relevo: lo que el prim
 Los datos MUST tener las cuatro tareas de la [propuesta](proposal.md#las-tareas-nuevas), con sus categorías, sesiones, trazadores y checks, los fixtures `psf-requests` (sin cambios sobre su fuente) y `shelf-notes`, y dos tareas de ejemplo de varias sesiones con sus streams. `data/agent-tasks/SOURCES.md` MUST nombrar la fuente, el commit y la licencia de `psf-requests`, las rutas que se tomaron y las que no, y qué escribió cada tarea. `agent-eval tasks` MUST dar todo válido y listar las sesiones de cada tarea.
 
 **Tests:** `the_example_tasks_are_valid_and_leak_no_tracer`, `the_tasks_of_several_sessions_are_listed_with_their_sessions`, `the_replayed_relay_example_follows_its_fact_to_the_second_session`, `the_replayed_missing_command_example_counts_its_failures`, `the_task_data_keeps_lf_line_endings_on_every_system` (`tests/agent_eval.rs`).
+
+## AS13. Un hecho lo guarda una sesión anterior a la que lo usa (modifica AS9)
+
+Un trazador nacido en la sesión i MUST contar como guardado sólo si lo escribió una sesión de la i a la penúltima, en la entrada de `save_memory` o `update_memory` o en un `Write` o `Edit` al directorio de la memoria nativa. Lo que guarda la última sesión MUST no contar: no trajo nada a ella. La sesión en que nació sí cuenta.
+
+#### Escenario: guarda al terminar
+- GIVEN una corrida `split` de dos sesiones bajo `a3` cuya sesión 1 no guarda `FORK_DEFAULT_TIMEOUT`, y cuya sesión 2 lo escribe en un archivo y lo guarda con `save_memory` al final
+- WHEN se puntúa
+- THEN el hecho sale `not_saved`, y con el `save_memory` en la sesión 1 sale `used`
+
+**Tests:** `a_fact_saved_only_by_the_last_session_is_not_saved` (`run.rs`), que hoy falla porque `run::facts` mira `sessions[i..]` (`run.rs:353`); `a_fact_is_told_as_not_saved_not_reached_not_used_or_used` sigue pasando.
+
+## AS14. El sobrecosto evitable y las relecturas (reemplaza el sobrecosto de AS9)
+
+Una corrida de dos sesiones MUST llevar `rereads`, lo que la sesión 2 relee, en tokens a 4 bytes por token, en dos partes:
+
+- `again`: los resultados de los `Read` de un archivo que la sesión 1 leyó o escribió, salvo los de un archivo que la sesión 2 edita (con `Edit`, `MultiEdit`, `Write` o `NotebookEdit`, antes o después de leerlo) y que la sesión 1 no escribió; los de `search_memory`, `recall_context`, `read_memory` y `list_memories`; y los `Read` del directorio de la memoria nativa.
+- `to_edit`: los resultados de los `Read` que `again` deja fuera por la edición.
+
+Las rutas MUST compararse resueltas desde el directorio de trabajo, sin importar separadores ni mayúsculas.
+
+`overhead`, el sobrecosto evitable, MUST ser, cuando la sesión 2 es nueva (una corrida `split` o la rama `split` de una bifurcación), lo que el primer pedido de la sesión 2 tiene de más sobre el de la sesión 1, sin bajar de 0, más `again`. Cuando la sesión 2 continúa la conversación, `overhead` MUST faltar y `rereads` MUST estar: su primer pedido es la conversación entera. Un `result.json` anterior, sin `rereads`, MUST seguir leyéndose.
+
+#### Escenario: lo que una edición exige no cuenta
+- GIVEN una sesión 1 que lee `a.py` y `b.py` y escribe `NOTES.md`, y una sesión 2 que lee `a.py` y lo edita, lee `b.py`, y lee `NOTES.md` y lo edita
+- WHEN se puntúa como `split`
+- THEN `again` son los resultados de `b.py` y `NOTES.md` entre 4, `to_edit` el de `a.py` entre 4, y `overhead` el crecimiento del primer pedido más `again`; como `joined`, `rereads` es el mismo y `overhead` falta
+
+**Tests:** `the_relay_overhead_leaves_out_the_reads_an_edit_needs`, `a_file_the_first_session_wrote_always_counts_as_read_again`, `a_continued_session_has_rereads_and_no_relay_overhead` (`run.rs`); `the_relay_overhead_is_what_the_new_session_starts_with_and_reads_again` cambia su aserción a la regla nueva; `a_result_written_before_sessions_still_reads` sigue pasando.
+
+## AS15. Lo que una sesión deja sin tocar (modifica AS2)
+
+Una sesión MAY llevar `untouched`, una lista de `{"path", "text"}`: al terminar esa sesión, el archivo `path` del directorio de trabajo MUST no contener `text`. `path` MUST ser relativo y quedar dentro del directorio de trabajo, y `text` MUST no estar vacío; si no, la tarea se rechaza nombrando la sesión y la entrada. `untouched` no es un check y no decide el éxito.
+
+El corredor MUST leer esos archivos justo después de la sesión, antes de que empiece la siguiente y antes de guardar el estado de una bifurcación, y escribir `untouched-K.json` con cada entrada y si su texto estaba; un archivo que falta no lo contiene, y el texto se busca como en los checks de archivo, con CRLF leído como LF. El registro de la sesión MUST llevar esas entradas, y una cuyo texto estaba es el artefacto `applied_early` (AS21).
+
+La sesión 1 de `requests-timeout-decision-relay` MUST dejar `src/requests/adapters.py` y `HISTORY.md` sin `FORK_DEFAULT_TIMEOUT` y `docs/user/advanced.rst` sin `4.5, 41`; las sesiones 1 y 2 de `requests-redact-decision-revised` MUST dejar `src/requests/utils.py` sin `def redact_url_credentials`. La sesión 1 de `example-relay-port` MUST dejar `notes.md` sin `confirmed`.
+
+#### Escenario: la sesión 1 aplicó antes de tiempo
+- GIVEN `example-relay-port` en seco, con un stream de la sesión 1 que escribe `confirmed` en `notes.md`
+- WHEN se reproduce bajo `a3`
+- THEN `untouched-1.json` dice que el texto estaba y `result.json` lleva `applied_early` en la sesión 1; con el stream del ejemplo no lleva ninguno
+
+**Tests:** `a_session_names_what_it_must_leave_untouched` (`task.rs`); `a_session_that_wrote_what_it_had_to_leave_untouched_is_found` y `the_tasks_that_hold_a_decision_back_name_what_stays_untouched` (`tests/agent_eval.rs`).
+
+## AS16. Las lecturas fuera del directorio de trabajo se niegan
+
+El `settings.json` de la configuración del cliente de todo brazo MUST llevar `permissions.blockReadsOutsideWorkingDirectories` en `true`, junto a lo que `setup` escribe en los brazos que lo tienen, que MUST conservarse. Bajo `a4` MUST llevar además, en `permissions.additionalDirectories`, el directorio de su memoria nativa; ningún otro brazo MUST llevar directorios adicionales.
+
+Una corrida paga MUST negarse, antes de preparar nada, si `--claude-version` es anterior a 2.1.257, la primera versión del cliente con ese bloqueo, nombrando la mínima.
+
+#### Escenario: `a4` lee sus notas y nada más
+- GIVEN una tarea con memorias
+- WHEN se planea bajo `a4` y bajo `a3`
+- THEN los dos `settings.json` bloquean las lecturas fuera, el de `a4` tiene como único directorio adicional el de su memoria nativa, y el de `a3` conserva los hooks de `setup` y no tiene ninguno
+
+**Tests:** `every_arm_blocks_the_reads_outside_its_working_directory`, `the_native_memory_is_a_working_directory_of_a4_only` (`arm.rs`); `a_paid_run_refuses_a_client_without_the_read_block` (`run.rs`).
+
+## AS17. Las lecturas fuera del directorio de trabajo se detectan
+
+El registro de cada sesión MUST llevar `outside_reads`: las llamadas, las de los subagentes incluidas, que leen fuera del directorio de trabajo y de los directorios adicionales del plan. Leen una ruta: `Read` por `file_path`; `Grep` y `Glob` por `path`, y por `pattern` cuando es una ruta absoluta; `LSP` por su archivo; y `Bash` por cada palabra de su comando que es una ruta absoluta (empieza con `/`, `~` o una letra de unidad) o tiene `..`. Una ruta relativa se resuelve desde el directorio de trabajo, y todas se comparan resueltas, sin importar separadores ni mayúsculas. Cada una MUST llevar la herramienta, la ruta y si el cliente la negó (su resultado vino marcado como error). Una ruta que contiene el `session_id` del `init` de la sesión MUST no listarse: son archivos que el cliente escribe para esa sesión y le pide leer.
+
+Una lectura fuera que el cliente no negó es el artefacto `read_outside` (AS21); una negada se lista y no lo es.
+
+#### Escenario: tres lecturas
+- GIVEN una sesión con un `Read` de `../run.json` que devolvió su contenido, un `Grep` sobre la ruta absoluta de `fork/` que volvió marcado como error y un `Read` de `src/a.py`
+- WHEN se puntúa
+- THEN `outside_reads` lista las dos primeras, la segunda negada, y `result.json` lleva `read_outside` sólo por la primera
+
+**Tests:** `a_read_outside_the_working_directory_is_listed_whatever_the_tool`, `a_denied_read_outside_is_listed_and_is_no_artifact`, `the_files_the_client_writes_for_the_session_are_not_outside` (`run.rs`).
+
+## AS18. Los intentos de un comando (modifica AS3)
+
+`command_runs` MUST ser un check con `command` y `max`: pasa si las llamadas a `Bash`, las de los subagentes incluidas, cuyo comando invoca `command` son `max` o menos, sea cual sea su resultado. Un comando invoca `command` si alguna de sus partes (separadas por `|`, `||`, `&&`, `;`, `&` o un salto de línea, o abiertas por `$(`, una comilla invertida o `(`) tiene como primera palabra, después de las asignaciones `NOMBRE=valor`, `command` o una ruta que termina en `/command`. Es de los que leen el stream, y `command` MUST estar en `shell` de la tarea.
+
+La sesión 3 de `shelf-eza-missing` MUST llevar `command_runs` de `eza` con `max` 0, además de sus dos checks.
+
+#### Escenario: dónde se invoca un comando
+- GIVEN las llamadas `eza -1 src | wc -l`, `ls src && eza docs`, `/usr/bin/eza src`, `echo eza` y `ls src`
+- WHEN se cuentan los intentos de `eza`
+- THEN son 3
+
+**Tests:** `the_runs_of_a_command_are_counted_in_every_part_of_a_shell_line` (`score.rs`); `a_command_run_check_names_a_command_of_the_shell` (`task.rs`); `the_replayed_missing_command_example_counts_its_failures` (`tests/agent_eval.rs`), con una aserción nueva sobre `command_runs` en la última sesión del ejemplo.
+
+## AS19. Toda corrida que falla se puntúa (modifica AS5)
+
+Una corrida que falla MUST dejar su `result.json` siempre que su primera sesión haya escrito un stream, también una de una sesión, con `success` en falso. En una bifurcación, si falla la segunda sesión de una rama, el corredor MUST mover a su subdirectorio los archivos de esa rama, como al terminarla bien, antes de devolver el error, y `score_dir` MUST puntuarla como una corrida de dos sesiones que no terminó; si falla la sesión 1, MUST dejar en la raíz un `result.json` de esa sesión, sin marca de par. `agent-eval costs` MUST contar cada sesión que dejó un stream con su costo, terminada o no.
+
+#### Escenario: falla la rama nueva
+- GIVEN una bifurcación en seco cuyo stream `split-2.jsonl` termina en error
+- WHEN corre
+- THEN `split/` tiene su `stream-2.jsonl`, su `work/` y un `result.json` de dos sesiones no terminado, y `costs` tiene una línea por cada una de las tres sesiones
+
+**Tests:** `a_failed_run_of_one_session_leaves_its_result`, `a_branch_whose_second_session_fails_keeps_its_files_and_is_scored` (`tests/agent_eval.rs`); `the_costs_count_the_sessions_of_a_run_that_failed` (`report.rs`).
+
+## AS20. La bifurcación restaura el home entero (modifica AS6)
+
+La bifurcación MUST guardar y restaurar el home entero de la corrida, salvo el directorio `models/` del directorio de datos de clawg, que queda donde está sin copiarse. Lo demás de AS6 no cambia.
+
+#### Escenario: lo que la rama continua dejó en el home
+- GIVEN una bifurcación cuya rama continua escribe un archivo en `home/` fuera del directorio de datos y, bajo `a4`, una nota en su `MEMORY.md`
+- WHEN corre la rama nueva
+- THEN no encuentra ni el archivo ni la nota, y `models/` no se copió
+
+**Tests:** `a_fork_restores_the_whole_home_but_the_models`, `a_fork_puts_back_the_native_memory_the_continued_branch_changed` (`run.rs`), sobre `save_state` y `restore_state` con el `Layout` de una corrida de `a4`. No es de integración: el cliente reproducido sólo escribe dentro del directorio de trabajo, y la memoria nativa está fuera.
+
+## AS21. Los artefactos de una corrida
+
+`result.json` MUST llevar `artifacts`, las causas de la regla 3 de la [propuesta](proposal.md#la-regla-de-decisión) que el resultado muestra, cada una con la sesión en que ocurrió:
+
+| Causa | Cuándo |
+|---|---|
+| `session_failed` | una sesión sin resultado o cuyo resultado es un error (a) |
+| `server_not_connected` | en un brazo con clawg, el servidor del perfil no figura `connected` en el `init` de una sesión (b) |
+| `not_continued` | una sesión que continúa la conversación tiene en su primer pedido menos contexto que en el último pedido de la anterior (c) |
+| `read_outside` | una lectura fuera que el cliente no negó (AS17) (e) |
+| `compacted_early` | una compactación en una sesión que no es la última de la corrida; en una rama, la sesión 1 es anterior (f) |
+| `applied_early` | una entrada de `untouched` cuyo texto estaba (AS15) (g) |
+
+La causa (d) no tiene lugar en el resultado: una corrida paga con un comando que debía faltar se niega antes de empezar. Decidir las causas MUST ser puro, sobre los registros de las sesiones y la forma de la corrida. Un `result.json` anterior, sin `artifacts`, MUST leerse sin ninguno.
+
+#### Escenario: una compactación al final no es artefacto
+- GIVEN una corrida `joined` de dos sesiones con una compactación en la sesión 2
+- WHEN se puntúa
+- THEN `artifacts` está vacío, y con la compactación en la sesión 1 lleva `compacted_early` en la sesión 1
+
+**Tests:** `the_artifacts_of_a_run_are_named_with_their_session`, `a_compaction_in_the_last_session_is_no_artifact` (`run.rs`).
+
+## AS22. El reporte con los artefactos, el ruido y los pares (modifica AS10)
+
+`agent-eval report` MUST:
+
+- dar una fila por tarea, brazo, forma y ruido (la cantidad de reglas de la corrida), con el ruido como columna;
+- dejar fuera de cada fila las corridas con algún artefacto, decir en una columna cuántas dejó fuera, y listar debajo de la tabla cada corrida excluida con su ruta y sus causas;
+- en una fila de forma `joined`, dejar vacía la columna del sobrecosto del relevo y dar la mediana de `again` en la de relecturas;
+- en la tabla de pares, dar sobre todos los pares cuántos tienen un artefacto en alguna rama, cuántos tienen `not_continued` y cuántos una compactación en cualquier sesión de cualquier rama; y, sólo sobre los pares sin artefacto, lo que AS10 ya pedía más la mediana del sobrecosto evitable de la rama nueva, la de su `to_edit` y la de `again` de la rama continua.
+
+`agent-eval calls` MUST dar, junto a la mediana y el p90 de los tokens que agrega cada llamada, la mediana de los bytes de su resultado entre 4.
+
+**Tests:** `rows_are_split_by_the_noise_of_the_run`, `rows_leave_out_the_runs_with_an_artifact_and_list_them`, `a_joined_row_has_rereads_and_no_relay_overhead`, `the_pairs_table_tells_what_was_excluded_continued_compacted_and_read_again`, `the_calls_table_gives_the_size_of_a_result_beside_what_a_call_adds` (`report.rs`). Los tests de AS10 siguen pasando con las columnas nuevas.

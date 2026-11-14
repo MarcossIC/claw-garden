@@ -89,12 +89,106 @@ Antes de empezar: `cargo clean --workspace --target-dir target-test`, porque es 
 - [x] `agent-eval tasks` da válidas las tareas y lista los dos ruidos.
 - [x] `verify.md` con lo anterior. El CI de Linux y Windows queda pendiente, y está en el verify.
 
+## Las enmiendas antes de pagar (AS13 a AS22, D14 a D22)
+
+Lo que pidió la [segunda verificación](verify.md#segunda-verificación). Las mismas reglas de arriba: el test va primero y falla, cada tarea es un commit comprobado con los tests de los archivos que cambia, y la suite y los dos clippy corren una vez, en la tarea 28. Antes de la 15: `cargo clean --workspace --target-dir target-test`, porque las fuentes son otra versión (las de la 14 y lo que haya entrado después, como el brazo `a3-short`).
+
+`arm.rs` lo toca otro trabajo en curso, el brazo `a3-short`. La tarea 19 es la única de esta tanda que lo cambia y se aplica sobre ese trabajo ya commiteado; las demás no lo tocan.
+
+## 15. El guardado de un hecho termina en la penúltima sesión (AS13, D14)
+
+- [ ] RED: `a_fact_saved_only_by_the_last_session_is_not_saved` (`run.rs`): una corrida de dos sesiones cuya última sesión guarda el trazador y la primera no; hoy sale `used`.
+- [ ] GREEN: `run::facts` busca el guardado en las sesiones de la de nacimiento a la penúltima.
+- Commit: `fix(agent-eval): count a fact as saved only by a session before the last`
+
+## 16. El sobrecosto deja fuera lo que una edición exige (AS14, D15)
+
+- [ ] RED: `the_relay_overhead_leaves_out_the_reads_an_edit_needs`, `a_file_the_first_session_wrote_always_counts_as_read_again`, `a_continued_session_has_rereads_and_no_relay_overhead` (`run.rs`); `the_relay_overhead_is_what_the_new_session_starts_with_and_reads_again` pide la regla nueva.
+- [ ] GREEN: `run::rereads`, puro, con `again` y `to_edit`; `run::overhead` suma el crecimiento del primer pedido y `again`; `RunResult::rereads`, con valor por omisión; `evaluate` deja `overhead` en `None` cuando la segunda sesión continúa la conversación.
+- Commit: `feat(agent-eval): leave the reads an edit needs out of the relay overhead`
+
+## 17. Los intentos de un comando (AS18, D18)
+
+- [ ] RED: `the_runs_of_a_command_are_counted_in_every_part_of_a_shell_line` (`score.rs`); `a_command_run_check_names_a_command_of_the_shell` (`task.rs`); en `the_replayed_missing_command_example_counts_its_failures` (`tests/agent_eval.rs`), la aserción sobre `command_runs` de la última sesión.
+- [ ] GREEN: `Check::CommandRuns`, con `describe` y `reads_only_the_stream`; `score::invocations`, puro; la regla de `problems` que exige el comando en `shell`; `command_runs` de `eza` con `max` 0 en la sesión 3 de `shelf-eza-missing` y en la última de `example-missing-command`.
+- Commit: `feat(agent-eval): count the runs of a shell command`
+
+## 18. Lo que una sesión deja sin tocar (AS15, D17)
+
+- [ ] RED: `a_session_names_what_it_must_leave_untouched` (`task.rs`); `a_session_that_wrote_what_it_had_to_leave_untouched_is_found` y `the_tasks_that_hold_a_decision_back_name_what_stays_untouched` (`tests/agent_eval.rs`), el primero con un stream de la sesión 1 que el test escribe en su directorio temporal.
+- [ ] GREEN: `SessionSpec::untouched` y su validación; `play_session` lee los archivos después de la sesión y escribe `untouched-K.json`, antes de la sesión siguiente y de `ForkStep::Save`; `score_dir` lo pone en el registro de la sesión; `untouched` en la sesión 1 de `requests-timeout-decision-relay`, las sesiones 1 y 2 de `requests-redact-decision-revised` y la sesión 1 de `example-relay-port`.
+- Commit: `feat(agent-eval): check after a session what it had to leave untouched`
+
+## 19. El cliente bloquea las lecturas fuera del directorio de trabajo (AS16, D16)
+
+Sobre el brazo `a3-short` ya commiteado en `arm.rs`.
+
+- [ ] RED: `every_arm_blocks_the_reads_outside_its_working_directory`, `the_native_memory_is_a_working_directory_of_a4_only` (`arm.rs`); `a_paid_run_refuses_a_client_without_the_read_block` (`run.rs`).
+- [ ] GREEN: `arm::plan` agrega `permissions.blockReadsOutsideWorkingDirectories` al `settings.json` de todo brazo, sin perder lo de `setup`, y bajo `a4` `permissions.additionalDirectories` con su memoria nativa; `run::check_read_block`, pura, sobre `--claude-version`, llamada antes de preparar una corrida paga.
+- Commit: `feat(agent-eval): block the reads of a session outside its working directory`
+
+## 20. Las lecturas fuera, detectadas (AS17, D16)
+
+- [ ] RED: `a_read_outside_the_working_directory_is_listed_whatever_the_tool`, `a_denied_read_outside_is_listed_and_is_no_artifact`, `the_files_the_client_writes_for_the_session_are_not_outside` (`run.rs`).
+- [ ] GREEN: `run::outside_reads`, puro, sobre las llamadas, el directorio de trabajo, los directorios adicionales que el plan escribió en `settings.json` y el `session_id`; `Session::outside_reads`, con valor por omisión.
+- Commit: `feat(agent-eval): list every read of a session outside its working directory`
+
+## 21. Los artefactos en el resultado (AS21, D21)
+
+- [ ] RED: `the_artifacts_of_a_run_are_named_with_their_session`, `a_compaction_in_the_last_session_is_no_artifact` (`run.rs`).
+- [ ] GREEN: `Artifact` con sus seis causas; `run::artifacts`, puro; `RunResult::artifacts`, con valor por omisión; en una rama, la sesión 1 cuenta como anterior.
+- Commit: `feat(agent-eval): name the artifacts of a run in its result`
+
+## 22. Toda corrida que falla se puntúa (AS19, D19)
+
+- [ ] RED: `a_failed_run_of_one_session_leaves_its_result`, `a_branch_whose_second_session_fails_keeps_its_files_and_is_scored` (`tests/agent_eval.rs`); `the_costs_count_the_sessions_of_a_run_that_failed` (`report.rs`).
+- [ ] GREEN: `run` puntúa la corrida que falló sea cual sea su número de sesiones (`main.rs`); `fork` aplica `Keep` de la rama cuya segunda sesión falló antes de devolver el error, y deja en la raíz el resultado de una sesión 1 que falló; `score_dir` y `costs` cuentan las sesiones que no terminaron.
+- Commit: `fix(agent-eval): score every run and branch that fails`
+
+## 23. La bifurcación restaura el home entero (AS20, D20)
+
+- [ ] RED: `a_fork_restores_the_whole_home_but_the_models`, `a_fork_puts_back_the_native_memory_the_continued_branch_changed` (`run.rs`).
+- [ ] GREEN: `save_state` copia `home/` sin `models/`, y `restore_state` lo vacía conservando `<datos>/models` y lo vuelve a copiar.
+- Commit: `fix(agent-eval): restore the whole home of a fork but the models`
+
+## 24. El reporte con los artefactos, el ruido y los pares (AS22, D21)
+
+- [ ] RED: `rows_are_split_by_the_noise_of_the_run`, `rows_leave_out_the_runs_with_an_artifact_and_list_them`, `a_joined_row_has_rereads_and_no_relay_overhead`, `the_pairs_table_tells_what_was_excluded_continued_compacted_and_read_again` (`report.rs`).
+- [ ] GREEN: `Row` con el ruido en la clave, las excluidas y las relecturas; la lista de corridas excluidas con sus causas; `PairRow` con los pares excluidos, los que no continuaron, los que compactaron, y las medianas del sobrecosto evitable, de `to_edit` de la rama nueva y de `again` de la continua.
+- Commit: `feat(agent-eval): report the artifacts, the noise and the rereads of each pair`
+
+## 25. El tamaño del resultado de una llamada (AS22)
+
+- [ ] RED: `the_calls_table_gives_the_size_of_a_result_beside_what_a_call_adds` (`report.rs`).
+- [ ] GREEN: `report::calls` con la mediana de los bytes del resultado entre 4, y su columna.
+- Commit: `feat(agent-eval): give the size of a call's result beside what it adds`
+
+## 26. Dos textos
+
+Sin test: no cambia ninguna conducta.
+
+- [ ] El comentario de `find_streams` (`report.rs:523`) deja de nombrar una fase de una campaña, y `main.rs:475-476` escribe el salto de línea como `\n`.
+- Commit: `style(agent-eval): name no campaign phase and escape the newline of the report`
+
+## 27. La referencia
+
+- [ ] `docs/reference/testing.md`: `untouched` y `untouched-K.json`, `command_runs`, el bloqueo de lecturas y la versión mínima del cliente, `outside_reads`, `artifacts`, `rereads` y el sobrecosto evitable, que toda corrida que falla deja su resultado, que la bifurcación restaura el home entero, y las columnas nuevas de `report` y `calls`.
+- [ ] `openspec/README.md`: el estado de la fila 129.
+- Commit: `docs: describe the artifacts, the read block and the rereads of agent-eval`
+
+## 28. Verificación de las enmiendas
+
+- [ ] `cargo test --workspace` y los dos `cargo clippy` de `docs/reference/testing.md`, sobre el último commit, en `target-test` en Windows.
+- [ ] `agent-eval tasks` da válidas las tareas, con `untouched` y `command_runs`, y lista los dos ruidos.
+- [ ] `verify.md`, una sección nueva con lo anterior y cada hallazgo de la segunda verificación contra su tarea.
+- Commit: `docs(openspec): verify the amendments of agent-eval-sessions`
+
 ## Después de este cambio
 
 Local, con una clave de API y autorización de gasto; nada de esto es de la suite.
 
-- [ ] La guía de la campaña, fuera de git, con las fases, los topes y la regla de decisión de la [propuesta](proposal.md#la-regla-de-decisión) copiada sin cambios.
+- [ ] La guía de la campaña, fuera de git, con las fases en el orden 1, 2, 4, 3, la regla de decisión de la [propuesta](proposal.md#la-regla-de-decisión) copiada sin cambios, y lo que D22 deja a la guía: los topes por proceso (1,20 R, 0,50 D y la K larga, 0,15 E y el piloto) y la cuenta de lo gastado con `agent-eval costs` contra el peor caso de cada corrida, sin pasar de 25 USD; el canario (Δ entre 500 y 3.000 tokens); el texto con que el shell informa que falta `eza`; el primer pedido de las sesiones de E bajo `a0` y su línea `init`; y las lecturas negadas de cada corrida del humo.
 - [ ] Fase 0: todas las tareas nuevas en seco con el modelo real.
-- [ ] Fase 1, humo y canarios. Es una puerta: la campaña sigue sólo si pasa.
-- [ ] Fases 2 a 4, y el resultado contra la regla, en `verify.md`.
-- [ ] Al archivar: AS1 reemplaza el orden del `MEMORY.md` en MD3 de [`specs/eval`](../../specs/eval/spec.md) (`openspec/specs/eval/spec.md:1491`), y AS2 a AS12 pasan a esa sección.
+- [ ] Fase 1, humo y canarios. Es una puerta: la campaña sigue sólo si pasa, y el canario es puerta de la fase 3.
+- [ ] Fases 2, 4 y 3, y el resultado contra la regla, en `verify.md`.
+- [ ] Al archivar: AS1 reemplaza el orden del `MEMORY.md` en MD3 de [`specs/eval`](../../specs/eval/spec.md) (`openspec/specs/eval/spec.md:1491`), y AS2 a AS22 pasan a esa sección, con las enmiendas ya aplicadas sobre lo que modifican.

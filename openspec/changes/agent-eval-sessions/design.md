@@ -132,6 +132,128 @@ Alternativa: un formato nuevo con versión. Obliga a migrar o a leer dos formato
 
 Un `.ignore` en `data/agent-tasks/fixtures/` los saca del recorrido del índice de docs (`crates/clawg-core/src/memory/project_docs/corpus.rs:81-91`) y de `rg`. La corrida copia el contenido de un fixture, no ese archivo, así que el índice de la corrida no cambia. Sin él, 600 KB de `requests` entrarían en `search_project` de quien trabaja en este repositorio. Costo: quien busque dentro de un fixture con `rg` tiene que pedirlo con `--no-ignore`.
 
+## Las enmiendas antes de pagar
+
+D14 a D22 resuelven lo que la [segunda verificación](verify.md#segunda-verificación) encontró en `91046225`. Requisitos en AS13 a AS22 de la [spec](spec.md).
+
+## D14. La ventana de guardado de un hecho termina en la penúltima sesión
+
+`run::facts` (`run.rs:348-365`) busca el guardado en `sessions[i..]`, que incluye la última. Pasa a `sessions[i..len - 1]`. La sesión en que nace el hecho sigue contando: un brazo que lo guarda en el momento en que lo oye es lo que se quiere medir.
+
+| Alternativa | Por qué no |
+|---|---|
+| Guardado en una sesión estrictamente anterior a la última y posterior a la de nacimiento | Saca el caso más común, guardar al oírlo, y deja a `a3` sin poder mantener un hecho de dos sesiones |
+| Contar el guardado de la última sólo si fue antes del primer uso del hecho | Pide ordenar llamadas dentro de una sesión para un caso que no trae nada de una sesión anterior: lo que llega ahí llegó por otro camino |
+
+## D15. El sobrecosto deja fuera lo que una edición exige
+
+La sesión 2 de R edita tres archivos que suman 134.458 bytes y que la sesión 1 leyó por pedido del prompt; el cliente exige un `Read` en la misma sesión antes de un `Edit`. Contadas, esas lecturas (unos 35.000 tokens) superan solas el umbral de H1 y el veredicto lo decide la tarea. Se elige: `again` cuenta los `Read` de archivos que la sesión 1 leyó o escribió, salvo los de un archivo que la sesión 2 edita y que la sesión 1 no escribió; `to_edit` guarda lo que queda fuera, y se informa. El umbral de `rinde` baja de 20.000 a 10.000 tokens porque la medida ya no lleva lo inevitable ([propuesta](proposal.md#h1-el-relevo)).
+
+| Alternativa | Por qué no |
+|---|---|
+| La diferencia dentro del par: lo que relee la rama nueva menos lo que relee la continua | Depende de si el cliente exige el `Read` también al continuar, que no está documentado: si lo exige, la diferencia se cancela; si no, vuelven los 35.000. Suma además el ruido de dos trayectorias por par. Se informa, no decide |
+| Excluir los archivos que nombran los checks de la tarea | Es un conocimiento de la tarea dentro de una medida del stream, y deja fuera `TIMEOUTS.md`, que nombra un check pero es justo el camino del relevo por el repositorio |
+| Achicar los archivos de R | Su tamaño lleva la sesión 1 a 150.000 tokens, la condición de validez; el fixture dejaría de ser una copia sin cambios de su fuente; y la medida seguiría dependiendo del tamaño de lo que se edita |
+| Dejar la medida y subir el umbral | Un umbral que contiene el tamaño de la tarea no se traslada a otra tarea ni a una sesión real |
+
+Una lectura de un archivo que la sesión 1 escribió cuenta siempre, aunque la sesión 2 lo edite: es la nota que dejó la sesión anterior, lo que una memoria reemplaza. Se pierde: una sesión que lee entero un archivo que después toca en una línea sale igual que una que lo lee por rangos; eso es costo del trabajo, no del relevo, y queda en `to_edit`. La rama continua lleva `rereads` y no `overhead`, porque su primer pedido es la conversación entera (la sugerencia 2 de la verificación).
+
+## D16. Las lecturas fuera de `work/`: el cliente las bloquea y el arnés las detecta
+
+`settings.json` de `claude-config/` lo escribe el arnés para todo brazo (`arm.rs:356-357`, a partir del de `setup` en los brazos que lo tienen, `arm.rs:310-312`), así que el bloqueo es una clave más en un archivo que el plan ya decide: `permissions.blockReadsOutsideWorkingDirectories: true`. El cliente niega con ella `Read`, `Grep`, `Glob` y `LSP` fuera de los directorios de trabajo en todo modo, desde la versión 2.1.257, según su referencia de configuración. `a4` agrega su directorio de memoria nativa en `permissions.additionalDirectories`: el bloqueo deja leer «los archivos que el cliente necesita», pero la lista que documenta no nombra la memoria automática, y una `a4` que no puede leer sus notas perdería por el arnés.
+
+La detección es pura sobre el stream: cada llamada que lee una ruta fuera del directorio de trabajo y de los adicionales queda en `outside_reads`, negada o no. La que devolvió contenido es el artefacto `read_outside`.
+
+| Alternativa | Por qué no |
+|---|---|
+| Separar el árbol: `work/` fuera de la raíz de la corrida | `..` deja de llevar a `run.json`, pero cualquier otra ruta sigue legible, incluido el directorio de datos de este repositorio con las tareas y sus checks. Rompe además el directorio de una corrida como unidad que `score` y `report` recorren, y la ruta del trabajo de una rama (`joined/work/`) |
+| Reglas `permissions.deny` con `Read(//<raíz>/run.json)`, `Read(//<raíz>/fork/**)` y demás | Hay que enumerar lo que hay que esconder, y lo que se olvide queda abierto; una regla de lectura no puede negar la raíz y permitir `work/` dentro, porque una negación le gana a un permiso. Su ventaja, que alcanza a `cat` y `head` en `Bash`, no hace falta: ningún brazo tiene esos comandos |
+| Sólo detectar | Una corrida con la fuga se tira y se repite: se paga dos veces lo que el cliente puede negar gratis |
+| El sandbox del cliente | Bloquea en el sistema operativo y alcanza a todo proceso, pero cambia cómo corren los comandos y los hooks del arnés y de clawg, y su soporte depende del sistema operativo |
+
+Lo que no cubre: el shell. Sólo E lo tiene, con `eza` y `ls`, que no leen contenido, y E no tiene trazadores; la detección lista igual un `ls` fuera. Lo que el cliente carga solo (la conversación con `--continue`, el `CLAUDE.md` de la configuración, el `MEMORY.md`) no pasa por una herramienta y el bloqueo no lo toca, que es lo que se quiere: la rama continua tiene su contexto y la nueva no puede leerlo.
+
+La versión mínima se comprueba sobre `--claude-version`, que `check_client_version` (`run.rs:702-711`) ya iguala a la que el cliente informa.
+
+## D17. `untouched` se lee al terminar cada sesión
+
+D4 rechaza un check de archivo dentro de una sesión porque el directorio de trabajo sólo se conserva al final. `untouched` no es un check: el corredor lee los archivos que nombra justo después de la sesión y deja `untouched-K.json`, que es lo único que el puntaje necesita, y el puntaje se sigue rehaciendo desde el disco.
+
+| Alternativa | Por qué no |
+|---|---|
+| Comprobar `fork/work/` en la guía, a mano | Sirve sólo para la bifurcación (D corre `split` y `joined`, sin `fork/`), y una exclusión que se decide a mano es una que se puede reinterpretar |
+| Comprobarlo desde el stream, por los `Write` y `Edit` de la sesión | Un `Edit` lleva sólo el fragmento cambiado, y un comando o un subagente puede escribir sin que el stream lo muestre igual |
+| Un check de archivo por sesión que falle la corrida | Haría de la desobediencia de la sesión 1 un fallo de la memoria en la sesión 2. Es un artefacto: el relevo ya no se mide |
+| Una copia del directorio de trabajo por sesión | Cuesta 600 KB por sesión para leer tres archivos |
+
+## D18. Un intento de un comando es una parte de la línea que lo invoca
+
+`command_runs` parte el comando de `Bash` por sus separadores y mira la primera palabra de cada parte. H6 lee los intentos y no la salida, así que no depende del texto del shell del cliente.
+
+| Alternativa | Por qué no |
+|---|---|
+| Sólo el texto `eza: command not found` | Es lo que había: con otro shell u otro mensaje, H6 sale «no hay efecto» por el arnés |
+| Buscar `eza` en cualquier lugar del comando | `echo eza` o un comentario lo cuentan, y un agente que explica por qué no lo usa sale como si lo hubiera intentado |
+| Un analizador de shell completo | Ninguna tarea lo pide; las formas que no se cubren (`sh -c 'eza'`, `xargs eza`) son raras en una sesión y salen como 0, el lado conservador de «la memoria lo evita» |
+
+## D19. Toda corrida que dejó un stream deja un resultado
+
+Hoy una corrida de una sesión que falla no escribe `result.json` (`main.rs:451`), y en una bifurcación la rama que falla no corre `Keep` (`run.rs:874-886`). Se escribe siempre que haya un stream de la sesión 1, y la rama que falla mueve sus archivos antes de devolver el error. Así `costs` cuenta lo gastado y la regla 4 cuenta las exclusiones con todo.
+
+Alternativa: dejarlo en la guía, con un `agent-eval score --run DIR` sobre cada corrida que falló. Es lo que la verificación propuso como paso provisorio; con más de cien corridas, un paso que se olvida es dinero que no se cuenta.
+
+## D20. La bifurcación copia el home entero menos los modelos
+
+`save_state` copia el directorio de datos de clawg y no el resto de `home/` (`run.rs:954-962`). Pasa a copiar `home/` entero con `models/` fuera, que `copy_dir` ya salta por nombre (`run.rs:639-653`); al restaurar, `clear_dir` conserva `<datos>/models`. Lo que el cliente o un hook escriba en el home deja de pasar de la rama continua a la nueva.
+
+Alternativa: listar `home/` en el humo y decidir a mano. No dice nada de las corridas que vienen después, y la copia es un cambio de una ruta.
+
+## D21. Las causas de un artefacto las decide el resultado
+
+`run::artifacts` es puro sobre los registros de las sesiones, la forma y `untouched`, y deja la lista en `result.json`; `report` la lee. Así la regla 3 se aplica igual en cada corrida, y una exclusión tiene su causa escrita al lado.
+
+| Alternativa | Por qué no |
+|---|---|
+| Que `report` las calcule al agregar | El reporte relee resultados, no streams, y la causa no quedaría en la corrida que la tiene |
+| Que la guía las lea en cada `result.json` | Es leer a mano lo que la regla dice que se muestra «sin interpretación» |
+
+La compactación entra así: en una sesión que no es la última es un artefacto, porque en R el par deja de comparar seguir con cortar; en la última se cuenta y se informa, porque es lo que hace una sesión real que sigue.
+
+## D22. Lo que va al código y lo que va a la guía
+
+Va al código lo que cambia un número que la regla lee o la decisión de excluir una corrida: el ruido en la clave de las filas (W1), la continuación y las compactaciones en la tabla de pares (W2), puntuar lo que falla (W3), `untouched` (W5), `command_runs` (W6) y el home entero (W7). Va a la guía lo que se lee una vez, en el humo, y no cambia ningún cálculo:
+
+- los topes de `--max-budget-usd` por tarea y la cuenta de lo gastado contra el peor caso de cada corrida;
+- el canario, Δ entre N bajo `a4` con 300 y con 15 reglas, que la propuesta fija entre 500 y 3.000 tokens (W4); el reporte ya da el primer pedido de cada fila;
+- el texto con que el shell del cliente informa que falta `eza` en la sesión 1 de E bajo `a0`, que se anota y no decide (W6);
+- bajo `a0` en E, que el primer pedido de las sesiones 2 y 3 sea el de la 1 y que la línea `init` no liste otro shell que `Bash` (la sugerencia 5);
+- las lecturas negadas de cada corrida del humo, para confirmar que el bloqueo no le niega a una sesión lo que necesita.
+
+Las sugerencias 3 (los bytes del resultado junto a lo que agrega una llamada) y 6 (un texto que nombra una fase, y un salto de línea literal) también van al código; la 4 (el trazador literal) es una regla de lectura de H3 en la propuesta.
+
+`--max-budget-usd` sigue siendo uno por corrida. Uno por sesión, en la tarea, ataría a la tarea un parámetro de la campaña, y el peor caso de una corrida (procesos por tope) ya da la cuenta que la guía necesita.
+
+Cada hallazgo de la segunda verificación, con lo que se hace:
+
+| Hallazgo | Qué se hace |
+|---|---|
+| CRITICAL 1, el guardado de la última sesión | Aceptado: D14, AS13, tarea 15 |
+| CRITICAL 2, el sobrecosto inflado por la tarea | Aceptado: D15, AS14, H1 reescrita, tarea 16 |
+| CRITICAL 3, lo que una sesión lee fuera de `work/` | Aceptado: D16, AS16 y AS17, tareas 19 y 20 |
+| W1, los dos ruidos en una fila | Aceptado: el ruido entra en la clave (AS22, tarea 24) |
+| W2, la puerta del humo se lee a mano | Aceptado: continuación y compactaciones en la tabla de pares, la compactación como artefacto (f) (AS21, AS22, tareas 21 y 24) |
+| W3, lo que se pierde cuando una sesión falla | Aceptado: D19, AS19, tarea 22 |
+| W4, el umbral del canario | Aceptado en la propuesta: `a4` con 300 contra `a4` con 15, entre 500 y 3.000 tokens; se lee en la guía |
+| W5, la sesión 1 que desobedece | Aceptado: `untouched` y el artefacto (g) (D17, AS15, tarea 18) |
+| W6, H6 lee el texto de salida | Aceptado: `command_runs`, y H6 lee los intentos (D18, AS18, tarea 17); el texto se anota en el humo |
+| W7, el home no se restaura | Aceptado: D20, AS20, tarea 23 |
+| S1, la bifurcación sólo se prueba en `a3` | Aceptado: un test de `a4` en la tarea 23 |
+| S2, el sobrecosto de las filas `joined` | Aceptado: vacío, con las relecturas (AS14, AS22) |
+| S3, `added_tokens` incluye el pensamiento | Aceptado: los bytes del resultado entre 4 al lado (AS22, tarea 25); una herramienta se anota para dieta sólo si las dos medianas pasan de 1.500 |
+| S4, el trazador literal | Aceptado como regla de lectura: en R decide `FORK_DEFAULT_TIMEOUT` (propuesta, H3); sin código |
+| S5, el primer pedido de E bajo `a0` | Aceptado, en la guía del humo; no decide |
+| S6, un texto que nombra una fase y un salto de línea literal | Aceptado: tarea 26 |
+
 ## Lo puro y lo que toca disco
 
 | Puro | I/O |
@@ -143,6 +265,7 @@ Un `.ignore` en `data/agent-tasks/fixtures/` los saca del recorrido del índice 
 | `score` por sesión, `seed::native_loaded`, `delivered`, la clase de un hecho, el sobrecosto | `run::score_dir`: leer streams, copias y registros |
 | Qué llamadas de un stream van al servidor y el stream con las respuestas | El proceso del servidor en `replay-client` |
 | `report::aggregate`, los pares, la tabla de llamadas | `report::load` |
+| `run::facts` con su ventana, `run::rereads`, `run::outside_reads`, `run::artifacts`, las invocaciones de un comando, la versión mínima del cliente, el bloqueo en `settings.json` | Leer los archivos de `untouched` después de cada sesión; copiar y restaurar el home |
 
 ## El directorio de una corrida
 
@@ -151,7 +274,8 @@ run.json
 stream.jsonl client.log                 una sesión
 stream-K.jsonl client-K.log             varias
 instructions-K.jsonl memory-before-K.md
-result.json                             split y joined
-fork/                                   both: el estado después de la sesión 1
+untouched-K.json                        una sesión con untouched
+result.json                             split y joined, también si falló
+fork/                                   both: el estado después de la sesión 1, con el home sin models/
 joined/ split/                          both: stream-2.jsonl, work/, result.json de cada rama
 ```
