@@ -2125,7 +2125,7 @@ mod tests {
             reason: "folder_name".into(),
             created_at: 1,
         };
-        let full = Context { suggestions: vec![suggestion; 9], ..context("x", 10_000) };
+        let full = Context { suggestions: vec![suggestion; 9], conclusions_to_review: 10_000, ..context("x", 10_000) };
         let notice = block_notice(Some(Lang::Es), Some("an old block"), version("0.88.0"), Profile::Prod).expect("a block that differs");
         let worst: Vec<tool_failures::Rule> = (0..tool_failures::MAX_RULES)
             .map(|i| tool_failures::Rule {
