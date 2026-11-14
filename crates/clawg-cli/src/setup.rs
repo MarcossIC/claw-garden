@@ -677,7 +677,7 @@ impl Stamp {
 }
 
 /// What the block holds when the person chose no variant: the whole protocol.
-pub const DEFAULT_VARIANT: Variant = Variant::Full;
+const DEFAULT_VARIANT: Variant = Variant::Full;
 
 /// The protocol for `language` as `variant` has it ([`protocol::text`],
 /// [`protocol::short`] or nothing) between its markers, with `stamp` after the

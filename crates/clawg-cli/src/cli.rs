@@ -22,12 +22,13 @@ pub struct Cli {
     pub command: Command,
 }
 
-/// Trims an `--agent` value, refusing one with nothing left: a blank id
-/// would be an agent no client could ever name again.
+/// Reads a `--protocol` value: `full`, `short` or `off`.
 fn parse_protocol(raw: &str) -> Result<Variant, String> {
     Variant::parse(raw).ok_or_else(|| format!("`{raw}` is not a protocol variant; use full, short or off"))
 }
 
+/// Trims an `--agent` value, refusing one with nothing left: a blank id
+/// would be an agent no client could ever name again.
 fn parse_agent(raw: &str) -> Result<String, String> {
     let agent = raw.trim();
     if agent.is_empty() {
