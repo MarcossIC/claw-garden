@@ -1,14 +1,14 @@
 change: protocol-block
 objective: "1, y el costo de cada sesión"
 depends_on: []  # el valor por defecto lo decide la campaña de agent-eval-sessions (129), fuera de este cambio
-phase: tasks
+phase: verify
 artifacts:
   exploration: done
   proposal: done
   spec: done  # PB1 a PB8
   design: done  # D1 a D6; D6 es la regla de decisión del valor por defecto, fijada antes de correr la campaña
   tasks: done  # seis tareas de código y la de verificación
-  apply: pending
+  apply: done  # seis tareas de código
   verify: pending
   archive: pending
 updated: 2026-11-13
