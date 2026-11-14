@@ -451,10 +451,15 @@ fn execute(command: Command) -> Result<(), String> {
             let exe = std::env::current_exe().map_err(|e| format!("cannot locate agent-eval: {e}"))?;
             if let Err(failed) = run::execute(&layout.root, &exe) {
                 // Every session that left a stream is still a result: it was paid for.
-                for result in run::score_dir(&layout.root).unwrap_or_default() {
-                    println!("{}", run::summary(&result));
-                }
-                return Err(failed.to_string());
+                return Err(match run::score_dir(&layout.root) {
+                    Ok(results) => {
+                        for result in results {
+                            println!("{}", run::summary(&result));
+                        }
+                        failed.to_string()
+                    }
+                    Err(unscored) => format!("{failed}; and the run could not be scored: {unscored}"),
+                });
             }
             for result in run::score_dir(&layout.root).map_err(|e| e.to_string())? {
                 println!("{}", run::summary(&result));
@@ -462,6 +467,7 @@ fn execute(command: Command) -> Result<(), String> {
             Ok(())
         }
         Command::Score { dir } => {
+            let dir = std::path::absolute(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
             for result in run::score_dir(&dir).map_err(|e| e.to_string())? {
                 println!("{}", run::summary(&result));
             }

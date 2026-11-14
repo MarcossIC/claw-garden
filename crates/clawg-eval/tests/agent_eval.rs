@@ -248,6 +248,33 @@ fn a_replayed_edit_changes_the_working_directory_the_checks_read() {
     assert_eq!(result(&run)["score"], r["score"]);
 }
 
+#[test]
+fn score_reads_a_relative_run_as_absolute() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("example-staging-port.a0");
+    let work = out.join("work").join("deploy").join("service.env");
+    let stream = std::fs::read_to_string(data().join("replays").join("example-staging-port.a0.jsonl")).unwrap();
+    let read = work.to_str().unwrap().replace(std::path::MAIN_SEPARATOR, "/");
+    assert!(stream.contains("\"file_path\":\"deploy/service.env\""));
+    let stream = stream.replace("\"file_path\":\"deploy/service.env\"", &format!("\"file_path\":\"{read}\""));
+    let streams = dir.path().join("staging.jsonl");
+    std::fs::write(&streams, stream).unwrap();
+    let (output, run) = replay_of(dir.path(), "example-staging-port", "a0", &streams, clawg());
+    ok(&output);
+    let before = result(&run);
+    assert_eq!(before["artifacts"], serde_json::json!([]), "the read is inside the working directory: {before:#}");
+    let relative = run.file_name().unwrap().to_str().unwrap();
+    let again = Command::new(env!("CARGO_BIN_EXE_agent-eval"))
+        .args(["score", "--run", relative])
+        .current_dir(dir.path())
+        .env("CLAWG_TEST_EMBEDDER", "fake")
+        .env_remove("CLAWG_PROFILE")
+        .output()
+        .expect("agent-eval must start");
+    ok(&again);
+    assert_eq!(result(&run)["artifacts"], before["artifacts"], "a read inside the working directory is not outside it");
+}
+
 fn relay_replays() -> PathBuf {
     data().join("replays").join("example-relay-port.a3")
 }

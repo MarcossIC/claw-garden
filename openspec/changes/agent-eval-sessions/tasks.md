@@ -207,8 +207,8 @@ La [tercera verificación](verify.md#tercera-verificación) encontró cuatro pun
 
 ## 32. `score` por su ruta absoluta, y el error de puntuar (W1 y una sugerencia)
 
-- [ ] RED: `score_reads_a_relative_run_as_absolute` (`main.rs` o `tests/agent_eval.rs`).
-- [ ] GREEN: `Command::Score` hace absoluta su ruta como `run`; `main.rs` imprime el error de `score_dir` de una corrida que falló, en vez de `unwrap_or_default`.
+- [x] RED: `score_reads_a_relative_run_as_absolute` (`main.rs` o `tests/agent_eval.rs`).
+- [x] GREEN: `Command::Score` hace absoluta su ruta como `run`; `main.rs` imprime el error de `score_dir` de una corrida que falló, en vez de `unwrap_or_default`.
 - Commit: `fix(agent-eval): score a run by its absolute path and say why scoring failed`
 
 ## 33. Verificación
