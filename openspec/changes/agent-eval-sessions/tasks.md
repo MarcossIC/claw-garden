@@ -195,8 +195,8 @@ La [tercera verificación](verify.md#tercera-verificación) encontró cuatro pun
 
 ## 30. La decisión del relevo, sin tocar en todo archivo que la puede llevar (W3)
 
-- [ ] RED: `the_relay_decision_stays_untouched_wherever_it_could_be_applied` (`tests/agent_eval.rs`): la sesión 1 de `requests-timeout-decision-relay` nombra los dos trazadores en `src/requests/adapters.py`, `src/requests/sessions.py`, `src/requests/api.py`, `docs/user/advanced.rst` y `HISTORY.md`.
-- [ ] GREEN: las entradas en el JSON de la tarea; `agent-eval tasks` la sigue dando válida.
+- [x] RED: `the_relay_decision_stays_untouched_wherever_it_could_be_applied` (`tests/agent_eval.rs`): la sesión 1 de `requests-timeout-decision-relay` nombra los dos trazadores en `src/requests/adapters.py`, `src/requests/sessions.py`, `src/requests/api.py`, `docs/user/advanced.rst` y `HISTORY.md`.
+- [x] GREEN: las entradas en el JSON de la tarea; `agent-eval tasks` la sigue dando válida.
 - Commit: `feat(agent-eval): hold the relay decision back in every file it could reach`
 
 ## 31. La rama que jugó guarda sus archivos aunque falle otro paso (W5)

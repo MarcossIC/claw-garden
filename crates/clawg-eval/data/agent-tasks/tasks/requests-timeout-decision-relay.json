@@ -8,8 +8,15 @@
       "tracers": ["FORK_DEFAULT_TIMEOUT", "4.5, 41"],
       "untouched": [
         {"path": "src/requests/adapters.py", "text": "FORK_DEFAULT_TIMEOUT"},
+        {"path": "src/requests/adapters.py", "text": "4.5, 41"},
+        {"path": "src/requests/sessions.py", "text": "FORK_DEFAULT_TIMEOUT"},
+        {"path": "src/requests/sessions.py", "text": "4.5, 41"},
+        {"path": "src/requests/api.py", "text": "FORK_DEFAULT_TIMEOUT"},
+        {"path": "src/requests/api.py", "text": "4.5, 41"},
+        {"path": "docs/user/advanced.rst", "text": "FORK_DEFAULT_TIMEOUT"},
+        {"path": "docs/user/advanced.rst", "text": "4.5, 41"},
         {"path": "HISTORY.md", "text": "FORK_DEFAULT_TIMEOUT"},
-        {"path": "docs/user/advanced.rst", "text": "4.5, 41"}
+        {"path": "HISTORY.md", "text": "4.5, 41"}
       ]
     },
     {

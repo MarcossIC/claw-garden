@@ -536,16 +536,29 @@ fn the_tasks_that_hold_a_decision_back_name_what_stays_untouched() {
             .unwrap_or_default()
     };
     let pair = |path: &str, text: &str| (path.to_owned(), text.to_owned());
-    assert_eq!(
-        untouched("requests-timeout-decision-relay", 0),
-        [pair("src/requests/adapters.py", "FORK_DEFAULT_TIMEOUT"), pair("HISTORY.md", "FORK_DEFAULT_TIMEOUT"), pair("docs/user/advanced.rst", "4.5, 41")]
-    );
     assert!(untouched("requests-timeout-decision-relay", 1).is_empty());
     let redact = [pair("src/requests/utils.py", "def redact_url_credentials")];
     assert_eq!(untouched("requests-redact-decision-revised", 0), redact);
     assert_eq!(untouched("requests-redact-decision-revised", 1), redact);
     assert!(untouched("requests-redact-decision-revised", 2).is_empty(), "the last session is the one that applies it");
     assert_eq!(untouched("example-relay-port", 0), [pair("notes.md", "confirmed")]);
+}
+
+#[test]
+fn the_relay_decision_stays_untouched_wherever_it_could_be_applied() {
+    let text = std::fs::read_to_string(data().join("tasks").join("requests-timeout-decision-relay.json")).unwrap();
+    let task: Value = serde_json::from_str(&text).unwrap();
+    let held: Vec<(String, String)> = task["sessions"][0]["untouched"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| (e["path"].as_str().unwrap().to_owned(), e["text"].as_str().unwrap().to_owned()))
+        .collect();
+    for path in ["src/requests/adapters.py", "src/requests/sessions.py", "src/requests/api.py", "docs/user/advanced.rst", "HISTORY.md"] {
+        for tracer in ["FORK_DEFAULT_TIMEOUT", "4.5, 41"] {
+            assert!(held.contains(&(path.to_owned(), tracer.to_owned())), "{path} must not hold {tracer} after the first session: {held:?}");
+        }
+    }
 }
 
 #[test]
