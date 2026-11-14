@@ -251,6 +251,96 @@ fn the_second_replayed_session_finds_what_the_first_one_saved() {
     assert_eq!(first_result(&bare), "nothing found", "an arm without clawg has no server: the stream is as recorded");
 }
 
+/// The example relay played `--sessions both` under `arm`: its first session
+/// once, and its second one continued and then new.
+fn fork(dir: &Path, arm: &str) -> (Output, PathBuf) {
+    let out = dir.join(format!("fork.{arm}"));
+    let streams = data().join("replays").join(format!("example-relay-port.{arm}.both"));
+    let output = agent_eval(&[
+        "run",
+        "--task",
+        "example-relay-port",
+        "--arm",
+        arm,
+        "--out",
+        out.to_str().unwrap(),
+        "--clawg",
+        clawg().to_str().unwrap(),
+        "--model",
+        "replay",
+        "--sessions",
+        "both",
+        "--replay",
+        streams.to_str().unwrap(),
+    ]);
+    (output, out)
+}
+
+/// What a replayed call of a branch's second session got back, by its id.
+fn result_of(run: &Path, branch: &str, id: &str) -> String {
+    let stream = std::fs::read_to_string(run.join(branch).join("stream-2.jsonl")).unwrap();
+    let line = stream.lines().find(|l| l.contains(&format!("\"{id}\"")) && l.contains("tool_result")).expect("the result of the call");
+    serde_json::from_str::<Value>(line).unwrap()["message"]["content"][0]["content"].as_str().unwrap().to_owned()
+}
+
+#[test]
+fn a_forked_run_plays_the_second_session_both_ways_from_one_first_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let (output, run) = fork(dir.path(), "a3");
+    ok(&output);
+
+    assert!(!run.join("result.json").exists(), "the run itself has no result: its branches do");
+    assert!(run.join("stream-1.jsonl").is_file() && !run.join("stream-2.jsonl").exists(), "the first session is the run's, once");
+    for branch in ["joined", "split"] {
+        assert!(run.join(branch).join("stream-2.jsonl").is_file(), "{branch}");
+        assert!(run.join(branch).join("client-2.log").is_file(), "{branch}");
+        assert!(run.join(branch).join("work").join("notes.md").is_file(), "{branch}");
+    }
+    assert!(run.join("fork").join("work").join("notes.md").is_file(), "the state after the first session stays in fork/");
+
+    let log = clawg_log(&run);
+    assert_eq!(log.matches(" import --from clawg").count(), 1, "the seed loads once:\n{log}");
+    assert_eq!(log.matches(" stop --profile dev").count(), 3, "the daemon stops after each part:\n{log}");
+    assert!(!run.join("home").join(".clawg-dev").join("daemon.json").exists());
+
+    let (joined, split) = (result(&run.join("joined")), result(&run.join("split")));
+    assert_eq!((&joined["shape"], &split["shape"]), (&Value::from("joined"), &Value::from("split")));
+    assert_eq!((&joined["paired"], &split["paired"]), (&Value::from("split"), &Value::from("joined")));
+    for r in [&joined, &split] {
+        assert_eq!(r["sessions"].as_array().unwrap().len(), 2);
+        assert_eq!(r["sessions"][0]["session"]["session_id"], "replay-relay-port-1", "both share the first session");
+        assert_eq!(r["score"]["success"], true, "{r:#}");
+    }
+    assert_eq!(joined["session"]["session_id"], "replay-relay-port-joined-2");
+    assert_eq!(split["session"]["session_id"], "replay-relay-port-split-2");
+
+    let scored = agent_eval(&["score", "--run", run.to_str().unwrap()]);
+    ok(&scored);
+    let printed = stdout(&scored);
+    assert!(printed.contains("2 sessions joined") && printed.contains("2 sessions split"), "score --run scores both branches: {printed}");
+    assert!(stdout(&output).contains("2 sessions joined") && stdout(&output).contains("2 sessions split"), "{}", stdout(&output));
+}
+
+#[test]
+fn a_branch_of_a_fork_does_not_see_what_the_other_did() {
+    let dir = tempfile::tempdir().unwrap();
+    let (output, run) = fork(dir.path(), "a3");
+    ok(&output);
+
+    let (joined, split) = (run.join("joined").join("work"), run.join("split").join("work"));
+    assert!(joined.join("only-joined.txt").is_file(), "the continued session wrote it");
+    assert!(!split.join("only-joined.txt").exists(), "the new session starts from the work as the first one left it");
+    assert_eq!(
+        std::fs::read_to_string(joined.join("notes.md")).unwrap(),
+        std::fs::read_to_string(split.join("notes.md")).unwrap(),
+        "and both edit the file the first session wrote"
+    );
+
+    assert!(result_of(&run, "joined", "toolu_5").contains("7719"), "the continued session finds what it saved: {}", result_of(&run, "joined", "toolu_5"));
+    assert!(!result_of(&run, "split", "toolu_2").contains("7719"), "the new session never meets it: {}", result_of(&run, "split", "toolu_2"));
+    assert!(result_of(&run, "split", "toolu_1").contains("48213"), "but it finds what the first session saved: {}", result_of(&run, "split", "toolu_1"));
+}
+
 #[test]
 fn a_session_that_fails_stops_the_run_and_still_stops_the_daemon() {
     let dir = tempfile::tempdir().unwrap();

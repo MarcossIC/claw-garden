@@ -106,8 +106,14 @@ RUN_OPTIONS:
   --sessions says how a task of several sessions is played: split (the
   default) starts a conversation for each session, joined continues the
   conversation of the one before with --continue, and both plays the second
-  session of a task of two sessions each way from the same first one. A task of
-  one session takes only split.
+  session of a task of two sessions each way from the same first one: after the
+  first session the working directory, the client's configuration and the data
+  of clawg (without its models) are copied to fork/, the second session is
+  played continued, everything is put back and it is played again as a new one.
+  Each branch is left in joined/ or split/ with its stream, its working
+  directory and its own result.json, and the run has none of its own. A replay
+  of a fork is a directory with session-1.jsonl, joined-2.jsonl and
+  split-2.jsonl. A task of one session takes only split.
 
 Exit 0 done, 1 a task, file or run could not be used, 2 bad arguments.";
 
@@ -404,19 +410,21 @@ fn execute(command: Command) -> Result<(), String> {
             if let Err(failed) = run::execute(&layout.root, &exe) {
                 // The sessions that ran before the failure are still a result.
                 if t.prompts().len() > 1 {
-                    if let Ok(result) = run::score_dir(&layout.root) {
+                    for result in run::score_dir(&layout.root).unwrap_or_default() {
                         println!("{}", run::summary(&result));
                     }
                 }
                 return Err(failed.to_string());
             }
-            let result = run::score_dir(&layout.root).map_err(|e| e.to_string())?;
-            println!("{}", run::summary(&result));
+            for result in run::score_dir(&layout.root).map_err(|e| e.to_string())? {
+                println!("{}", run::summary(&result));
+            }
             Ok(())
         }
         Command::Score { dir } => {
-            let result = run::score_dir(&dir).map_err(|e| e.to_string())?;
-            println!("{}", run::summary(&result));
+            for result in run::score_dir(&dir).map_err(|e| e.to_string())? {
+                println!("{}", run::summary(&result));
+            }
             Ok(())
         }
         Command::Report { dir } => {

@@ -69,13 +69,14 @@ impl Client {
         }
     }
 
-    /// The command that starts session `k`: the plan's own, or `agent_eval`
-    /// replaying its stream, with `mcp_config` when the run has a server.
-    fn step(&self, planned: &Step, agent_eval: &Path, k: usize, mcp_config: Option<&Path>) -> Step {
+    /// The command that starts a session: the plan's own, or `agent_eval`
+    /// replaying a stream, which is the file `replayed` of the directory a
+    /// replay names, with `mcp_config` when the run has a server.
+    fn step(&self, planned: &Step, agent_eval: &Path, replayed: &str, mcp_config: Option<&Path>) -> Step {
         match self {
             Client::Claude => planned.clone(),
             Client::Replay(stream) => {
-                let stream = if stream.is_dir() { stream.join(format!("session-{k}.jsonl")) } else { stream.clone() };
+                let stream = if stream.is_dir() { stream.join(replayed) } else { stream.clone() };
                 let mut args = vec!["replay-client".to_owned(), stream.to_string_lossy().into_owned()];
                 if let Some(config) = mcp_config {
                     args.extend(["--mcp-config".to_owned(), config.to_string_lossy().into_owned()]);
@@ -594,7 +595,7 @@ pub fn prepare(task: &Task, arm: Arm, fixture: &Path, layout: &Layout, options: 
         return Err(RunError::NotEmpty(root.clone()));
     }
     let plan = crate::arm::plan(task, arm, layout, options)?;
-    copy_dir(fixture, &layout.workdir())?;
+    copy_dir(fixture, &layout.workdir(), &[])?;
     for dir in [layout.home(), layout.config_dir()] {
         std::fs::create_dir_all(&dir).map_err(io(&dir))?;
     }
@@ -624,13 +625,18 @@ pub fn prepare(task: &Task, arm: Arm, fixture: &Path, layout: &Layout, options: 
     Ok(plan)
 }
 
-fn copy_dir(from: &Path, to: &Path) -> Result<(), RunError> {
+/// Copies what `from` holds into `to`, except the entries named in `skip`,
+/// wherever they are.
+fn copy_dir(from: &Path, to: &Path, skip: &[&str]) -> Result<(), RunError> {
     std::fs::create_dir_all(to).map_err(io(to))?;
     for entry in std::fs::read_dir(from).map_err(io(from))? {
         let entry = entry.map_err(io(from))?;
+        if skip.iter().any(|name| entry.file_name() == *name) {
+            continue;
+        }
         let target = to.join(entry.file_name());
         if entry.file_type().map_err(io(&entry.path()))?.is_dir() {
-            copy_dir(&entry.path(), &target)?;
+            copy_dir(&entry.path(), &target, skip)?;
         } else {
             std::fs::copy(entry.path(), &target).map_err(io(&target))?;
         }
@@ -715,14 +721,19 @@ fn read_record(root: &Path) -> Result<Value, RunError> {
 /// before the sessions, the sessions in order on one working directory and the
 /// commands after them, which also run when the seed or a session failed. A
 /// seed that does not load starts no client, and a session that does not end
-/// lets no other begin. `agent_eval`, this binary, is the replay client.
+/// lets no other begin. A run that forks plays its second session twice, each
+/// way from the state the first one left ([`fork_steps`]). `agent_eval`, this
+/// binary, is the replay client.
 pub fn execute(root: &Path, agent_eval: &Path) -> Result<(), RunError> {
     let (plan, client) = read_run(root)?;
     let layout = Layout { root: root.to_owned() };
+    if read_shape(&read_record(root)?) == Shape::Both {
+        return fork(&plan, &client, &layout, agent_eval);
+    }
     let Some(daemon) = &plan.daemon else {
         return play(&plan, &client, &layout, agent_eval);
     };
-    let served = Served::start(daemon, &plan.env, root)?;
+    let served = Served::start(daemon, &plan.env, root, root.join(SERVE_LOG))?;
     served.listening(&daemon.state_file)?;
     let log_path = root.join(CLAWG_LOG);
     let mut log = File::create(&log_path).map_err(io(&log_path))?;
@@ -741,41 +752,243 @@ pub fn execute(root: &Path, agent_eval: &Path) -> Result<(), RunError> {
     }
 }
 
-/// Plays the sessions of `plan` in order. Before each, the native memory the
-/// agent finds is copied to `memory-before-K.md`; after each of a run of
-/// several, the instruction files the client loaded move to
-/// `instructions-K.jsonl`, so each session has its own.
+/// The shape a `run.json` records; a run written before shapes is `split`.
+fn read_shape(record: &Value) -> Shape {
+    serde_json::from_value(record["shape"].clone()).unwrap_or_default()
+}
+
+/// Plays the sessions of `plan` in order.
 fn play(plan: &RunPlan, client: &Client, layout: &Layout, agent_eval: &Path) -> Result<(), RunError> {
-    let sessions = plan.sessions();
-    let of = sessions.len();
-    for (i, planned) in sessions.into_iter().enumerate() {
+    for (i, planned) in plan.sessions().into_iter().enumerate() {
         let k = i + 1;
-        if let Some(memory) = native_memory_file(plan).filter(|m| m.is_file()) {
-            let copy = layout.root.join(format!("memory-before-{k}.md"));
-            std::fs::copy(memory, &copy).map_err(io(&copy))?;
-        }
-        let mcp_config = plan.daemon.as_ref().map(|_| layout.mcp_config());
-        let code = start_client(plan, layout, &client.step(planned, agent_eval, k, mcp_config.as_deref()), k)?;
-        let (stream_name, log_name) = session_files(k, of);
-        let log = layout.root.join(log_name);
-        if code != Some(0) {
-            return Err(RunError::Client { code, log });
-        }
-        if k < of {
-            let stream_path = layout.root.join(stream_name);
-            let stream = std::fs::read_to_string(&stream_path).map_err(io(&stream_path))?;
-            ended(&stream).map_err(|why| RunError::Session { k, why, log })?;
-        }
-        let instructions = layout.instructions_log();
-        if of > 1 && instructions.is_file() {
-            let moved = layout.root.join(instructions_file(k, of));
-            std::fs::rename(&instructions, &moved).map_err(io(&moved))?;
-        }
+        play_session(plan, client, layout, agent_eval, k, planned, &format!("session-{k}.jsonl"))?;
     }
     Ok(())
 }
 
-/// The native memory file of the plan, when its arm has one.
+/// Plays session `k` (from 1) with the command `planned`; a replay prints the
+/// file `replayed` of its directory. Before it, the native memory the agent
+/// finds is copied to `memory-before-K.md`; after it, in a run of several, the
+/// instruction files the client loaded move to `instructions-K.jsonl`, so each
+/// session has its own. A session that is not the last must end well.
+fn play_session(plan: &RunPlan, client: &Client, layout: &Layout, agent_eval: &Path, k: usize, planned: &Step, replayed: &str) -> Result<(), RunError> {
+    let of = plan.sessions().len();
+    if let Some(memory) = native_memory_file(plan).filter(|m| m.is_file()) {
+        let copy = layout.root.join(format!("memory-before-{k}.md"));
+        std::fs::copy(memory, &copy).map_err(io(&copy))?;
+    }
+    let mcp_config = plan.daemon.as_ref().map(|_| layout.mcp_config());
+    let code = start_client(plan, layout, &client.step(planned, agent_eval, replayed, mcp_config.as_deref()), k)?;
+    let (stream_name, log_name) = session_files(k, of);
+    let log = layout.root.join(log_name);
+    if code != Some(0) {
+        return Err(RunError::Client { code, log });
+    }
+    if k < of {
+        let stream_path = layout.root.join(stream_name);
+        let stream = std::fs::read_to_string(&stream_path).map_err(io(&stream_path))?;
+        ended(&stream).map_err(|why| RunError::Session { k, why, log })?;
+    }
+    let instructions = layout.instructions_log();
+    if of > 1 && instructions.is_file() {
+        let moved = layout.root.join(instructions_file(k, of));
+        std::fs::rename(&instructions, &moved).map_err(io(&moved))?;
+    }
+    Ok(())
+}
+
+/// What a run that forks does, in order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForkStep {
+    /// The daemon of the run up with its model ready, and the seed loaded when
+    /// `seed`; its log is kept with the branch it serves, if any.
+    Start { branch: Option<Shape>, seed: bool },
+    /// Session `k` (from 1), the second one continued or new according to its branch.
+    Play { k: usize, branch: Option<Shape> },
+    Stop,
+    /// The state the first session left, copied to `fork/`.
+    Save,
+    /// The working directory and the files of the second session, moved under its branch.
+    Keep(Shape),
+    /// The state saved, put back.
+    Restore,
+}
+
+/// The steps of a run that plays its first session once and its second one
+/// twice from the same state, the continued one first so it finds the cache of
+/// the first still warm. The daemon is down while the state is copied.
+pub fn fork_steps(with_daemon: bool) -> Vec<ForkStep> {
+    let part = |branch: Option<Shape>, k: usize, seed: bool| {
+        let play = ForkStep::Play { k, branch };
+        if with_daemon { vec![ForkStep::Start { branch, seed }, play, ForkStep::Stop] } else { vec![play] }
+    };
+    [
+        part(None, 1, true),
+        vec![ForkStep::Save],
+        part(Some(Shape::Joined), 2, false),
+        vec![ForkStep::Keep(Shape::Joined), ForkStep::Restore],
+        part(Some(Shape::Split), 2, false),
+        vec![ForkStep::Keep(Shape::Split)],
+    ]
+    .concat()
+}
+
+/// Where a fork keeps the state the first session left.
+const FORK_DIR: &str = "fork";
+
+/// The models in the data directory: hundreds of megabytes no session writes.
+const MODELS_DIR: &str = "models";
+
+/// The command of the second session as `branch` plays it: the plan's own for
+/// the branch that continues, and for the new one the same without `--continue`.
+fn branch_step(planned: &Step, branch: Shape) -> Step {
+    let mut step = planned.clone();
+    if branch == Shape::Split && step.args.last().is_some_and(|a| a == "--continue") {
+        step.args.pop();
+    }
+    step
+}
+
+/// A run that forks: its state, the daemon it serves and the log of what its
+/// clawg commands printed, as the steps of [`fork_steps`] go by.
+struct Fork<'a> {
+    plan: &'a RunPlan,
+    client: &'a Client,
+    layout: &'a Layout,
+    agent_eval: &'a Path,
+    journal: Option<(File, PathBuf)>,
+    served: Option<Served>,
+}
+
+fn fork(plan: &RunPlan, client: &Client, layout: &Layout, agent_eval: &Path) -> Result<(), RunError> {
+    let mut run = Fork { plan, client, layout, agent_eval, journal: None, served: None };
+    let mut outcome = Ok(());
+    for step in fork_steps(plan.daemon.is_some()) {
+        outcome = run.apply(step);
+        if outcome.is_err() {
+            break;
+        }
+    }
+    if outcome.is_err() && run.served.is_some() {
+        // The daemon is stopped whatever failed; the failure is what is reported.
+        let _ = run.apply(ForkStep::Stop);
+    }
+    outcome
+}
+
+impl Fork<'_> {
+    fn data_dir(&self) -> Option<&Path> {
+        self.plan.daemon.as_ref().and_then(|d| d.state_file.parent())
+    }
+
+    fn apply(&mut self, step: ForkStep) -> Result<(), RunError> {
+        let (plan, layout) = (self.plan, self.layout);
+        let root = &layout.root;
+        match step {
+            ForkStep::Start { branch, seed } => {
+                let daemon = plan.daemon.as_ref().expect("a daemon is started only for an arm that has one");
+                let dir = branch.map_or_else(|| root.clone(), |b| root.join(b.as_str()));
+                std::fs::create_dir_all(&dir).map_err(io(&dir))?;
+                let served = self.served.insert(Served::start(daemon, &plan.env, root, dir.join(SERVE_LOG))?);
+                served.listening(&daemon.state_file)?;
+                if self.journal.is_none() {
+                    let path = root.join(CLAWG_LOG);
+                    self.journal = Some((File::create(&path).map_err(io(&path))?, path));
+                }
+                let (log, log_path) = self.journal.as_mut().expect("the log was just opened");
+                served.ready(&daemon.status, &plan.env, root, log, log_path)?;
+                if seed {
+                    plan.before.iter().try_for_each(|step| run_step(step, &plan.env, root, log, log_path))?;
+                }
+                Ok(())
+            }
+            ForkStep::Play { k, branch } => {
+                let planned = plan.sessions()[k - 1];
+                let (step, replayed) = match branch {
+                    None => (planned.clone(), format!("session-{k}.jsonl")),
+                    Some(b) => (branch_step(planned, b), format!("{}-{k}.jsonl", b.as_str())),
+                };
+                play_session(plan, self.client, layout, self.agent_eval, k, &step, &replayed)
+            }
+            ForkStep::Stop => {
+                let served = self.served.take().expect("a daemon is stopped only after it started");
+                let (log, log_path) = self.journal.as_mut().expect("a daemon that started has its log");
+                let stopped = plan.after.iter().try_for_each(|step| run_step(step, &plan.env, root, log, log_path));
+                let gone = served.gone_within(EXIT_BUDGET);
+                stopped?;
+                if gone { Ok(()) } else { Err(RunError::DaemonStayed(served.log.clone())) }
+            }
+            ForkStep::Save => save_state(layout, self.data_dir()),
+            ForkStep::Keep(branch) => {
+                let dir = root.join(branch.as_str());
+                std::fs::create_dir_all(&dir).map_err(io(&dir))?;
+                let work = dir.join("work");
+                std::fs::rename(layout.workdir(), &work).map_err(io(&work))?;
+                let (stream, log) = session_files(2, 2);
+                for name in [stream, log, instructions_file(2, 2), "memory-before-2.md".to_owned()] {
+                    let from = root.join(&name);
+                    if from.is_file() {
+                        std::fs::rename(&from, dir.join(&name)).map_err(io(&from))?;
+                    }
+                }
+                Ok(())
+            }
+            ForkStep::Restore => restore_state(layout, self.data_dir()),
+        }
+    }
+}
+
+/// Copies what the first session left to `fork/`: the working directory, the
+/// client's configuration and, when the run has clawg, its data directory
+/// without the models. The daemon is not running: on Windows a file it holds
+/// open cannot be replaced.
+fn save_state(layout: &Layout, data: Option<&Path>) -> Result<(), RunError> {
+    let fork = layout.root.join(FORK_DIR);
+    copy_dir(&layout.workdir(), &fork.join("work"), &[])?;
+    copy_dir(&layout.config_dir(), &fork.join("claude-config"), &[])?;
+    if let Some(data) = data {
+        copy_dir(data, &fork.join("data"), &[MODELS_DIR])?;
+    }
+    Ok(())
+}
+
+/// Puts back what [`save_state`] copied, in the same paths: whatever a branch
+/// added or changed is removed first, and the models stay where they are.
+fn restore_state(layout: &Layout, data: Option<&Path>) -> Result<(), RunError> {
+    let fork = layout.root.join(FORK_DIR);
+    let mut parts: Vec<(PathBuf, PathBuf, &[&str])> =
+        vec![(fork.join("work"), layout.workdir(), &[]), (fork.join("claude-config"), layout.config_dir(), &[])];
+    if let Some(data) = data {
+        parts.push((fork.join("data"), data.to_owned(), &[MODELS_DIR]));
+    }
+    for (saved, live, keep) in parts {
+        clear_dir(&live, keep)?;
+        copy_dir(&saved, &live, &[])?;
+    }
+    Ok(())
+}
+
+/// Removes what `dir` holds except the entries named in `keep`; a directory
+/// that is not there holds nothing.
+fn clear_dir(dir: &Path, keep: &[&str]) -> Result<(), RunError> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(io(dir)(e)),
+    };
+    for entry in entries {
+        let entry = entry.map_err(io(dir))?;
+        if keep.iter().any(|name| entry.file_name() == *name) {
+            continue;
+        }
+        let path = entry.path();
+        let removed = if entry.file_type().map_err(io(&path))?.is_dir() { std::fs::remove_dir_all(&path) } else { std::fs::remove_file(&path) };
+        removed.map_err(io(&path))?;
+    }
+    Ok(())
+}
+
+// The native memory file of the plan, when its arm has one.
 fn native_memory_file(plan: &RunPlan) -> Option<&Path> {
     plan.files.iter().map(|(path, _)| path.as_path()).find(|path| path.ends_with("memory/MEMORY.md"))
 }
@@ -877,8 +1090,8 @@ fn lock(child: &Mutex<Child>) -> MutexGuard<'_, Child> {
 }
 
 impl Served {
-    fn start(daemon: &Daemon, env: &[(String, String)], root: &Path) -> Result<Self, RunError> {
-        let log = root.join(SERVE_LOG);
+    /// Starts the daemon in `root`, its output into `log`.
+    fn start(daemon: &Daemon, env: &[(String, String)], root: &Path, log: PathBuf) -> Result<Self, RunError> {
         let out = File::create(&log).map_err(io(&log))?;
         let err = out.try_clone().map_err(io(&log))?;
         let child = Command::new(&daemon.serve.program)
@@ -1008,10 +1221,29 @@ fn instructions_file(k: usize, of: usize) -> String {
 /// Scores the run in `root` from its `run.json`, the stream of every session
 /// that ran, the logs of the instruction files each loaded, the native memory
 /// each began with and the working directory, and writes `result.json`. A run
-/// stopped by a session that failed is scored with the sessions it played.
-pub fn score_dir(root: &Path) -> Result<RunResult, RunError> {
-    let not_a_run = |why: &str| RunError::NotARun(root.to_owned(), why.to_owned());
+/// stopped by a session that failed is scored with the sessions it played. A
+/// run that forked has no result of its own: each branch that ran is scored
+/// as a run of two sessions of its shape, in its own directory.
+pub fn score_dir(root: &Path) -> Result<Vec<RunResult>, RunError> {
     let record = read_record(root)?;
+    if read_shape(&record) != Shape::Both {
+        return Ok(vec![score_run(root, &record, None)?]);
+    }
+    let results: Vec<RunResult> = [Shape::Joined, Shape::Split]
+        .into_iter()
+        .filter(|branch| root.join(branch.as_str()).is_dir())
+        .map(|branch| score_run(root, &record, Some(branch)))
+        .collect::<Result<_, _>>()?;
+    if results.is_empty() {
+        return Err(RunError::NotARun(root.to_owned(), "no branch of the fork ran".to_owned()));
+    }
+    Ok(results)
+}
+
+/// The run of `root` scored as one of `shape`: with `branch`, the second
+/// session and the working directory are those of that branch of a fork.
+fn score_run(root: &Path, record: &Value, branch: Option<Shape>) -> Result<RunResult, RunError> {
+    let not_a_run = |why: &str| RunError::NotARun(root.to_owned(), why.to_owned());
     let client: Client = serde_json::from_value(record["client"].clone()).map_err(|e| not_a_run(&e.to_string()))?;
     let task: Task = serde_json::from_value(record["task"].clone()).map_err(|e| not_a_run(&e.to_string()))?;
     let arm = record["arm"].as_str().ok_or_else(|| not_a_run("no arm"))?.to_owned();
@@ -1022,9 +1254,15 @@ pub fn score_dir(root: &Path) -> Result<RunResult, RunError> {
     };
     let lang = record["lang"].as_str().and_then(Lang::parse);
     let plan: RunPlan = serde_json::from_value(record["plan"].clone()).map_err(|e| not_a_run(&e.to_string()))?;
-    let shape: Shape = serde_json::from_value(record["shape"].clone()).unwrap_or_default();
+    let shape = branch.unwrap_or_else(|| read_shape(record));
     let noise_rules = record["noise_rules"].as_u64().map_or(0, |n| n as usize);
     let of = plan.sessions().len();
+    let branch_dir = branch.map(|b| root.join(b.as_str()));
+    // The files of session `k`: the branch has those of the second session.
+    let dir_of = |k: usize| match (&branch_dir, k) {
+        (Some(dir), 2) => dir.clone(),
+        _ => root.to_owned(),
+    };
     // A stream is created right before its client starts and closed when it exits.
     let utc = |t: std::io::Result<std::time::SystemTime>| {
         let since = t.ok()?.duration_since(std::time::UNIX_EPOCH).ok()?;
@@ -1038,22 +1276,24 @@ pub fn score_dir(root: &Path) -> Result<RunResult, RunError> {
     let mut played = Vec::new();
     let mut times = Vec::new();
     for k in 1..=of {
-        let stream_path = root.join(session_files(k, of).0);
+        let dir = dir_of(k);
+        let stream_path = dir.join(session_files(k, of).0);
         let Some(stream) = read_optional(&stream_path)? else {
             if k == 1 {
                 return Err(io(&stream_path)(std::io::ErrorKind::NotFound.into()));
             }
             break;
         };
-        let loaded = read_optional(&root.join(instructions_file(k, of)))?.map(|text| hooks::read_log(&text)).unwrap_or_default();
-        let before = read_optional(&root.join(format!("memory-before-{k}.md")))?;
+        let loaded = read_optional(&dir.join(instructions_file(k, of)))?.map(|text| hooks::read_log(&text)).unwrap_or_default();
+        let before = read_optional(&dir.join(format!("memory-before-{k}.md")))?;
         let mut texts = delivered(&plan, &loaded, before.as_deref());
         texts.extend(earlier_prompts(&task, shape, k));
         let meta = std::fs::metadata(&stream_path).map_err(io(&stream_path))?;
         times.push((utc(meta.created()), utc(meta.modified())));
         played.push(Played { transcript: stream::parse(&stream), delivered: texts, loaded });
     }
-    let workdir = Layout { root: root.to_owned() }.workdir();
+    let out_dir = branch_dir.unwrap_or_else(|| root.to_owned());
+    let workdir = Layout { root: out_dir.clone() }.workdir();
     let read_file = |rel: &str| task::is_relative_inside(rel).then(|| std::fs::read_to_string(workdir.join(rel)).ok()).flatten();
     let info = RunInfo { arm: &arm, client: client.name(), profile, lang, shape, noise_rules, native_dir: native_memory_file(&plan).and_then(Path::parent) };
     let mut result = evaluate(&task, &info, &played, read_file);
@@ -1064,7 +1304,8 @@ pub fn score_dir(root: &Path) -> Result<RunResult, RunError> {
     if let Some(last) = result.sessions.last() {
         result.session = last.session.clone();
     }
-    let out = root.join(RESULT_FILE);
+    result.paired = branch.map(|b| if b == Shape::Joined { Shape::Split } else { Shape::Joined }.as_str().to_owned());
+    let out = out_dir.join(RESULT_FILE);
     std::fs::write(&out, serde_json::to_string_pretty(&result).expect("JSON serializes") + "\n").map_err(io(&out))?;
     Ok(result)
 }
@@ -1198,6 +1439,13 @@ mod tests {
         assert!(ancestors.iter().find(|(d, _)| d == &out).unwrap().1.is_empty());
     }
 
+    /// The result of a run that did not fork.
+    fn scored(root: &Path) -> RunResult {
+        let mut results = score_dir(root).unwrap();
+        assert_eq!(results.len(), 1);
+        results.remove(0)
+    }
+
     fn task() -> Task {
         task::parse(
             r#"{"id": "t", "category": "K1", "fixture": "f", "prompt": "Which port?",
@@ -1265,19 +1513,19 @@ mod tests {
     fn the_client_is_claude_as_planned_or_a_replay_of_a_stream() {
         let planned = Step { program: "claude".into(), args: vec!["-p".into(), "Which port?".into()] };
         let exe = Path::new("/bin/agent-eval");
-        assert_eq!(Client::Claude.step(&planned, exe, 1, Some(Path::new("/runs/mcp.json"))), planned);
+        assert_eq!(Client::Claude.step(&planned, exe, "session-1.jsonl", Some(Path::new("/runs/mcp.json"))), planned);
 
         let dir = tempfile::tempdir().unwrap();
         let streams = Client::Replay(dir.path().to_owned());
         assert_eq!(
-            streams.step(&planned, exe, 2, None).args,
+            streams.step(&planned, exe, "session-2.jsonl", None).args,
             ["replay-client", dir.path().join("session-2.jsonl").to_str().unwrap()],
             "a directory holds a stream for each session"
         );
         let replay = Client::Replay(PathBuf::from("/runs/s.jsonl"));
-        assert_eq!(replay.step(&planned, exe, 1, None), Step { program: "/bin/agent-eval".into(), args: vec!["replay-client".into(), "/runs/s.jsonl".into()] });
+        assert_eq!(replay.step(&planned, exe, "session-1.jsonl", None), Step { program: "/bin/agent-eval".into(), args: vec!["replay-client".into(), "/runs/s.jsonl".into()] });
         assert_eq!(
-            replay.step(&planned, exe, 1, Some(Path::new("/runs/mcp.json"))).args,
+            replay.step(&planned, exe, "session-1.jsonl", Some(Path::new("/runs/mcp.json"))).args,
             ["replay-client", "/runs/s.jsonl", "--mcp-config", "/runs/mcp.json"],
             "a run with a server tells the replay where it is"
         );
@@ -1420,7 +1668,7 @@ mod tests {
         prepare(&task(), Arm::A0, &fixture, &layout, &options(dir.path().join("clawg")), &replay).unwrap();
         std::fs::write(layout.root.join(STREAM_FILE), STREAM).unwrap();
 
-        let r = score_dir(&layout.root).unwrap();
+        let r = scored(&layout.root);
 
         assert!(r.score.success);
         assert_eq!((r.arm.as_str(), r.client.as_str()), ("a0", "replay"));
@@ -1431,7 +1679,7 @@ mod tests {
         let claude = Layout { root: dir.path().join("claude") };
         prepare(&task(), Arm::A0, &fixture, &claude, &options(dir.path().join("clawg")), &Client::Claude).unwrap();
         std::fs::write(claude.root.join(STREAM_FILE), STREAM).unwrap();
-        assert_eq!(score_dir(&claude.root).unwrap().client, "claude");
+        assert_eq!(scored(&claude.root).client, "claude");
     }
 
     #[test]
@@ -1474,13 +1722,13 @@ mod tests {
         std::fs::write(layout.root.join(STREAM_FILE), stream).unwrap();
         std::fs::write(layout.instructions_log(), "{\"file_path\":\"/c/CLAUDE.md\",\"load_reason\":\"session_start\"}\n").unwrap();
 
-        let r = score_dir(&layout.root).unwrap();
+        let r = scored(&layout.root);
 
         assert_eq!(r.score.tracers, vec![("48213".to_owned(), TracerFate::RetrievedButIgnored)], "MEMORY.md is in the context");
         assert_eq!(r.session.first_request_tokens, Some(543));
         assert_eq!(r.session.instructions_loaded, [Loaded { file_path: "/c/CLAUDE.md".into(), load_reason: "session_start".into() }]);
         std::fs::remove_file(layout.instructions_log()).unwrap();
-        assert!(score_dir(&layout.root).unwrap().session.instructions_loaded.is_empty(), "a run without the log loaded none");
+        assert!(scored(&layout.root).session.instructions_loaded.is_empty(), "a run without the log loaded none");
     }
 
     #[test]
@@ -1493,7 +1741,7 @@ mod tests {
         let stream = STREAM.replacen(r#""subtype":"init","#, r#""subtype":"init","apiKeySource":"ANTHROPIC_API_KEY","#, 1);
         std::fs::write(layout.root.join(STREAM_FILE), stream).unwrap();
 
-        let r = score_dir(&layout.root).unwrap();
+        let r = scored(&layout.root);
 
         assert_eq!(r.session.api_key_source.as_deref(), Some("ANTHROPIC_API_KEY"));
         let ended = r.session.ended_at.expect("every platform knows when a file was last written");
@@ -1679,7 +1927,7 @@ mod tests {
         put("memory-before-2.md", "# Memory\n\nProxy alias quokka\n\ntimeout 4.5-41\n");
         put("instructions-1.jsonl", "{\"file_path\":\"/c/CLAUDE.md\",\"load_reason\":\"session_start\"}\n");
 
-        let r = score_dir(&layout.root).unwrap();
+        let r = scored(&layout.root);
 
         assert_eq!(r.sessions.len(), 2);
         assert_eq!((r.sessions[0].session.session_id.as_deref(), r.sessions[1].session.session_id.as_deref()), (Some("s1"), Some("s2")));
@@ -1705,7 +1953,7 @@ mod tests {
         assert_eq!(written, r);
 
         std::fs::remove_file(layout.root.join("stream-2.jsonl")).unwrap();
-        let cut = score_dir(&layout.root).unwrap();
+        let cut = scored(&layout.root);
         assert_eq!(cut.sessions.len(), 1, "the sessions that ran are scored");
         assert!(!cut.score.ended && !cut.score.success, "a run that did not play every session did not end");
         assert!(cut.facts.is_empty() && cut.overhead.is_none());
@@ -1713,5 +1961,87 @@ mod tests {
 
         std::fs::remove_file(layout.root.join("stream-1.jsonl")).unwrap();
         assert!(matches!(score_dir(&layout.root), Err(RunError::Io { .. })));
+    }
+
+    #[test]
+    fn a_fork_plays_the_second_session_continued_and_then_new() {
+        use ForkStep::{Keep, Play, Restore, Save, Start, Stop};
+        let (joined, split) = (Some(Shape::Joined), Some(Shape::Split));
+        assert_eq!(
+            fork_steps(true),
+            [
+                Start { branch: None, seed: true },
+                Play { k: 1, branch: None },
+                Stop,
+                Save,
+                Start { branch: joined, seed: false },
+                Play { k: 2, branch: joined },
+                Stop,
+                Keep(Shape::Joined),
+                Restore,
+                Start { branch: split, seed: false },
+                Play { k: 2, branch: split },
+                Stop,
+                Keep(Shape::Split),
+            ],
+            "the daemon goes down while the state is copied, and the seed loads once"
+        );
+        assert_eq!(
+            fork_steps(false),
+            [Play { k: 1, branch: None }, Save, Play { k: 2, branch: joined }, Keep(Shape::Joined), Restore, Play { k: 2, branch: split }, Keep(Shape::Split)],
+            "an arm without clawg has no daemon to start or stop"
+        );
+    }
+
+    #[test]
+    fn the_new_branch_plays_the_command_of_the_second_session_without_continuing() {
+        let continued = Step { program: "claude".into(), args: ["-p", "two", "--model", "m", "--continue"].map(String::from).to_vec() };
+        assert_eq!(branch_step(&continued, Shape::Joined), continued);
+        assert_eq!(branch_step(&continued, Shape::Split).args, ["-p", "two", "--model", "m"]);
+        let alone = Step { program: "claude".into(), args: vec!["-p".into(), "one".into()] };
+        assert_eq!(branch_step(&alone, Shape::Split), alone);
+    }
+
+    #[test]
+    fn a_restore_puts_back_the_work_the_config_and_the_data_but_leaves_the_models() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout { root: dir.path().join("run") };
+        let data = layout.home().join(".clawg-dev");
+        let put = |path: PathBuf, text: &str| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        let read = |path: PathBuf| std::fs::read_to_string(path).ok();
+        put(layout.workdir().join("src").join("a.txt"), "first");
+        put(layout.config_dir().join("settings.json"), "config");
+        put(data.join("memory.db"), "store");
+        put(data.join("models").join("m.bin"), "model");
+
+        save_state(&layout, Some(&data)).unwrap();
+        let saved = layout.root.join(FORK_DIR);
+        assert_eq!(read(saved.join("work").join("src").join("a.txt")).as_deref(), Some("first"));
+        assert_eq!(read(saved.join("data").join("memory.db")).as_deref(), Some("store"));
+        assert!(!saved.join("data").join("models").exists(), "the models are not copied: no session writes them");
+
+        put(layout.workdir().join("src").join("a.txt"), "changed");
+        put(layout.workdir().join("new.txt"), "new");
+        put(layout.config_dir().join("projects").join("p.jsonl"), "talk");
+        put(data.join("memory.db"), "grown");
+        put(data.join("extra.db"), "extra");
+        put(data.join("models").join("m.bin"), "other model");
+
+        restore_state(&layout, Some(&data)).unwrap();
+
+        assert_eq!(read(layout.workdir().join("src").join("a.txt")).as_deref(), Some("first"));
+        assert!(!layout.workdir().join("new.txt").exists());
+        assert!(!layout.config_dir().join("projects").exists());
+        assert_eq!(read(layout.config_dir().join("settings.json")).as_deref(), Some("config"));
+        assert_eq!(read(data.join("memory.db")).as_deref(), Some("store"));
+        assert!(!data.join("extra.db").exists());
+        assert_eq!(read(data.join("models").join("m.bin")).as_deref(), Some("other model"), "the models stay where they are");
+
+        std::fs::remove_dir_all(layout.workdir()).unwrap();
+        restore_state(&layout, Some(&data)).unwrap();
+        assert_eq!(read(layout.workdir().join("src").join("a.txt")).as_deref(), Some("first"), "a working directory moved away comes back");
     }
 }
