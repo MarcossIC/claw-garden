@@ -67,7 +67,11 @@ agent-eval hook-log FILE
                  home through the system, so an arm with clawg needs a
                  `testing` build of it, which reads CLAWG_TEST_HOME; any
                  other is refused.
-  score          scores a run directory again from its stream.jsonl.
+  score          scores a run directory again from the streams of its sessions
+                 (stream.jsonl, or stream-K.jsonl for a task of several): each
+                 session on its own, with the path of every fact born in a
+                 session, and the run as a whole. A run that a session stopped
+                 is scored with the sessions that ran, and did not end.
   report         reads the result.json of every directory up to 3 levels
                  below DIR and prints a Markdown table by task and arm: runs,
                  successes, runs that did not end, mean cost, turns, seconds
@@ -397,7 +401,15 @@ fn execute(command: Command) -> Result<(), String> {
             }
             let layout = prepare(&args, &t, noise, &client)?;
             let exe = std::env::current_exe().map_err(|e| format!("cannot locate agent-eval: {e}"))?;
-            run::execute(&layout.root, &exe).map_err(|e| e.to_string())?;
+            if let Err(failed) = run::execute(&layout.root, &exe) {
+                // The sessions that ran before the failure are still a result.
+                if t.prompts().len() > 1 {
+                    if let Ok(result) = run::score_dir(&layout.root) {
+                        println!("{}", run::summary(&result));
+                    }
+                }
+                return Err(failed.to_string());
+            }
             let result = run::score_dir(&layout.root).map_err(|e| e.to_string())?;
             println!("{}", run::summary(&result));
             Ok(())

@@ -99,6 +99,24 @@ pub fn native_memory(memories: &[SeedMemory]) -> String {
     out
 }
 
+/// How many lines of a native memory file the client loads at startup.
+const NATIVE_LOADED_LINES: usize = 200;
+
+/// How many bytes of it, when they come before those lines.
+const NATIVE_LOADED_BYTES: usize = 25_000;
+
+/// What the client puts in the context of a session of a native memory file
+/// `text`: its first 200 lines or its first 25,000 bytes, whichever it reaches
+/// first, as the client documents it.
+pub fn native_loaded(text: &str) -> &str {
+    let by_lines = text.match_indices('\n').nth(NATIVE_LOADED_LINES - 1).map_or(text.len(), |(at, _)| at + 1);
+    let mut end = by_lines.min(NATIVE_LOADED_BYTES);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
 /// The directory name the client keeps a project's native memory under: the
 /// absolute path of its working directory with every character that is not
 /// a letter or a digit turned into `-`.
@@ -187,6 +205,30 @@ mod tests {
         let text = native_memory(&seeded(&task, &noise));
         let order: Vec<&str> = text.lines().filter(|l| !l.is_empty() && *l != "# Memory").collect();
         assert_eq!(order, ["noise oldest", "task old", "noise mid", "noise new", "task new"], "at one age the noise goes first");
+    }
+
+    #[test]
+    fn the_client_loads_the_first_200_lines_or_25_kb_of_the_native_memory() {
+        let lines = |n: usize| (1..=n).map(|i| format!("line {i}\n")).collect::<String>();
+        assert_eq!(native_loaded("# Memory\n\nshort\n"), "# Memory\n\nshort\n");
+        assert_eq!(native_loaded(""), "");
+
+        let long = lines(900);
+        let loaded = native_loaded(&long);
+        assert_eq!(loaded.lines().count(), 200, "the lines cut first");
+        assert!(loaded.ends_with("line 200\n") && !loaded.contains("line 201\n"));
+        assert!(long.starts_with(loaded));
+        let exact = lines(200);
+        assert_eq!(native_loaded(&exact), exact, "200 lines are all loaded");
+
+        let wide = format!("{}\n{}", "x".repeat(24_000), "y".repeat(5_000));
+        let loaded = native_loaded(&wide);
+        assert_eq!(loaded.len(), 25_000, "the bytes cut first: a line is cut where the limit falls");
+        assert!(loaded.ends_with('y'));
+
+        let euros = "€".repeat(9_000);
+        let loaded = native_loaded(&euros);
+        assert_eq!(loaded.len(), 24_999, "never in the middle of a character");
     }
 
     #[test]

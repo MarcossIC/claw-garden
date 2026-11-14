@@ -16,11 +16,12 @@ use clawg_core::preferences::Lang;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::arm::{Arm, Daemon, Layout, Options, RunPlan, Step, TEST_HOME_VAR};
+use crate::arm::{Arm, Daemon, Layout, Options, RunPlan, Shape, Step, TEST_HOME_VAR};
 use crate::hooks::{self, Loaded};
 use crate::rubric::{self, Mark, SaveMarks};
-use crate::score::{self, Score, TracerFate};
-use crate::stream::{self, Outcome, Transcript};
+use crate::score::{self, Journey, Score, SessionScore, TracerFate};
+use crate::seed;
+use crate::stream::{self, is_tool, Outcome, ToolCall, Transcript};
 use crate::task::{self, Task};
 
 pub const RUN_FILE: &str = "run.json";
@@ -129,27 +130,144 @@ pub struct RunResult {
     /// [`Client::name`].
     pub client: String,
     pub lang: Option<Lang>,
+    /// The record of the last session that ran.
     pub session: Session,
+    /// The score of the run: every session and the task.
     pub score: Score,
+    /// The `save_memory` calls of the last session, judged.
+    pub saves: Vec<SaveMarks>,
+    /// Each session that ran, in order; none in a result written before the
+    /// sessions of a task, which is a run of one.
+    #[serde(default)]
+    pub sessions: Vec<SessionResult>,
+    #[serde(default)]
+    pub shape: Shape,
+    /// How many rules of other topics the memory was seeded with.
+    #[serde(default)]
+    pub noise_rules: usize,
+    /// Each fact born in a session, followed to the last one.
+    #[serde(default)]
+    pub facts: Vec<Fact>,
+    /// [`overhead`], for a run of two sessions.
+    #[serde(default)]
+    pub overhead: Option<u64>,
+    /// The other branch of the fork this run is one of.
+    #[serde(default)]
+    pub paired: Option<String>,
+}
+
+impl RunResult {
+    /// The record of every session that ran: a result written before the
+    /// sessions of a task has the one it carries.
+    pub fn records(&self) -> Vec<&Session> {
+        if self.sessions.is_empty() { vec![&self.session] } else { self.sessions.iter().map(|s| &s.session).collect() }
+    }
+
+    /// The saves of every session that ran, judged.
+    fn every_save(&self) -> Vec<&SaveMarks> {
+        if self.sessions.is_empty() { self.saves.iter().collect() } else { self.sessions.iter().flat_map(|s| &s.saves).collect() }
+    }
+}
+
+/// One session of a run, scored on its own.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionResult {
+    pub session: Session,
+    /// Its own checks, the task's tracers and whether it ended.
+    pub score: Score,
+    /// Every tracer of the task and each born in an earlier session, with what brought it.
+    pub followed: Vec<Journey>,
+    /// The tracers born in a session until this one that it wrote to a memory:
+    /// in the input of `save_memory` or `update_memory`, or of a `Write` or
+    /// `Edit` to the directory of the native memory.
+    pub saved: Vec<String>,
+    /// How many `Write` and `Edit` went to the directory of the native memory.
+    pub native_memory_writes: usize,
     pub saves: Vec<SaveMarks>,
 }
 
-pub fn evaluate(
-    task: &Task,
-    arm: &str,
-    client: &str,
-    profile: Profile,
-    lang: Option<Lang>,
-    t: &Transcript,
-    read_file: impl Fn(&str) -> Option<String>,
-) -> RunResult {
+/// Where a fact born in a session ended up in the last one, told by what the
+/// run shows and without judging it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FactClass {
+    /// No session since its own wrote it to a memory.
+    NotSaved,
+    SavedNotReached,
+    ReachedNotUsed,
+    Used,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Fact {
+    pub tracer: String,
+    /// The session it was born in, from 1.
+    pub born: usize,
+    pub class: FactClass,
+}
+
+/// A session as it played, with what reached its context outside its stream.
+pub struct Played {
+    pub transcript: Transcript,
+    pub delivered: Vec<String>,
+    pub loaded: Vec<Loaded>,
+}
+
+/// What a run is besides the sessions it played.
+pub struct RunInfo<'a> {
+    pub arm: &'a str,
+    pub client: &'a str,
+    pub profile: Profile,
+    pub lang: Option<Lang>,
+    pub shape: Shape,
+    pub noise_rules: usize,
+    /// Where the client keeps the native memory of the run, when its arm has one.
+    pub native_dir: Option<&'a Path>,
+}
+
+/// A path as it is compared: the client writes it with either separator and any case.
+fn norm_path(path: &str) -> String {
+    path.trim_start_matches(r"\\?\").replace('\\', "/").to_lowercase()
+}
+
+fn in_dir(path: &str, dir: &str) -> bool {
+    norm_path(path).starts_with(&format!("{}/", dir.trim_end_matches('/')))
+}
+
+fn file_path(call: &ToolCall) -> Option<&str> {
+    call.input.get("file_path").and_then(Value::as_str)
+}
+
+/// A `Write` or `Edit` to a file in the directory of the native memory.
+fn writes_native_memory(call: &ToolCall, native_dir: Option<&str>) -> bool {
+    matches!(call.name.as_str(), "Write" | "Edit") && native_dir.is_some_and(|dir| file_path(call).is_some_and(|path| in_dir(path, dir)))
+}
+
+/// The tracers born in session `k` (from 0) or before that it wrote to a memory.
+fn saved(task: &Task, k: usize, t: &Transcript, native_dir: Option<&str>) -> Vec<String> {
+    let written: Vec<String> = t
+        .calls
+        .iter()
+        .filter(|c| is_tool(&c.name, "save_memory") || is_tool(&c.name, "update_memory") || writes_native_memory(c, native_dir))
+        .map(|c| c.input.to_string())
+        .collect();
+    task.sessions
+        .iter()
+        .take(k + 1)
+        .flat_map(|s| &s.tracers)
+        .filter(|tracer| written.iter().any(|input| score::shows(input, &task.id, tracer)))
+        .cloned()
+        .collect()
+}
+
+fn record(t: &Transcript, profile: Profile, loaded: Vec<Loaded>) -> Session {
     let server = profile.mcp_server_name();
     let prefix = format!("mcp__{server}__");
     let mut clawg_calls = BTreeMap::new();
     for call in t.server_calls(server) {
         *clawg_calls.entry(call.name[prefix.len()..].to_owned()).or_insert(0) += 1;
     }
-    let session = Session {
+    Session {
         session_id: t.session_id.clone(),
         model: t.model.clone(),
         client_version: t.client_version.clone(),
@@ -167,33 +285,121 @@ pub fn evaluate(
         unknown_lines: t.unknown_lines,
         invalid_lines: t.invalid_lines.clone(),
         first_request_tokens: t.first_request_tokens,
-        instructions_loaded: Vec::new(),
+        instructions_loaded: loaded,
         outcome: t.result.clone(),
-    };
+    }
+}
+
+/// The run of `task` scored from the sessions it `played`, each on its own and
+/// all together, with the path of each fact and the cost of the relay.
+///
+/// # Panics
+///
+/// When `played` is empty: a run has at least its first session.
+pub fn evaluate(task: &Task, info: &RunInfo, played: &[Played], read_file: impl Fn(&str) -> Option<String>) -> RunResult {
+    let native = info.native_dir.map(|dir| norm_path(&dir.to_string_lossy()));
+    let scored: Vec<SessionScore> = played.iter().enumerate().map(|(k, p)| score::score_session(task, k, &p.transcript, &p.delivered)).collect();
+    let transcripts: Vec<&Transcript> = played.iter().map(|p| &p.transcript).collect();
+    let run_score = score::score(task, &transcripts, &scored, read_file);
+    let sessions: Vec<SessionResult> = played
+        .iter()
+        .zip(scored)
+        .enumerate()
+        .map(|(k, (p, s))| SessionResult {
+            session: record(&p.transcript, info.profile, p.loaded.clone()),
+            score: s.score,
+            followed: s.followed,
+            saved: saved(task, k, &p.transcript, native.as_deref()),
+            native_memory_writes: p.transcript.calls.iter().filter(|c| writes_native_memory(c, native.as_deref())).count(),
+            saves: rubric::judge_session(&p.transcript, info.lang),
+        })
+        .collect();
+    let last = sessions.last().expect("a run has its first session");
+    let relay = (played.len() == 2).then(|| overhead(&played[0].transcript, &played[1].transcript, info.native_dir));
     RunResult {
         task: task.id.clone(),
         category: task.category.clone(),
         example: task.example,
-        arm: arm.to_owned(),
-        client: client.to_owned(),
-        lang,
-        session,
-        score: score::score(task, t, read_file),
-        saves: rubric::judge_session(t, lang),
+        arm: info.arm.to_owned(),
+        client: info.client.to_owned(),
+        lang: info.lang,
+        session: last.session.clone(),
+        score: run_score,
+        saves: last.saves.clone(),
+        facts: facts(task, &sessions),
+        sessions,
+        shape: info.shape,
+        noise_rules: info.noise_rules,
+        overhead: relay,
+        paired: None,
     }
 }
 
+/// Each fact born in a session that ran before the last, classified over the last.
+pub fn facts(task: &Task, sessions: &[SessionResult]) -> Vec<Fact> {
+    let Some(last) = sessions.last() else { return Vec::new() };
+    let mut told = Vec::new();
+    for (i, spec) in task.sessions.iter().enumerate().take(sessions.len() - 1) {
+        for tracer in &spec.tracers {
+            let written = sessions[i..].iter().any(|s| s.saved.contains(tracer));
+            let fate = last.followed.iter().find(|j| &j.tracer == tracer).map(|j| j.fate);
+            let class = match (written, fate) {
+                (false, _) => FactClass::NotSaved,
+                (true, Some(TracerFate::Used)) => FactClass::Used,
+                (true, Some(TracerFate::RetrievedButIgnored)) => FactClass::ReachedNotUsed,
+                (true, _) => FactClass::SavedNotReached,
+            };
+            told.push(Fact { tracer: tracer.clone(), born: i + 1, class });
+        }
+    }
+    told
+}
+
+/// What a relay costs the new session, in tokens: what its first request has
+/// over the first of the session before (never below 0) plus what it reads
+/// again at 4 bytes a token: the files the first one already read, the answers
+/// of the tools that read a memory and what it reads of the native memory.
+pub fn overhead(first: &Transcript, second: &Transcript, native_dir: Option<&Path>) -> u64 {
+    let growth = match (first.first_request_tokens, second.first_request_tokens) {
+        (Some(before), Some(after)) => after.saturating_sub(before),
+        _ => 0,
+    };
+    let native = native_dir.map(|dir| norm_path(&dir.to_string_lossy()));
+    let read_before: Vec<String> = first.calls.iter().filter(|c| c.name == "Read").filter_map(file_path).map(norm_path).collect();
+    let bytes: usize = second
+        .calls
+        .iter()
+        .filter(|c| {
+            let read = c.name == "Read" && file_path(c).is_some_and(|path| read_before.contains(&norm_path(path)) || native.as_deref().is_some_and(|dir| in_dir(path, dir)));
+            read || ["search_memory", "recall_context", "read_memory", "list_memories"].iter().any(|tool| is_tool(&c.name, tool))
+        })
+        .map(|c| c.result.as_deref().map_or(0, str::len))
+        .sum();
+    growth + (bytes / 4) as u64
+}
+
+/// The prompts of the sessions before session `k` (from 1) when each continues
+/// the conversation: they are in its context. A new session never saw them.
+pub fn earlier_prompts(task: &Task, shape: Shape, k: usize) -> Vec<String> {
+    if shape == Shape::Joined { task.prompts().iter().take(k.saturating_sub(1)).map(|p| (*p).to_owned()).collect() } else { Vec::new() }
+}
+
 /// The texts the plan put in the session's context that the stream does not
-/// show: the native memory, which the client loads at startup, and each file
-/// of the plan that `loaded` names. Paths match whatever their separators and
-/// case, since the client may write them either way.
-pub fn delivered(plan: &RunPlan, loaded: &[Loaded]) -> Vec<String> {
-    let norm = |path: &str| path.trim_start_matches(r"\\?\").replace('\\', "/").to_lowercase();
-    let loaded: Vec<String> = loaded.iter().map(|l| norm(&l.file_path)).collect();
+/// show: the native memory, as the client loads it at startup from what the
+/// file held before the session (`before`, or the file of the plan), and each
+/// file of the plan that `loaded` names. Paths match whatever their separators
+/// and case, since the client may write them either way.
+pub fn delivered(plan: &RunPlan, loaded: &[Loaded], before: Option<&str>) -> Vec<String> {
+    let loaded: Vec<String> = loaded.iter().map(|l| norm_path(&l.file_path)).collect();
     plan.files
         .iter()
-        .filter(|(path, _)| path.ends_with("memory/MEMORY.md") || loaded.contains(&norm(&path.to_string_lossy())))
-        .map(|(_, body)| body.clone())
+        .filter_map(|(path, body)| {
+            if path.ends_with("memory/MEMORY.md") {
+                Some(seed::native_loaded(before.unwrap_or(body)).to_owned())
+            } else {
+                loaded.contains(&norm_path(&path.to_string_lossy())).then(|| body.clone())
+            }
+        })
         .collect()
 }
 
@@ -201,10 +407,13 @@ pub fn delivered(plan: &RunPlan, loaded: &[Loaded]) -> Vec<String> {
 pub fn summary(r: &RunResult) -> String {
     let passed = r.score.checks.iter().filter(|c| c.passed).count();
     let fate = |f: TracerFate| r.score.tracers.iter().filter(|(_, x)| *x == f).count();
-    let clawg: usize = r.session.clawg_calls.values().sum();
-    let failed: usize = r.saves.iter().map(|s| s.count(Mark::Fail)).sum();
-    format!(
-        "{} {}: {}, checks {passed}/{}, tracers used {} retrieved_but_ignored {} never_reached {}, clawg calls {clawg} ({} after ToolSearch), saves {} with {failed} failed criteria",
+    let records = r.records();
+    let clawg: usize = records.iter().map(|s| s.clawg_calls.values().sum::<usize>()).sum();
+    let after_search: usize = records.iter().map(|s| s.clawg_calls_after_tool_search).sum();
+    let saves = r.every_save();
+    let failed: usize = saves.iter().map(|s| s.count(Mark::Fail)).sum();
+    let mut line = format!(
+        "{} {}: {}, checks {passed}/{}, tracers used {} retrieved_but_ignored {} never_reached {}, clawg calls {clawg} ({after_search} after ToolSearch), saves {} with {failed} failed criteria",
         r.task,
         r.arm,
         if r.score.success { "success" } else { "failure" },
@@ -212,9 +421,21 @@ pub fn summary(r: &RunResult) -> String {
         fate(TracerFate::Used),
         fate(TracerFate::RetrievedButIgnored),
         fate(TracerFate::NeverReached),
-        r.session.clawg_calls_after_tool_search,
-        r.saves.len(),
-    )
+        saves.len(),
+    );
+    if r.sessions.len() > 1 {
+        let class = |c: FactClass| r.facts.iter().filter(|f| f.class == c).count();
+        line.push_str(&format!(
+            "; {} sessions {}, facts not_saved {} saved_not_reached {} reached_not_used {} used {}",
+            r.sessions.len(),
+            r.shape.as_str(),
+            class(FactClass::NotSaved),
+            class(FactClass::SavedNotReached),
+            class(FactClass::ReachedNotUsed),
+            class(FactClass::Used),
+        ));
+    }
+    line
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -395,6 +616,7 @@ pub fn prepare(task: &Task, arm: Arm, fixture: &Path, layout: &Layout, options: 
         "claude_version": options.claude_version,
         "client": client,
         "shape": options.shape,
+        "noise_rules": options.noise.len(),
         "plan": plan,
     });
     let path = root.join(RUN_FILE);
@@ -783,9 +1005,10 @@ fn instructions_file(k: usize, of: usize) -> String {
     if of == 1 { "instructions.jsonl".to_owned() } else { format!("instructions-{k}.jsonl") }
 }
 
-/// Scores the run in `root` from its `run.json`, `stream.jsonl`, the log of
-/// the instruction files the client loaded and the working directory, and
-/// writes `result.json`.
+/// Scores the run in `root` from its `run.json`, the stream of every session
+/// that ran, the logs of the instruction files each loaded, the native memory
+/// each began with and the working directory, and writes `result.json`. A run
+/// stopped by a session that failed is scored with the sessions it played.
 pub fn score_dir(root: &Path) -> Result<RunResult, RunError> {
     let not_a_run = |why: &str| RunError::NotARun(root.to_owned(), why.to_owned());
     let record = read_record(root)?;
@@ -799,28 +1022,48 @@ pub fn score_dir(root: &Path) -> Result<RunResult, RunError> {
     };
     let lang = record["lang"].as_str().and_then(Lang::parse);
     let plan: RunPlan = serde_json::from_value(record["plan"].clone()).map_err(|e| not_a_run(&e.to_string()))?;
+    let shape: Shape = serde_json::from_value(record["shape"].clone()).unwrap_or_default();
+    let noise_rules = record["noise_rules"].as_u64().map_or(0, |n| n as usize);
     let of = plan.sessions().len();
-    let stream_path = root.join(session_files(of, of).0);
-    let stream = std::fs::read_to_string(&stream_path).map_err(io(&stream_path))?;
-    let workdir = Layout { root: root.to_owned() }.workdir();
-    let read_file = |rel: &str| task::is_relative_inside(rel).then(|| std::fs::read_to_string(workdir.join(rel)).ok()).flatten();
-    let mut result = evaluate(&task, &arm, client.name(), profile, lang, &stream::parse(&stream), read_file);
-    let log_path = root.join(instructions_file(of, of));
-    let loaded = match std::fs::read_to_string(&log_path) {
-        Ok(text) => hooks::read_log(&text),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-        Err(e) => return Err(io(&log_path)(e)),
-    };
-    score::add_delivered(&mut result.score, &task.id, &delivered(&plan, &loaded));
-    result.session.instructions_loaded = loaded;
-    // The stream is created right before the client starts and closed when it exits.
-    let meta = std::fs::metadata(&stream_path).map_err(io(&stream_path))?;
+    // A stream is created right before its client starts and closed when it exits.
     let utc = |t: std::io::Result<std::time::SystemTime>| {
         let since = t.ok()?.duration_since(std::time::UNIX_EPOCH).ok()?;
         Some(clawg_cli::memories::format_utc(i64::try_from(since.as_millis()).ok()?))
     };
-    result.session.started_at = utc(meta.created());
-    result.session.ended_at = utc(meta.modified());
+    let read_optional = |path: &Path| match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(io(path)(e)),
+    };
+    let mut played = Vec::new();
+    let mut times = Vec::new();
+    for k in 1..=of {
+        let stream_path = root.join(session_files(k, of).0);
+        let Some(stream) = read_optional(&stream_path)? else {
+            if k == 1 {
+                return Err(io(&stream_path)(std::io::ErrorKind::NotFound.into()));
+            }
+            break;
+        };
+        let loaded = read_optional(&root.join(instructions_file(k, of)))?.map(|text| hooks::read_log(&text)).unwrap_or_default();
+        let before = read_optional(&root.join(format!("memory-before-{k}.md")))?;
+        let mut texts = delivered(&plan, &loaded, before.as_deref());
+        texts.extend(earlier_prompts(&task, shape, k));
+        let meta = std::fs::metadata(&stream_path).map_err(io(&stream_path))?;
+        times.push((utc(meta.created()), utc(meta.modified())));
+        played.push(Played { transcript: stream::parse(&stream), delivered: texts, loaded });
+    }
+    let workdir = Layout { root: root.to_owned() }.workdir();
+    let read_file = |rel: &str| task::is_relative_inside(rel).then(|| std::fs::read_to_string(workdir.join(rel)).ok()).flatten();
+    let info = RunInfo { arm: &arm, client: client.name(), profile, lang, shape, noise_rules, native_dir: native_memory_file(&plan).and_then(Path::parent) };
+    let mut result = evaluate(&task, &info, &played, read_file);
+    for (session, (started, ended)) in result.sessions.iter_mut().zip(times) {
+        session.session.started_at = started;
+        session.session.ended_at = ended;
+    }
+    if let Some(last) = result.sessions.last() {
+        result.session = last.session.clone();
+    }
     let out = root.join(RESULT_FILE);
     std::fs::write(&out, serde_json::to_string_pretty(&result).expect("JSON serializes") + "\n").map_err(io(&out))?;
     Ok(result)
@@ -971,9 +1214,17 @@ mod tests {
 {"type":"result","subtype":"success","is_error":false,"result":"48213"}
 "#;
 
+    fn info(arm: &str, profile: Profile) -> RunInfo<'_> {
+        RunInfo { arm, client: "replay", profile, lang: None, shape: Shape::Split, noise_rules: 0, native_dir: None }
+    }
+
+    fn played(stream: &str) -> Played {
+        Played { transcript: stream::parse(stream), delivered: Vec::new(), loaded: Vec::new() }
+    }
+
     #[test]
     fn evaluate_counts_clawg_calls_and_judges_the_saves() {
-        let r = evaluate(&task(), "a3", "replay", Profile::Dev, None, &stream::parse(STREAM), |p| (p == "a.txt").then(|| "ok".into()));
+        let r = evaluate(&task(), &info("a3", Profile::Dev), &[played(STREAM)], |p| (p == "a.txt").then(|| "ok".into()));
         assert!(r.score.success);
         assert_eq!(r.session.clawg_calls, BTreeMap::from([("save_memory".to_owned(), 1), ("search_memory".to_owned(), 2)]));
         assert_eq!(r.session.clawg_calls_after_tool_search, 3);
@@ -989,7 +1240,7 @@ mod tests {
 
     #[test]
     fn the_prod_server_is_counted_by_its_own_name() {
-        let r = evaluate(&task(), "a3", "replay", Profile::Prod, None, &stream::parse(STREAM), |_| None);
+        let r = evaluate(&task(), &info("a3", Profile::Prod), &[played(STREAM)], |_| None);
         assert!(r.session.clawg_calls.is_empty());
         assert!(!r.score.success);
     }
@@ -1188,10 +1439,10 @@ mod tests {
         let layout = Layout { root: if cfg!(windows) { PathBuf::from(r"C:\runs\r") } else { PathBuf::from("/runs/r") } };
         let opts = options(layout.root.join("clawg"));
         let a4 = crate::arm::plan(&task(), Arm::A4, &layout, &opts).unwrap();
-        let native = delivered(&a4, &[]);
+        let native = delivered(&a4, &[], None);
         assert_eq!(native.len(), 1);
         assert!(native[0].contains("Staging port 48213"), "{native:?}");
-        assert!(delivered(&crate::arm::plan(&task(), Arm::A3, &layout, &opts).unwrap(), &[]).is_empty());
+        assert!(delivered(&crate::arm::plan(&task(), Arm::A3, &layout, &opts).unwrap(), &[], None).is_empty());
 
         let rules = task::parse(
             r#"{"id": "t", "category": "K3", "fixture": "f", "prompt": "Write the notes.", "checks": [{"kind": "answer_contains", "text": "x"}],
@@ -1204,10 +1455,10 @@ mod tests {
             Loaded { file_path: reported, load_reason: "path_glob_match".into() },
             Loaded { file_path: "/elsewhere/CLAUDE.md".into(), load_reason: "session_start".into() },
         ];
-        let texts = delivered(&l2, &loaded);
+        let texts = delivered(&l2, &loaded, None);
         assert_eq!(texts.len(), 1, "{texts:?}");
         assert!(texts[0].contains("asterisk") && !texts[0].contains("Go errors"), "{}", texts[0]);
-        assert!(delivered(&l2, &[]).is_empty(), "a rules file the client did not load reached nothing");
+        assert!(delivered(&l2, &[], None).is_empty(), "a rules file the client did not load reached nothing");
     }
 
     #[test]
@@ -1250,5 +1501,217 @@ mod tests {
         if cfg!(windows) {
             assert!(r.session.started_at.is_some(), "Windows knows when a file was created");
         }
+    }
+
+    fn three_sessions() -> Task {
+        task::parse(
+            r#"{"id": "t", "category": "D", "fixture": "f",
+                "sessions": [{"prompt": "one"}, {"prompt": "two"}, {"prompt": "three"}],
+                "checks": [{"kind": "answer_contains", "text": "x"}]}"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_joined_session_has_the_earlier_prompts_in_its_context() {
+        let t = three_sessions();
+        assert!(earlier_prompts(&t, Shape::Joined, 1).is_empty());
+        assert_eq!(earlier_prompts(&t, Shape::Joined, 2), ["one"]);
+        assert_eq!(earlier_prompts(&t, Shape::Joined, 3), ["one", "two"]);
+        assert!(earlier_prompts(&t, Shape::Split, 3).is_empty(), "a new session never saw them");
+        assert!(earlier_prompts(&task(), Shape::Split, 1).is_empty());
+    }
+
+    #[test]
+    fn the_native_memory_delivered_is_what_the_file_held_before_the_session() {
+        let layout = Layout { root: if cfg!(windows) { PathBuf::from(r"C:\runs\r") } else { PathBuf::from("/runs/r") } };
+        let a4 = crate::arm::plan(&task(), Arm::A4, &layout, &options(layout.root.join("clawg"))).unwrap();
+
+        let planned = delivered(&a4, &[], None);
+        assert!(planned.len() == 1 && planned[0].contains("Staging port 48213"), "without a copy, the file of the plan: {planned:?}");
+
+        let changed = delivered(&a4, &[], Some("# Memory\n\nThe agent wrote quokka here\n"));
+        assert_eq!(changed, ["# Memory\n\nThe agent wrote quokka here\n"], "the copy replaces the file of the plan");
+
+        let long: String = (1..=300).map(|i| format!("line {i}\n")).collect();
+        let cut = delivered(&a4, &[], Some(&long));
+        assert!(cut[0].contains("line 200\n") && !cut[0].contains("line 201\n"), "the client loads the first 200 lines");
+        assert!(delivered(&a4, &[], Some("")).first().is_some_and(String::is_empty), "an empty file is loaded as nothing");
+    }
+
+    fn walked(followed: &[(&str, TracerFate)], saved: &[&str]) -> SessionResult {
+        SessionResult {
+            session: evaluate(&task(), &info("a0", Profile::Dev), &[played("")], |_| None).session,
+            score: Score { success: true, ended: true, checks: Vec::new(), tracers: Vec::new() },
+            followed: followed.iter().map(|(tracer, fate)| score::Journey { tracer: (*tracer).to_owned(), fate: *fate, brought_by: Vec::new() }).collect(),
+            saved: saved.iter().map(|s| (*s).to_owned()).collect(),
+            native_memory_writes: 0,
+            saves: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_fact_is_told_as_not_saved_not_reached_not_used_or_used() {
+        let t = task::parse(
+            r#"{"id": "t", "category": "D", "fixture": "f",
+                "sessions": [
+                    {"prompt": "Hide with alpha-1, bravo-2, charlie-3 and delta-4.", "tracers": ["alpha-1", "bravo-2", "charlie-3", "delta-4"]},
+                    {"prompt": "Now zulu-9.", "tracers": ["zulu-9"]},
+                    {"prompt": "Apply."}],
+                "checks": [{"kind": "answer_contains", "text": "x"}]}"#,
+        )
+        .unwrap();
+        let last = [
+            ("alpha-1", TracerFate::Used),
+            ("bravo-2", TracerFate::RetrievedButIgnored),
+            ("charlie-3", TracerFate::NeverReached),
+            ("delta-4", TracerFate::NeverReached),
+            ("zulu-9", TracerFate::Used),
+        ];
+        let sessions = [walked(&[], &["alpha-1", "bravo-2"]), walked(&[], &["charlie-3", "zulu-9"]), walked(&last, &[])];
+        let told = facts(&t, &sessions);
+        let by = |tracer: &str| told.iter().find(|f| f.tracer == tracer).map(|f| (f.born, f.class));
+        assert_eq!(by("alpha-1"), Some((1, FactClass::Used)));
+        assert_eq!(by("bravo-2"), Some((1, FactClass::ReachedNotUsed)));
+        assert_eq!(by("charlie-3"), Some((1, FactClass::SavedNotReached)), "a later session saved it");
+        assert_eq!(by("delta-4"), Some((1, FactClass::NotSaved)), "no session wrote it, whatever its fate");
+        assert_eq!(by("zulu-9"), Some((2, FactClass::Used)));
+        assert_eq!(told.len(), 5);
+        assert_eq!(serde_json::to_value(FactClass::SavedNotReached).unwrap(), json!("saved_not_reached"));
+
+        assert!(facts(&t, &sessions[..1]).is_empty(), "a fact born in the last session has no later one to reach");
+        assert!(facts(&task(), &sessions[..1]).is_empty());
+    }
+
+    #[test]
+    fn the_relay_overhead_is_what_the_new_session_starts_with_and_reads_again() {
+        let usage = |tokens: u64| format!(r#""usage":{{"input_tokens":3,"cache_creation_input_tokens":{},"cache_read_input_tokens":{}}}"#, tokens - 3 - 100, 100);
+        let first = format!(
+            r#"{{"type":"assistant","message":{{"id":"m1","content":[{{"type":"tool_use","id":"r1","name":"Read","input":{{"file_path":"src/a.py"}}}}],{}}}}}
+{{"type":"user","message":{{"content":[{{"type":"tool_result","tool_use_id":"r1","content":"x"}}]}}}}
+{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}
+"#,
+            usage(1000)
+        );
+        let memory = if cfg!(windows) { r"C:\runs\r\claude-config\projects\p\memory" } else { "/runs/r/claude-config/projects/p/memory" };
+        let memory_file = Path::new(memory).join("MEMORY.md").to_string_lossy().into_owned();
+        let call = |id: &str, name: &str, input: Value, result: usize| {
+            format!(
+                "{}\n{}\n",
+                json!({"type": "assistant", "message": {"id": format!("m-{id}"), "content": [{"type": "tool_use", "id": id, "name": name, "input": input}]}}),
+                json!({"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": id, "content": "z".repeat(result)}]}})
+            )
+        };
+        let second = |tokens: u64| {
+            format!(
+                "{}{}{}{}{}{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"ok\"}}\n",
+                format_args!("{{\"type\":\"assistant\",\"message\":{{\"id\":\"n1\",\"content\":[],{}}}}}\n", usage(tokens)),
+                call("a", "Read", json!({"file_path": "src/a.py"}), 400),
+                call("b", "Read", json!({"file_path": "src/b.py"}), 4000),
+                call("c", "mcp__clawg-dev__search_memory", json!({"query": "timeout"}), 800),
+                call("d", "Read", json!({"file_path": memory_file}), 200),
+            )
+        };
+        let (first, later) = (stream::parse(&first), stream::parse(&second(1500)));
+        assert_eq!((first.first_request_tokens, later.first_request_tokens), (Some(1000), Some(1500)));
+        let dir = Path::new(memory);
+        assert_eq!(overhead(&first, &later, Some(dir)), 500 + (400 + 800 + 200) / 4, "what it starts with and what it reads again; src/b.py is new");
+        assert_eq!(overhead(&first, &later, None), 500 + (400 + 800) / 4, "without a native memory its directory reads nothing");
+        assert_eq!(overhead(&first, &stream::parse(&second(900)), Some(dir)), (400 + 800 + 200) / 4, "it starts with less: nothing is added, and below 0 it stays at 0");
+        assert_eq!(overhead(&stream::parse(""), &stream::parse(&second(1500)), Some(dir)), (800 + 200) / 4, "no first request to compare with, and no file read before");
+    }
+
+    const OLD_RESULT: &str = r#"{"task": "t", "category": "K1", "example": false, "arm": "a3", "client": "replay", "lang": null,
+        "session": {"session_id": "s", "model": null, "client_version": null, "mcp_servers": [], "tool_calls": 1,
+                    "clawg_calls": {"search_memory": 1}, "clawg_calls_after_tool_search": 0, "clawg_calls_in_subagents": 0,
+                    "tool_search_calls": 0, "hook_events": 0, "compactions": 0, "unknown_lines": 0, "invalid_lines": [], "outcome": null},
+        "score": {"success": true, "ended": true, "checks": [{"check": "c", "passed": true}], "tracers": [["48213", "used"]]},
+        "saves": []}"#;
+
+    #[test]
+    fn a_result_written_before_sessions_still_reads() {
+        let r: RunResult = serde_json::from_str(OLD_RESULT).unwrap();
+        assert!(r.sessions.is_empty() && r.facts.is_empty());
+        assert_eq!((r.shape, r.noise_rules, r.overhead, r.paired.as_deref()), (Shape::Split, 0, None, None));
+        assert_eq!(r.records().len(), 1, "a run of one session");
+        assert_eq!(
+            summary(&r),
+            "t a3: success, checks 1/1, tracers used 1 retrieved_but_ignored 0 never_reached 0, clawg calls 1 (0 after ToolSearch), saves 0 with 0 failed criteria"
+        );
+    }
+
+    #[test]
+    fn score_dir_scores_every_session_of_the_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = dir.path().join("fixture");
+        std::fs::create_dir_all(&fixture).unwrap();
+        let layout = Layout { root: dir.path().join("run") };
+        let relay = task::parse(
+            r#"{"id": "relay", "category": "R", "fixture": "f",
+                "memories": [{"content": "Proxy alias quokka"}], "tracers": ["quokka"],
+                "sessions": [{"prompt": "Decide on 4.5-41 and write it down.", "tracers": ["4.5-41"], "checks": [{"kind": "tool_called", "name": "Write"}]},
+                             {"prompt": "Apply it."}],
+                "checks": [{"kind": "answer_contains", "text": "4.5-41"}]}"#,
+        )
+        .unwrap();
+        let mut opts = options(dir.path().join("clawg"));
+        opts.shape = Shape::Joined;
+        opts.noise = (0..2).map(|i| serde_json::from_str(&format!(r#"{{"content": "Rule {i}", "rule": {{}}}}"#)).unwrap()).collect();
+        let plan = prepare(&relay, Arm::A4, &fixture, &layout, &opts, &Client::Replay(dir.path().join("streams"))).unwrap();
+        let memory = native_memory_file(&plan).unwrap().parent().unwrap().to_owned();
+
+        let line = |value: Value| value.to_string() + "\n";
+        let first = [
+            r#"{"type":"system","subtype":"init","session_id":"s1","mcp_servers":[]}"#.to_owned() + "\n",
+            line(json!({"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "w1", "name": "Write", "input": {"file_path": memory.join("notes.md"), "content": "timeout 4.5-41"}},
+                {"type": "tool_use", "id": "m1", "name": "mcp__clawg-dev__save_memory", "input": {"content": "Timeout decision\nUse 4.5-41 as http_timeout."}}]}})),
+            line(json!({"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "w1", "content": "written"}, {"type": "tool_result", "tool_use_id": "m1", "content": "saved"}]}})),
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"Noted."}"#.to_owned() + "\n",
+        ]
+        .concat();
+        let second = "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s2\",\"mcp_servers\":[]}\n{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"Applied 4.5-41\"}\n";
+        let put = |name: &str, text: &str| std::fs::write(layout.root.join(name), text).unwrap();
+        put("stream-1.jsonl", &first);
+        put("stream-2.jsonl", second);
+        put("memory-before-1.md", "# Memory\n\nProxy alias quokka\n");
+        put("memory-before-2.md", "# Memory\n\nProxy alias quokka\n\ntimeout 4.5-41\n");
+        put("instructions-1.jsonl", "{\"file_path\":\"/c/CLAUDE.md\",\"load_reason\":\"session_start\"}\n");
+
+        let r = score_dir(&layout.root).unwrap();
+
+        assert_eq!(r.sessions.len(), 2);
+        assert_eq!((r.sessions[0].session.session_id.as_deref(), r.sessions[1].session.session_id.as_deref()), (Some("s1"), Some("s2")));
+        assert_eq!(r.session, r.sessions[1].session, "above, the record of the last session");
+        assert_eq!((r.shape, r.noise_rules, r.paired.as_deref()), (Shape::Joined, 2, None));
+        assert_eq!((r.sessions[0].native_memory_writes, r.sessions[1].native_memory_writes), (1, 0));
+        assert_eq!((r.sessions[0].saved.as_slice(), r.sessions[1].saved.as_slice()), (["4.5-41".to_owned()].as_slice(), [].as_slice()));
+        assert_eq!(r.sessions[0].session.instructions_loaded.len(), 1);
+        assert!(r.sessions[1].session.instructions_loaded.is_empty(), "each session has its own log");
+        let brought = |s: usize, tracer: &str| r.sessions[s].followed.iter().find(|j| j.tracer == tracer).map(|j| (j.fate, j.brought_by.clone()));
+        assert_eq!(brought(0, "quokka"), Some((TracerFate::RetrievedButIgnored, vec!["context".to_owned()])), "the file before session 1");
+        assert_eq!(brought(1, "4.5-41"), Some((TracerFate::Used, vec!["context".to_owned()])), "the prompt of the session before, and the file the agent wrote");
+        assert_eq!(brought(0, "4.5-41"), None, "a session does not follow its own fact");
+        assert_eq!(r.facts, [Fact { tracer: "4.5-41".into(), born: 1, class: FactClass::Used }]);
+        assert!(r.score.success && r.score.ended, "{:?}", r.score);
+        assert_eq!(r.score.checks.len(), 2);
+        assert_eq!(r.overhead, Some(0));
+        assert!(r.sessions.iter().all(|s| s.session.ended_at.is_some()));
+        let text = summary(&r);
+        assert!(text.contains("saves 1 with 0 failed criteria") && text.contains("2 sessions joined"), "{text}");
+        assert!(text.contains("facts not_saved 0 saved_not_reached 0 reached_not_used 0 used 1"), "{text}");
+        let written: RunResult = serde_json::from_str(&std::fs::read_to_string(layout.root.join(RESULT_FILE)).unwrap()).unwrap();
+        assert_eq!(written, r);
+
+        std::fs::remove_file(layout.root.join("stream-2.jsonl")).unwrap();
+        let cut = score_dir(&layout.root).unwrap();
+        assert_eq!(cut.sessions.len(), 1, "the sessions that ran are scored");
+        assert!(!cut.score.ended && !cut.score.success, "a run that did not play every session did not end");
+        assert!(cut.facts.is_empty() && cut.overhead.is_none());
+        assert!(summary(&cut).contains("saves 1"), "{}", summary(&cut));
+
+        std::fs::remove_file(layout.root.join("stream-1.jsonl")).unwrap();
+        assert!(matches!(score_dir(&layout.root), Err(RunError::Io { .. })));
     }
 }

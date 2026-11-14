@@ -39,10 +39,11 @@ pub enum Arm {
 }
 
 /// How the sessions of a task are played on one working directory.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Shape {
     /// Every session starts a conversation of its own.
+    #[default]
     Split,
     /// Each session after the first continues the conversation of the one before.
     Joined,

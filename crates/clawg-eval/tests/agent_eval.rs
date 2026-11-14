@@ -225,6 +225,11 @@ fn a_replayed_run_of_two_sessions_shares_its_daemon_and_its_working_directory() 
     let r = result(&run);
     assert_eq!(r["score"]["success"], true, "{r:#}");
     assert_eq!(r["session"]["session_id"], "replay-relay-port-2", "the result is the last session's");
+    assert_eq!(r["sessions"].as_array().unwrap().len(), 2, "and each session has its own record and score");
+    assert_eq!(r["sessions"][0]["session"]["session_id"], "replay-relay-port-1");
+    assert_eq!(r["shape"], "split");
+    assert!(stdout(&output).contains("saves 1 with"), "the summary counts what the first session saved: {}", stdout(&output));
+    assert!(stdout(&output).contains("2 sessions split"), "{}", stdout(&output));
     assert_eq!(serde_json::from_str::<Value>(&std::fs::read_to_string(run.join("run.json")).unwrap()).unwrap()["shape"], "split");
 }
 
@@ -262,6 +267,10 @@ fn a_session_that_fails_stops_the_run_and_still_stops_the_daemon() {
     assert!(stderr(&output).contains("session 1") && stderr(&output).contains("client-1.log"), "{}", stderr(&output));
     assert!(run.join("stream-1.jsonl").is_file() && !run.join("stream-2.jsonl").exists(), "the second session never started");
     assert_eq!(std::fs::read_to_string(run.join("work").join("notes.md")).unwrap(), "staging port: 48213\n");
+    let r = result(&run);
+    assert_eq!(r["sessions"].as_array().unwrap().len(), 1, "the sessions that ran are scored");
+    assert_eq!((&r["score"]["ended"], &r["score"]["success"]), (&Value::Bool(false), &Value::Bool(false)));
+    assert!(stdout(&output).contains("failure"), "the summary of what ran is still printed: {}", stdout(&output));
     let log = clawg_log(&run);
     assert!(log.contains(&imported(noise())) && log.contains(" stop --profile dev"), "{log}");
     assert!(!run.join("home").join(".clawg-dev").join("daemon.json").exists(), "clawg stop ended the daemon");

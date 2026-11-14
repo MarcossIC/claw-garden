@@ -314,6 +314,7 @@ pub fn load_named(dir: &Path) -> Result<Vec<(String, RunResult)>, ReportError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::arm::Shape;
     use crate::hooks::Loaded;
     use crate::run::Session;
     use crate::score::{CheckResult, Score};
@@ -388,6 +389,12 @@ mod tests {
                 tracers: vec![("t1".to_owned(), s.fates[0]), ("t2".to_owned(), s.fates[1])],
             },
             saves: vec![],
+            sessions: vec![],
+            shape: Shape::Split,
+            noise_rules: 0,
+            facts: vec![],
+            overhead: None,
+            paired: None,
         }
     }
 
