@@ -344,13 +344,15 @@ pub fn evaluate(task: &Task, info: &RunInfo, played: &[Played], read_file: impl 
     }
 }
 
-/// Each fact born in a session that ran before the last, classified over the last.
+/// Each fact born in a session that ran before the last, classified over the
+/// last. It is saved only by a session from the one it was born in to the one
+/// before the last: what the last session saves at the end brought nothing to it.
 pub fn facts(task: &Task, sessions: &[SessionResult]) -> Vec<Fact> {
     let Some(last) = sessions.last() else { return Vec::new() };
     let mut told = Vec::new();
     for (i, spec) in task.sessions.iter().enumerate().take(sessions.len() - 1) {
         for tracer in &spec.tracers {
-            let written = sessions[i..].iter().any(|s| s.saved.contains(tracer));
+            let written = sessions[i..sessions.len() - 1].iter().any(|s| s.saved.contains(tracer));
             let fate = last.followed.iter().find(|j| &j.tracer == tracer).map(|j| j.fate);
             let class = match (written, fate) {
                 (false, _) => FactClass::NotSaved,
@@ -1841,6 +1843,21 @@ mod tests {
 
         assert!(facts(&t, &sessions[..1]).is_empty(), "a fact born in the last session has no later one to reach");
         assert!(facts(&task(), &sessions[..1]).is_empty());
+    }
+
+    #[test]
+    fn a_fact_saved_only_by_the_last_session_is_not_saved() {
+        let t = task::parse(
+            r#"{"id": "t", "category": "R", "fixture": "f",
+                "sessions": [{"prompt": "Decide on alpha-1.", "tracers": ["alpha-1"]}, {"prompt": "Apply it."}],
+                "checks": [{"kind": "answer_contains", "text": "x"}]}"#,
+        )
+        .unwrap();
+        let last = [("alpha-1", TracerFate::Used)];
+        let class = |saved_first: &[&str], saved_last: &[&str]| facts(&t, &[walked(&[], saved_first), walked(&last, saved_last)])[0].class;
+        assert_eq!(class(&[], &["alpha-1"]), FactClass::NotSaved, "what the last session saves at the end brought nothing to it");
+        assert_eq!(class(&["alpha-1"], &["alpha-1"]), FactClass::Used);
+        assert_eq!(class(&["alpha-1"], &[]), FactClass::Used);
     }
 
     #[test]
