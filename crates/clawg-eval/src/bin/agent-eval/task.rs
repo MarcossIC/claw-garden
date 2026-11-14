@@ -154,12 +154,15 @@ pub enum Check {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         text: Option<String>,
     },
+    /// At most `max` calls to `Bash`, whatever they returned, invoke the shell
+    /// command `command`, which the task lists in its `shell`.
+    CommandRuns { command: String, max: u32 },
 }
 
 impl Check {
     /// Whether the check reads the stream of a session and not the files it left.
     pub fn reads_only_the_stream(&self) -> bool {
-        matches!(self, Check::AnswerContains { .. } | Check::AnswerLacks { .. } | Check::ToolCalled { .. } | Check::ToolFailedCount { .. })
+        matches!(self, Check::AnswerContains { .. } | Check::AnswerLacks { .. } | Check::ToolCalled { .. } | Check::ToolFailedCount { .. } | Check::CommandRuns { .. })
     }
 
     pub fn describe(&self) -> String {
@@ -171,6 +174,7 @@ impl Check {
             Check::ToolCalled { name } => format!("{name} was called"),
             Check::ToolFailedCount { name, max, text: None } => format!("{name} failed at most {max} times"),
             Check::ToolFailedCount { name, max, text: Some(text) } => format!("{name} failed at most {max} times with {text:?}"),
+            Check::CommandRuns { command, max } => format!("{command} was run at most {max} times"),
         }
     }
 }
@@ -225,6 +229,9 @@ pub fn problems(task: &Task) -> Vec<String> {
         for check in session.checks.iter().filter(|c| !c.reads_only_the_stream()) {
             out.push(format!("session {n} has the check {}, which reads files and not the stream", check.describe()));
         }
+        for check in session.checks.iter().filter(|c| outside_the_shell(c, &task.shell)) {
+            out.push(format!("session {n} has the check {}, which names a command that is not in the shell", check.describe()));
+        }
         for tracer in &session.tracers {
             if tracer.trim().is_empty() {
                 out.push(format!("a tracer of session {n} is empty"));
@@ -243,6 +250,9 @@ pub fn problems(task: &Task) -> Vec<String> {
     }
     if task.checks.is_empty() && task.sessions.iter().all(|s| s.checks.is_empty()) {
         out.push("a task needs at least one check".to_owned());
+    }
+    for check in task.checks.iter().filter(|c| outside_the_shell(c, &task.shell)) {
+        out.push(format!("the check {} names a command that is not in the shell", check.describe()));
     }
     for check in &task.checks {
         match check {
@@ -273,6 +283,11 @@ pub fn problems(task: &Task) -> Vec<String> {
         }
     }
     out
+}
+
+/// Whether `check` counts the runs of a command that `shell` does not list.
+fn outside_the_shell(check: &Check, shell: &[String]) -> bool {
+    matches!(check, Check::CommandRuns { command, .. } if !shell.contains(command))
 }
 
 /// What is wrong with the seeded memory `name` names.
@@ -618,6 +633,29 @@ mod tests {
             assert!(found.contains(expected), "{expected} missing from:
 {found}");
         }
+    }
+
+    #[test]
+    fn a_command_run_check_names_a_command_of_the_shell() {
+        let with = |shell: &str, fields: &str| TASK.replace("\"checks\": [", &format!("{shell}\"checks\": [{fields}"));
+        let check = r#"{"kind": "command_runs", "command": "eza", "max": 0},"#;
+        let task = parse(&with(r#""shell": ["eza", "ls"],"#, check)).unwrap();
+        let expected = Check::CommandRuns { command: "eza".into(), max: 0 };
+        assert_eq!(task.checks[0], expected);
+        assert!(expected.reads_only_the_stream(), "it reads the calls of a session, not its files");
+        assert_eq!(expected.describe(), "eza was run at most 0 times");
+        assert!(problems(&task).is_empty(), "{:?}", problems(&task));
+        assert!(parse(&with("", r#"{"kind": "command_runs", "command": "eza"},"#)).is_err(), "the most it may run is not optional");
+
+        let found = problems(&parse(&with(r#""shell": ["ls"],"#, check)).unwrap()).join("; ");
+        assert!(found.contains("the check eza was run at most 0 times names a command that is not in the shell"), "{found}");
+
+        let in_a_session = TASK.replace("\"prompt\": \"Which port does staging use?\"", &format!(
+            r#""shell": ["ls"], "sessions": [{{"prompt": "Which port?", "checks": [{check_without_comma}]}}]"#,
+            check_without_comma = check.trim_end_matches(',')
+        ));
+        let found = problems(&parse(&in_a_session).unwrap()).join("; ");
+        assert!(found.contains("session 1 has the check eza was run at most 0 times, which names a command that is not in the shell"), "{found}");
     }
 
     #[test]

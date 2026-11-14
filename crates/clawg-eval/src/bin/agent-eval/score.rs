@@ -94,6 +94,7 @@ fn run_check(check: &Check, answer: &str, calls: &[&ToolCall], read_file: impl F
         Check::FileLacks { path, text } => !read_file(path).is_some_and(|body| file_has(&body, text)),
         Check::ToolCalled { name } => calls.iter().any(|c| is_tool(&c.name, name)),
         Check::ToolFailedCount { name, max, text } => failed_calls(calls, name, text.as_deref()) <= *max as usize,
+        Check::CommandRuns { command, max } => command_runs(calls, command) <= *max as usize,
     };
     CheckResult { check: check.describe(), passed }
 }
@@ -110,6 +111,55 @@ fn failed_calls(calls: &[&ToolCall], name: &str, text: Option<&str>) -> usize {
             None => c.is_error,
         })
         .count()
+}
+
+/// The calls to `Bash`, a subagent's included, whose command invokes `command`,
+/// whatever came back from them.
+fn command_runs(calls: &[&ToolCall], command: &str) -> usize {
+    calls
+        .iter()
+        .filter(|c| is_tool(&c.name, "Bash"))
+        .filter(|c| c.input.get("command").and_then(serde_json::Value::as_str).is_some_and(|line| invocations(line, command) > 0))
+        .count()
+}
+
+/// How many parts of the shell line `line` invoke `command`: a part is what
+/// the separators `|`, `||`, `&&`, `;`, `&` and a newline leave, or what a `$(`,
+/// a backtick or a `(` opens, and it invokes the command when its first word,
+/// after any `NAME=value`, is `command` or a path that ends in `/command`. A
+/// separator inside quotes separates nothing.
+///
+/// The forms this does not read, such as `sh -c 'eza'` or `xargs eza`, count as 0.
+pub fn invocations(line: &str, command: &str) -> usize {
+    let mut parts = vec![String::new()];
+    let mut quote: Option<char> = None;
+    for c in line.chars() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None if c == '\'' || c == '"' => quote = Some(c),
+            None if SEPARATORS.contains(&c) => {
+                parts.push(String::new());
+                continue;
+            }
+            None => {}
+        }
+        parts.last_mut().expect("a part is always open").push(c);
+    }
+    parts.iter().filter(|part| first_word(part).is_some_and(|word| word == command || word.ends_with(&format!("/{command}")))).count()
+}
+
+/// What starts a new part of a shell line.
+const SEPARATORS: [char; 7] = ['|', '&', ';', '\n', '(', ')', '`'];
+
+/// The first word of a shell part that is not an assignment, without its quotes.
+fn first_word(part: &str) -> Option<String> {
+    let word = part.split_whitespace().find(|w| !is_assignment(w))?;
+    Some(word.chars().filter(|c| !matches!(c, '\'' | '"')).collect())
+}
+
+fn is_assignment(word: &str) -> bool {
+    word.split_once('=').is_some_and(|(name, _)| !name.is_empty() && !name.starts_with(|c: char| c.is_ascii_digit()) && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
 }
 
 /// A checkout with `core.autocrlf` leaves CRLF in the fixtures and the agent's edits keep it,
@@ -318,6 +368,61 @@ mod tests {
         assert!(check(0, Some("no such text")).passed);
         assert_eq!(check(2, Some("eza: command not found")).check, "Bash failed at most 2 times with \"eza: command not found\"");
         assert_eq!(check(1, None).check, "Bash failed at most 1 times");
+    }
+
+    #[test]
+    fn the_runs_of_a_command_are_counted_in_every_part_of_a_shell_line() {
+        let calls = |commands: &[&str]| -> Transcript {
+            let lines: String = commands
+                .iter()
+                .enumerate()
+                .map(|(i, c)| {
+                    let mut event = serde_json::json!({"type": "assistant", "message": {"content": [{"type": "tool_use", "id": format!("b{i}"), "name": "Bash", "input": {"command": c}}]}});
+                    if i == 0 {
+                        event["parent_tool_use_id"] = serde_json::json!("agent");
+                    }
+                    format!("{event}
+")
+                })
+                .collect();
+            parse_stream(&lines)
+        };
+        let t = calls(&["eza -1 src | wc -l", "ls src && eza docs", "/usr/bin/eza src", "echo eza", "ls src"]);
+        let task = |max: u32| {
+            parse_task(&format!(
+                r#"{{"id": "t", "category": "E", "fixture": "f", "prompt": "p", "shell": ["ls", "eza"],
+                    "checks": [{{"kind": "command_runs", "command": "eza", "max": {max}}}]}}"#
+            ))
+            .unwrap()
+        };
+        assert!(!one(&task(2), &t, |_| None).checks[0].passed, "three calls invoke it, whatever came back");
+        assert!(one(&task(3), &t, |_| None).checks[0].passed);
+        assert_eq!(one(&task(3), &t, |_| None).checks[0].check, "eza was run at most 3 times");
+
+        for (line, runs) in [
+            ("eza", 1),
+            ("eza -1 src | wc -l", 1),
+            ("ls src && eza docs", 1),
+            ("ls src || eza docs", 1),
+            ("ls; eza", 1),
+            ("ls & eza", 1),
+            ("ls
+eza", 1),
+            ("echo $(eza src)", 1),
+            ("echo `eza src`", 1),
+            ("(eza src)", 1),
+            ("LC_ALL=C TZ=UTC eza src", 1),
+            ("/usr/bin/eza src", 1),
+            ("eza a && eza b", 2),
+            ("echo eza", 0),
+            ("echo \"ls && eza\"", 0),
+            ("ls eza", 0),
+            ("EZA_COLORS=x ls", 0),
+            ("/usr/bin/ezas src", 0),
+            ("", 0),
+        ] {
+            assert_eq!(invocations(line, "eza"), runs, "{line:?}");
+        }
     }
 
     /// A session that ends with `answer`, after the `calls` lines.

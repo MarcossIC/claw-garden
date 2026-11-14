@@ -398,9 +398,9 @@ fn the_tasks_of_several_sessions_are_listed_with_their_sessions() {
         "requests-timeout-decision-relay R fixture=psf-requests memories=0 tracers=2 checks=5 sessions=2",
         "requests-redact-decision-revised D fixture=psf-requests memories=0 tracers=2 checks=4 sessions=3",
         "requests-history-owner-convention K2 fixture=psf-requests memories=1 tracers=1 checks=2",
-        "shelf-eza-missing E fixture=shelf-notes memories=0 tracers=0 checks=2 sessions=3",
+        "shelf-eza-missing E fixture=shelf-notes memories=0 tracers=0 checks=3 sessions=3",
         "example-relay-port R fixture=example-tally memories=0 tracers=1 checks=3 sessions=2 example",
-        "example-missing-command E fixture=example-tally memories=0 tracers=0 checks=2 sessions=2 example",
+        "example-missing-command E fixture=example-tally memories=0 tracers=0 checks=3 sessions=2 example",
     ] {
         assert!(listed.lines().any(|l| l == line), "{line} is not listed in:
 {listed}");
@@ -430,6 +430,8 @@ fn the_replayed_missing_command_example_counts_its_failures() {
     let r = result(&run);
     assert_eq!(r["score"]["success"], true, "the failure of the first session is not charged to the check of the second: {r:#}");
     assert_eq!(r["sessions"].as_array().unwrap().len(), 2);
+    let runs = r["score"]["checks"].as_array().unwrap().iter().find(|c| c["check"] == "session 2: eza was run at most 0 times");
+    assert_eq!(runs.map(|c| &c["passed"]), Some(&serde_json::json!(true)), "the first session tried eza and the second did not: {r:#}");
 
     let repeated = dir.path().join("repeated");
     std::fs::create_dir_all(&repeated).unwrap();
@@ -446,7 +448,7 @@ fn the_replayed_missing_command_example_counts_its_failures() {
     let r = result(&again);
     assert_eq!(r["score"]["success"], false, "{r:#}");
     let failed: Vec<&str> = r["score"]["checks"].as_array().unwrap().iter().filter(|c| c["passed"] == false).map(|c| c["check"].as_str().unwrap()).collect();
-    assert_eq!(failed, ["session 2: Bash failed at most 0 times with \"eza: command not found\""]);
+    assert_eq!(failed, ["session 2: Bash failed at most 0 times with \"eza: command not found\"", "session 2: eza was run at most 0 times"]);
     assert!(stdout(&output).contains("failure"), "{}", stdout(&output));
 }
 

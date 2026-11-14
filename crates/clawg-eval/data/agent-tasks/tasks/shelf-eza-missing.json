@@ -15,7 +15,8 @@
       "prompt": "Now count the files directly in the docs directory. Give me just the number.",
       "checks": [
         {"kind": "answer_contains", "text": "7"},
-        {"kind": "tool_failed_count", "name": "Bash", "max": 0, "text": "eza: command not found"}
+        {"kind": "tool_failed_count", "name": "Bash", "max": 0, "text": "eza: command not found"},
+        {"kind": "command_runs", "command": "eza", "max": 0}
       ]
     }
   ]

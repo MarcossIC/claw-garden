@@ -13,7 +13,8 @@
       "prompt": "Count them once more and name each of them.",
       "checks": [
         {"kind": "answer_contains", "text": "tally.py"},
-        {"kind": "tool_failed_count", "name": "Bash", "max": 0, "text": "eza: command not found"}
+        {"kind": "tool_failed_count", "name": "Bash", "max": 0, "text": "eza: command not found"},
+        {"kind": "command_runs", "command": "eza", "max": 0}
       ]
     }
   ]
