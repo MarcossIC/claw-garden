@@ -131,6 +131,11 @@ fn command_runs(calls: &[&ToolCall], command: &str) -> usize {
 ///
 /// The forms this does not read, such as `sh -c 'eza'` or `xargs eza`, count as 0.
 pub fn invocations(line: &str, command: &str) -> usize {
+    shell_parts(line).iter().filter(|part| first_word(part).is_some_and(|word| word == command || word.ends_with(&format!("/{command}")))).count()
+}
+
+/// The parts of the shell line `line`, as [`invocations`] cuts them.
+pub fn shell_parts(line: &str) -> Vec<String> {
     let mut parts = vec![String::new()];
     let mut quote: Option<char> = None;
     for c in line.chars() {
@@ -146,7 +151,29 @@ pub fn invocations(line: &str, command: &str) -> usize {
         }
         parts.last_mut().expect("a part is always open").push(c);
     }
-    parts.iter().filter(|part| first_word(part).is_some_and(|word| word == command || word.ends_with(&format!("/{command}")))).count()
+    parts
+}
+
+/// The words of a shell part without their quotes: what quotes hold stays one
+/// word, spaces included.
+pub fn shell_words(part: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut word: Option<String> = None;
+    let mut quote: Option<char> = None;
+    for c in part.chars() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => word.get_or_insert_with(String::new).push(c),
+            None if c == '\'' || c == '"' => {
+                quote = Some(c);
+                word.get_or_insert_with(String::new);
+            }
+            None if c.is_whitespace() => words.extend(word.take()),
+            None => word.get_or_insert_with(String::new).push(c),
+        }
+    }
+    words.extend(word);
+    words
 }
 
 /// What starts a new part of a shell line.
@@ -158,7 +185,7 @@ fn first_word(part: &str) -> Option<String> {
     Some(word.chars().filter(|c| !matches!(c, '\'' | '"')).collect())
 }
 
-fn is_assignment(word: &str) -> bool {
+pub fn is_assignment(word: &str) -> bool {
     word.split_once('=').is_some_and(|(name, _)| !name.is_empty() && !name.starts_with(|c: char| c.is_ascii_digit()) && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
 }
 
@@ -203,6 +230,12 @@ mod tests {
     use super::*;
     use crate::stream::parse as parse_stream;
     use crate::task::parse as parse_task;
+
+    #[test]
+    fn what_quotes_hold_stays_one_word_without_them() {
+        assert_eq!(shell_words(r#"awk '/x y/ {print}' "a b"c '' d"#), ["awk", "/x y/ {print}", "a bc", "", "d"]);
+        assert_eq!(shell_parts("ls -p | grep -v '|' ; wc"), ["ls -p ", " grep -v '|' ", " wc"]);
+    }
 
     /// The score of a run of one session.
     fn one(task: &Task, t: &Transcript, read_file: impl Fn(&str) -> Option<String>) -> Score {

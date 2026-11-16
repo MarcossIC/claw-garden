@@ -548,7 +548,7 @@ fn resolved(path: &str, workdir: &str) -> String {
 
 /// The paths a call reads: `Read` its file; `Grep` and `Glob` their `path`, and
 /// their `pattern` when it is an absolute path (a `Glob`'s only: a `Grep` pattern is a regex); `LSP` its file; and `Bash` each
-/// word of its command that is an absolute path or goes up with `..`.
+/// word of its command that is an absolute path or goes up with `..` ([`shell_reads`]).
 fn read_paths(call: &ToolCall) -> Vec<String> {
     let text = |key: &str| call.input.get(key).and_then(Value::as_str).map(str::to_owned);
     match call.name.as_str() {
@@ -556,17 +556,62 @@ fn read_paths(call: &ToolCall) -> Vec<String> {
         "Grep" => text("path").into_iter().collect(),
         "Glob" => text("path").into_iter().chain(text("pattern").filter(|p| is_absolute(&norm_path(p)))).collect(),
         "LSP" => text("filePath").or_else(|| text("file_path")).into_iter().collect(),
-        "Bash" => text("command")
-            .map(|line| {
-                line.split_whitespace()
-                    .map(|word| word.trim_matches(|c| "'\"`;&|()<>".contains(c)))
-                    .filter(|word| *word != "/dev/null" && (is_absolute(&norm_path(word)) || word.split(['/', '\\']).any(|part| part == "..")))
-                    .map(str::to_owned)
-                    .collect()
-            })
-            .unwrap_or_default(),
+        "Bash" => text("command").map(|line| shell_reads(&line)).unwrap_or_default(),
         _ => Vec::new(),
     }
+}
+
+/// The programs whose first operand is a pattern or a script, never a file,
+/// unless an option names it.
+const PATTERN_FIRST: [&str; 7] = ["grep", "egrep", "fgrep", "rg", "sed", "awk", "gawk"];
+
+/// The words of a shell line that are an absolute path (not `/dev/null`) or go
+/// up with `..`, part by part ([`score::shell_parts`]) and with quotes read as
+/// the shell reads them. In a part that runs a [`PATTERN_FIRST`] program the
+/// pattern or script is no path: its first operand, or the word after `-e`,
+/// `--regexp` or `--expression`; after `-f` or `--file` comes a file it reads,
+/// and then every operand is one.
+fn shell_reads(line: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    for part in score::shell_parts(line) {
+        let words: Vec<String> = score::shell_words(&part).into_iter().skip_while(|w| score::is_assignment(w)).collect();
+        let Some((program, rest)) = words.split_first() else { continue };
+        let filters = PATTERN_FIRST.contains(&program.rsplit('/').next().unwrap_or(program));
+        let mut read = vec![program.as_str()];
+        let (mut named, mut options_done, mut skip_next) = (false, false, false);
+        for word in rest {
+            if std::mem::take(&mut skip_next) {
+                continue;
+            }
+            if filters && !options_done && word.starts_with('-') && word.len() > 1 {
+                match word.as_str() {
+                    "--" => options_done = true,
+                    "-e" | "--regexp" | "--expression" => (named, skip_next) = (true, true),
+                    "-f" | "--file" => named = true,
+                    w if w.starts_with("--regexp=") || w.starts_with("--expression=") => named = true,
+                    w => {
+                        if let Some(file) = w.strip_prefix("--file=") {
+                            named = true;
+                            read.push(file);
+                        }
+                    }
+                }
+                continue;
+            }
+            if filters && !named {
+                named = true;
+                continue;
+            }
+            read.push(word);
+        }
+        found.extend(
+            read.into_iter()
+                .map(|word| word.trim_matches(|c| "<>".contains(c)))
+                .filter(|word| *word != "/dev/null" && (is_absolute(&norm_path(word)) || word.split(['/', '\\']).any(|part| part == "..")))
+                .map(str::to_owned),
+        );
+    }
+    found
 }
 
 /// A Git Bash path `/c/dir` as the drive `c:/dir` when `windows`: the client
@@ -2393,7 +2438,7 @@ mod tests {
             pair("LSP", "/runs/r/run.json"),
             pair("Bash", "../run.json"),
             pair("Bash", "/runs/r/fork"),
-            pair("Bash", "/tmp/x"),
+            pair("Bash", "/tmp/x y"),
         ];
         let mut expected = all.to_vec();
         expected.push(pair("Read", &format!("{memory}/MEMORY.md")));
@@ -2413,6 +2458,14 @@ mod tests {
         let calls = calls_of("s1", &[("Grep", json!({"pattern": "/etc/hosts"}), false), ("Glob", json!({"pattern": "/etc/*.conf"}), false)]);
         let found: Vec<(String, String)> = outside_reads(&calls, Path::new(WORKDIR), &[], Some("s1")).into_iter().map(|r| (r.tool, r.path)).collect();
         assert_eq!(found, [("Glob".to_owned(), "/etc/*.conf".to_owned())], "a regex is no path, a glob is");
+    }
+
+    #[test]
+    fn the_pattern_or_script_of_a_shell_filter_is_no_path() {
+        let line = "ls -p | grep -v / | wc -l; awk '/x y/ {print}' notes.txt; sed -n '/a/,/b/p' /etc/hosts; LC_ALL=C rg -e /etc /srv; sed -f /etc/script.sed notes.txt";
+        let calls = calls_of("s1", &[("Bash", json!({ "command": line }), false)]);
+        let found: Vec<String> = outside_reads(&calls, Path::new(WORKDIR), &[], Some("s1")).into_iter().map(|r| r.path).collect();
+        assert_eq!(found, ["/etc/hosts", "/srv", "/etc/script.sed"], "the first operand of grep, rg, sed and awk is a pattern or a script, unless -e names it; -f names a file");
     }
 
     #[test]
