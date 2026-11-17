@@ -45,7 +45,7 @@ Con `target\debug\clawg.exe` compilado desde `b302fd7` y registrado en Claude Co
 
 ### Hallazgo: qué tipo lleva un bug arreglado
 
-El protocolo pide guardar un bug arreglado con su causa raíz («When to save»), pero «Type and importance» no dice qué tipo le corresponde. En la sesión, el agente lo guardó como `tool_error`, que el protocolo describe como "a tool failure" y del que dice "They fade fast". Un arreglo con su causa raíz es un hecho que tiene que durar. No bloquea el archivo. Queda como arreglo suelto en el backlog del [README](../../../README.md#backlog-sin-spec-arreglos-sueltos): que «Type and importance» diga que un bug arreglado se guarda como `semantic_fact` (o `architectural_decision` si fija una regla) y que `tool_error` es una falla de herramienta sin resolver.
+El protocolo pide guardar un bug arreglado con su causa raíz («When to save»), pero «Type and importance» no dice qué tipo le corresponde. En la sesión, el agente lo guardó como `tool_error`, que el protocolo describe como "a tool failure" y del que dice "They fade fast". Un arreglo con su causa raíz es un hecho que tiene que durar. No bloquea el archivo. Queda como arreglo suelto en el backlog ([backlog.md](../../../backlog.md)): que «Type and importance» diga que un bug arreglado se guarda como `semantic_fact` (o `architectural_decision` si fija una regla) y que `tool_error` es una falla de herramienta sin resolver.
 
 ## `rag-eval`
 

@@ -183,7 +183,7 @@ Una investigación posterior, sobre la integración con Claude Code, dejó tres 
 | ¿Los subagentes llaman a las herramientas de clawg? | 99, parte D | Llamadas a `search_memory` y `search_project` dentro de un subagente. Piloto, sin costo extra |
 | ¿Un aviso `gone=` (algo que la memoria nombra ya no existe) hace que el agente compruebe el código antes de usar la memoria? | [memory-anchors](../../memory-anchors/exploration.md) (98), paso 2 | Una tarea S con una memoria que nombra una función que se renombró antes de la tarea, con y sin el aviso. El error es determinista: el diff usa el nombre viejo. Segunda tanda, después del paso 2 de 98 |
 | ¿Clawg agrega algo sobre la memoria nativa con los mismos hechos? | [native-memory-import](../2026-10-31-native-memory-import/exploration.md) (100), parte B | Es A3 contra A4, la pregunta de producto de P1: 100 no recomienda apagar la memoria nativa hasta tenerla |
-| ¿Buscar en `UserPromptSubmit` y mostrar hasta 3 entradas compactas ayuda más que lo que cuesta? | «Ideas evaluadas» del [README](../../../README.md) | Un brazo de diagnóstico más, A3 con ese hook, sólo si el piloto muestra muchas tareas K sin ninguna búsqueda. No entra en el piloto |
+| ¿Buscar en `UserPromptSubmit` y mostrar hasta 3 entradas compactas ayuda más que lo que cuesta? | «Ideas evaluadas» ([ideas.md](../../../ideas.md)) | Un brazo de diagnóstico más, A3 con ese hook, sólo si el piloto muestra muchas tareas K sin ninguna búsqueda. No entra en el piloto |
 
 ## Hallazgos laterales
 
