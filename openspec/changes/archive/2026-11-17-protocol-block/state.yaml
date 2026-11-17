@@ -1,0 +1,16 @@
+change: protocol-block
+objective: "1, y el costo de cada sesión"
+depends_on: []  # el valor por defecto lo decidió la campaña de agent-eval-sessions (129), fuera de este cambio
+phase: archived
+release: "0.88.0"  # el sello del bloque, `doctor` con o sin preferencia, el aviso de `session-start`, `--protocol` y el brazo `a3-short`; el valor por defecto sigue en `full` (D6, verify.md)
+artifacts:
+  exploration: done
+  proposal: done
+  spec: done  # PB1 a PB8
+  design: done  # D1 a D6; D6 es la regla de decisión del valor por defecto, fijada antes de correr la campaña
+  tasks: done  # seis tareas de código y la de verificación
+  apply: done  # seis tareas de código
+  verify: done  # sin CRITICAL; los tres WARNING resueltos, el CI de Linux y Windows pasó sobre 9a76a8ec y la campaña corrió; queda el uso real en una máquina con el bloque viejo, ver «Pendiente después de publicar» en verify.md
+  archive: done  # PB1, PB5 y PB6 en specs/setup, PB2 y PB3 en specs/doctor, el cambio de LP2 en specs/preferences, PB4 en specs/hooks y PB7 en specs/eval; PB8 no se consolida
+updated: 2026-11-17
+main_spec: openspec/specs/setup/spec.md, openspec/specs/doctor/spec.md, openspec/specs/hooks/spec.md, openspec/specs/preferences/spec.md, openspec/specs/eval/spec.md

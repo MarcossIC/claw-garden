@@ -1,6 +1,6 @@
 # protocol-block — Verificación
 
-Veredicto: **cumple PB1 a PB8, sin hallazgos CRITICAL**. Quedan tres WARNING para resolver al archivar o en un cambio propio, y fuera de esta verificación quedan el CI de Linux y Windows, el uso real en una máquina con el bloque viejo y la campaña que decide el valor por defecto (D6).
+Veredicto: **cumple PB1 a PB8, sin hallazgos CRITICAL**. Los tres WARNING se resolvieron después (W1 y W3 con commits, W2 al consolidar PB6 en `specs/setup`). El CI de Linux y Windows pasó sobre `9a76a8ec`, que lleva todo el código del cambio, y la campaña que decide el valor por defecto (D6) corrió y lo dejó en `full`. Lo que sigue sin hacerse está en «Pendiente después de publicar», al final.
 
 ## Qué se revisó
 
@@ -57,7 +57,7 @@ Ninguno.
 
 ## Pendiente en local
 
-- **CI.** Tiene que pasar en verde en Linux y en Windows, y antes de archivar hay que correr una vez la suite y los dos clippy de `.claude/CLAUDE.md` sobre el commit final, con `cargo clean --workspace --target-dir target-test` antes.
+- **CI.** Tiene que pasar en verde en Linux y en Windows, y antes de archivar hay que correr una vez la suite y los dos clippy de `.claude/CLAUDE.md` sobre el commit final, con `cargo clean --workspace --target-dir target-test` antes. Hecho: el CI pasó sobre `9a76a8ec`.
 - **El bloque de la máquina.** Con la versión instalada que trae este cambio, abrir una sesión de Claude Code en una máquina con el bloque de antes de 0.85.0. El agente tiene que nombrar `clawg setup claude-code --profile prod`. Después, correr `clawg setup claude-code --profile prod` (primero con `--dry-run`: la línea del protocolo tiene que decir `would update it (protocol=full)`, o `se actualizaría (protocol=full)` con la preferencia `es`) y `clawg doctor --profile prod`, que tiene que dar `protocol_block` `ok` `healthy` con `written_by` igual a `this_version`. Con el perfil `dev` también instalado, `clawg doctor --profile dev` puede dar `stale` o `newer` según su versión (W1).
 - **El efecto en las sesiones.** Con los scripts de A1 (`docs/completed-impl/hipotesis/A1/`) sobre los transcripts de las semanas siguientes, los `resolve_conflict` por cada save con cercanas tienen que bajar a menos de 0,15, el umbral de verdict-on-replace.
 - **El valor por defecto.** Lo decide la campaña sobre las tres tareas largas de agent-eval-sessions, con `a3`, `a3-short` y `l0`, 3 corridas por celda, 18 corridas nuevas y un tope de 15 USD, aplicando la regla de [D6](design.md#d6-la-regla-de-decisión-del-valor-por-defecto) tal como quedó fijada. La campaña es paga y la autoriza la persona. Si la regla elige `short` u `off`, el cambio va en un commit propio.
@@ -70,7 +70,7 @@ Ninguno.
 | W3, el peor caso del tope | `7c3e357c` | `what_the_hook_adds_stays_small` con `conclusions_to_review` de 10.000, que suma el `review_nudge`; el tope de 2.000 bytes se cumple |
 | S1 y S2 | `6bb07af9` | la documentación de `parse_agent` y de `parse_protocol` en su función; `DEFAULT_VARIANT` privado |
 
-W2 queda como está: al consolidar PB6 en `specs/setup` se escribe que `setup cursor --protocol` sale con 1. S3 lo comprueba la guía de la campaña.
+W2 queda como está: al consolidar PB6 en `specs/setup` se escribió que `setup cursor --protocol` sale con 1. S3 lo comprobó la campaña: ninguna sesión de los brazos con bloque trajo el aviso del bloque viejo.
 
 ## La campaña
 
@@ -113,3 +113,18 @@ Corrió en la fase 3 de agent-eval-sessions, con el mismo build: 3 corridas de `
 | T | 187.750 | 131.177 | 148.193 |
 
 `off` no pasa por E (7 contra 11) y por G (8 contra 17). `short` no pasa por B (3 contra 6) y por J (0,83 contra 0,5). **D6 queda cerrada: el valor por defecto es `full`.** T se calculó igual que arriba, la suma de entrada, caché leída y caché escrita de cada sesión, y la de `a3` sin la K da otra vez 156.340.
+
+## Al archivar (2026-11-17)
+
+- PB1, PB5 y PB6 pasan a [`specs/setup`](../../../specs/setup/spec.md), junto a R4 y LP13; PB2 y PB3 a [`specs/doctor`](../../../specs/doctor/spec.md), con la frase de LP14 reemplazada; el cambio de LP2 a [`specs/preferences`](../../../specs/preferences/spec.md); PB4 a [`specs/hooks`](../../../specs/hooks/spec.md), con el tope de 2.000 bytes en R4 y R7; PB7 a [`specs/eval`](../../../specs/eval/spec.md). PB8 no se consolida.
+- PB6 dice lo de W2: con `setup cursor` sale con 1, no con 2. PB4 dice lo que arregló W1: en el perfil `dev` el aviso calla cuando el sello lleva la versión propia.
+- D6 queda cerrada: el valor por defecto sigue en `full`, así que ningún commit cambia la variante.
+- Ninguna spec cambia el contrato del agente ni el daemon (PB8). `docs/reference/commands.md` ya describe `--protocol`, el sello y el aviso.
+- Sale en 0.88.0.
+
+## Pendiente después de publicar
+
+Local, con la versión instalada.
+
+- **El bloque de la máquina.** Con 0.88.0 instalada, abrir una sesión de Claude Code en una máquina con el bloque de antes de 0.85.0: el agente tiene que nombrar `clawg setup claude-code --profile prod`. Después correr ese comando (primero con `--dry-run`: la línea del protocolo dice `would update it (protocol=full)`, o `se actualizaría (protocol=full)` con la preferencia `es`) y `clawg doctor --profile prod`, que tiene que dar `protocol_block` `ok` `healthy` con `written_by` igual a `this_version`.
+- **El efecto en las sesiones.** Con los scripts de A1 (`docs/completed-impl/hipotesis/A1/`) sobre los transcripts de las semanas siguientes, los `resolve_conflict` por cada save con cercanas tienen que bajar a menos de 0,15, el umbral de verdict-on-replace.

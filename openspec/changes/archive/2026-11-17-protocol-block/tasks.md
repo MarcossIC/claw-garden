@@ -46,11 +46,11 @@ Strict TDD: en cada tarea el test va primero y falla por la aserción (o porque 
 
 - [x] `cargo clean --workspace --target-dir target-test`, y después la suite y los dos clippy de `.claude/CLAUDE.md`, una vez, sobre el último commit. Pasan según el informe de apply; la verificación fue de lectura y no los volvió a correr ([verify](verify.md#qué-se-revisó)).
 - [x] `the_agent_contract_matches_its_file` y `the_spanish_agent_contract_matches_its_file` pasan sin regenerar nada (PB8); `git diff` no toca `crates/clawg-cli/src/mcp/agent_contract*.json` ni `crates/clawg-cli/src/daemon/`.
-- [ ] El CI en verde en Linux y Windows.
+- [x] El CI en verde en Linux y Windows: pasó sobre `9a76a8ec`.
 - [x] `verify.md`: los requisitos con sus tests, y lo pendiente en local.
 
 ## Después de este cambio
 
-- **En local, con la versión instalada:** abrir una sesión de Claude Code en una máquina con el bloque de antes de 0.85.0 y ver que el agente nombra la orden; correrla y ver `doctor` en `ok`. Con los scripts de A1 (`docs/completed-impl/hipotesis/A1/`) sobre los transcripts de las semanas siguientes, los `resolve_conflict` por save con cercanas tienen que bajar a menos de 0,15 (umbral de verdict-on-replace).
-- **La campaña**, sobre las tareas largas de 129, con los brazos `a3`, `a3-short` y `l0`, 18 corridas nuevas con un tope de 15 USD, y la regla de [design](design.md#d6-la-regla-de-decisión-del-valor-por-defecto), que no se cambia después de ver resultados. Necesita el arnés de 129 aplicado; es paga y la autoriza la persona.
-- **El valor por defecto:** si la regla elige `short` u `off`, un commit propio cambia la variante de por defecto en `setup.rs` y sus tests, `docs/reference/commands.md` y `specs/setup` ya consolidada, y sube la versión como un arreglo fuera de openspec. Quien eligió con `--protocol` conserva su variante; quien no eligió toma la nueva la próxima vez que corre `setup`, y el aviso de `session-start` se lo pide.
+- [ ] **En local, con la versión instalada:** abrir una sesión de Claude Code en una máquina con el bloque de antes de 0.85.0 y ver que el agente nombra la orden; correrla y ver `doctor` en `ok`. Con los scripts de A1 (`docs/completed-impl/hipotesis/A1/`) sobre los transcripts de las semanas siguientes, los `resolve_conflict` por save con cercanas tienen que bajar a menos de 0,15 (umbral de verdict-on-replace). Pendiente después de publicar: [verify](verify.md#pendiente-después-de-publicar).
+- [x] **La campaña**, sobre las tareas largas de 129, con los brazos `a3`, `a3-short` y `l0`, 18 corridas nuevas con un tope de 15 USD, y la regla de [design](design.md#d6-la-regla-de-decisión-del-valor-por-defecto), que no se cambió después de ver resultados. Corrió con el arnés de 129: [verify](verify.md#la-campaña).
+- [x] **El valor por defecto:** la regla no eligió `short` ni `off`, así que sigue en `full` y no hay commit que cambie la variante ([verify](verify.md#la-celda-k-de-a3)).

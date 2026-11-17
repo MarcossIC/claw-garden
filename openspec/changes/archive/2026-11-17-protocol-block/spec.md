@@ -62,9 +62,9 @@ La clasificación MUST NOT mirar la versión cuando los cuerpos son iguales, de 
 - `newer`: `info` `newer`, sin `safe_next_step`, con un `message` que dice que lo escribió un clawg posterior;
 - un archivo que no se lee o un marcador suelto: `warn` `unreadable`, como hoy.
 
-`evidence` MUST llevar `path`, `written_by` (la versión del sello, o `null`) y `this_version` (la versión propia). Sin bloque, `doctor` MUST sumar `info` `not_installed` sólo con preferencia, como hoy, y sin preferencia MUST NOT sumar ningún hallazgo `protocol_block`. Cada `message` MUST estar en los dos idiomas (CL4 de [`specs/doctor`](../../specs/doctor/spec.md)).
+`evidence` MUST llevar `path`, `written_by` (la versión del sello, o `null`) y `this_version` (la versión propia). Sin bloque, `doctor` MUST sumar `info` `not_installed` sólo con preferencia, como hoy, y sin preferencia MUST NOT sumar ningún hallazgo `protocol_block`. Cada `message` MUST estar en los dos idiomas (CL4 de [`specs/doctor`](../../../specs/doctor/spec.md)).
 
-Esto reemplaza en LP14 de `specs/doctor` «Con preferencia, MUST sumar el chequeo `protocol_block`» y, en LP2 de [`specs/preferences`](../../specs/preferences/spec.md), «`doctor` no tiene hallazgos … `protocol_block`» pasa a «`doctor` no tiene hallazgos `preferences`, y `protocol_block` sólo cuando hay un bloque».
+Esto reemplaza en LP14 de `specs/doctor` «Con preferencia, MUST sumar el chequeo `protocol_block`» y, en LP2 de [`specs/preferences`](../../../specs/preferences/spec.md), «`doctor` no tiene hallazgos … `protocol_block`» pasa a «`doctor` no tiene hallazgos `preferences`, y `protocol_block` sólo cuando hay un bloque».
 
 #### Escenario: sin preferencia, un bloque viejo
 - GIVEN un perfil sin `preferences.json` y un `CLAUDE.md` con un bloque sin sello y otro texto
@@ -86,7 +86,7 @@ Esto reemplaza en LP14 de `specs/doctor` «Con preferencia, MUST sumar el cheque
 
 ## PB4. `session-start` avisa del bloque que difiere
 
-`clawg hook session-start` con `--client claude-code` MUST leer el bloque del `CLAUDE.md` del usuario (el de `locations`, con el `CLAUDE_CONFIG_DIR` de su entorno) y, cuando PB2 lo da `stale`, MUST sumar la línea del aviso: que el bloque del protocolo del `CLAUDE.md` del usuario no es el que escribe este clawg, con su versión, que puede contradecir las instrucciones del servidor, que donde difieran siga las del servidor, y que le diga una vez a la persona que `clawg setup claude-code --profile P` lo reescribe, con el perfil del hook. Los textos son los de [design](design.md#d3-el-aviso-en-cada-inicio-de-sesión), en el idioma preferido (AL6 de [`specs/hooks`](../../specs/hooks/spec.md)).
+`clawg hook session-start` con `--client claude-code` MUST leer el bloque del `CLAUDE.md` del usuario (el de `locations`, con el `CLAUDE_CONFIG_DIR` de su entorno) y, cuando PB2 lo da `stale`, MUST sumar la línea del aviso: que el bloque del protocolo del `CLAUDE.md` del usuario no es el que escribe este clawg, con su versión, que puede contradecir las instrucciones del servidor, que donde difieran siga las del servidor, y que le diga una vez a la persona que `clawg setup claude-code --profile P` lo reescribe, con el perfil del hook. Los textos son los de [design](design.md#d3-el-aviso-en-cada-inicio-de-sesión), en el idioma preferido (AL6 de [`specs/hooks`](../../../specs/hooks/spec.md)).
 
 - La línea MUST ir después de la del idioma y antes del contexto.
 - MUST imprimirse en cada `session-start`, con cualquier `source`, también sin daemon, con un daemon que falla o no responde, o con el contexto vacío, como la línea del idioma (R3 y R7 de `specs/hooks`).
@@ -136,7 +136,7 @@ El bloque `short` MUST ocupar menos de 2.000 bytes en los dos idiomas, y MUST NO
 
 `clawg setup claude-code` MUST tomar `--protocol full|short|off`. Con la opción MUST escribir esa variante, con `protocol=V` en el sello. Sin la opción MUST mantener la variante del sello del bloque instalado cuando trae `protocol=`, y si no, escribir la de por defecto sin `protocol=`. La de por defecto MUST ser `full`. `--protocol` MUST ser un error de uso con `--remove`, con `--local` o `--path`, y con `setup cursor`, sin escribir nada. El reporte MUST nombrar la variante que quedó.
 
-Con el bloque instalado igual al planeado salvo por la versión del sello, el paso MUST ser `Unchanged` y el sello MUST quedar como estaba (R4 y R5 de [`specs/setup`](../../specs/setup/spec.md)).
+Con el bloque instalado igual al planeado salvo por la versión del sello, el paso MUST ser `Unchanged` y el sello MUST quedar como estaba (R4 y R5 de [`specs/setup`](../../../specs/setup/spec.md)).
 
 #### Escenario: elegir y conservar
 - GIVEN un `CLAUDE.md` con el bloque `full` de antes del sello
@@ -174,8 +174,8 @@ Las instrucciones del servidor (`server.rs:2069`) y la lista de herramientas MUS
 
 ## Specs que se consolidan al archivar
 
-- PB1, PB5 y PB6 en [`specs/setup`](../../specs/setup/spec.md), junto a R4 y LP13.
-- PB2 y PB3 en [`specs/doctor`](../../specs/doctor/spec.md), reemplazando la frase de LP14; el cambio de LP2 en [`specs/preferences`](../../specs/preferences/spec.md).
-- PB4 en [`specs/hooks`](../../specs/hooks/spec.md), con el tope nuevo de R4 y lo que suman R3 y R7.
-- PB7 en [`specs/eval`](../../specs/eval/spec.md).
+- PB1, PB5 y PB6 en [`specs/setup`](../../../specs/setup/spec.md), junto a R4 y LP13.
+- PB2 y PB3 en [`specs/doctor`](../../../specs/doctor/spec.md), reemplazando la frase de LP14; el cambio de LP2 en [`specs/preferences`](../../../specs/preferences/spec.md).
+- PB4 en [`specs/hooks`](../../../specs/hooks/spec.md), con el tope nuevo de R4 y lo que suman R3 y R7.
+- PB7 en [`specs/eval`](../../../specs/eval/spec.md).
 - PB8 no se consolida.

@@ -2,7 +2,7 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| 1, y el costo de cada sesión | M | — ; el valor por defecto lo decide la campaña de [agent-eval-sessions](../archive/2026-11-17-agent-eval-sessions/proposal.md) (129), con la regla de [design](design.md#d6-la-regla-de-decisión-del-valor-por-defecto) | propuesta; las decisiones abiertas de la [exploración](exploration.md) se cierran con su opción recomendada |
+| 1, y el costo de cada sesión | M | — ; el valor por defecto lo decide la campaña de [agent-eval-sessions](../2026-11-17-agent-eval-sessions/proposal.md) (129), con la regla de [design](design.md#d6-la-regla-de-decisión-del-valor-por-defecto) | propuesta; las decisiones abiertas de la [exploración](exploration.md) se cierran con su opción recomendada |
 
 ## Problema
 
@@ -43,13 +43,13 @@ Están en [design.md](design.md): detectar y avisar sin reescribir (D1), el sell
 - `setup --protocol short` escribe el bloque corto, una segunda corrida sin la opción no cambia nada y `doctor` lo da `ok` (`setup.rs`, `tests/binary.rs`).
 - El contrato del agente no cambia.
 
-**Con uso real**, después de instalar la versión: en la primera sesión de una máquina con el bloque de antes de 0.85.0, el agente dice la orden; después de correrla, `doctor` da `ok`. Con los scripts de A1 sobre los transcripts de las semanas siguientes, los `resolve_conflict` por save con cercanas bajan de 3,0 a menos de 0,15, el umbral que ya fijó verdict-on-replace ([verify](../archive/2026-11-12-verdict-on-replace/verify.md#pendiente-en-prod)).
+**Con uso real**, después de instalar la versión: en la primera sesión de una máquina con el bloque de antes de 0.85.0, el agente dice la orden; después de correrla, `doctor` da `ok`. Con los scripts de A1 sobre los transcripts de las semanas siguientes, los `resolve_conflict` por save con cercanas bajan de 3,0 a menos de 0,15, el umbral que ya fijó verdict-on-replace ([verify](../2026-11-12-verdict-on-replace/verify.md#pendiente-en-prod)).
 
 **El valor por defecto**, con la campaña de 129 y la regla D6, fijada antes de correr.
 
 ## Riesgos
 
-- **El aviso no entra en el presupuesto del hook.** Lo que `session-start` suma tiene que quedar bajo 1.500 bytes ([`specs/hooks`](../../specs/hooks/spec.md) R4), y el peor caso de hoy, con todos los avisos en español, ya anda cerca. La spec sube el tope a 2.000 bytes, que con los 8.000 del contexto sigue dentro de los 10.000 que inyecta el cliente (`SESSION_BUDGET`, `crates/clawg-cli/src/hook.rs:65`).
+- **El aviso no entra en el presupuesto del hook.** Lo que `session-start` suma tiene que quedar bajo 1.500 bytes ([`specs/hooks`](../../../specs/hooks/spec.md) R4), y el peor caso de hoy, con todos los avisos en español, ya anda cerca. La spec sube el tope a 2.000 bytes, que con los 8.000 del contexto sigue dentro de los 10.000 que inyecta el cliente (`SESSION_BUDGET`, `crates/clawg-cli/src/hook.rs:65`).
 - **El agente no le dice nada a la persona.** La línea pide decirlo una vez; si no lo hace, `doctor` lo sigue marcando y la sesión igual sigue las instrucciones del servidor, que es lo que importa.
 - **Un bloque editado a mano** se ve `stale` y la orden lo reescribe, como ya hace `setup` (R4 de `specs/setup`). El mensaje dice «no es el que escribe este clawg», no «es viejo».
 - **La variante elegida se pierde si alguien borra la línea del sello.** El bloque queda sin elección y `setup` escribe la de por defecto: lo mismo que hoy.

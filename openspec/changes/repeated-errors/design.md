@@ -2,7 +2,7 @@
 
 Las decisiones de fondo están en la [propuesta](proposal.md#decisiones) y no se reabren. Acá van las de implementación, con lo que se descartó. Las citas son `ruta:línea` de `develop` en `8a2f3723`.
 
-Después de esa cita [protocol-block](../protocol-block/proposal.md) cambió `hook.rs`, `setup.rs` y el doctor, así que las líneas de esos tres archivos se corrieron y vale el nombre de la función. Lo que cambió y toca a este diseño:
+Después de esa cita [protocol-block](../archive/2026-11-17-protocol-block/proposal.md) cambió `hook.rs`, `setup.rs` y el doctor, así que las líneas de esos tres archivos se corrieron y vale el nombre de la función. Lo que cambió y toca a este diseño:
 
 - `session-start` ya trae una línea más de la palabra de clawg, el aviso del bloque del protocolo viejo (`block_notice`), que va después de la línea del idioma. Las reglas de este cambio van entre las dos: idioma, reglas, aviso del bloque, contexto.
 - `respond_reading` ya lee el idioma y el bloque del `CLAUDE.md` a la vez, con la misma espera. Las reglas se leen en el mismo `join`, con una lectura inyectada como las otras dos.

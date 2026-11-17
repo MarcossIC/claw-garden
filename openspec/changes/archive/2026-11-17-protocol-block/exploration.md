@@ -2,7 +2,7 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| 1 (lo que el agente lee para guardar y buscar) y transversal (costo de cada sesión) | M: el detector del bloque viejo es S; la opción de variante y el brazo del arnés, S–M; el cambio del valor por defecto queda fuera, detrás de una campaña | — para el detector; la decisión del valor por defecto, de la campaña de [agent-eval-sessions](../archive/2026-11-17-agent-eval-sessions/proposal.md) (129); toma el dato de [memory-delivery](../archive/2026-11-13-memory-delivery/verify.md) (127) que esperaba [claude-code-plugin](../claude-code-plugin/exploration.md) (120) | exploración |
+| 1 (lo que el agente lee para guardar y buscar) y transversal (costo de cada sesión) | M: el detector del bloque viejo es S; la opción de variante y el brazo del arnés, S–M; el cambio del valor por defecto queda fuera, detrás de una campaña | — para el detector; la decisión del valor por defecto, de la campaña de [agent-eval-sessions](../2026-11-17-agent-eval-sessions/proposal.md) (129); toma el dato de [memory-delivery](../2026-11-13-memory-delivery/verify.md) (127) que esperaba [claude-code-plugin](../../claude-code-plugin/exploration.md) (120) | exploración |
 
 **Tesis.** El bloque del protocolo que `clawg setup claude-code` escribe en el `CLAUDE.md` del usuario tiene dos problemas distintos. El primero es un bug: el bloque instalado no se actualiza con el binario, y nada lo avisa salvo con una preferencia de idioma, así que un cliente sigue leyendo reglas que el servidor ya cambió. El segundo es de costo: el bloque son unos 3.550 tokens por pedido al modelo y en sesiones cortas no cambió ningún resultado, pero nadie midió una sesión larga. El primero se arregla ya. El segundo se prepara ya (una opción para elegir la variante, con la variante corta escrita en el producto) y se decide con una campaña de tareas largas, con la regla de decisión fijada antes de correrla.
 
@@ -24,7 +24,7 @@ El análisis A1 (`docs/completed-impl/hipotesis/A1/informe.md`, «Restos que sig
 ### Lo que complica el arreglo
 
 - **El bloque es uno para los dos perfiles.** `locations` no depende del perfil (`crates/clawg-cli/src/setup.rs:670-683`) y `--remove` deja el bloque mientras el servidor del otro perfil siga registrado (`setup.rs:234-245`). Un binario `dev` con el protocolo de una rama y un `prod` instalado comparan el mismo bloque contra textos distintos: los dos lo verían «viejo», y el remedio de cada uno («corré `setup`») pisaría el del otro. Para decir en qué dirección está la diferencia hace falta saber qué versión escribió el bloque, y hoy el bloque no lo dice (`block`, `setup.rs:603-607`: marcadores y texto, nada más).
-- **El `CLAUDE.md` es de la persona.** Lo que está entre los marcadores es de clawg, y `setup` lo reescribe cuando difiere (`install_block`, `setup.rs:636-639`; [`specs/setup`](../../specs/setup/spec.md) R4), pero sólo cuando la persona corre `setup`.
+- **El `CLAUDE.md` es de la persona.** Lo que está entre los marcadores es de clawg, y `setup` lo reescribe cuando difiere (`install_block`, `setup.rs:636-639`; [`specs/setup`](../../../specs/setup/spec.md) R4), pero sólo cuando la persona corre `setup`.
 - **El binario que actualiza es el viejo.** `clawg update` corre el binario anterior, que no conoce el texto nuevo; para refrescar el bloque tendría que lanzar el `setup` del binario nuevo, con todo lo demás que `setup` hace (servidor, hooks).
 
 ### Enfoques para el bloque viejo
@@ -33,8 +33,8 @@ El análisis A1 (`docs/completed-impl/hipotesis/A1/informe.md`, «Restos que sig
 |---|---|---|---|
 | **1. Detectar y avisar** | `doctor` compara siempre que hay bloque; `session-start` suma una línea cuando el bloque difiere, que pide seguir las instrucciones del servidor y nombra la orden exacta | No escribe nada que la persona no pidió; corrige la sesión en curso aunque nadie corra `setup`; puro y testeable | Hasta que la persona corre `setup`, cada sesión paga la línea (~80 tokens) además del bloque |
 | 2. `clawg serve` refresca el bloque al arrancar | El daemon reescribe el bloque si difiere | Sin intervención | Un daemon de cualquier perfil y versión escribe un archivo de la persona sin una orden; un `dev` de una rama pisaría el bloque de `prod`; el daemon arranca sin consola, así que nadie ve el reporte ni la copia |
-| 3. El hook refresca el bloque | `session-start` reescribe | Llega en la primera sesión | Corre con 3 s de tope, en paralelo en varias sesiones, mientras el cliente ya leyó el archivo; escribir en un hook contradice que el hook nunca rompe nada ([`specs/hooks`](../../specs/hooks/spec.md) R3) |
-| 4. `clawg update` refresca | Tras reemplazar el binario, lanza el `setup` del nuevo | Es una orden que la persona dio | `update` tiene sus efectos fijados ([`specs/self-update`](../../specs/self-update/spec.md)); `setup` además toca servidor y hooks, y puede fallar sin `claude` en el PATH; no cubre al que instala a mano |
+| 3. El hook refresca el bloque | `session-start` reescribe | Llega en la primera sesión | Corre con 3 s de tope, en paralelo en varias sesiones, mientras el cliente ya leyó el archivo; escribir en un hook contradice que el hook nunca rompe nada ([`specs/hooks`](../../../specs/hooks/spec.md) R3) |
+| 4. `clawg update` refresca | Tras reemplazar el binario, lanza el `setup` del nuevo | Es una orden que la persona dio | `update` tiene sus efectos fijados ([`specs/self-update`](../../../specs/self-update/spec.md)); `setup` además toca servidor y hooks, y puede fallar sin `claude` en el PATH; no cubre al que instala a mano |
 
 Recomendado: **1**. El aviso del hook es lo único que llega a la sesión que está leyendo el bloque viejo, y le dice qué hacer mientras tanto. 2 y 3 escriben un archivo de la persona sin que lo pida, y el problema de los dos perfiles los vuelve peligrosos. 4 queda como mejora posible, fuera de este cambio.
 
@@ -64,7 +64,7 @@ No se decide leyendo. Lo que sí se puede hacer ya, sin apostar nada: escribir (
 
 ## La campaña que decide
 
-[agent-eval-sessions](../archive/2026-11-17-agent-eval-sessions/proposal.md) (129) arma las tareas largas: un relevo de dos sesiones (R), una decisión revisada en tres sesiones (D) y una K de 12 a 15 pedidos, sobre un fixture de unos 600 KB. Deja lugar para este cambio: sus tareas nuevas corren bajo `l0` sin cambios y su informe da las llamadas a clawg por sesión ([«Lugar para 131 y 132»](../archive/2026-11-17-agent-eval-sessions/proposal.md#lugar-para-131-y-132)). Este cambio le suma el brazo `a3-short` y fija, antes de correr, qué tiene que pasar para cambiar el valor por defecto, con las reglas de lectura de 129 ([design](design.md#d6-la-regla-de-decisión-del-valor-por-defecto)).
+[agent-eval-sessions](../2026-11-17-agent-eval-sessions/proposal.md) (129) arma las tareas largas: un relevo de dos sesiones (R), una decisión revisada en tres sesiones (D) y una K de 12 a 15 pedidos, sobre un fixture de unos 600 KB. Deja lugar para este cambio: sus tareas nuevas corren bajo `l0` sin cambios y su informe da las llamadas a clawg por sesión ([«Lugar para 131 y 132»](../2026-11-17-agent-eval-sessions/proposal.md#lugar-para-131-y-132)). Este cambio le suma el brazo `a3-short` y fija, antes de correr, qué tiene que pasar para cambiar el valor por defecto, con las reglas de lectura de 129 ([design](design.md#d6-la-regla-de-decisión-del-valor-por-defecto)).
 
 ## Decisiones que quedan abiertas
 

@@ -22,6 +22,7 @@ Fuente de verdad del comportamiento actual de la evaluación de recuperación: e
 - [memory-delivery](../../changes/archive/2026-11-13-memory-delivery/proposal.md), archivado el 2026-11-13, que sale en 0.86.0 (MD1 a MD7, en «`agent-eval`: las reglas, el ruido y los brazos de entrega», al final de esta spec). Sólo entró su paso 1, que es del arnés: la campaña que corrió con él no dio ganador, así que nada cambió en el producto ([verify](../../changes/archive/2026-11-13-memory-delivery/verify.md#la-campaña-2026-11-11)).
 - [agent-eval](../../changes/archive/2026-11-17-agent-eval/proposal.md), archivado el 2026-11-17, que sale en 0.88.0 (AE1 a AE9, en «`agent-eval`: el arnés», antes de la sección de memory-delivery). Es la base del arnés y no toca el producto; memory-delivery se archivó antes porque se aplicó sobre ella sin esperar a su archivado.
 - [agent-eval-sessions](../../changes/archive/2026-11-17-agent-eval-sessions/proposal.md), archivado el 2026-11-17, que sale en 0.88.0 (AS1 a AS22, en «`agent-eval`: las sesiones, el relevo y los artefactos», al final de esta spec; AS1 reemplaza el orden del `MEMORY.md` de `a4` en MD3). La campaña que corrió con él está en su [verify](../../changes/archive/2026-11-17-agent-eval-sessions/verify.md#la-campaña).
+- [protocol-block](../../changes/archive/2026-11-17-protocol-block/proposal.md), archivado el 2026-11-17, que sale en 0.88.0 (sólo PB7, el brazo `a3-short`, en «`agent-eval`: el brazo `a3-short`», al final de esta spec). Sus otros requisitos están en [`specs/setup`](../setup/spec.md), [`specs/doctor`](../doctor/spec.md), [`specs/hooks`](../hooks/spec.md) y [`specs/preferences`](../preferences/spec.md).
 
 ## Definiciones
 
@@ -1481,7 +1482,7 @@ Las categorías dicen qué mide la tarea: `K1` una preferencia de la persona, `K
 
 ### AE2. Los brazos
 
-`arm::plan` MUST decidir, sin tocar disco, los archivos, los comandos y las variables de una corrida bajo `a0`, `a2`, `a3`, `a3-eager`, `a4` o `b`. Toda corrida MUST tener su home y su `CLAUDE_CONFIG_DIR` propios, `--mcp-config` con `--strict-mcp-config` y salida `stream-json`. Los brazos con clawg MUST llevar el servidor que `setup::plan` registraría; `a3`, `a3-eager` y `b` además MUST llevar el `settings.json` y el `CLAUDE.md` que ese plan escribe, en el idioma de la corrida, y `preferences.json` cuando hay idioma. `a3-eager` MUST apagar la búsqueda de herramientas, `b` MUST quitar `search_memory`, `read_memory` y `list_memories`, y `a4` MUST llevar las mismas memorias en el `MEMORY.md` nativo, sin servidor. `a0` MUST no tener servidor, siembra ni memoria nativa. Una ruta de `clawg` relativa MUST rechazarse. Como en `-p` nada puede aprobar un permiso, todo brazo MUST correr con `--permission-mode acceptEdits` (ediciones aprobadas sólo dentro del directorio de trabajo) y negar `Bash`, y los brazos con clawg MUST permitir todas las herramientas de su servidor (`--allowedTools mcp__<servidor>`); `b` MUST negar sus tres herramientas de lectura en el mismo `--disallowedTools` que `Bash`.
+`arm::plan` MUST decidir, sin tocar disco, los archivos, los comandos y las variables de una corrida bajo `a0`, `a2`, `a3`, `a3-eager`, `a4` o `b`. Toda corrida MUST tener su home y su `CLAUDE_CONFIG_DIR` propios, `--mcp-config` con `--strict-mcp-config` y salida `stream-json`. Los brazos con clawg MUST llevar el servidor que `setup::plan` registraría; `a3`, `a3-eager` y `b` además MUST llevar el `settings.json` y el `CLAUDE.md` que ese plan escribe, en el idioma de la corrida, y `preferences.json` cuando hay idioma. `a3-eager` MUST apagar la búsqueda de herramientas, `b` MUST quitar `search_memory`, `read_memory` y `list_memories`, `a3-short` es `a3` con el bloque corto del protocolo (PB7), y `a4` MUST llevar las mismas memorias en el `MEMORY.md` nativo, sin servidor. `a0` MUST no tener servidor, siembra ni memoria nativa. Una ruta de `clawg` relativa MUST rechazarse. Como en `-p` nada puede aprobar un permiso, todo brazo MUST correr con `--permission-mode acceptEdits` (ediciones aprobadas sólo dentro del directorio de trabajo) y negar `Bash`, y los brazos con clawg MUST permitir todas las herramientas de su servidor (`--allowedTools mcp__<servidor>`); `b` MUST negar sus tres herramientas de lectura en el mismo `--disallowedTools` que `Bash`.
 
 ##### Escenario: lo que instala setup
 - GIVEN una tarea con memorias y el idioma `es`
@@ -1926,3 +1927,18 @@ La causa (d) no tiene lugar en el resultado: una corrida paga con un comando que
 `agent-eval calls` MUST dar, junto a la mediana y el p90 de los tokens que agrega cada llamada, la mediana de los bytes de su resultado entre 4.
 
 **Tests:** `rows_are_split_by_the_noise_of_the_run`, `rows_leave_out_the_runs_with_an_artifact_and_list_them`, `a_joined_row_has_rereads_and_no_relay_overhead`, `the_pairs_table_tells_what_was_excluded_continued_compacted_and_read_again`, `the_calls_table_gives_the_size_of_a_result_beside_what_a_call_adds` (`report.rs`). Los tests de AS10 siguen pasando con las columnas nuevas.
+
+## `agent-eval`: el brazo `a3-short`
+
+El brazo que mide el bloque corto del protocolo. Sus tests corren con la suite, como los de las secciones anteriores. Origen: [protocol-block](../../changes/archive/2026-11-17-protocol-block/proposal.md). Lo que se midió con él, 18 corridas sobre las tareas largas de la sección anterior, está en su [verify](../../changes/archive/2026-11-17-protocol-block/verify.md#la-campaña): `short` y `off` no pasan la regla D6, y el valor por defecto de `setup` sigue siendo `full`.
+
+### PB7. El brazo `a3-short`
+
+`agent-eval` MUST tener el brazo `a3-short`: `a3` con el bloque `short` que planea `setup::plan` con `--protocol short`, y todo lo demás (servidor, hooks, daemon, memorias, argumentos del cliente) igual a `a3`. `a3` MUST seguir escribiendo el bloque `full` y `l0` ninguno.
+
+##### Escenario
+- GIVEN una tarea con memorias
+- WHEN se planean `a3` y `a3-short`
+- THEN sus planes son iguales salvo el `CLAUDE.md`, que en `a3-short` es el bloque corto con `protocol=short`
+
+**Tests:** `a3_short_is_a3_with_the_short_block` (`crates/clawg-eval/src/bin/agent-eval/arm.rs`).
