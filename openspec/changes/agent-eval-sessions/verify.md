@@ -224,6 +224,8 @@ Sin «aguanta» no hay «ventaja en escala». En la K larga con 300, `a3` aprueb
 
 La C que falla no la decide la escala sino el arnés. La sesión buscó, recibió las dos decisiones opuestas sobre los paquetes internos (`==` y `~=`), leyó las dos con `read_memory` y eligió `~=` «porque tiene el id más alto y se lee como la respuesta a la primera». `seed.rs` numera las memorias de la más nueva a la más vieja (`seeded` y `id: i + 1`), así que en el fixture un id más alto es una memoria más vieja, al revés que en un store real. Con 300 reglas la decisión vigente quedó en `#9` y la vieja en `#142`. Las causas de exclusión no incluyen este caso, así que cuenta como falla y el veredicto queda. La otra corrida de C bajo `a3` no buscó y aprobó.
 
+**Arreglado en el arnés.** `export` numera ahora las memorias de la más vieja a la más nueva, como las numera un store, y conserva cada fecha. Las campañas de antes se sembraron con el orden invertido: en una tarea con dos memorias que se contradicen, una corrida nueva no se compara con ellas. Test `the_export_numbers_the_memories_from_the_oldest_to_the_newest_as_a_store_does`.
+
 Lo que muestran los datos y no decide:
 - Con 300 reglas `a3` falla K1, K2 y K3 (0 de 6), como con 15 en el piloto (0 de 6): no es un efecto de la escala.
 - `a4` con 300 falla K1, K2 y K3 (0 de 6) y la K larga 2 de 3, contra 6 de 6 y 3 de 3 con 15. Es por construcción: con 300 reglas la memoria de la tarea queda fuera de las 200 líneas, y en las dos K largas que fallan el agente no la fue a buscar al archivo.

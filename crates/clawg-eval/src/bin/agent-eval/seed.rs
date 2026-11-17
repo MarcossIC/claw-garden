@@ -14,7 +14,7 @@ const DAY_MS: i64 = 86_400_000;
 pub const PROJECT_ID: &str = "agent-eval-fixture";
 
 /// The export of `memories`, saved by `agent` in the project rooted at `root`,
-/// each `age_days` before `now_ms`.
+/// each `age_days` before `now_ms`, numbered from the oldest to the newest.
 pub fn export(memories: &[SeedMemory], agent: &str, root: &str, name: &str, now_ms: i64) -> String {
     let mut lines = vec![
         Line::Header(Header {
@@ -32,11 +32,16 @@ pub fn export(memories: &[SeedMemory], agent: &str, root: &str, name: &str, now_
             ..Default::default()
         }),
     ];
-    for (i, memory) in memories.iter().enumerate() {
-        // Rows of one age stay apart so their order is the file's.
-        let created_at = now_ms - i64::from(memory.age_days) * DAY_MS + i as i64;
+    // Rows of one age stay apart so their order is the file's.
+    let mut dated: Vec<(i64, &SeedMemory)> =
+        memories.iter().enumerate().map(|(i, memory)| (now_ms - i64::from(memory.age_days) * DAY_MS + i as i64, memory)).collect();
+    // A store hands out ids as it saves, so a later id is a later memory, and
+    // an agent may read them that way when two memories disagree. The import
+    // keeps the file's id order.
+    dated.sort_by_key(|(created_at, _)| *created_at);
+    for (id, (created_at, memory)) in (1..).zip(dated) {
         lines.push(Line::Memory(MemoryLine {
-            id: i as i64 + 1,
+            id,
             scope: "agent".into(),
             agent_id: Some(agent.into()),
             project_id: Some(PROJECT_ID.into()),
@@ -190,6 +195,29 @@ mod tests {
         assert_eq!(old.topic_key.as_deref(), Some("deploy/port"));
         let Line::Memory(decision) = &lines[3] else { panic!() };
         assert_eq!((decision.id, decision.tier, decision.created_at), (2, 1, now + 1));
+    }
+
+    #[test]
+    fn the_export_numbers_the_memories_from_the_oldest_to_the_newest_as_a_store_does() {
+        let now = 1_800_000_000_000;
+        let task = [memory("task old", "semantic_fact", 120, 1), memory("task new", "semantic_fact", 10, 1)];
+        let noise = [memory("noise mid", "semantic_fact", 60, 1), memory("noise new", "semantic_fact", 10, 1), memory("noise oldest", "semantic_fact", 200, 1)];
+        let memories = seeded(&task, &noise);
+        let text = export(&memories, "claude-code", "/w", "f", now);
+        let rows: Vec<MemoryLine> = text
+            .lines()
+            .filter_map(|l| match serde_json::from_str(l).unwrap() {
+                Line::Memory(m) => Some(m),
+                _ => None,
+            })
+            .collect();
+        let by_id: Vec<(i64, &str)> = rows.iter().map(|m| (m.id, m.content.as_str())).collect();
+        assert_eq!(by_id, [(1, "noise oldest"), (2, "task old"), (3, "noise mid"), (4, "noise new"), (5, "task new")]);
+        assert!(rows.windows(2).all(|w| w[0].created_at < w[1].created_at), "a later id is a later memory");
+
+        let dated = |content: &str| rows.iter().find(|m| m.content == content).unwrap().created_at;
+        assert_eq!(dated("noise new"), now - 10 * DAY_MS, "the dates are those of the newest-first order");
+        assert_eq!(dated("task new"), now - 10 * DAY_MS + 1, "at one age the task's memory is still the newer");
     }
 
     #[test]
