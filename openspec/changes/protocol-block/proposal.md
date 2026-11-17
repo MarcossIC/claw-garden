@@ -2,7 +2,7 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| 1, y el costo de cada sesión | M | — ; el valor por defecto lo decide la campaña de [agent-eval-sessions](../agent-eval-sessions/proposal.md) (129), con la regla de [design](design.md#d6-la-regla-de-decisión-del-valor-por-defecto) | propuesta; las decisiones abiertas de la [exploración](exploration.md) se cierran con su opción recomendada |
+| 1, y el costo de cada sesión | M | — ; el valor por defecto lo decide la campaña de [agent-eval-sessions](../archive/2026-11-17-agent-eval-sessions/proposal.md) (129), con la regla de [design](design.md#d6-la-regla-de-decisión-del-valor-por-defecto) | propuesta; las decisiones abiertas de la [exploración](exploration.md) se cierran con su opción recomendada |
 
 ## Problema
 

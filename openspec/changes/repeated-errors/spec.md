@@ -160,7 +160,7 @@ El plan de `clawg setup claude-code`, con o sin `--local`, MUST sumar dos evento
 
 ## RE9. La medición en agent-eval
 
-Se construye cuando [agent-eval-sessions](../agent-eval-sessions/proposal.md) (129) esté aplicado. Ese cambio da las tareas de varias sesiones (`sessions`), el shell acotado (`shell` con `missing_commands`), el check `tool_failed_count` y la tarea `shelf-eza-missing`, que es la línea base de este cambio ([129, «Lugar para 131 y 132»](../agent-eval-sessions/proposal.md#lugar-para-131-y-132)). Este cambio no redefine nada de eso y sólo suma un brazo.
+Se construye cuando [agent-eval-sessions](../archive/2026-11-17-agent-eval-sessions/proposal.md) (129) esté aplicado. Ese cambio da las tareas de varias sesiones (`sessions`), el shell acotado (`shell` con `missing_commands`), el check `tool_failed_count` y la tarea `shelf-eza-missing`, que es la línea base de este cambio ([129, «Lugar para 131 y 132»](../archive/2026-11-17-agent-eval-sessions/proposal.md#lugar-para-131-y-132)). Este cambio no redefine nada de eso y sólo suma un brazo.
 
 Los brazos con hooks toman los de `setup::plan` (`crates/clawg-eval/src/bin/agent-eval/arm.rs:243-249`), así que, desde RE7, `a3` corre con los hooks nuevos. El `a3` que mide 129 antes de este cambio queda como un brazo nuevo:
 

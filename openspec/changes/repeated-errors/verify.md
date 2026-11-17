@@ -1,6 +1,6 @@
 # repeated-errors — Verificación
 
-Veredicto: **cumple RE1 a RE8, sin hallazgos CRITICAL**. RE9 queda pendiente, porque es la tarea 9 y espera a [agent-eval-sessions](../agent-eval-sessions/proposal.md). Hay tres WARNING para resolver antes de archivar: un falso positivo que contradice D5, el nombre de un test y el regex que compila `redact` en el camino con firma. Fuera de esta verificación quedan la tarea 8 (la verificación local en Windows), la puerta de latencia, la entrada real de los dos eventos y la campaña.
+Veredicto: **cumple RE1 a RE8, sin hallazgos CRITICAL**. RE9 queda pendiente, porque es la tarea 9 y espera a [agent-eval-sessions](../archive/2026-11-17-agent-eval-sessions/proposal.md). Hay tres WARNING para resolver antes de archivar: un falso positivo que contradice D5, el nombre de un test y el regex que compila `redact` en el camino con firma. Fuera de esta verificación quedan la tarea 8 (la verificación local en Windows), la puerta de latencia, la entrada real de los dos eventos y la campaña.
 
 ## Qué se revisó
 

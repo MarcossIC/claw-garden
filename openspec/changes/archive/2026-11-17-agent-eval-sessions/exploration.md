@@ -2,9 +2,9 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| medición (1, 5): si clawg hace rendir más una sesión larga, un relevo entre sesiones y un store grande | M–L, sólo en `crates/clawg-eval` | [agent-eval](../archive/2026-11-17-agent-eval/proposal.md) (96), del que toma el arnés; sigue a [memory-delivery](../archive/2026-11-13-memory-delivery/verify.md) (127, archivado); deja el arnés que usan repeated-errors (131) y protocol-block (132) | exploración hecha el 2026-11-13; sigue en la [propuesta](proposal.md) |
+| medición (1, 5): si clawg hace rendir más una sesión larga, un relevo entre sesiones y un store grande | M–L, sólo en `crates/clawg-eval` | [agent-eval](../2026-11-17-agent-eval/proposal.md) (96), del que toma el arnés; sigue a [memory-delivery](../2026-11-13-memory-delivery/verify.md) (127, archivado); deja el arnés que usan repeated-errors (131) y protocol-block (132) | exploración hecha el 2026-11-13; sigue en la [propuesta](proposal.md) |
 
-**Tesis.** La campaña de memory-delivery no dio ganador porque medía sesiones que no existen: de 2 a 7 turnos y unos 17.000 tokens ([verify](../archive/2026-11-13-memory-delivery/verify.md#lo-que-la-campaña-no-podía-medir)). Una sesión real de este proyecto tiene de mediana 40 pedidos y 62 llamadas, empieza en unos 70.000 tokens y pasa de 200.000 en la mitad de los casos. Lo que una memoria ahorra o cuesta está ahí: en el relevo entre una sesión y la siguiente, en un store con cientos de memorias y en memorias que escribió una sesión anterior, no en una sembrada a mano. El arnés de hoy corre una sola sesión por corrida y no puede medir nada de eso. Este cambio le da sesiones encadenadas, una bifurcación que juega la segunda parte de las dos formas, un ruido de 300 reglas y el costo de cada llamada, y fija antes de correr qué resultado decide cada hipótesis.
+**Tesis.** La campaña de memory-delivery no dio ganador porque medía sesiones que no existen: de 2 a 7 turnos y unos 17.000 tokens ([verify](../2026-11-13-memory-delivery/verify.md#lo-que-la-campaña-no-podía-medir)). Una sesión real de este proyecto tiene de mediana 40 pedidos y 62 llamadas, empieza en unos 70.000 tokens y pasa de 200.000 en la mitad de los casos. Lo que una memoria ahorra o cuesta está ahí: en el relevo entre una sesión y la siguiente, en un store con cientos de memorias y en memorias que escribió una sesión anterior, no en una sembrada a mano. El arnés de hoy corre una sola sesión por corrida y no puede medir nada de eso. Este cambio le da sesiones encadenadas, una bifurcación que juega la segunda parte de las dos formas, un ruido de 300 reglas y el costo de cada llamada, y fija antes de correr qué resultado decide cada hipótesis.
 
 ## Lo que se midió sobre sesiones reales
 
@@ -59,7 +59,7 @@ Todo en `crates/clawg-eval/src/bin/agent-eval/`, leído en `8a2f3723`.
 - **Ningún brazo tiene shell.** Todos niegan `Bash` (`arm.rs:316-320`), y un nombre de herramienta negado la saca del contexto del agente, según la referencia del cliente: no puede ni intentarla. Un error repetido de un comando que no existe no se puede provocar.
 - **Las categorías `D` y `R` existen sin tareas** (`task.rs:11`); las seis tareas reales son K1, K2, K3, S, C y N.
 - **Sólo se leen los tokens del primer pedido.** `stream::parse` toma el `usage` del primer mensaje del asistente y nada más (`stream.rs:158-163`); `ToolCall` no guarda tokens (`stream.rs:14-26`). En un stream real cada evento del asistente trae el `id` de su mensaje y su `usage`, así que el dato está y no se lee.
-- **El `MEMORY.md` de `a4` va al revés.** `seed::seeded` ordena de la más nueva a la más vieja (`seed.rs:80-84`) y ese orden llega al archivo (`arm.rs:232`, `arm.rs:276-279`, `seed.rs:87-95`). Un agente que agrega notas al final deja la más nueva abajo, y en la tarea C el agente eligió «la que aparece más tarde», que era la vieja: el 0 de 2 de `a4` fue del arnés ([verify](../archive/2026-11-13-memory-delivery/verify.md#lo-que-no-cuenta-como-resultado)).
+- **El `MEMORY.md` de `a4` va al revés.** `seed::seeded` ordena de la más nueva a la más vieja (`seed.rs:80-84`) y ese orden llega al archivo (`arm.rs:232`, `arm.rs:276-279`, `seed.rs:87-95`). Un agente que agrega notas al final deja la más nueva abajo, y en la tarea C el agente eligió «la que aparece más tarde», que era la vieja: el 0 de 2 de `a4` fue del arnés ([verify](../2026-11-13-memory-delivery/verify.md#lo-que-no-cuenta-como-resultado)).
 - **`delivered` da por entregado el `MEMORY.md` entero** (`run.rs:185-193`), el que escribió el plan. No mira lo que el agente escribió después ni lo que el cliente carga de verdad.
 - **El ruido es uno.** `load_noise` lee `noise.json` (`task.rs:82`, `task.rs:212-234`), que tiene 15 reglas. No tiene tope, y los tests lo cuentan del archivo (`tests/agent_eval.rs:19-22`, `:164`), así que 300 reglas no rompen nada: falta poder elegir el ruido de una corrida.
 - **El reporte agrupa por tarea y brazo** (`report.rs:119-164`) y los costos van una línea por sesión y modelo (`report.rs:206-261`), con una sesión por corrida.
@@ -106,7 +106,7 @@ Se recomienda el tercero.
 
 ## Fuentes
 
-- El [verify](../archive/2026-11-13-memory-delivery/verify.md) de memory-delivery y los resultados de su campaña y del piloto.
+- El [verify](../2026-11-13-memory-delivery/verify.md) de memory-delivery y los resultados de su campaña y del piloto.
 - Las dos pasadas sobre los transcripts, del 2026-11-11 y el 2026-11-13, fuera de git; la tabla del ahorro sale de la simulación de la segunda, corrida de nuevo con las tres relaciones de precio.
 - Las páginas del cliente citadas arriba, leídas el 2026-11-13.
 - Código de `develop` en `8a2f3723`, con las rutas y líneas citadas en cada punto.

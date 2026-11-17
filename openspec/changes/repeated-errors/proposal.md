@@ -2,7 +2,7 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| 1 y 5 (clawg aprende de lo que pasa en la sesión sin que el agente decida guardar) | M: siete commits del producto (el último de docs), una verificación local y uno del arnés | — para el producto; [agent-eval-sessions](../agent-eval-sessions/proposal.md) (129) para la campaña paga | tareas escritas |
+| 1 y 5 (clawg aprende de lo que pasa en la sesión sin que el agente decida guardar) | M: siete commits del producto (el último de docs), una verificación local y uno del arnés | — para el producto; [agent-eval-sessions](../archive/2026-11-17-agent-eval-sessions/proposal.md) (129) para la campaña paga | tareas escritas |
 
 ## Problema
 
@@ -17,7 +17,7 @@ B, A y D, en ese orden. C queda afuera.
 1. **B, el aviso en el mismo turno.** `clawg hook post-tool-use` y `clawg hook post-tool-use-failure`, instalados con matcher `Bash`. Cuando la salida de la llamada trae la firma de un programa ausente que el comando llamó, el hook devuelve una línea por `additionalContext`, en el idioma preferido: el programa no existe en el Bash de esta máquina, no lo llames otra vez en esta sesión, usa Glob, Grep, Read o Edit u otro programa instalado.
 2. **A, el libro y la regla al arrancar.** Los mismos hooks anotan en `<data>/tool-failures.jsonl` cada fallo con firma, y el primer éxito verificado después de un fallo. Sólo anotan el programa, la herramienta, la sesión y la hora. `session-start` arma con el libro las reglas que valen y las imprime como la palabra de clawg, junto a la línea del idioma y antes de la evidencia. Una regla vale si en los últimos 30 días el programa falló en dos sesiones distintas o más, no anduvo ninguna vez y no está en el PATH del hook.
 3. **D, el diagnóstico.** `clawg doctor` lista las reglas aprendidas y nombra el `CLAUDE.md` que pide cada programa ausente. También avisa cuando el hook de arranque está instalado sin los dos hooks nuevos, con `clawg setup claude-code` como paso.
-4. **La medición en agent-eval.** Un brazo `a3-notools`, que es `a3` sin los dos hooks nuevos: es el `a3` que mide 129 antes de este cambio, porque los brazos toman los hooks de `setup::plan`. La tarea `shelf-eza-missing`, el shell acotado y el check `tool_failed_count` son de [agent-eval-sessions](../agent-eval-sessions/proposal.md) (129), que la propone como línea base de este cambio. Se construye cuando 129 esté aplicado.
+4. **La medición en agent-eval.** Un brazo `a3-notools`, que es `a3` sin los dos hooks nuevos: es el `a3` que mide 129 antes de este cambio, porque los brazos toman los hooks de `setup::plan`. La tarea `shelf-eza-missing`, el shell acotado y el check `tool_failed_count` son de [agent-eval-sessions](../archive/2026-11-17-agent-eval-sessions/proposal.md) (129), que la propone como línea base de este cambio. Se construye cuando 129 esté aplicado.
 
 ## Fuera de alcance
 

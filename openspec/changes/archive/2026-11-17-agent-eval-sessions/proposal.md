@@ -2,11 +2,11 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| medición (1, 5) | M–L, sólo en `crates/clawg-eval` (el binario `agent-eval` y sus datos) | [agent-eval](../archive/2026-11-17-agent-eval/proposal.md) (96); sigue a [memory-delivery](../archive/2026-11-13-memory-delivery/verify.md) (127, archivado) | tareas 1 a 14 aplicadas y verificadas; la [segunda verificación](verify.md#segunda-verificación) pidió las enmiendas de las tareas 15 a 28, sin aplicar. La campaña paga no corre antes de ellas |
+| medición (1, 5) | M–L, sólo en `crates/clawg-eval` (el binario `agent-eval` y sus datos) | [agent-eval](../2026-11-17-agent-eval/proposal.md) (96); sigue a [memory-delivery](../2026-11-13-memory-delivery/verify.md) (127, archivado) | tareas 1 a 14 aplicadas y verificadas; la [segunda verificación](verify.md#segunda-verificación) pidió las enmiendas de las tareas 15 a 28, sin aplicar. La campaña paga no corre antes de ellas |
 
 ## Problema
 
-La campaña de memory-delivery gastó 60 sesiones y no dio ganador. Su [verify](../archive/2026-11-13-memory-delivery/verify.md#lo-que-la-campaña-no-podía-medir) dice por qué: las sesiones del arnés tienen de 2 a 7 turnos y unos 17.000 tokens, con 16 memorias todos los brazos que entregan empatan, y una regla de decisión que nadie cumplió se mezcló con un artefacto del arnés (el orden del `MEMORY.md` de `a4`). Las sesiones reales, medidas en la [exploración](exploration.md#lo-que-se-midió-sobre-sesiones-reales), tienen 40 pedidos de mediana, pasan de 200.000 tokens en la mitad de los casos y se relevan con `/clear`.
+La campaña de memory-delivery gastó 60 sesiones y no dio ganador. Su [verify](../2026-11-13-memory-delivery/verify.md#lo-que-la-campaña-no-podía-medir) dice por qué: las sesiones del arnés tienen de 2 a 7 turnos y unos 17.000 tokens, con 16 memorias todos los brazos que entregan empatan, y una regla de decisión que nadie cumplió se mezcló con un artefacto del arnés (el orden del `MEMORY.md` de `a4`). Las sesiones reales, medidas en la [exploración](exploration.md#lo-que-se-midió-sobre-sesiones-reales), tienen 40 pedidos de mediana, pasan de 200.000 tokens en la mitad de los casos y se relevan con `/clear`.
 
 El arnés no puede jugar nada de eso: una corrida es una sesión (`crates/clawg-eval/src/bin/agent-eval/arm.rs:187`, `run.rs:466-490`), una tarea tiene un prompt (`task.rs:34`), un trazador sólo nace en la siembra (`task.rs:176-179`), el ruido son 15 reglas, ningún brazo tiene shell (`arm.rs:316-320`) y de cada sesión se lee sólo el primer pedido (`stream.rs:158-163`).
 
@@ -142,7 +142,7 @@ Sobre `shelf-eza-missing`, 3 corridas por brazo. Un **intento** es una llamada a
 - **Hay efecto:** bajo `a0`, la sesión 3 intenta `eza` al menos una vez en al menos 2 de 3.
 - **La memoria de hoy ya lo evita**, para `a3-notools` o `a4`: 0 intentos en la sesión 3 en 3 de 3.
 
-La memoria de hoy es la de antes de [repeated-errors](../repeated-errors/proposal.md) (131): `a3-notools`. Desde 131, `a3` trae los hooks de Bash que aprenden el programa que falta, así que bajo `a3` la sesión 3 llega a 0 intentos por lo que 131 agrega, y la fase 4 mediría a 131 en lugar de su línea base. El `a3` de ahora lo corre la campaña de 131.
+La memoria de hoy es la de antes de [repeated-errors](../../repeated-errors/proposal.md) (131): `a3-notools`. Desde 131, `a3` trae los hooks de Bash que aprenden el programa que falta, así que bajo `a3` la sesión 3 llega a 0 intentos por lo que 131 agrega, y la fase 4 mediría a 131 en lugar de su línea base. El `a3` de ahora lo corre la campaña de 131.
 
 Si hay efecto y ninguna memoria lo evita, 131 tiene su línea base y su meta, 0 intentos en 3 de 3. Si no hay efecto, la tarea no mide lo que 131 necesita y 131 la cambia en su propuesta.
 

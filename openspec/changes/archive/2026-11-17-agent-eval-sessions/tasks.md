@@ -222,8 +222,10 @@ La [tercera verificación](verify.md#tercera-verificación) encontró cuatro pun
 
 Local, con una clave de API y autorización de gasto; nada de esto es de la suite.
 
-- [ ] La guía de la campaña, fuera de git, con las fases en el orden 1, 2, 4, 3, la regla de decisión de la [propuesta](proposal.md#la-regla-de-decisión) copiada sin cambios, y lo que D22 deja a la guía: los topes por proceso (1,20 R, 0,50 D y la K larga, 0,15 E y el piloto) y la cuenta de lo gastado con `agent-eval costs` contra el peor caso de cada corrida, sin pasar de 30 USD; el canario (Δ entre 500 y 3.000 tokens); el texto con que el shell informa que falta `eza`; el primer pedido de las sesiones de E bajo `a0` y su línea `init`; y las lecturas negadas de cada corrida del humo.
-- [ ] Fase 0: todas las tareas nuevas en seco con el modelo real.
-- [ ] Fase 1, humo y canarios. Es una puerta: la campaña sigue sólo si pasa, y el canario es puerta de la fase 3.
-- [ ] Fases 2, 4 y 3, y el resultado contra la regla, en `verify.md`.
-- [ ] Al archivar: AS1 reemplaza el orden del `MEMORY.md` en MD3 de [`specs/eval`](../../specs/eval/spec.md) (`openspec/specs/eval/spec.md:1491`), y AS2 a AS22 pasan a esa sección, con las enmiendas ya aplicadas sobre lo que modifican.
+- [x] La guía de la campaña, fuera de git, con las fases en el orden 1, 2, 4, 3, la regla de decisión de la [propuesta](proposal.md#la-regla-de-decisión) copiada sin cambios, y lo que D22 deja a la guía: los topes por proceso (1,20 R, 0,50 D y la K larga, 0,15 E y el piloto) y la cuenta de lo gastado con `agent-eval costs` contra el peor caso de cada corrida, sin pasar de 30 USD; el canario (Δ entre 500 y 3.000 tokens); el texto con que el shell informa que falta `eza`; el primer pedido de las sesiones de E bajo `a0` y su línea `init`; y las lecturas negadas de cada corrida del humo.
+- [ ] Fase 0: todas las tareas nuevas en seco con el modelo real. No hay constancia de una corrida aparte en `verify.md`: el humo de la fase 1 las corrió con el modelo real.
+- [x] Fase 1, humo y canarios. Es una puerta: la campaña sigue sólo si pasa, y el canario es puerta de la fase 3.
+- [x] Fases 2, 4 y 3, y el resultado contra la regla, en `verify.md`.
+- [x] Al archivar: AS1 reemplaza el orden del `MEMORY.md` en MD3 de [`specs/eval`](../../../specs/eval/spec.md), y AS1 a AS22 pasan a la sección «`agent-eval`: las sesiones, el relevo y los artefactos», con las enmiendas nombradas en los requisitos que modifican.
+
+Lo que la campaña dejó sin medir (la celda C de la escala, el relevo a 150.000 tokens y el `session_summary` que ningún brazo guardó) está en el [verify](verify.md#pendiente-después-de-publicar).

@@ -1,6 +1,6 @@
 # agent-eval-sessions — Verificación
 
-Veredicto: **cumple lo que la suite puede comprobar**. Quedan fuera de esta verificación el CI de Linux y Windows y la campaña, que es local y paga.
+Veredicto: **cumple lo que la suite puede comprobar**. El CI de Linux y Windows pasó después sobre `9a76a8ec`, que lleva todo el código del cambio, y la campaña paga corrió (sección «La campaña»); lo que quedó sin medir está en «Pendiente después de publicar», al final.
 
 ## Qué se corrió
 
@@ -43,9 +43,9 @@ El cambio no toca el ranking, así que no corre `rag-eval`. Ninguna corrida fue 
 
 ## Pendiente en local
 
-- El CI en verde en Linux y Windows.
+- El CI en verde en Linux y Windows: hecho, pasó sobre `9a76a8ec`.
 - La campaña: fase 0 (todas las tareas nuevas en seco con el modelo real), fase 1 (humo y canarios, que es una puerta) y las fases 2 a 4, con la regla de decisión de la [propuesta](proposal.md#la-regla-de-decisión) copiada sin cambios. Lo que el arnés no comprueba y sólo una sesión paga muestra: que `--continue` conserve el contexto en `-p`, que la memoria nativa escriba en `-p`, el modelo de carga de 200 líneas o 25.000 bytes del `MEMORY.md` y el costo real de las sesiones largas.
-- Al archivar: AS1 reemplaza el orden del `MEMORY.md` en MD3 de `openspec/specs/eval/spec.md`, y AS2 a AS12 pasan a esa sección, con el escenario de AS9 corregido.
+- Al archivar: AS1 reemplaza el orden del `MEMORY.md` en MD3 de `openspec/specs/eval/spec.md`, y AS2 a AS12 pasan a esa sección, con el escenario de AS9 corregido: hecho el 2026-11-17 (AS1 a AS22).
 
 ## Segunda verificación
 
@@ -252,3 +252,18 @@ Ninguna herramienta de clawg queda como candidata a una dieta.
 - **La memoria de hoy no lo evita:** `a3-notools` y `a4` intentan `eza` en la sesión 3 en 3 de 3 cada uno.
 
 repeated-errors tiene su línea base y su meta: 0 intentos en 3 de 3. El texto del shell fue `/usr/bin/bash: line 1: eza: command not found` en todas las sesiones. Después de fallar en Bash, el agente casi siempre prueba `eza` en la herramienta PowerShell, que pide una aprobación que nadie da, y termina contando con `Glob`. H6 cuenta sólo Bash, igual en todos los brazos.
+
+## Al archivar (2026-11-17)
+
+- AS1 a AS22 pasan con sus ids a [`specs/eval`](../../../specs/eval/spec.md), en «`agent-eval`: las sesiones, el relevo y los artefactos». AS1 reemplaza el orden del `MEMORY.md` de `a4` en MD3, y MD3 suma además la numeración de los ids del export, de la más vieja a la más nueva, que arregló la campaña (H2). Las enmiendas AS13 a AS22 quedan como requisitos propios, y los requisitos que modifican (AS2, AS3, AS5, AS6, AS9 y AS10) los nombran.
+- Ninguna spec del producto cambia. `docs/reference/testing.md` ya describe las sesiones, la bifurcación, los artefactos y el reporte.
+- Sale en 0.88.0. Todo el código está en `develop`: el CI de Linux y Windows pasó sobre `9a76a8ec`, y después sólo cambió `crates/clawg-eval` (el número de los ids del export) y documentos.
+- Las cuatro hipótesis con respuesta (H1, H2, H4 y H6) están en «La campaña». H3 y H5 se informan sin decidir nada.
+
+## Pendiente después de publicar
+
+Local, con una clave de API y autorización de gasto; nada de esto es de la suite.
+
+- Volver a correr la celda C de la escala: `amb-ts-semver-pin-conflict` bajo `a3` con 300 reglas. Falló por los ids invertidos del export, que `seed.rs` ya numera como un store; la campaña de H2 no se puede comparar con una corrida nueva en esa tarea.
+- Medir el relevo en el régimen de 150.000 tokens o más. La campaña lo midió a unos 66.000 tokens, así que el umbral del aviso de corte no sale de ella.
+- Ninguna sesión de ningún brazo guardó un `session_summary`: sin eso, el traspaso entre sesiones del producto no se puso a prueba con esta campaña.

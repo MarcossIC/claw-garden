@@ -2,7 +2,7 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| 1 (lo que el agente lee para guardar y buscar) y transversal (costo de cada sesión) | M: el detector del bloque viejo es S; la opción de variante y el brazo del arnés, S–M; el cambio del valor por defecto queda fuera, detrás de una campaña | — para el detector; la decisión del valor por defecto, de la campaña de [agent-eval-sessions](../agent-eval-sessions/proposal.md) (129); toma el dato de [memory-delivery](../archive/2026-11-13-memory-delivery/verify.md) (127) que esperaba [claude-code-plugin](../claude-code-plugin/exploration.md) (120) | exploración |
+| 1 (lo que el agente lee para guardar y buscar) y transversal (costo de cada sesión) | M: el detector del bloque viejo es S; la opción de variante y el brazo del arnés, S–M; el cambio del valor por defecto queda fuera, detrás de una campaña | — para el detector; la decisión del valor por defecto, de la campaña de [agent-eval-sessions](../archive/2026-11-17-agent-eval-sessions/proposal.md) (129); toma el dato de [memory-delivery](../archive/2026-11-13-memory-delivery/verify.md) (127) que esperaba [claude-code-plugin](../claude-code-plugin/exploration.md) (120) | exploración |
 
 **Tesis.** El bloque del protocolo que `clawg setup claude-code` escribe en el `CLAUDE.md` del usuario tiene dos problemas distintos. El primero es un bug: el bloque instalado no se actualiza con el binario, y nada lo avisa salvo con una preferencia de idioma, así que un cliente sigue leyendo reglas que el servidor ya cambió. El segundo es de costo: el bloque son unos 3.550 tokens por pedido al modelo y en sesiones cortas no cambió ningún resultado, pero nadie midió una sesión larga. El primero se arregla ya. El segundo se prepara ya (una opción para elegir la variante, con la variante corta escrita en el producto) y se decide con una campaña de tareas largas, con la regla de decisión fijada antes de correrla.
 
@@ -64,7 +64,7 @@ No se decide leyendo. Lo que sí se puede hacer ya, sin apostar nada: escribir (
 
 ## La campaña que decide
 
-[agent-eval-sessions](../agent-eval-sessions/proposal.md) (129) arma las tareas largas: un relevo de dos sesiones (R), una decisión revisada en tres sesiones (D) y una K de 12 a 15 pedidos, sobre un fixture de unos 600 KB. Deja lugar para este cambio: sus tareas nuevas corren bajo `l0` sin cambios y su informe da las llamadas a clawg por sesión ([«Lugar para 131 y 132»](../agent-eval-sessions/proposal.md#lugar-para-131-y-132)). Este cambio le suma el brazo `a3-short` y fija, antes de correr, qué tiene que pasar para cambiar el valor por defecto, con las reglas de lectura de 129 ([design](design.md#d6-la-regla-de-decisión-del-valor-por-defecto)).
+[agent-eval-sessions](../archive/2026-11-17-agent-eval-sessions/proposal.md) (129) arma las tareas largas: un relevo de dos sesiones (R), una decisión revisada en tres sesiones (D) y una K de 12 a 15 pedidos, sobre un fixture de unos 600 KB. Deja lugar para este cambio: sus tareas nuevas corren bajo `l0` sin cambios y su informe da las llamadas a clawg por sesión ([«Lugar para 131 y 132»](../archive/2026-11-17-agent-eval-sessions/proposal.md#lugar-para-131-y-132)). Este cambio le suma el brazo `a3-short` y fija, antes de correr, qué tiene que pasar para cambiar el valor por defecto, con las reglas de lectura de 129 ([design](design.md#d6-la-regla-de-decisión-del-valor-por-defecto)).
 
 ## Decisiones que quedan abiertas
 

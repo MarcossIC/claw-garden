@@ -124,7 +124,7 @@ Que falten los hooks se mira con una función pura sobre el texto del `settings.
 
 `a3-notools` es `a3` con las claves `PostToolUse` y `PostToolUseFailure` sacadas del `settings.json` que da `setup::plan` (`crates/clawg-eval/src/bin/agent-eval/arm.rs:243-249`). Es el `a3` de antes de este cambio, sin mantener una copia de los hooks viejos.
 
-La tarea (`shelf-eza-missing`), el shell acotado y `tool_failed_count` son de [129](../agent-eval-sessions/proposal.md#lugar-para-131-y-132). Si su diseño deja que el check reciba el texto de la firma, se le pasa `eza: command not found`, que es la forma que reconoce RE2. Este cambio no le pide más.
+La tarea (`shelf-eza-missing`), el shell acotado y `tool_failed_count` son de [129](../archive/2026-11-17-agent-eval-sessions/proposal.md#lugar-para-131-y-132). Si su diseño deja que el check reciba el texto de la firma, se le pasa `eza: command not found`, que es la forma que reconoce RE2. Este cambio no le pide más.
 
 **Descartado:** comparar `a3` contra el resultado de `a3` de la campaña de 129. Esa campaña corre con otra versión del binario y con 3 corridas, y la regla de decisión pide 5 con todo lo demás igual. Su `a0` sí se reusa: no corre clawg.
 
