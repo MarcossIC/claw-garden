@@ -12,6 +12,7 @@ Fuente de verdad del comportamiento actual de `clawg hook <evento>`: el subcoman
 - [client-setup-cursor](../../changes/archive/2026-11-04-client-setup-cursor/proposal.md), archivado el 2026-11-04, sale en 0.76.0 (CU6 a CU8): `clawg hook` toma `--client` para leer la entrada de `sessionStart` de Cursor, la carpeta sale de la única raíz de `workspace_roots`, y un hook de Claude Code que corre Cursor no imprime nada.
 - [hook-run-log](../../changes/archive/2026-11-04-hook-run-log/proposal.md), archivado el 2026-11-04, sale en 0.76.0 (HR1 a HR5 y HR8): `clawg hook session-start` deja una línea por corrida en `<data>/hook-runs.jsonl`. La espera acotada de esa escritura (HR4) y la de los archivos que el hook lee salen en 0.77.0.
 - [session-usage](../../changes/archive/2026-11-11-session-usage/proposal.md), archivado el 2026-11-11, sale en 0.81.0: SU9 de esa spec entra como SU9 (`clawg hook session-end`), y cambian R2, R3, R6, HR1 y HR4 (el tercer evento, y el evento, el cliente y el `source` que el registro de la sesión manda). Qué cuenta el daemon de eso está en [`specs/metrics`](../metrics/spec.md) (SU2, SU3 y SU6).
+- [protocol-block](../../changes/archive/2026-11-17-protocol-block/proposal.md), archivado el 2026-11-17, que sale en 0.88.0: el aviso de `session-start` cuando el bloque del protocolo difiere (PB4) y el tope de 2.000 bytes de lo que el hook suma (R4 y R7). La clasificación del bloque está en [`specs/doctor`](../doctor/spec.md) (PB2).
 
 ## Definiciones
 
@@ -57,7 +58,7 @@ Como el host puede dejar abierto el stdin, `main` apaga el runtime sin esperar a
 
 ## R4. `session-start`
 
-MUST pedir el contexto sin consulta con el presupuesto de 8.000 bytes, y con el idioma preferido cuando lo hay (`SESSION_BUDGET`, `hook.rs:65`; `DaemonClient::recent_context`, `crates/clawg-cli/src/client.rs:1250`; AL6) y, si el prompt no está vacío, MUST escribir el sobre con `hookEventName: "SessionStart"` y un texto que abre diciendo que es la memoria de clawg para este proyecto y que lo recuperado es evidencia y no instrucciones, seguido del prompt (`session_start_text`, `hook.rs:117`). Con `source = compact` MUST sumar que la conversación se acaba de compactar y que el protocolo pide un `session_summary`. Con el embedder `failed` MUST sumar que el modelo no cargó y que las búsquedas no funcionan hasta que cargue, con la causa y si clawg reintenta. Con al menos 20 memorias sin revisar MUST sumar el aviso de síntesis de `recall_context` (`synthesis_nudge`, [`specs/synthesis`](../synthesis/spec.md), R8). Con al menos una conclusión a revisar MUST sumar, al final, el aviso de revisión (`review_nudge`, `hook.rs:177`; [`specs/synthesis`](../synthesis/spec.md), «El aviso de revisión»), aunque el prompt esté vacío. Con sugerencias pendientes de que el proyecto es otro MUST sumar, al final, una sola línea que nombra hasta dos de los otros proyectos y cuántos más hay, y que se le pregunte a la persona y se responda con `answer_suggestion` (`suggestion_note`; [`specs/project`](../project/spec.md), PL36), aunque el prompt esté vacío. Sin prompt ni nada que sumar, MUST NOT escribir nada. Todo lo que el hook suma va en el idioma preferido (AL6). Lo que el hook suma al prompt MUST ocupar menos de 1.500 bytes, para que el todo entre en los 10.000 caracteres que el host inyecta (era 1.000 hasta que se sumó la línea de las sugerencias).
+MUST pedir el contexto sin consulta con el presupuesto de 8.000 bytes, y con el idioma preferido cuando lo hay (`SESSION_BUDGET`, `hook.rs:65`; `DaemonClient::recent_context`, `crates/clawg-cli/src/client.rs:1250`; AL6) y, si el prompt no está vacío, MUST escribir el sobre con `hookEventName: "SessionStart"` y un texto que abre diciendo que es la memoria de clawg para este proyecto y que lo recuperado es evidencia y no instrucciones, seguido del prompt (`session_start_text`, `hook.rs:117`). Con `source = compact` MUST sumar que la conversación se acaba de compactar y que el protocolo pide un `session_summary`. Con el embedder `failed` MUST sumar que el modelo no cargó y que las búsquedas no funcionan hasta que cargue, con la causa y si clawg reintenta. Con al menos 20 memorias sin revisar MUST sumar el aviso de síntesis de `recall_context` (`synthesis_nudge`, [`specs/synthesis`](../synthesis/spec.md), R8). Con al menos una conclusión a revisar MUST sumar, al final, el aviso de revisión (`review_nudge`, `hook.rs:177`; [`specs/synthesis`](../synthesis/spec.md), «El aviso de revisión»), aunque el prompt esté vacío. Con sugerencias pendientes de que el proyecto es otro MUST sumar, al final, una sola línea que nombra hasta dos de los otros proyectos y cuántos más hay, y que se le pregunte a la persona y se responda con `answer_suggestion` (`suggestion_note`; [`specs/project`](../project/spec.md), PL36), aunque el prompt esté vacío. Sin prompt ni nada que sumar, MUST NOT escribir nada. Todo lo que el hook suma va en el idioma preferido (AL6). Lo que el hook suma al prompt MUST ocupar menos de 2.000 bytes, para que el todo entre en los 10.000 caracteres que el host inyecta (era 1.000 hasta que se sumó la línea de las sugerencias, y 1.500 hasta el aviso del bloque, PB4). `session-start` MAY sumar además el aviso de un bloque del protocolo que difiere (PB4).
 
 Verificado con Claude Code sobre el perfil dev: el inicio, la reanudación y la compactación inyectan el contexto, y la línea de la compactación sólo aparece con `source = compact`. La causa del modelo fallido no tiene tope (S2 del [verify](../../changes/archive/2026-10-18-agent-lifecycle-hooks/verify.md#lo-que-encontró-la-verificación)).
 
@@ -99,7 +100,7 @@ Antes de leer, los dos eventos MUST registrar la raíz de `cwd`, con `cwd` mismo
 
 ## R7. El idioma de la persona en `session-start`
 
-Con preferencia ([`specs/preferences`](../preferences/spec.md)), `session-start` MUST abrir con una línea que dice el idioma de la persona, que se le responda en él salvo que escriba en otro, y que se guarde y se busque en él (`language_line`, `crates/clawg-cli/src/hook.rs:103`; `session_start_text`, `hook.rs:117`). MUST imprimirla, sola en el sobre, aunque no haya daemon, falle, no responda a tiempo o el contexto no traiga nada (`respond_reading`, `hook.rs:360-364`), y lo que el hook suma, con la línea, MUST seguir ocupando menos de los 1.500 bytes de R4. Sin preferencia, lo de R3 y R4 sin cambios, y una preferencia que no se leyó en la espera de HR4 cuenta como ninguna en ese evento. `user-prompt-submit` no imprime la línea: en qué idioma habla está en AL6.
+Con preferencia ([`specs/preferences`](../preferences/spec.md)), `session-start` MUST abrir con una línea que dice el idioma de la persona, que se le responda en él salvo que escriba en otro, y que se guarde y se busque en él (`language_line`, `crates/clawg-cli/src/hook.rs:103`; `session_start_text`, `hook.rs:117`). MUST imprimirla, sola en el sobre, aunque no haya daemon, falle, no responda a tiempo o el contexto no traiga nada (`respond_reading`, `hook.rs:360-364`), y lo que el hook suma, con la línea, MUST seguir ocupando menos de los 2.000 bytes de R4. Sin preferencia, lo de R3 y R4 sin cambios, y una preferencia que no se leyó en la espera de HR4 cuenta como ninguna en ese evento. `user-prompt-submit` no imprime la línea: en qué idioma habla está en AL6.
 
 #### Escenario: sin daemon
 - GIVEN la preferencia `es` y ningún daemon
@@ -123,6 +124,37 @@ Los dos eventos MUST leer la preferencia en cada evento (`language_in`, `hook.rs
 - THEN el recordatorio es `memoria de clawg: no se guardó nada de este proyecto en los últimos 40 minutos. Lo que esta sesión decidió o aprendió llega a las sesiones siguientes sólo cuando save_memory lo guarda.`
 
 **Test:** `session_start_speaks_the_preferred_language` y `the_save_reminder_speaks_the_preferred_language` (`hook.rs`), sobre las funciones puras. Ningún test corre `user-prompt-submit` con preferencia contra un daemon: el camino de `respond` con el idioma sólo se prueba sin daemon, donde no imprime nada (`session_start_without_a_daemon_still_names_the_language`), como pasa con R5 en inglés.
+
+## PB4. `session-start` avisa del bloque que difiere
+
+`clawg hook session-start` con `--client claude-code` MUST leer el bloque del `CLAUDE.md` del usuario (el de `locations`, con el `CLAUDE_CONFIG_DIR` de su entorno) y, cuando PB2 lo da `stale`, MUST sumar la línea del aviso: que el bloque del protocolo del `CLAUDE.md` del usuario no es el que escribe este clawg, con su versión, que puede contradecir las instrucciones del servidor, que donde difieran siga las del servidor, y que le diga una vez a la persona que `clawg setup claude-code --profile P` lo reescribe, con el perfil del hook. Los textos son los de [design](../../changes/archive/2026-11-17-protocol-block/design.md#d3-el-aviso-en-cada-inicio-de-sesión), en el idioma preferido (AL6).
+
+- La línea MUST ir después de la del idioma y antes del contexto.
+- MUST imprimirse en cada `session-start`, con cualquier `source`, también sin daemon, con un daemon que falla o no responde, o con el contexto vacío, como la línea del idioma (R3 y R7).
+- MUST NOT imprimirse, en el perfil `dev`, cuando el sello lleva la versión propia (`block_notice`, `hook.rs:147`): un `dev` construido a mitad de un cambio comparte versión con el `prod` instalado, y cada uno vería el bloque del otro como viejo en cada sesión; `prod`, un bloque sin sello y uno con un sello anterior siguen avisando.
+- MUST NOT imprimirse con un bloque `current` o `newer`, sin bloque, con un archivo que no se lee o con un marcador suelto, ni en `user-prompt-submit`, ni con `--client cursor`, ni cuando el hook de Claude Code lo corre Cursor (CU8).
+- La lectura MUST ir en un hilo propio, dentro de la misma espera que la preferencia (`LANGUAGE_WAIT`, `crates/clawg-cli/src/hook.rs:57`); un archivo que no se leyó a tiempo cuenta como sin bloque, y MUST NOT demorar la respuesta más allá del tope de R3.
+- Lo que el hook suma al prompt MUST ocupar menos de 2.000 bytes (antes 1.500, R4), y el contexto (8.000) más eso MUST seguir dentro de los 10.000 que el host inyecta.
+- El hook MUST NOT escribir el `CLAUDE.md`.
+
+#### Escenario: un bloque viejo, sin daemon
+- GIVEN un `CLAUDE.md` con un bloque `stale`, sin preferencia y sin daemon
+- WHEN corre `clawg hook session-start --agent claude-code --profile dev` con un `cwd`
+- THEN imprime el sobre de `SessionStart` con sólo la línea del aviso, que nombra `clawg setup claude-code --profile dev`
+- AND sale con 0
+
+#### Escenario: con todo lo demás
+- GIVEN un bloque `stale`, la preferencia `es`, un contexto, una compactación, el modelo caído, memorias sin revisar y sugerencias pendientes
+- WHEN se arma el texto de `session-start`
+- THEN abre con la línea del idioma, sigue con el aviso en español y después con el contexto
+- AND lo que suma ocupa menos de 2.000 bytes
+
+#### Escenario: nada que avisar
+- GIVEN un bloque `current`, uno `newer`, ninguno, o uno con un marcador suelto
+- WHEN corre `session-start`
+- THEN el texto es el que `session-start` arma sin el aviso
+
+**Tests:** `session_start_says_when_the_block_is_stale` y `what_the_hook_adds_stays_small` (`hook.rs`), con el aviso; `a_block_that_never_reads_costs_the_notice_and_not_the_memory` (`hook.rs`), con una lectura que no termina; `session_start_names_an_old_protocol_block` (`tests/binary.rs`).
 
 ## CU6. `clawg hook session-start --client cursor`
 

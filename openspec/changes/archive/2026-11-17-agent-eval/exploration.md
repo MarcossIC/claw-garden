@@ -2,7 +2,7 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| medición (1, 5) | L (por fases; la primera es S y no gasta) | — (absorbe M3 de [revision-eval](../archive/2026-10-21-revision-eval/proposal.md), 48, archivado) | exploración (borrador) |
+| medición (1, 5) | L (por fases; la primera es S y no gasta) | — (absorbe M3 de [revision-eval](../2026-10-21-revision-eval/proposal.md), 48, archivado) | exploración (borrador) |
 
 **Tesis:** `rag-eval` mide qué se recupera y `--agent-view` qué texto le llega al agente, pero nada mide si una sesión de un agente de código con clawg resuelve una tarea mejor, más rápido o más barato que sin clawg, ni cuánto daña una memoria vieja, ni qué calidad tienen los saves que escribe el agente. Cada cambio que tocó lo que ve el agente se verificó con una sesión manual de Claude Code (25, 41, 45). Este cambio propone convertir esa verificación en una medición repetible con sesiones reales de `claude -p`, empezando por un piloto chico y por la serie M3 que revision-eval dejó escrita y sin correr.
 
@@ -178,12 +178,12 @@ Una investigación posterior, sobre la integración con Claude Code, dejó tres 
 
 | Pregunta | Para qué cambio | Qué se cuenta, y en qué tanda |
 |---|---|---|
-| ¿Cuántas sesiones llegan a compactar sin haber guardado un `session_summary`? | [session-lifecycle](../session-lifecycle/exploration.md) (99), parte B | En el stream de cada corrida larga y en las tareas R: eventos de compactación y saves de `session_summary` antes de cada uno. Campaña núcleo |
+| ¿Cuántas sesiones llegan a compactar sin haber guardado un `session_summary`? | [session-lifecycle](../../session-lifecycle/exploration.md) (99), parte B | En el stream de cada corrida larga y en las tareas R: eventos de compactación y saves de `session_summary` antes de cada uno. Campaña núcleo |
 | ¿Un resumen del cliente (`compact_summary`) sirve tanto como uno del agente para retomar? | 99, parte C | Tareas R con dos siembras de LAST SESSION, una con cada resumen. Segunda tanda |
 | ¿Los subagentes llaman a las herramientas de clawg? | 99, parte D | Llamadas a `search_memory` y `search_project` dentro de un subagente. Piloto, sin costo extra |
-| ¿Un aviso `gone=` (algo que la memoria nombra ya no existe) hace que el agente compruebe el código antes de usar la memoria? | [memory-anchors](../memory-anchors/exploration.md) (98), paso 2 | Una tarea S con una memoria que nombra una función que se renombró antes de la tarea, con y sin el aviso. El error es determinista: el diff usa el nombre viejo. Segunda tanda, después del paso 2 de 98 |
-| ¿Clawg agrega algo sobre la memoria nativa con los mismos hechos? | [native-memory-import](../archive/2026-10-31-native-memory-import/exploration.md) (100), parte B | Es A3 contra A4, la pregunta de producto de P1: 100 no recomienda apagar la memoria nativa hasta tenerla |
-| ¿Buscar en `UserPromptSubmit` y mostrar hasta 3 entradas compactas ayuda más que lo que cuesta? | «Ideas evaluadas» del [README](../../README.md) | Un brazo de diagnóstico más, A3 con ese hook, sólo si el piloto muestra muchas tareas K sin ninguna búsqueda. No entra en el piloto |
+| ¿Un aviso `gone=` (algo que la memoria nombra ya no existe) hace que el agente compruebe el código antes de usar la memoria? | [memory-anchors](../../memory-anchors/exploration.md) (98), paso 2 | Una tarea S con una memoria que nombra una función que se renombró antes de la tarea, con y sin el aviso. El error es determinista: el diff usa el nombre viejo. Segunda tanda, después del paso 2 de 98 |
+| ¿Clawg agrega algo sobre la memoria nativa con los mismos hechos? | [native-memory-import](../2026-10-31-native-memory-import/exploration.md) (100), parte B | Es A3 contra A4, la pregunta de producto de P1: 100 no recomienda apagar la memoria nativa hasta tenerla |
+| ¿Buscar en `UserPromptSubmit` y mostrar hasta 3 entradas compactas ayuda más que lo que cuesta? | «Ideas evaluadas» ([ideas.md](../../../ideas.md)) | Un brazo de diagnóstico más, A3 con ese hook, sólo si el piloto muestra muchas tareas K sin ninguna búsqueda. No entra en el piloto |
 
 ## Hallazgos laterales
 

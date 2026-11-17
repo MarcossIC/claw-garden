@@ -74,7 +74,7 @@ pub(crate) struct Found {
 /// A text with its secrets replaced by `[REDACTED:<kind>]`, and the kinds that
 /// were replaced, each once, in order of first appearance.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Redacted {
+pub struct Redacted {
     pub text: String,
     pub kinds: Vec<SecretKind>,
 }
@@ -232,7 +232,7 @@ pub(crate) fn find_secrets(text: &str) -> Vec<Found> {
 
 /// `text` with every secret [`find_secrets`] reports replaced by its
 /// placeholder.
-pub(crate) fn redact(text: &str) -> Redacted {
+pub fn redact(text: &str) -> Redacted {
     let mut out = String::with_capacity(text.len());
     let mut kinds: Vec<SecretKind> = Vec::new();
     let mut at = 0;

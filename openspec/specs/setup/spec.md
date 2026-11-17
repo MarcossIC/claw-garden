@@ -10,6 +10,7 @@ Fuente de verdad del comportamiento actual de `clawg setup <cliente>`: el subcom
 - [client-setup-cursor](../../changes/archive/2026-11-04-client-setup-cursor/proposal.md), archivado el 2026-11-04, sale en 0.76.0: `clawg setup cursor` (CU1 a CU5), que escribe el servidor en `~/.cursor/mcp.json` y el hook de `sessionStart` en `~/.cursor/hooks.json`, con la misma escritura, copia y reporte que R7. Lo que sólo Cursor real reproduce queda en prod ([pendiente](../../changes/archive/2026-11-04-client-setup-cursor/verify.md#pendiente-en-prod)).
 - [setup-local-hooks](../../changes/archive/2026-11-08-setup-local-hooks/proposal.md), archivado el 2026-11-08, sale en 0.80.0: `clawg setup claude-code --local` y `--path DIR` (SL1 a SL6), que instalan sólo los hooks de Claude Code en `<carpeta>/.claude/settings.local.json`, con la misma escritura, copia y reporte que R7. Lo que sólo Claude Code real reproduce queda para el piloto ([pendiente](../../changes/archive/2026-11-08-setup-local-hooks/verify.md#pendiente-en-prod)).
 - [session-usage](../../changes/archive/2026-11-11-session-usage/proposal.md), archivado el 2026-11-11, sale en 0.81.0: SU10 de esa spec, repartido en los requisitos que listan los hooks (R3 y R6 para Claude Code, CU1, CU3 a CU5 para Cursor y SL2 para `--local`) en lugar de una sección propia: el hook `SessionEnd` de Claude Code, con y sin `--local`, y `sessionEnd` de Cursor. Qué hace ese hook y qué cuenta el daemon con él, en [`specs/hooks`](../hooks/spec.md) (SU9) y [`specs/metrics`](../metrics/spec.md) (SU3 y SU10).
+- [protocol-block](../../changes/archive/2026-11-17-protocol-block/proposal.md), archivado el 2026-11-17, que sale en 0.88.0: el sello con la versión del bloque (PB1), las variantes `full`, `short` y `off` (PB5) y `--protocol` (PB6). La frescura del bloque y su revisión están en [`specs/doctor`](../doctor/spec.md) (PB2 y PB3) y el aviso de `session-start` en [`specs/hooks`](../hooks/spec.md) (PB4); el brazo `a3-short`, en [`specs/eval`](../eval/spec.md) (PB7). La campaña que dejó el valor por defecto en `full` está en su [verify](../../changes/archive/2026-11-17-protocol-block/verify.md#la-campaña).
 
 ## Definiciones
 
@@ -21,7 +22,11 @@ Fuente de verdad del comportamiento actual de `clawg setup <cliente>`: el subcom
 - **Hook del plan:** `{"type": "command", "command": <exe>, "args": <argumentos del hook>, "timeout": 5}`, con `<exe>` la ruta absoluta del binario tal como la da `current_exe`, sin cambiar separadores ni agregar comillas (`planned_hook`, `setup.rs:336`). El cliente lo corre sin shell: `args` existe desde Claude Code 2.1.139.
 - **Hook de clawg de un evento y un perfil:** en forma exec, un hook con `args` cuyo `command` es un programa llamado `clawg` (o `clawg.exe`), cuyos dos primeros argumentos son `hook <evento>` y que lleva `--profile P` (o `--profile=P`); en forma heredada, un hook sin `args` cuyo `command`, partido como lo partiría un shell simple, cumple lo mismo (`is_clawg_hook`, `setup.rs:438`; `hook_words`, `setup.rs:426`).
 - **Forma heredada idéntica:** una forma heredada cuyas palabras son exactamente `<clawg> hook <evento> --agent claude-code --profile P` y cuyo `command` es la cadena que generaban las versiones anteriores de `setup` para esa ruta: la ruta sin comillas si sólo tiene letras ASCII, dígitos y `/._-:`, si no entre comillas dobles con `"`, `$`, `` ` `` y `\` escapados, seguida de los argumentos separados por un espacio (`is_legacy_hook`, `setup.rs:453`; `legacy_command`, `setup.rs:360`, que sólo reconoce y ya no escribe). En Windows esas versiones ya habían pasado la ruta a `/`.
-- **Bloque:** el texto de `crates/clawg-cli/src/mcp/protocol.md` entre `<!-- BEGIN CLAWG MEMORY PROTOCOL -->` y `<!-- END CLAWG MEMORY PROTOCOL -->`.
+- **Bloque:** el texto de `crates/clawg-cli/src/mcp/protocol.md` entre `<!-- BEGIN CLAWG MEMORY PROTOCOL -->` y `<!-- END CLAWG MEMORY PROTOCOL -->`, con el sello que sigue al marcador de apertura (`BEGIN_MARKER`, `END_MARKER`, `crates/clawg-cli/src/setup.rs:36-37`; `find_block`, `setup.rs:612`).
+- **Sello:** la línea que sigue al marcador de apertura, `<!-- clawg X.Y.Z -->` o `<!-- clawg X.Y.Z protocol=V -->`, con `X.Y.Z` como lo lee `Version::parse` (`crates/clawg-cli/src/update/version.rs:21`) y `V` una de las variantes (PB1).
+- **Variante:** `full`, `short` u `off` (PB5).
+- **Cuerpo:** el bloque sin el sello, con los finales de línea pasados a `\n`.
+- **Versión propia:** la de `clawg_core::build_info::version()`.
 - **Directorio de Cursor:** `~/.cursor`, con el home de `clawg_core::paths::home_dir` (el de `CLAWG_TEST_HOME` en un build de tests). Ahí viven `mcp.json` (los servidores de usuario, en `mcpServers`) y `hooks.json` (los hooks de usuario, en `hooks.<evento>`).
 - **Servidor del plan de Cursor:** `{"type": "stdio", "command": <exe>, "args": ["mcp", "--profile", P, "--agent", "cursor"]}`, con `<exe>` la ruta absoluta del binario en ejecución sin el prefijo `\\?\`. Su nombre es el del perfil (`Profile::mcp_server_name`), igual que en Claude Code.
 - **Argumentos del hook de Cursor de un evento:** `hook <evento> --agent cursor --client cursor --profile P`, con `<evento>` `session-start` (para `sessionStart`) o `session-end` (para `sessionEnd`) (`hook_args`, `crates/clawg-cli/src/setup/cursor.rs:140`).
@@ -70,7 +75,7 @@ El plan MUST agregar a `settings.json`, al final del arreglo de cada evento, un 
 
 ## R4. El bloque del protocolo
 
-El plan MUST agregar el bloque al final de `CLAUDE.md`, separado por una línea en blanco, o crear el archivo con él, con los finales de línea que el archivo ya usa (`install_block`, `setup.rs:628`). Un bloque idéntico MUST quedar como está y uno distinto MUST reescribirse; el texto fuera de los marcadores MUST NOT cambiar.
+El plan MUST agregar el bloque al final de `CLAUDE.md`, separado por una línea en blanco, o crear el archivo con él, con los finales de línea que el archivo ya usa (`install_block`, `setup.rs:628`). Un bloque idéntico MUST quedar como está y uno distinto MUST reescribirse; el texto fuera de los marcadores MUST NOT cambiar. Idéntico es lo que dice PB6: un bloque que sólo difiere en la versión del sello queda como está.
 
 **Tests:** `the_block_is_appended_and_rewritten_in_place` (`setup.rs`).
 
@@ -123,6 +128,67 @@ Cada archivo MUST escribirse por un temporal en el directorio del archivo real y
 `clawg setup claude-code` MUST escribir entre los marcadores el protocolo de [`specs/mcp`](../mcp/spec.md) LP9 para la preferencia del perfil (`protocol::text`; el archivo tal cual sin preferencia), que `read_state` lee en `State.language`. Con un bloque instalado para otro idioma MUST reescribirlo, y `--dry-run` MUST decirlo sin escribir.
 
 **Test:** `the_block_follows_the_preferred_language` y `another_language_rewrites_the_block` (`setup.rs`, sobre `plan`).
+
+## PB1. El sello
+
+`setup claude-code` MUST escribir el sello en la línea siguiente al marcador de apertura, con la versión propia, y con ` protocol=V` sólo cuando la variante se eligió (PB6). Los dos marcadores MUST NOT cambiar, así que `find_block` y `remove_block` de un binario anterior encuentran y quitan un bloque con sello. Un bloque sin sello MUST leerse como uno sin versión y sin variante elegida. Un sello que no se puede leer (otra forma, una versión mal escrita, una variante desconocida) MUST leerse como si no estuviera, y la línea cuenta como parte del cuerpo.
+
+#### Escenario: el sello de un bloque nuevo
+- GIVEN un `CLAUDE.md` que no existe y la versión propia `0.88.0`
+- WHEN `setup claude-code` planea instalar sin `--protocol`
+- THEN el archivo empieza por `<!-- BEGIN CLAWG MEMORY PROTOCOL -->`, sigue con `<!-- clawg 0.88.0 -->` y después `# Claw Garden memory protocol`
+
+#### Escenario: un bloque de antes del sello
+- GIVEN un bloque sin sello
+- WHEN se lee su sello
+- THEN no tiene versión ni variante elegida
+
+**Tests:** `the_block_carries_the_version_that_wrote_it` y `a_stamp_reads_its_version_and_its_choice` (`setup.rs`).
+
+## PB5. Las variantes del bloque
+
+`block` MUST armar, entre los marcadores y después del sello:
+
+- `full`: `protocol::text(language)`, el protocolo entero (`crates/clawg-cli/src/mcp/protocol.rs:58`);
+- `short`: el título del protocolo del idioma, la línea fija de [design](../../changes/archive/2026-11-17-protocol-block/design.md#d4-tres-variantes-de-un-solo-archivo) y las secciones «Session summary» y «After a compaction» (en español, «Resumen de sesión» y «Después de una compactación») tal como están en ese mismo texto, cada una hasta la sección siguiente;
+- `off`: nada; el bloque son los dos marcadores y el sello.
+
+El bloque `short` MUST ocupar menos de 2.000 bytes en los dos idiomas, y MUST NOT contener la apertura.
+
+#### Escenario: el bloque corto en español
+- GIVEN la preferencia `es`
+- WHEN se arma el bloque `short`
+- THEN contiene `## Resumen de sesión` con sus secciones (`Objetivo:` … `Validación:`) y `## Después de una compactación`
+- AND no contiene `## Cómo escribir un save` ni la primera oración de la apertura
+
+**Tests:** `the_short_protocol_keeps_the_session_summary_in_both_languages` y `the_short_protocol_has_no_opening` (`protocol.rs`); `each_variant_is_its_block` (`setup.rs`).
+
+## PB6. `--protocol`
+
+`clawg setup claude-code` MUST tomar `--protocol full|short|off`. Con la opción MUST escribir esa variante, con `protocol=V` en el sello. Sin la opción MUST mantener la variante del sello del bloque instalado cuando trae `protocol=`, y si no, escribir la de por defecto sin `protocol=`. La de por defecto MUST ser `full`: la campaña sobre las tareas largas de agent-eval-sessions no dio un caso para cambiarla, y la regla D6 fija que sólo un cambio propio, con una medición nueva, la mueve ([verify](../../changes/archive/2026-11-17-protocol-block/verify.md#la-celda-k-de-a3)). `--protocol` MUST ser un error de uso (clap, sale con 2) con `--remove`, con `--local` o `--path`. Con `setup cursor` MUST salir con 1, con `SetupError::ProtocolForCursor`, como el `FolderForCursor` de antes: no es un error de uso de clap, y no escribe nada. El reporte MUST nombrar la variante que quedó.
+
+Con el bloque instalado igual al planeado salvo por la versión del sello, el paso MUST ser `Unchanged` y el sello MUST quedar como estaba (R4 y R5).
+
+#### Escenario: elegir y conservar
+- GIVEN un `CLAUDE.md` con el bloque `full` de antes del sello
+- WHEN corre `clawg setup claude-code --protocol short --profile dev`
+- THEN el bloque es el `short` con `protocol=short` en el sello, y el texto fuera de los marcadores no cambió
+- AND una segunda corrida sin `--protocol` no escribe nada
+
+#### Escenario: sin elección, la de por defecto
+- GIVEN un bloque `full` sin `protocol=` en el sello
+- WHEN corre `clawg setup claude-code` sin `--protocol`
+- THEN el bloque queda `Unchanged`
+
+#### Escenario: con `--local`
+- WHEN corre `clawg setup claude-code --local --protocol short`
+- THEN sale con un error de uso (2) y no escribe nada
+
+#### Escenario: con Cursor
+- WHEN corre `clawg setup cursor --protocol short`
+- THEN sale con 1 y no escribe nada
+
+**Tests:** `the_protocol_option_writes_its_variant_and_a_run_without_it_keeps_it`, `a_new_version_with_the_same_text_rewrites_nothing` (`setup.rs`); `the_protocol_option_parses_and_excludes_local_remove_and_cursor` (`cli.rs`); `setup_protocol_short_writes_the_short_block` y `setup_cursor_refuses_a_protocol` (`tests/binary.rs`).
 
 ## CU1. `clawg setup cursor`
 

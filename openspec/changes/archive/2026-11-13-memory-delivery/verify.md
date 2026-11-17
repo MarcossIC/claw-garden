@@ -71,7 +71,7 @@ El 0 de 2 de `a4` en C es del arnés, no de la memoria nativa. Desde MD3 el `MEM
 
 ## Al archivar (2026-11-13)
 
-- MD1 a MD7 pasan con sus ids a [`specs/eval`](../../../specs/eval/spec.md), en «`agent-eval`: las reglas, el ruido y los brazos de entrega». La base del arnés (AE1 a AE6) sigue en la spec de [agent-eval](../../agent-eval/spec.md) (96), que no está archivado; esa sección la cita.
+- MD1 a MD7 pasan con sus ids a [`specs/eval`](../../../specs/eval/spec.md), en «`agent-eval`: las reglas, el ruido y los brazos de entrega». La base del arnés (AE1 a AE6) quedó en la spec de [agent-eval](../2026-11-17-agent-eval/spec.md) (96), que se archivó después, el 2026-11-17, en `specs/eval`; esa sección la cita.
 - Ninguna spec del producto cambia, y `docs/reference/testing.md` ya describe los brazos, el ruido y el registro de instrucciones desde `eb909d62`.
 - Sale en 0.86.0. Como sólo agrega documentos sobre `c575889d`, la suite no se corrió al archivar.
 - Lo que queda (sacar o no el bloque del protocolo, el orden del `MEMORY.md` de `a4`, B y las preguntas abiertas) no es de este cambio: cada cosa se propone aparte si se decide hacerla.

@@ -182,9 +182,7 @@ pub fn run(profile: Profile) -> Result<Report, DoctorError> {
     let sharing_error = sharing::load(&data_dir).err().map(|e| e.to_string());
     found.extend(checks::sharing(lang, sharing_error.as_deref(), profile));
     found.extend(checks::preferences(lang, &state, &preferences_path));
-    if let Some(language) = language {
-        found.extend(protocol_block(language, profile));
-    }
+    found.extend(protocol_block(language, profile));
     if let Some(facts) = &inspection.facts {
         let daemon_running = owner.as_ref().is_some_and(|o| o.holder == StoreHolder::Daemon);
         found.extend(checks::outbox(lang, &facts.outbox, daemon_running, profile));
@@ -218,6 +216,11 @@ pub fn run(profile: Profile) -> Result<Report, DoctorError> {
     let runs = crate::hook_log::read_runs(&data_dir);
     let cursor_hook = crate::setup::cursor::hook_installed(clawg_core::paths::home_dir().as_deref(), profile);
     found.extend(checks::hook_runs(lang, &runs, cursor_hook, now_ms(), profile));
+    let now = now_ms();
+    let rules = crate::tool_failures::rules(&crate::tool_failures::read(&data_dir), now, crate::tool_failures::on_path);
+    let instructions = if rules.is_empty() { Vec::new() } else { instruction_files() };
+    found.extend(checks::tool_rules(lang, &rules, &instructions, now));
+    found.extend(checks::tool_hooks(lang, &settings_files(), profile));
 
     let summary = Summary::of(&found);
     Ok(Report {
@@ -273,11 +276,48 @@ fn lines_in(path: &Path) -> usize {
     std::fs::read(path).map(|b| b.split(|&c| c == b'\n').filter(|l| !l.is_empty()).count()).unwrap_or(0)
 }
 
-/// The protocol block of the user `CLAUDE.md` `clawg setup claude-code`
-/// writes, against the one it would write for `language`.
-fn protocol_block(language: Lang, profile: Profile) -> Vec<Finding> {
+/// The instruction files of Claude Code that can ask for a program, as far as
+/// they read: the user's `CLAUDE.md`, and the `CLAUDE.md` and the
+/// `.claude/CLAUDE.md` of the current folder.
+fn instruction_files() -> Vec<(PathBuf, String)> {
     let home = clawg_core::paths::home_dir();
-    let Ok((_, _, path)) = crate::setup::locations(home.as_deref(), std::env::var_os("CLAUDE_CONFIG_DIR")) else {
+    let user = crate::setup::locations(home.as_deref(), std::env::var_os("CLAUDE_CONFIG_DIR")).ok().map(|(_, _, md)| md);
+    let here = std::env::current_dir().ok().into_iter().flat_map(|dir| [dir.join("CLAUDE.md"), dir.join(".claude").join("CLAUDE.md")]);
+    let mut seen: Vec<PathBuf> = Vec::new();
+    let mut files = Vec::new();
+    for path in user.into_iter().chain(here) {
+        if seen.contains(&path) {
+            continue;
+        }
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            files.push((path.clone(), text));
+        }
+        seen.push(path);
+    }
+    files
+}
+
+/// The `settings.json` of Claude Code that hold clawg's hooks, as far as they
+/// read: the user's, and the `.claude/settings.local.json` of the current
+/// folder, which `--local` writes.
+fn settings_files() -> Vec<checks::SettingsFile> {
+    let home = clawg_core::paths::home_dir();
+    let user = crate::setup::locations(home.as_deref(), std::env::var_os("CLAUDE_CONFIG_DIR")).ok().map(|(_, settings, _)| (settings, false));
+    let here = std::env::current_dir().ok().map(|dir| (dir.join(".claude").join("settings.local.json"), true));
+    user.into_iter()
+        .chain(here)
+        .filter_map(|(path, local)| std::fs::read_to_string(&path).ok().map(|text| checks::SettingsFile { path, text, local }))
+        .collect()
+}
+
+/// The protocol block of the user `CLAUDE.md` `clawg setup claude-code`
+/// writes, against the one this binary would write for `language`, the
+/// preferred language if there is one.
+fn protocol_block(language: Option<Lang>, profile: Profile) -> Vec<Finding> {
+    let home = clawg_core::paths::home_dir();
+    let (Ok((_, _, path)), Ok(own)) =
+        (crate::setup::locations(home.as_deref(), std::env::var_os("CLAUDE_CONFIG_DIR")), crate::setup::own_version())
+    else {
         return Vec::new();
     };
     let state = match std::fs::read_to_string(&path) {
@@ -286,13 +326,19 @@ fn protocol_block(language: Lang, profile: Profile) -> Vec<Finding> {
         Ok(text) => {
             let file = crate::setup::File { path: path.clone(), text: Some(text) };
             match crate::setup::find_block(&file) {
-                Ok(Some((begin, end))) => checks::BlockState::Installed(file.text.unwrap_or_default()[begin..end].to_string()),
+                Ok(Some((begin, end))) => {
+                    let block = &file.text.as_deref().unwrap_or_default()[begin..end];
+                    checks::BlockState::Installed {
+                        freshness: crate::setup::freshness(block, language, own),
+                        written_by: crate::setup::read_stamp(block).map(|stamp| stamp.version),
+                    }
+                }
                 Ok(None) => checks::BlockState::Missing,
                 Err(e) => checks::BlockState::Unreadable(e.to_string()),
             }
         }
     };
-    checks::protocol_block(language, &state, &crate::setup::block("\n", Some(language)), &path, profile)
+    checks::protocol_block(language.unwrap_or(Lang::En), &state, language.is_some(), own, &path, profile)
 }
 
 /// Claude Code's registration of this profile's server, from the file

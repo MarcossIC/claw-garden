@@ -255,7 +255,9 @@ mod tests {
         serde_json::json!({ "hooks": {
             "SessionStart": [{ "matcher": "startup|resume|clear|compact", "hooks": [hook("session-start")] }],
             "UserPromptSubmit": [{ "hooks": [hook("user-prompt-submit")] }],
-            "SessionEnd": [{ "hooks": [hook("session-end")] }]
+            "SessionEnd": [{ "hooks": [hook("session-end")] }],
+            "PostToolUse": [{ "matcher": "Bash", "hooks": [hook("post-tool-use")] }],
+            "PostToolUseFailure": [{ "matcher": "Bash", "hooks": [hook("post-tool-use-failure")] }]
         }})
     }
 
@@ -279,7 +281,7 @@ mod tests {
     #[test]
     fn local_hooks_go_in_the_folder_settings_alone() {
         let plan = plan(&state(None), Mode::Install).unwrap();
-        assert_eq!(plan.hooks.added, ["SessionStart", "UserPromptSubmit", "SessionEnd"]);
+        assert_eq!(plan.hooks.added, ["SessionStart", "UserPromptSubmit", "SessionEnd", "PostToolUse", "PostToolUseFailure"]);
         assert_eq!(written(&plan.settings), installed());
 
         let dir = tempfile::tempdir().unwrap();
@@ -292,7 +294,7 @@ mod tests {
         let value: Value = serde_json::from_str(&std::fs::read_to_string(app.join(".claude").join("settings.local.json")).unwrap()).unwrap();
         assert_eq!(value, installed());
         let shown = app.join(".claude").join("settings.local.json");
-        assert!(text.contains(&format!("hooks in {}: added SessionStart, UserPromptSubmit, SessionEnd", shown.display())), "{text}");
+        assert!(text.contains(&format!("hooks in {}: added SessionStart, UserPromptSubmit, SessionEnd, PostToolUse, PostToolUseFailure", shown.display())), "{text}");
         assert!(text.contains(&format!("Open a new Claude Code session in {}", app.display())), "{text}");
         assert!(!text.contains("mcp server") && !text.contains("memory protocol"), "the server and the protocol are the user's: {text}");
     }
@@ -303,11 +305,11 @@ mod tests {
         let FileStep::Write(text) = &first.settings else { panic!("{:?}", first.settings) };
         let again = state(Some(text));
         let second = plan(&again, Mode::Install).unwrap();
-        assert_eq!(second.hooks.unchanged, ["SessionStart", "UserPromptSubmit", "SessionEnd"]);
+        assert_eq!(second.hooks.unchanged, ["SessionStart", "UserPromptSubmit", "SessionEnd", "PostToolUse", "PostToolUseFailure"]);
         assert_eq!(second.settings, FileStep::Unchanged);
         let (text, code) = report(&second, &again, Some(&nothing_written()));
         assert_eq!(code, 0, "{text}");
-        assert!(text.contains("SessionStart, UserPromptSubmit, SessionEnd already there"), "{text}");
+        assert!(text.contains("SessionStart, UserPromptSubmit, SessionEnd, PostToolUse, PostToolUseFailure already there"), "{text}");
         assert!(!text.contains("Open a new"), "{text}");
     }
 
@@ -318,11 +320,11 @@ mod tests {
         let s = state(Some(&earlier.to_string()));
         let plan = plan(&s, Mode::Install).unwrap();
         assert_eq!(plan.hooks.added, ["SessionEnd"]);
-        assert_eq!(plan.hooks.unchanged, ["SessionStart", "UserPromptSubmit"]);
+        assert_eq!(plan.hooks.unchanged, ["SessionStart", "UserPromptSubmit", "PostToolUse", "PostToolUseFailure"]);
         assert_eq!(written(&plan.settings), installed());
         let (text, code) = report(&plan, &s, None);
         assert_eq!(code, 0, "{text}");
-        assert!(text.contains("would add SessionEnd; SessionStart, UserPromptSubmit already there"), "{text}");
+        assert!(text.contains("would add SessionEnd; SessionStart, UserPromptSubmit, PostToolUse, PostToolUseFailure already there"), "{text}");
     }
 
     #[test]
@@ -333,7 +335,7 @@ mod tests {
         let s = state(Some(&moved));
         let plan = plan(&s, Mode::Install).unwrap();
         assert_eq!(plan.hooks.conflicts.len(), 1, "{:?}", plan.hooks);
-        assert_eq!(plan.hooks.added, ["UserPromptSubmit", "SessionEnd"]);
+        assert_eq!(plan.hooks.added, ["UserPromptSubmit", "SessionEnd", "PostToolUse", "PostToolUseFailure"]);
         let value = written(&plan.settings);
         assert_eq!(value["hooks"]["SessionStart"].as_array().unwrap().len(), 1, "the conflicting hook is not replaced");
         let (text, code) = report(&plan, &s, None);
@@ -346,11 +348,11 @@ mod tests {
     fn remove_deletes_a_file_left_with_nothing() {
         let s = state(Some(&installed().to_string()));
         let plan = plan(&s, Mode::Remove).unwrap();
-        assert_eq!(plan.hooks.removed, ["SessionStart", "UserPromptSubmit", "SessionEnd"]);
+        assert_eq!(plan.hooks.removed, ["SessionStart", "UserPromptSubmit", "SessionEnd", "PostToolUse", "PostToolUseFailure"]);
         assert_eq!(plan.settings, FileStep::Delete);
         let (text, code) = report(&plan, &s, None);
         assert_eq!(code, 0, "{text}");
-        assert!(text.contains("would remove SessionStart, UserPromptSubmit, SessionEnd"), "{text}");
+        assert!(text.contains("would remove SessionStart, UserPromptSubmit, SessionEnd, PostToolUse, PostToolUseFailure"), "{text}");
         assert!(text.contains(&format!("nothing else was in {}: would delete it", s.settings.path.display())), "{text}");
     }
 

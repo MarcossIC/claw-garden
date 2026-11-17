@@ -81,4 +81,11 @@ Salen de la investigación de fuentes externas: MemoryCode (K1 y K2), un ADR de 
 
 ## Después de este cambio
 
-- [ ] El piloto, con tope de gasto: una sesión humo por brazo (`a0`, `a3`, `a4`), las seis tareas sin memoria para descartar las que `a0` ya resuelve, y las que queden con `a3`, `a4` y `a3-eager`. La primera sesión real confirma los nombres del cliente (decisión 8).
+- [x] El piloto, con tope de gasto: corrió el 2026-11-11, con una sesión humo por brazo, las seis tareas y los brazos `a3`, `a4` y `a3-eager`. La primera sesión real confirmó los nombres del cliente (decisión 8). Lo que midió está en el [verify de memory-delivery](../2026-11-13-memory-delivery/verify.md#la-campaña-2026-11-11).
+
+## Al archivar (2026-11-17)
+
+- AE1 a AE9 pasan con sus ids a [`specs/eval`](../../../specs/eval/spec.md), en «`agent-eval`: el arnés». La propuesta y el `state.yaml` decían AE1 a AE6, pero la spec ya tenía AE7 (el corredor), AE8 (el reporte) y AE9 (los costos): los nueve pasan.
+- Ninguna spec del producto cambia, y `docs/reference/testing.md` ya describe el arnés y su corredor.
+- Sale en 0.88.0. Su código está en `develop` desde antes de la 0.86.0, y el CI de Linux y Windows pasa sobre él con todo lo que se le sumó después.
+- Pendiente después de publicar: nada propio. El arnés no se instala con el producto (ningún binario publicado enlaza `clawg-eval`), y lo que falta medir con él es de agent-eval-sessions y de protocol-block.

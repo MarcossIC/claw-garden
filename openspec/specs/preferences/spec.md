@@ -5,6 +5,7 @@ Fuente de verdad del comportamiento actual de las preferencias del usuario: el a
 **Origen:**
 - [language-preference](../../changes/archive/2026-10-23-language-preference/proposal.md), archivado el 2026-10-23. Los ids de requisito son los de esa spec; acá están LP1 a LP3.
 - [cli-language](../../changes/archive/2026-10-23-cli-language/proposal.md), archivado el 2026-10-23: lo que imprimen los comandos en el idioma preferido (CL1 a CL3 y CL5; CL4 está en [`specs/doctor`](../doctor/spec.md)).
+- [protocol-block](../../changes/archive/2026-11-17-protocol-block/proposal.md), archivado el 2026-11-17, que sale en 0.88.0: sólo el cambio de LP2, que `doctor` suma `protocol_block` también sin preferencia, cuando hay un bloque (PB3 de [`specs/doctor`](../doctor/spec.md)).
 
 ## Definiciones
 
@@ -30,11 +31,11 @@ Fuente de verdad del comportamiento actual de las preferencias del usuario: el a
 
 ## LP2. Sin preferencia, lo de antes
 
-Sin preferencia, las instrucciones del servidor, la lista de herramientas (salvo la descripción de LP10, [`specs/mcp`](../mcp/spec.md)), las respuestas de las herramientas, el contexto, lo que imprimen los hooks, el bloque que escribe `setup` y los hallazgos de `doctor` MUST ser los de antes de las preferencias. Un archivo inválido MUST NOT hacer fallar ningún comando, herramienta ni hook: el puente, `session-start`, `setup` y cada comando de CL3 lo leen con `language_in`, y sólo `doctor` lo nombra (LP14).
+Sin preferencia, las instrucciones del servidor, la lista de herramientas (salvo la descripción de LP10, [`specs/mcp`](../mcp/spec.md)), las respuestas de las herramientas, el contexto, lo que imprimen los hooks, el bloque que escribe `setup` y los hallazgos de `doctor` MUST ser los de antes de las preferencias, salvo `protocol_block`, que `doctor` suma siempre que el `CLAUDE.md` tenga un bloque ([`specs/doctor`](../doctor/spec.md), PB3). Un archivo inválido MUST NOT hacer fallar ningún comando, herramienta ni hook: el puente, `session-start`, `setup` y cada comando de CL3 lo leen con `language_in`, y sólo `doctor` lo nombra (LP14).
 
 #### Escenario: nada cambia
 - GIVEN un perfil sin `preferences.json`
-- THEN `get_info().instructions` es la apertura de `protocol.md`, `session_start_text` da lo de antes, `setup` deja el bloque instalado `Unchanged` y `doctor` no tiene hallazgos `preferences` ni `protocol_block`
+- THEN `get_info().instructions` es la apertura de `protocol.md`, `session_start_text` da lo de antes, `setup` deja el bloque instalado `Unchanged` y `doctor` no tiene hallazgos `preferences`, y `protocol_block` sólo cuando hay un bloque
 
 #### Escenario: un archivo roto
 - GIVEN un `preferences.json` que no es JSON

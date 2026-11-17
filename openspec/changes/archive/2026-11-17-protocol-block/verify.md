@@ -1,0 +1,130 @@
+# protocol-block — Verificación
+
+Veredicto: **cumple PB1 a PB8, sin hallazgos CRITICAL**. Los tres WARNING se resolvieron después (W1 y W3 con commits, W2 al consolidar PB6 en `specs/setup`). El CI de Linux y Windows pasó sobre `9a76a8ec`, que lleva todo el código del cambio, y la campaña que decide el valor por defecto (D6) corrió y lo dejó en `full`. Lo que sigue sin hacerse está en «Pendiente después de publicar», al final.
+
+## Qué se revisó
+
+Una verificación de lectura sobre `b5ddf4c8`, `adf61177`, `038daf86`, `a73e36c6`, `771c289e`, `eabdc005` y `5ac5f544` (`git diff b5ddf4c8~1 5ac5f544`), contra la exploración, la propuesta, PB1 a PB8, D1 a D6 y las tareas. No se corrió `cargo`, porque otro trabajo compilaba en el mismo `target-test`. La suite y los dos clippy pasan según el informe de la tarea de apply. Esta verificación no los volvió a correr, y tienen que correr otra vez, una sola vez, sobre el commit que se archive.
+
+Comprobado con `git`:
+
+- `crates/clawg-cli/src/mcp/agent_contract.json`, `agent_contract.es.json`, `server.rs`, `protocol.md`, `protocol.es.md` y `crates/clawg-cli/src/daemon/` no cambian en ningún commit de la serie (PB8).
+- Ningún mensaje de commit lleva `Co-Authored-By` ni nombra planes, fases o el cambio. Tampoco los tests ni los comentarios nuevos.
+- No hay `#[allow]` nuevo. El único atributo nuevo es `#[expect(clippy::too_many_arguments, reason = …)]` en `respond_reading` (`hook.rs`), como pide `.claude/CLAUDE.md`.
+
+El cambio no toca el ranking, así que no corre `rag-eval`.
+
+## Requisitos
+
+| Requisito | Código | Tests | Veredicto |
+| --- | --- | --- | --- |
+| PB1 el sello | `Stamp::parse`, `Stamp::line` (`setup.rs:622-643`); `assemble` escribe el sello después de `BEGIN_MARKER`; `split_stamp` (`setup.rs:673`) lo saca sólo si la segunda línea se lee entera; los marcadores no cambian | `the_block_carries_the_version_that_wrote_it` (con `find_block` sobre el bloque con sello), `a_stamp_reads_its_version_and_its_choice` (siete sellos ilegibles, CRLF, bloque sin sello) | Cumple |
+| PB2 la frescura | `freshness` (`setup.rs:702`), pura: compara el cuerpo sin sello y con `\n` contra `unstamped(language, variant)`, con la variante del sello o `DEFAULT_VARIANT`; `Newer` sólo con sello posterior | `a_block_is_current_stale_or_newer` (los tres escenarios, CRLF, otro idioma, el mismo número de versión con otro texto, un sello ilegible), `each_variant_is_its_block` | Cumple (ver W1) |
+| PB3 `doctor` | `doctor::protocol_block` corre siempre (`doctor/mod.rs:185`, `:277`); `checks::protocol_block` (`checks.rs:444`): `healthy`, `stale` con el paso, `newer` sin paso, `unreadable`, `not_installed` sólo con preferencia (`checks.rs:492`); `evidence` con `path`, `written_by` y `this_version` | `protocol_block_findings` (con y sin preferencia), `the_findings_are_the_same_in_both_languages_but_their_message`, `doctor_marks_an_old_block_stale_without_a_preference` (sin bloque, `stale` con `written_by: null`, `newer` con `99.0.0`, y `healthy` después de `setup` con cada variante) | Cumple |
+| PB4 `session-start` | `block_notice` (`hook.rs:125`), pura; `opening_lines` (`:146`) la pone después del idioma; `respond_checking` (`:369`) la pide sólo con perfil; `respond_reading` lee el bloque en paralelo con la preferencia dentro de `wait` (`:423`) y sólo para el `SessionStart` de Claude Code; la línea sale también sin daemon o con el daemon fuera de tiempo; `read_user_block` (`:387`) sólo lee | `the_block_notice_is_for_a_block_that_differs`, `session_start_puts_the_notice_after_the_language_and_before_the_context`, `session_start_says_when_the_block_is_stale`, `a_hook_cursor_runs_for_claude_code_does_not_name_the_block`, `a_block_that_never_reads_costs_the_notice_and_not_the_memory`, `what_the_hook_adds_stays_small` (tope 2.000), `session_start_names_an_old_protocol_block` (binario: sin daemon, en español, nada en `user-prompt-submit` ni en Cursor, el archivo sigue igual, y nada después de `setup`) | Cumple (ver W3) |
+| PB5 las variantes | `Variant` (`protocol.rs:33`), `protocol::short` (`:118`) corta «Session summary» y «After a compaction» (y sus pares en español) del mismo archivo con `section` (`:131`); `Off` deja los marcadores y el sello | `the_short_protocol_keeps_the_session_summary_in_both_languages` (menos de 2.000 bytes, sin `\r`), `the_short_protocol_has_no_opening` (ningún párrafo de la apertura), `a_variant_is_named_by_its_option`, `each_variant_is_its_block` | Cumple |
+| PB6 `--protocol` | `parse_protocol` y `conflicts_with_all = ["remove", "local", "path"]` (`cli.rs:27`, `:314`); `SetupError::ProtocolForCursor` (`main.rs:283`); `install_block` (`setup.rs:736`): la pedida, si no la del sello, si no `full`; `Unchanged` cuando el cuerpo y la elección coinciden, sin tocar el sello; el reporte dice `(protocol=V)` | `the_protocol_option_writes_its_variant_and_a_run_without_it_keeps_it`, `a_new_version_with_the_same_text_rewrites_nothing`, `the_protocol_option_parses_and_excludes_local_remove_and_cursor`, `setup_protocol_short_writes_the_short_block`, `setup_cursor_refuses_a_protocol` | Cumple, con un desvío de forma (W2) |
+| PB7 `a3-short` | `Arm::A3Short` en `ARMS`, `has_clawg`, `has_setup` y `has_protocol`; el `State` del arnés pasa `Some(Variant::Short)` sólo para ese brazo (`arm.rs:308`) | `a3_short_is_a3_with_the_short_block`: el plan, sin el `CLAUDE.md` y sin el nombre del brazo, es igual al de `a3`; también en español; `l0` sigue sin bloque | Cumple |
+| PB8 lo que no cambia | Ningún archivo del contrato, del servidor ni del daemon en la serie; el único que escribe el `CLAUDE.md` sigue siendo `setup::apply` | Los dos tests del contrato, según el informe de apply, sin `CLAWG_BLESS` | Cumple |
+
+## Lo que se miró con cuidado
+
+**El `CLAUDE.md` de la persona.** Sólo `setup claude-code` lo escribe: el hook y `doctor` llaman a `locations`, `find_block`, `freshness` y `read_stamp`, que son lecturas, y el test del binario comprueba que el archivo queda igual después del hook. `--dry-run` planea y reporta por el mismo camino de antes, y `run_in` sólo cambió de firma. Un bloque editado a mano sale `stale`: el hook y `doctor` lo dicen, pero sólo `setup` lo reescribe, con la copia en `backups/setup/` de siempre. `--remove` sigue quitando el bloque con sello entre los mismos marcadores, o lo deja con el servidor del otro perfil registrado.
+
+**El sello.** Un sello que no se lee cuenta como cuerpo, así que el bloque sale `stale` y nunca `newer`. Un binario anterior al sello ve que el bloque con sello difiere y lo reescribe entero, sin sello, entre los mismos marcadores. Un bloque sin sello con el texto de hoy queda `Unchanged` y sigue sin sello, como pide PB6.
+
+**El hook.** Lee el `CLAUDE.md` en cada `session-start` de Claude Code, y nunca en `user-prompt-submit`, en `session-end` ni con Cursor. El costo es leer un archivo de unos KB y armar una vez el bloque esperado (unos 11 KB, con dos reemplazos de texto). Corre en un hilo propio y en paralelo con la preferencia, con la misma espera de 1 s, así que la espera total no crece. Un archivo que no termina de leerse cuenta como sin bloque, y el test lo comprueba dentro de `HOOK_DEADLINE`. Las pruebas no dependen del home real: los tests unitarios inyectan la lectura o pasan `profile: None`, y los del binario corren con `CLAWG_TEST_HOME` y, desde este cambio, sin el `CLAUDE_CONFIG_DIR` del entorno (`binary.rs:74`). Ningún test lee un archivo de instrucciones del repositorio. Los directorios temporales nuevos son `tempfile::tempdir()` y se borran al soltarlos.
+
+**Visibilidad nueva.** `Freshness` es `pub` porque la nombra `checks::BlockState`, que es pública en `pub mod checks`. `setup::own_version`, `Variant` y los campos nuevos de `State` los usa `clawg-eval`. `Stamp`, `block`, `read_stamp` y `freshness` son `pub(crate)`. La excepción es `DEFAULT_VARIANT` (S2).
+
+## Hallazgos
+
+### CRITICAL
+
+Ninguno.
+
+### WARNING
+
+1. **Con el mismo número de versión, el sello no dice de qué lado está la diferencia.** D2 elige el sello para que un binario `dev` y uno `prod` no se pisen. Eso funciona cuando las versiones difieren: el de menor versión ve `newer` y calla. Pero la versión sólo sube al cerrar un cambio, así que un `dev` construido a mitad de un cambio que edita `protocol.md` tiene la misma versión que el `prod` instalado. Entonces cada uno ve `stale` el bloque del otro (PB2 lo fija así, con el test «this version's stamp over text it does not write»). Los hooks de los dos perfiles están en el mismo `settings.json`, así que cada sesión recibe el aviso y cada `setup` hace que el otro avise. Nada se escribe solo, porque cada reescritura pide que la persona corra `setup`, pero las indicaciones van y vienen. Pasa lo mismo con un bloque sin sello que quedó `Unchanged`. Alternativas: (a) dejarlo escrito en `specs/setup` al archivar, como límite conocido, sin cambiar código; (b) que el sello lleve, además, un hash corto del texto, para que un binario reconozca un texto que escribió otro con su misma versión y lo dé `newer` o calle (cuesta unos 10 caracteres y una regla más en PB2); (c) que el hook del perfil `dev` no avise cuando el sello tiene su misma versión (es simple, pero esconde el bloque realmente viejo de una rama).
+2. **`setup cursor --protocol` sale con 1, no con un error de uso.** PB6 pide «un error de uso» para `--remove`, `--local`, `--path` y `setup cursor`. Los tres primeros salen con 2 (clap), pero `setup cursor` se rechaza en `main.rs:283` con `SetupError::ProtocolForCursor`, que sale con 1, como el `FolderForCursor` de antes. `docs/reference/commands.md` lo documenta así («`setup cursor` refuses it (exit 1)»), y lo fija `setup_cursor_refuses_a_protocol`. Tampoco escribe nada. Al consolidar PB6 en `specs/setup` hay que escribir lo que se hizo.
+3. **El peor caso del tope de 2.000 bytes no es el peor.** `what_the_hook_adds_stays_small` arma el texto con la compactación, el modelo caído, 10.000 memorias sin revisar, nueve sugerencias y el aviso, pero `context("x", 10_000)` deja `conclusions_to_review` en 0, así que falta el `review_nudge`. Calculado a mano con los textos en español de `hook.rs` y `mcp/tools.rs`, el test suma unos 1.680 bytes y con el `review_nudge` de 10.000 conclusiones unos 1.865: el tope se cumple, pero el test no lo prueba y el margen es de unos 135 bytes. La falta es anterior al cambio, porque el test del tope de 1.500 tampoco lo tenía (con él, aquel peor caso ya pasaba de 1.500), pero ahora el tope queda más cerca. Hay que sumar `conclusions_to_review` al contexto del test.
+
+### SUGGESTION
+
+1. **Un comentario de documentación fuera de lugar.** `parse_protocol` quedó entre el comentario de `parse_agent` («Trims an `--agent` value…») y su función (`cli.rs:25-31`): `parse_protocol` lleva la documentación de otra función y `parse_agent` se quedó sin la suya.
+2. **`DEFAULT_VARIANT` es `pub` y sólo lo usa `setup.rs`.** Puede ser privado hasta que algo de afuera lo necesite. `.claude/CLAUDE.md` pide no sumar visibilidad sin un uso.
+3. **La campaña depende de que el binario sea el mismo build.** El bloque de `a3` y `a3-short` lleva la versión y el texto del build de `clawg-eval` (`setup::own_version()` en `arm.rs`), mientras que el hook de la corrida es el de `--clawg PATH`. Si ese binario es otro build con otro protocolo, cada sesión de los brazos con bloque recibe el aviso, y la campaña mide también esa línea. D6 ya pide el mismo build. Conviene que la guía de la campaña compruebe que ninguna sesión trae «memory protocol block» en la salida de su `SessionStart`, o que `agent-eval` la rechace.
+
+## Pendiente en local
+
+- **CI.** Tiene que pasar en verde en Linux y en Windows, y antes de archivar hay que correr una vez la suite y los dos clippy de `.claude/CLAUDE.md` sobre el commit final, con `cargo clean --workspace --target-dir target-test` antes. Hecho: el CI pasó sobre `9a76a8ec`.
+- **El bloque de la máquina.** Con la versión instalada que trae este cambio, abrir una sesión de Claude Code en una máquina con el bloque de antes de 0.85.0. El agente tiene que nombrar `clawg setup claude-code --profile prod`. Después, correr `clawg setup claude-code --profile prod` (primero con `--dry-run`: la línea del protocolo tiene que decir `would update it (protocol=full)`, o `se actualizaría (protocol=full)` con la preferencia `es`) y `clawg doctor --profile prod`, que tiene que dar `protocol_block` `ok` `healthy` con `written_by` igual a `this_version`. Con el perfil `dev` también instalado, `clawg doctor --profile dev` puede dar `stale` o `newer` según su versión (W1).
+- **El efecto en las sesiones.** Con los scripts de A1 (`docs/completed-impl/hipotesis/A1/`) sobre los transcripts de las semanas siguientes, los `resolve_conflict` por cada save con cercanas tienen que bajar a menos de 0,15, el umbral de verdict-on-replace.
+- **El valor por defecto.** Lo decide la campaña sobre las tres tareas largas de agent-eval-sessions, con `a3`, `a3-short` y `l0`, 3 corridas por celda, 18 corridas nuevas y un tope de 15 USD, aplicando la regla de [D6](design.md#d6-la-regla-de-decisión-del-valor-por-defecto) tal como quedó fijada. La campaña es paga y la autoriza la persona. Si la regla elige `short` u `off`, el cambio va en un commit propio.
+
+## Arreglos después de la verificación
+
+| Hallazgo | Commit | Lo fija |
+| --- | --- | --- |
+| W1, la misma versión en `dev` y `prod`, con la alternativa (c) | `14ab7891` | `block_notice` calla en el perfil `dev` cuando el sello lleva su propia versión y el bloque es `Stale`; `prod`, un bloque sin sello y uno con sello anterior siguen avisando. Casos nuevos en `the_block_notice_is_for_a_block_that_differs`; `docs/reference/commands.md` |
+| W3, el peor caso del tope | `7c3e357c` | `what_the_hook_adds_stays_small` con `conclusions_to_review` de 10.000, que suma el `review_nudge`; el tope de 2.000 bytes se cumple |
+| S1 y S2 | `6bb07af9` | la documentación de `parse_agent` y de `parse_protocol` en su función; `DEFAULT_VARIANT` privado |
+
+W2 queda como está: al consolidar PB6 en `specs/setup` se escribió que `setup cursor --protocol` sale con 1. S3 lo comprobó la campaña: ninguna sesión de los brazos con bloque trajo el aviso del bloque viejo.
+
+## La campaña
+
+Corrieron las 18 corridas de `a3-short` y `l0`: R bifurcada, D partida y la K larga, 3 por celda, con 15 reglas de ruido. Ninguna tuvo un artefacto, y ocho intentos de `Bash` fuera de `work/` los negó el cliente. Gasto: 5,46 USD de los 15 del tope.
+
+`a3` sale de agent-eval-sessions. Usa el mismo `clawg.exe` y el mismo texto del protocolo, porque entre los dos builds sólo cambió el conteo de costos de agent-eval (`9f933ab0`). Ninguna sesión de los brazos con bloque trajo el aviso del bloque viejo en su `SessionStart` (S3). **Falta una celda de `a3`: la K larga con 15 reglas.** Es de la fase 3 de agent-eval-sessions, que no corrió. Las métricas de `a3` son de R y D; las de las variantes se dan de R y D y, entre paréntesis, con la K.
+
+| Métrica | `a3` | `a3-short` | `l0` |
+|---|---|---|---|
+| E, corridas que aprueban | 9 de 9 (R continua 3, R nueva 3, D 3) | 9 de 9 (12 de 12) | 7 de 9 (7 de 12: R nueva 1 de 3, K 0 de 3) |
+| B, buscan antes de su primer `Write` o `Edit` | 4 de 9 | 0 de 9 (3 de 12) | 2 de 9 (2 de 12) |
+| G, hechos guardados antes de usarse | 18 de 18 | 18 de 18 | 8 de 18 |
+| S, `session_summary` completos | 0 de 9 | 0 de 9 | 0 de 9 |
+| J, `resolve_conflict` por save con cercanas | 0 / 2 = 0 | 5 / 6 = 0,83 | 1 / 1 = 1 |
+| T, mediana por sesión de los tokens de entrada | 156.340 | 111.482 (131.177) | 111.618 (148.193) |
+
+**`off` no pasa** por E (7 contra 9 − 1) y por G (8 contra 18 − 1). La celda que falta sólo puede sumarle a `a3`, así que no cambia nada.
+
+**`short` no pasa** por B (0 contra 4 − 1) y por J (0,83 contra 0 + 0,5). Con la K, B(`short`) es 3. Alcanzaría sólo si ninguna K de `a3` buscara antes de editar, y la K de `a3` del humo buscó. J cambiaría sólo si las K de `a3` llamaran a `resolve_conflict`, y ninguna K de ningún brazo guardó nada.
+
+**El valor por defecto queda en `full`.** Lo confirma la celda K de `a3` con 15 reglas, [abajo](#la-celda-k-de-a3).
+
+Lo que muestran los datos y no decide:
+- J separa las variantes por `topic_key`. Bajo `a3`, los seis saves de la decisión de D llevan `topic_key`: la versión revisada reemplaza sola a la primera y nadie llama a `resolve_conflict`. Bajo `a3-short`, tres de los seis van sin `topic_key`, salen con cercanas y el agente resuelve a mano. Cuatro de sus cinco veredictos son `supersedes` correctos, y uno es el `compatible` innecesario que J vigila.
+- `a3-short` aprueba todo, y su sobrecosto del relevo es de 70 tokens: la memoria llegó en el arranque y la sesión nueva no releyó `TIMEOUTS.md`. Pierde en B porque no busca, no porque le falte el dato.
+- Ninguna sesión de ningún brazo guardó un `session_summary`: S no separa `short` de `off` en tareas con `-p`.
+- Un bloque corto que conserve la parte de `topic_key` es una hipótesis nueva, no otra lectura de D6.
+
+### La celda K de `a3`
+
+Corrió en la fase 3 de agent-eval-sessions, con el mismo build: 3 corridas de `requests-history-owner-convention` con 15 reglas, ninguna excluida. Las tres aprueban, las tres llaman a `search_memory` antes de su primer `Edit` y ninguna guarda nada. Con ella las tres columnas cubren R, D y la K:
+
+| Métrica | `a3` | `a3-short` | `l0` |
+|---|---|---|---|
+| E | 12 de 12 | 12 de 12 | 7 de 12 |
+| B | 7 de 12 | 3 de 12 | 2 de 12 |
+| G | 18 de 18 | 18 de 18 | 8 de 18 |
+| S | 0 de 9 | 0 de 9 | 0 de 9 |
+| J | 0 | 0,83 | 1 |
+| T | 187.750 | 131.177 | 148.193 |
+
+`off` no pasa por E (7 contra 11) y por G (8 contra 17). `short` no pasa por B (3 contra 6) y por J (0,83 contra 0,5). **D6 queda cerrada: el valor por defecto es `full`.** T se calculó igual que arriba, la suma de entrada, caché leída y caché escrita de cada sesión, y la de `a3` sin la K da otra vez 156.340.
+
+## Al archivar (2026-11-17)
+
+- PB1, PB5 y PB6 pasan a [`specs/setup`](../../../specs/setup/spec.md), junto a R4 y LP13; PB2 y PB3 a [`specs/doctor`](../../../specs/doctor/spec.md), con la frase de LP14 reemplazada; el cambio de LP2 a [`specs/preferences`](../../../specs/preferences/spec.md); PB4 a [`specs/hooks`](../../../specs/hooks/spec.md), con el tope de 2.000 bytes en R4 y R7; PB7 a [`specs/eval`](../../../specs/eval/spec.md). PB8 no se consolida.
+- PB6 dice lo de W2: con `setup cursor` sale con 1, no con 2. PB4 dice lo que arregló W1: en el perfil `dev` el aviso calla cuando el sello lleva la versión propia.
+- D6 queda cerrada: el valor por defecto sigue en `full`, así que ningún commit cambia la variante.
+- Ninguna spec cambia el contrato del agente ni el daemon (PB8). `docs/reference/commands.md` ya describe `--protocol`, el sello y el aviso.
+- Sale en 0.88.0.
+
+## Pendiente después de publicar
+
+Local, con la versión instalada.
+
+- **El bloque de la máquina.** Con 0.88.0 instalada, abrir una sesión de Claude Code en una máquina con el bloque de antes de 0.85.0: el agente tiene que nombrar `clawg setup claude-code --profile prod`. Después correr ese comando (primero con `--dry-run`: la línea del protocolo dice `would update it (protocol=full)`, o `se actualizaría (protocol=full)` con la preferencia `es`) y `clawg doctor --profile prod`, que tiene que dar `protocol_block` `ok` `healthy` con `written_by` igual a `this_version`.
+- **El efecto en las sesiones.** Con los scripts de A1 (`docs/completed-impl/hipotesis/A1/`) sobre los transcripts de las semanas siguientes, los `resolve_conflict` por cada save con cercanas tienen que bajar a menos de 0,15, el umbral de verdict-on-replace.

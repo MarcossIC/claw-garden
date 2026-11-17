@@ -3,3 +3,4 @@ release/*.pub text eol=lf
 
 crates/clawg-cli/src/update/testdata/* -text
 crates/clawg-eval/data/agent-tasks/** text eol=lf
+crates/clawg-eval/data/agent-tasks/fixtures/psf-requests/docs/make.bat -text

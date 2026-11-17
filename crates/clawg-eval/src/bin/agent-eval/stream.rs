@@ -23,6 +23,24 @@ pub struct ToolCall {
     pub subagent: bool,
     /// A `ToolSearch` call came before it in the session.
     pub after_tool_search: bool,
+    /// The tokens it added to the context: how much the next request grew over
+    /// its own, for a call that is alone in its message; the input, the result
+    /// and the text the agent wrote with it. `None` when that cannot be told.
+    pub added_tokens: Option<u64>,
+}
+
+/// One request of the main loop: a message of the assistant, which the client
+/// may print in several events with one `id`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct Request {
+    pub id: Option<String>,
+    /// The input, cache written and cache read of its `usage`, which is
+    /// everything the model read to answer it.
+    pub context: Option<u64>,
+    /// How much of that context the cache gave: its cache read.
+    pub cache_read: Option<u64>,
+    /// Indexes into [`Transcript::calls`] of the calls it made.
+    pub calls: Vec<usize>,
 }
 
 /// The tokens of the main loop. A subagent's are left out, and so is the
@@ -68,6 +86,31 @@ pub struct Outcome {
     pub model_usage: BTreeMap<String, ModelUsage>,
 }
 
+impl Outcome {
+    /// What this outcome spent after `before`, the outcome of the session whose
+    /// conversation it continued. Claude Code reports the cost and the usage by
+    /// model of a continued conversation from its start, and the turns, the
+    /// duration and the usage of the main loop of the session alone. Without the
+    /// cost before, the whole cost stays: a figure too high stops a cap sooner.
+    pub fn after(&self, before: &Outcome) -> Outcome {
+        let less = |now: Option<f64>, then: Option<f64>| match (now, then) {
+            (Some(now), Some(then)) => Some((now - then).max(0.0)),
+            (now, _) => now,
+        };
+        let mut own = self.clone();
+        own.total_cost_usd = less(self.total_cost_usd, before.total_cost_usd);
+        for (model, m) in &mut own.model_usage {
+            let Some(b) = before.model_usage.get(model) else { continue };
+            m.input_tokens = m.input_tokens.saturating_sub(b.input_tokens);
+            m.output_tokens = m.output_tokens.saturating_sub(b.output_tokens);
+            m.cache_read_input_tokens = m.cache_read_input_tokens.saturating_sub(b.cache_read_input_tokens);
+            m.cache_creation_input_tokens = m.cache_creation_input_tokens.saturating_sub(b.cache_creation_input_tokens);
+            m.cost_usd = less(m.cost_usd, b.cost_usd);
+        }
+        own
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct HookEvent {
     pub subtype: String,
@@ -90,8 +133,10 @@ pub struct Transcript {
     /// The assistant's text blocks, in order.
     pub texts: Vec<String>,
     pub compactions: usize,
-    /// The input, cache written and cache read of the first message of the
-    /// main loop: what the session's context costs before the agent acts.
+    /// Every request of the main loop, in order; a subagent's are left out.
+    pub requests: Vec<Request>,
+    /// The context of the first request of the main loop: what the session's
+    /// context costs before the agent acts.
     pub first_request_tokens: Option<u64>,
     pub result: Option<Outcome>,
     /// Lines of a kind this reader does not know.
@@ -120,6 +165,11 @@ impl Transcript {
 /// any server whose own name is `name`.
 pub fn is_tool(call_name: &str, name: &str) -> bool {
     call_name == name || (call_name.starts_with("mcp__") && call_name.ends_with(&format!("__{name}")))
+}
+
+/// A tool as the agent knows it: an MCP tool without its server's prefix.
+pub fn tool_name(name: &str) -> &str {
+    name.strip_prefix("mcp__").and_then(|rest| rest.split_once("__")).map_or(name, |(_, tool)| tool)
 }
 
 pub fn parse(text: &str) -> Transcript {
@@ -155,11 +205,20 @@ pub fn parse(text: &str) -> Transcript {
                 t.hooks.push(HookEvent { subtype: s.to_owned(), text: strings.join("\n") });
             }
             ("assistant", _) => {
-                if !subagent && t.first_request_tokens.is_none() {
-                    t.first_request_tokens = event.get("message").and_then(|m| m.get("usage")).map(|u| {
-                        let tokens = |name: &str| u.get(name).and_then(Value::as_u64).unwrap_or(0);
-                        tokens("input_tokens") + tokens("cache_creation_input_tokens") + tokens("cache_read_input_tokens")
-                    });
+                if !subagent {
+                    let message = event.get("message");
+                    let id = message.and_then(|m| m.get("id")).and_then(Value::as_str).map(str::to_owned);
+                    let usage = message.and_then(|m| m.get("usage"));
+                    let tokens = |u: &Value, name: &str| u.get(name).and_then(Value::as_u64).unwrap_or(0);
+                    let context = usage.map(|u| tokens(u, "input_tokens") + tokens(u, "cache_creation_input_tokens") + tokens(u, "cache_read_input_tokens"));
+                    let cache_read = usage.map(|u| tokens(u, "cache_read_input_tokens"));
+                    match t.requests.last_mut() {
+                        Some(last) if id.is_some() && last.id == id => {
+                            last.context = last.context.or(context);
+                            last.cache_read = last.cache_read.or(cache_read);
+                        }
+                        _ => t.requests.push(Request { id, context, cache_read, calls: Vec::new() }),
+                    }
                 }
                 for block in content(&event) {
                     match block.get("type").and_then(Value::as_str) {
@@ -175,6 +234,9 @@ pub fn parse(text: &str) -> Transcript {
                                 ..Default::default()
                             };
                             searched |= call.name == "ToolSearch";
+                            if let (false, Some(request)) = (subagent, t.requests.last_mut()) {
+                                request.calls.push(t.calls.len());
+                            }
                             t.calls.push(call);
                         }
                         _ => {}
@@ -224,6 +286,13 @@ pub fn parse(text: &str) -> Transcript {
                 });
             }
             _ => t.unknown_lines += 1,
+        }
+    }
+    t.first_request_tokens = t.requests.iter().find_map(|r| r.context);
+    for i in 1..t.requests.len() {
+        let (Some(before), Some(after)) = (t.requests[i - 1].context, t.requests[i].context) else { continue };
+        if let [only] = t.requests[i - 1].calls[..] {
+            t.calls[only].added_tokens = after.checked_sub(before);
         }
     }
     t
@@ -341,6 +410,35 @@ not json
     }
 
     #[test]
+    fn what_a_continued_outcome_spent_after_the_one_before_is_its_cost_and_model_usage_less_theirs() {
+        let model = |output: u64, cost: Option<f64>| ModelUsage { input_tokens: 10, output_tokens: output, cache_read_input_tokens: 5000, cache_creation_input_tokens: 900, cost_usd: cost, cost_basis: Some("list".into()) };
+        let before = Outcome {
+            total_cost_usd: Some(0.30),
+            model_usage: BTreeMap::from([("sonnet".to_owned(), model(1500, Some(0.30)))]),
+            ..Outcome::default()
+        };
+        let now = Outcome {
+            num_turns: Some(9),
+            total_cost_usd: Some(0.40),
+            usage: Usage { output_tokens: 400, ..Usage::default() },
+            model_usage: BTreeMap::from([
+                ("sonnet".to_owned(), ModelUsage { input_tokens: 18, output_tokens: 1900, cache_read_input_tokens: 9000, cache_creation_input_tokens: 1000, ..model(0, Some(0.39)) }),
+                ("haiku".to_owned(), model(20, Some(0.01))),
+            ]),
+            ..Outcome::default()
+        };
+        let own = now.after(&before);
+        assert!((own.total_cost_usd.unwrap() - 0.10).abs() < 1e-9, "{:?}", own.total_cost_usd);
+        let sonnet = &own.model_usage["sonnet"];
+        assert_eq!((sonnet.input_tokens, sonnet.output_tokens, sonnet.cache_read_input_tokens, sonnet.cache_creation_input_tokens), (8, 400, 4000, 100));
+        assert!((sonnet.cost_usd.unwrap() - 0.09).abs() < 1e-9, "{:?}", sonnet.cost_usd);
+        assert_eq!(own.model_usage["haiku"], model(20, Some(0.01)), "a model the one before did not use is all its own");
+        assert_eq!((own.num_turns, own.usage.output_tokens), (Some(9), 400), "the turns and the usage of the main loop are the session's own already");
+        let unpriced = Outcome { total_cost_usd: None, ..before };
+        assert_eq!(now.after(&unpriced).total_cost_usd, Some(0.40), "without the cost before, the whole cost stays");
+    }
+
+    #[test]
     fn a_stream_without_the_newer_fields_reads_them_as_absent() {
         let t = parse(STREAM);
         assert_eq!(t.api_key_source, None);
@@ -358,6 +456,67 @@ not json
         );
         assert_eq!(t.first_request_tokens, Some(2 + 8733 + 11728), "input, cache written and cache read; not the subagent's");
         assert_eq!(parse(STREAM).first_request_tokens, None, "messages without usage");
+    }
+
+    /// An event of the assistant: message `id`, a context of `read` tokens, and `blocks`.
+    fn message(id: &str, read: u64, blocks: &str, parent: &str) -> String {
+        format!(
+            r#"{{"type":"assistant","message":{{"id":"{id}","content":[{blocks}],"usage":{{"input_tokens":3,"cache_creation_input_tokens":7,"cache_read_input_tokens":{},"output_tokens":9}}}},"parent_tool_use_id":{parent}}}"#,
+            read - 10
+        ) + "\n"
+    }
+
+    fn call(id: &str) -> String {
+        format!(r#"{{"type":"tool_use","id":"{id}","name":"Read","input":{{}}}}"#)
+    }
+
+    #[test]
+    fn each_request_of_the_main_loop_is_read_once_with_its_context() {
+        let stream = message("m1", 1000, r#"{"type":"text","text":"Reading."}"#, "null")
+            + &message("m1", 1000, &call("a"), "null")
+            + &message("s1", 77, &call("sub"), "\"agent\"")
+            + &message("m2", 1800, &(call("b") + "," + &call("c")), "null")
+            + r#"{"type":"assistant","message":{"content":[{"type":"text","text":"no usage"}]}}"#;
+        let t = parse(&stream);
+        assert_eq!(t.requests.len(), 3, "a message in two events is one request, a subagent's is none: {:?}", t.requests);
+        assert_eq!(t.requests[0].context, Some(1000));
+        assert_eq!(t.requests[0].calls, [0], "the call the second event of its message made");
+        assert_eq!((t.requests[1].context, t.requests[1].calls.clone()), (Some(1800), vec![2, 3]));
+        assert_eq!((t.requests[2].context, t.requests[2].calls.len()), (None, 0), "a message without usage has no context");
+        assert_eq!(t.first_request_tokens, Some(1000));
+    }
+
+    #[test]
+    fn a_request_tells_how_much_of_its_context_came_from_the_cache() {
+        let stream = message("m1", 1000, &call("a"), "null")
+            + &message("m1", 1000, &call("b"), "null")
+            + r#"{"type":"assistant","message":{"id":"m2","content":[{"type":"text","text":"no usage"}]}}"#;
+        let t = parse(&stream);
+        assert_eq!((t.requests[0].context, t.requests[0].cache_read), (Some(1000), Some(990)));
+        assert_eq!((t.requests[1].context, t.requests[1].cache_read), (None, None), "a message without usage reads nothing from the cache");
+    }
+
+    #[test]
+    fn a_call_alone_in_its_message_adds_what_the_next_request_grew() {
+        let stream = message("m1", 1000, &call("a"), "null")
+            + &message("m2", 1800, &call("b"), "null")
+            + &message("m3", 2000, &call("c"), "null")
+            + &message("m4", 2500, r#"{"type":"text","text":"Done."}"#, "null");
+        let t = parse(&stream);
+        let added: Vec<Option<u64>> = t.calls.iter().map(|c| c.added_tokens).collect();
+        assert_eq!(added, [Some(800), Some(200), Some(500)]);
+    }
+
+    #[test]
+    fn calls_that_share_a_message_have_no_tokens_of_their_own() {
+        let stream = message("m1", 1000, &(call("a") + "," + &call("b")), "null")
+            + &message("m2", 1800, &call("c"), "null")
+            + &message("m3", 900, &call("d"), "null")
+            + &message("m4", 5000, &call("e"), "null");
+        let t = parse(&stream);
+        let added: Vec<Option<u64>> = t.calls.iter().map(|c| c.added_tokens).collect();
+        assert_eq!(added, [None, None, None, Some(4100), None], "two calls in a message, a context that shrank after c, and the last request");
+        assert!(parse(STREAM).calls.iter().all(|c| c.added_tokens.is_none()), "a stream without usage measures nothing");
     }
 
     #[test]

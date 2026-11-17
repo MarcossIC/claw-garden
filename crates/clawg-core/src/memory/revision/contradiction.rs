@@ -8,8 +8,9 @@
 //! in `worker.rs` between embed and insert so the pairs are written inside the
 //! INSERT transaction.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
+use crate::memory::retrieval::pieces::{read_links, SaveLink};
 use crate::memory::retrieval::search::{identifier_tokens, search_all_memories, SearchScope};
 use crate::memory::domain::sharing::Reader;
 use crate::memory::domain::record::MemoryType;
@@ -233,11 +234,64 @@ pub(crate) async fn detect_contradiction(
     };
     found
         .into_iter()
-        .map(|c| {
-            let key = saves.get(&c.id).map_or(SaveKey::Row(c.id), |link| SaveKey::Save(link.save_id));
-            (key, c)
+        .map(|c| (save_key(&saves, c.id), c))
+        .collect()
+}
+
+/// The save the row `id` belongs to, as `links` says.
+fn save_key(links: &HashMap<i64, SaveLink>, id: i64) -> SaveKey {
+    links.get(&id).map_or(SaveKey::Row(id), |link| SaveKey::Save(link.save_id))
+}
+
+/// The saves that `pairs` (`(new, old)` rows of `memory_conflict`) join to
+/// one of the `resumed` pieces, from either side.
+fn saves_paired_with(pairs: &[(i64, i64)], resumed: &[i64], links: &HashMap<i64, SaveLink>) -> HashSet<SaveKey> {
+    pairs
+        .iter()
+        .filter_map(|&(new, old)| {
+            let other = if resumed.contains(&new) {
+                old
+            } else if resumed.contains(&old) {
+                new
+            } else {
+                return None;
+            };
+            Some(save_key(links, other))
         })
         .collect()
+}
+
+/// The saves the `resumed` pieces of a save were already paired with by an
+/// earlier take of it. A failed read is logged and answers none: the save is
+/// then judged as it was before, and ingest never stops for it.
+pub(crate) async fn saves_already_paired(store: &MemoryStore, resumed: &[i64]) -> HashSet<SaveKey> {
+    if resumed.is_empty() {
+        return HashSet::new();
+    }
+    let ids = resumed.to_vec();
+    let read = store
+        .conn
+        .call(move |c| -> rusqlite::Result<HashSet<SaveKey>> {
+            let marks = vec!["?"; ids.len()].join(", ");
+            let mut stmt = c.prepare(&format!(
+                "SELECT new_id, old_id FROM memory_conflict WHERE new_id IN ({marks}) OR old_id IN ({marks})"
+            ))?;
+            let pairs = stmt
+                .query_map(rusqlite::params_from_iter(ids.iter().chain(&ids)), |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<Result<Vec<(i64, i64)>, _>>()?;
+            let others: Vec<i64> =
+                pairs.iter().map(|&(new, old)| if ids.contains(&new) { old } else { new }).collect();
+            let links = read_links(c, &others)?;
+            Ok(saves_paired_with(&pairs, &ids, &links))
+        })
+        .await;
+    match read {
+        Ok(paired) => paired,
+        Err(e) => {
+            log::warn!("could not read the pairs of a resumed save: {e}");
+            HashSet::new()
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -318,6 +372,26 @@ mod tests {
     /// actually measure (distance banding, not eligibility).
     async fn insert_row(store: &MemoryStore, agent_id: &str, embedding: &[f32]) -> i64 {
         insert_row_typed(store, agent_id, "user_preference", embedding).await
+    }
+
+    // ── The saves a resumed save already paired with ────────────────────────
+
+    #[test]
+    fn the_saves_a_resumed_save_already_paired_with() {
+        use crate::memory::retrieval::pieces::SaveLink;
+        use crate::memory::retrieval::search::PiecePosition;
+        let link = |save_id| SaveLink { save_id, position: PiecePosition { piece: 1, pieces: 2 } };
+        let resumed = [10, 11];
+        // A row that paired with a resumed piece, a piece the resumed one
+        // paired with, a piece of that save that paired with it, and a pair
+        // of two rows the save has nothing to do with.
+        let pairs = [(20, 10), (11, 30), (31, 11), (40, 50)];
+        let links = HashMap::from([(30, link(7)), (31, link(7))]);
+
+        let paired = saves_paired_with(&pairs, &resumed, &links);
+
+        assert_eq!(paired, HashSet::from([SaveKey::Row(20), SaveKey::Save(7)]));
+        assert!(saves_paired_with(&[], &resumed, &links).is_empty());
     }
 
     // ── Pinned constant: CONTRADICTION_THRESHOLD ────────────────────────────

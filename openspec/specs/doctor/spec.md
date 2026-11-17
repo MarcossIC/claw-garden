@@ -11,6 +11,7 @@ Fuente de verdad de `clawg doctor`: qué `clawg` resuelve el PATH y qué está m
 - [project-locators](../../changes/archive/2026-10-27-project-locators/proposal.md), archivado el 2026-10-27, su entrega 1, que sale en 0.65.0: los chequeos `projects` y `project_remotes` leen las carpetas de `project_path` (V27), con los mismos hallazgos. Un store anterior a V27 se lee con la tabla que tiene. Su entrega 2a, en la misma versión: los chequeos `project_duplicates`, `project_orphans` y `project_merges` (R7). Su entrega 2b: el chequeo `project_deletes`, y un proyecto borrado ni es un duplicado ni deja huérfanas a sus filas (R7). Su entrega 3b: el chequeo `project_subfolders` (R7).
 - [native-memory-import](../../changes/archive/2026-10-31-native-memory-import/proposal.md), archivado el 2026-10-31, que sale en 0.72.0: el chequeo `native_memory` (NM7). Cómo se importa esa memoria está en [`specs/portability`](../portability/spec.md) (NM1 a NM6).
 - [hook-run-log](../../changes/archive/2026-11-04-hook-run-log/proposal.md), archivado el 2026-11-04, sale en 0.76.0: el chequeo `hooks.runs` (HR6 y HR7). Lo que lee está en [`specs/hooks`](../hooks/spec.md) (HR1 a HR5 y HR8).
+- [protocol-block](../../changes/archive/2026-11-17-protocol-block/proposal.md), archivado el 2026-11-17, que sale en 0.88.0: la frescura del bloque del protocolo (PB2) y el chequeo `protocol_block` con o sin preferencia (PB3), que reemplaza lo que LP14 decía de ese chequeo. El sello y las variantes están en [`specs/setup`](../setup/spec.md).
 
 **Dónde vive:** las decisiones en `crates/clawg-cli/src/doctor/` (`finding.rs`, el sobre y el resumen; `checks.rs`, los chequeos puros; `mcp.rs`, el registro; `mod.rs`, el PATH y la lectura en `run`); los hechos del store en `crates/clawg-core/src/memory/projects/inspect.rs`; la lectura del registro del hook en `crates/clawg-cli/src/hook_log.rs`, y si el hook de Cursor está instalado en `crates/clawg-cli/src/setup/cursor.rs`. Un test citado como «(`doctor`)» está en el `mod tests` de alguno de esos archivos.
 - [retire-legacy-kinds](../../changes/archive/2026-11-07-retire-legacy-kinds/proposal.md), archivado el 2026-11-07, que sale en 0.79.0 (RL8, al final de esta spec; `project_orphans` y `project_deletes` dejan de nombrar las tablas que V32 retira). Los requisitos de ese cambio se numeran R1 a R10 allí y RL1 a RL10 acá, para no chocar con los ids de cada spec.
@@ -121,9 +122,69 @@ La edad de un snapshot MUST salir de su nombre (`parse_snapshot_time`, pura), no
 
 ## LP14. La preferencia y el bloque del protocolo
 
-Cuando `preferences.json` existe, `doctor` MUST sumar el chequeo `preferences` (`checks::preferences`, `crates/clawg-cli/src/doctor/checks.rs:322`): `ok` legible, o `warn` `invalid` con la causa en `message`, sin `safe_next_step` y con el path en `evidence`. Con preferencia, MUST sumar el chequeo `protocol_block` (`checks.rs:350`) sobre el `CLAUDE.md` del usuario que lee `setup`: `ok` cuando el bloque es el que `setup` escribiría, `warn` `stale` cuando es otro e `info` `not_installed` sin bloque, las dos con `safe_next_step` `clawg setup claude-code --profile P`, y `warn` `unreadable` cuando el archivo no se puede leer o tiene un marcador suelto. Sin el archivo MUST NOT sumar ninguno de los dos.
+Cuando `preferences.json` existe, `doctor` MUST sumar el chequeo `preferences` (`checks::preferences`, `crates/clawg-cli/src/doctor/checks.rs:322`): `ok` legible, o `warn` `invalid` con la causa en `message`, sin `safe_next_step` y con el path en `evidence`. Sin el archivo MUST NOT sumarlo. El chequeo `protocol_block` (`checks.rs:350`), sobre el `CLAUDE.md` del usuario que lee `setup`, es de PB3: lo suma con o sin preferencia, siempre que el archivo tenga un bloque, y clasifica el bloque como dice PB2.
 
 **Test:** `preferences_findings` y `protocol_block_findings` (`doctor/checks.rs`); `doctor_names_a_broken_preferences_file` (`tests/binary.rs`).
+
+## PB2. La frescura del bloque
+
+Una función pura MUST clasificar un bloque instalado, dado el idioma preferido y la versión propia, contra el bloque que este binario escribiría para la variante que dice el sello (o la de por defecto, sin variante elegida):
+
+- `current`, si los cuerpos son iguales;
+- `newer`, si difieren y el sello tiene una versión posterior a la propia;
+- `stale`, si difieren en cualquier otro caso, también sin sello o con un sello que no se lee.
+
+La clasificación MUST NOT mirar la versión cuando los cuerpos son iguales, de modo que un bloque que escribió una versión anterior con el mismo texto es `current`.
+
+Bloque, sello, variante, cuerpo y versión propia son los de [`specs/setup`](../setup/spec.md), PB1. La función es `setup::freshness`.
+
+#### Escenario: mismo texto, otra versión
+- GIVEN un bloque `full` con sello `0.87.0` cuyo cuerpo es el que escribe `0.88.0`
+- WHEN se clasifica con la versión propia `0.88.0`
+- THEN es `current`
+
+#### Escenario: el bloque de antes de verdict-on-replace
+- GIVEN un bloque sin sello con el texto que pide juzgar cada cercana como `compatible` o `scoped`
+- WHEN se clasifica con la versión propia `0.88.0`, sin preferencia
+- THEN es `stale`
+
+#### Escenario: un bloque de un binario posterior
+- GIVEN un bloque con sello `0.90.0` y otro cuerpo
+- WHEN se clasifica con la versión propia `0.88.0`
+- THEN es `newer`
+
+**Tests:** `a_block_is_current_stale_or_newer` (`setup.rs`).
+
+## PB3. `doctor` revisa el bloque con preferencia o sin ella
+
+`doctor` MUST sumar el chequeo `protocol_block` siempre que el `CLAUDE.md` del usuario tenga un bloque, haya preferencia de idioma o no, con la clasificación de PB2:
+
+- `current`: `ok` `healthy`;
+- `stale`: `warn` `stale`, con `safe_next_step` `clawg setup claude-code --profile P` y un `message` que dice que el bloque no es el que escribe este clawg y que el agente puede leer ahí otras reglas que en las instrucciones del servidor, sin nombrar el idioma preferido cuando no lo hay;
+- `newer`: `info` `newer`, sin `safe_next_step`, con un `message` que dice que lo escribió un clawg posterior;
+- un archivo que no se lee o un marcador suelto: `warn` `unreadable`.
+
+`evidence` MUST llevar `path`, `written_by` (la versión del sello, o `null`) y `this_version` (la versión propia). Sin bloque, `doctor` MUST sumar `info` `not_installed` sólo con preferencia, y sin preferencia MUST NOT sumar ningún hallazgo `protocol_block`. Cada `message` MUST estar en los dos idiomas (CL4).
+
+`preferences` sigue siendo de LP14, sólo con el archivo; `protocol_block` ya no espera a una preferencia.
+
+#### Escenario: sin preferencia, un bloque viejo
+- GIVEN un perfil sin `preferences.json` y un `CLAUDE.md` con un bloque sin sello y otro texto
+- WHEN corre `clawg doctor --profile dev`
+- THEN hay un hallazgo `protocol_block` `warn` `stale` con `safe_next_step` `clawg setup claude-code --profile dev`
+- AND su `evidence.written_by` es `null`
+
+#### Escenario: sin preferencia, sin bloque
+- GIVEN un perfil sin `preferences.json` y un `CLAUDE.md` sin marcadores
+- WHEN corre `clawg doctor`
+- THEN no hay hallazgos `protocol_block`
+
+#### Escenario: después de `setup`
+- GIVEN el `CLAUDE.md` que deja `clawg setup claude-code --profile dev`, con cualquier variante
+- WHEN corre `clawg doctor --profile dev`
+- THEN `protocol_block` es `ok` `healthy`
+
+**Tests:** `protocol_block_findings` (`doctor/checks.rs`), con `newer` y con el mensaje sin preferencia; `the_findings_are_the_same_in_both_languages_but_their_message` (`checks.rs`), con los hallazgos nuevos; `doctor_marks_an_old_block_stale_without_a_preference` (`tests/binary.rs`). `doctor_names_a_broken_preferences_file` (`tests/binary.rs`) sigue igual: su sandbox no tiene bloque.
 
 ## CL4. Sólo `message` cambia de idioma
 

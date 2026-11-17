@@ -2,7 +2,7 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| 1 y 4 | M, por partes (A es S–M; B y C son investigaciones S) | el paso 1 de [memory-anchors](../memory-anchors/exploration.md) (98), que registra el checkout de cada save, para la parte A; [agent-eval](../agent-eval/exploration.md) (96) para medir B, C y D | exploración (borrador) |
+| 1 y 4 | M, por partes (A es S–M; B y C son investigaciones S) | el paso 1 de [memory-anchors](../memory-anchors/exploration.md) (98), que registra el checkout de cada save, para la parte A; [agent-eval](../archive/2026-11-17-agent-eval/exploration.md) (96) para medir B, C y D | exploración (borrador) |
 
 **Tesis:** el ciclo «guardar un traspaso, limpiar la sesión y retomarlo» que proponen las investigaciones ya existe casi entero en clawg (`session_summary` con secciones fijas, LAST SESSION en cada contexto, `session-start` en `startup|resume|clear|compact`). Lo que falla es el caso que esas mismas investigaciones recomiendan como flujo diario: **varias sesiones en paralelo, una por worktree, del mismo proyecto.** Ahí cada sesión arranca con el traspaso de la otra y sus saves pueden quedar sellados con la sesión equivocada. Este cambio arregla eso (parte A) y deja medidas, no implementadas, tres ideas de las investigaciones sobre el ciclo de vida: avisar cuando el contexto se llena (B), guardar el resumen que hace el cliente al compactar (C) y darle contexto a los subagentes (D).
 

@@ -4,4 +4,5 @@
 [advisories]
 ignore = [
     { id = "RUSTSEC-2024-0436", reason = "paste is unmaintained with no successor release; tokenizers brings it in as a proc-macro run at build time, so none of its code ships in the binary" },
+    { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained with no successor release, not vulnerable; rmcp requires it unconditionally for its protocol types (3.11.0 still does) and turns on schemars' chrono04 feature, and clawg never calls it" },
 ]

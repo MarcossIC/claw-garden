@@ -268,7 +268,7 @@ En otro home se probaron las formas de escribir un camino en Windows, con la dec
 - **Un camino `\\?\` mal formado.** Con `{"cwd": "\\\\?\\C:\\…\\mono\\apps/web/src"}` (el prefijo verbatim con `/` después), `session-start` lee el monorepo en vez de `web`, y el monorepo queda con una segunda carpeta `\\?\C:\…\mono`.
   - La causa: en un camino `\\?\` la `/` no separa, y `fs::canonicalize` falla. El respaldo de `canonical_form` (`crates/clawg-core/src/memory/identity.rs:82-87`), `normalize_lexical(absolute(path))`, sí llega al directorio, pero no llama a `strip_verbatim`. La raíz conserva el prefijo, se graba como otra carpeta y el subcamino queda fuera de ella.
   - Lo mismo pasa con un cliente HTTP propio que manda una raíz con los separadores mezclados: `POST /v1/projects` toma `root_path` como llega, y cada forma se graba como otra carpeta. El puente, los hooks y la CLI mandan siempre la raíz canónica, y ni Claude Code ni una shell dan un `cwd` así.
-  - El respaldo es anterior al cambio (`a556e90`). Queda como arreglo suelto en el backlog del [README](../../../README.md#backlog-sin-spec-arreglos-sueltos).
+  - El respaldo es anterior al cambio (`a556e90`). Queda como arreglo suelto en el backlog ([backlog.md](../../../backlog.md)).
 
 ### CI
 
@@ -327,7 +327,7 @@ Como en Linux, con el binario de `target-test` copiado fuera del directorio de b
 - **`--map-root` compara OLD byte a byte.**
   - `roots_here` (`crates/clawg-core/src/memory/portability/import.rs:415`) busca un OLD igual al `root_path` exportado. En Windows, `C:/…/mono`, `c:\…` o un `\` final no son `C:\…\mono`, y el mapa se ignora sin aviso: el proyecto cae `by remote`.
   - Un OLD que no está en el archivo también se ignora sin aviso. `--project-map`, en cambio, nombra los nombres que ninguna nota tiene.
-  - Es anterior a la entrega 4 (`6424bca`). Queda como arreglo suelto en el backlog del [README](../../../README.md#backlog-sin-spec-arreglos-sueltos).
+  - Es anterior a la entrega 4 (`6424bca`). Queda como arreglo suelto en el backlog ([backlog.md](../../../backlog.md)).
 - **Un `--map-root` hacia una subcarpeta declarada** hace lo que dice la spec: `--map-root <monoA>=<monoB>\apps\web\src` pone `mono` en `web2`. Después escribe la declaración del archivo como `web2 apps/web → web-136d`, cuyo lado del repositorio no tiene carpeta y nadie alcanza, y deja la sugerencia `similar_name` entre `web2` y `mono-3629`.
 
 ### CI
@@ -355,5 +355,5 @@ El pull request de `develop` a `main` lo vuelve a correr, sobre el cambio entero
 - **El CI.** Las entregas 1 a 2b no tuvieron pull request propio. La 3a, la 3b y la 4 sí (#95, #96 y #97, a `develop`), y su CI pasó en Linux y Windows. El del #97 corrió sobre todo el cambio unido en `develop`, así que cubre también las entregas 1 a 2b. El pull request de `develop` a `main` lo vuelve a correr antes del release.
 - **Lo que queda fuera del cambio:**
   - el paso operativo de ubicar las 15.709 filas sin proyecto del import en prod: no es código, pide autorización explícita y corre con 0.65.0 instalado, porque un build de debug no abre prod. Las que queden sin proyecto se cuentan antes de la línea base de 86;
-  - los dos hallazgos de Windows (el respaldo de `canonical_form` sin `strip_verbatim`, y `--map-root` comparado byte a byte), anteriores al cambio, que quedan como arreglos sueltos en el backlog del [README](../../../README.md#backlog-sin-spec-arreglos-sueltos).
+  - los dos hallazgos de Windows (el respaldo de `canonical_form` sin `strip_verbatim`, y `--map-root` comparado byte a byte), anteriores al cambio, que quedan como arreglos sueltos en el backlog ([backlog.md](../../../backlog.md)).
 - Las citas `ruta:línea` de la propuesta, la spec y el diseño que quedan aquí no cambian, porque describen el código contra el que se escribieron. Sólo se ajustaron los enlaces relativos que rompió el traslado a `archive/`.

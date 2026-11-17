@@ -5,6 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
+use clawg_cli::mcp::protocol::Variant;
 use clawg_cli::setup::{self, FileStep, Mode, State};
 use clawg_core::paths::Profile;
 use clawg_core::preferences::{Lang, Preferences};
@@ -24,6 +25,12 @@ pub enum Arm {
     A3,
     /// A3 with the client's tool search off, so clawg's tools load up front.
     A3Eager,
+    /// A3 with the short protocol block `clawg setup claude-code --protocol
+    /// short` writes.
+    A3Short,
+    /// A3 without the `PostToolUse` and `PostToolUseFailure` hooks that `setup`
+    /// installs for `Bash`: what a3 was before they existed.
+    A3NoTools,
     /// The client's native memory holding the same facts, without clawg.
     A4,
     /// A3 without the tools that read memories back: only what reaches the
@@ -38,10 +45,53 @@ pub enum Arm {
     L2,
 }
 
-pub const ARMS: [Arm; 9] = [Arm::A0, Arm::A2, Arm::A3, Arm::A3Eager, Arm::A4, Arm::B, Arm::L0, Arm::L1, Arm::L2];
+/// How the sessions of a task are played on one working directory.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Shape {
+    /// Every session starts a conversation of its own.
+    #[default]
+    Split,
+    /// Each session after the first continues the conversation of the one before.
+    Joined,
+    /// The second session is played both ways from the same first one.
+    Both,
+}
+
+impl Shape {
+    pub fn parse(name: &str) -> Option<Shape> {
+        [Shape::Split, Shape::Joined, Shape::Both].into_iter().find(|s| s.as_str() == name)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Shape::Split => "split",
+            Shape::Joined => "joined",
+            Shape::Both => "both",
+        }
+    }
+
+    /// Why a task of `sessions` sessions cannot be played this way, if it cannot.
+    pub fn check(self, sessions: usize) -> Result<(), String> {
+        match (self, sessions) {
+            (Shape::Split, _) | (Shape::Joined, 2..) | (Shape::Both, 2) => Ok(()),
+            (_, 1) => Err(format!("a task of one session is played only with --sessions split, not {}", self.as_str())),
+            (_, n) => Err(format!("--sessions both needs a task of two sessions, and this one has {n}")),
+        }
+    }
+}
+
+pub const ARMS: [Arm; 11] = [Arm::A0, Arm::A2, Arm::A3, Arm::A3Eager, Arm::A3Short, Arm::A3NoTools, Arm::A4, Arm::B, Arm::L0, Arm::L1, Arm::L2];
+
+/// The events of the hooks `setup` installs for the tools the agent calls, which
+/// arm `a3-notools` does not have.
+const TOOL_HOOK_EVENTS: [&str; 2] = ["PostToolUse", "PostToolUseFailure"];
 
 /// The tools arm B takes away.
 const READ_TOOLS: [&str; 3] = ["search_memory", "read_memory", "list_memories"];
+
+/// The most characters of the output of a hook the client puts in the context.
+const HOOK_CONTEXT_MAX_CHARS: usize = 10_000;
 
 /// The client a real run starts, found on the `PATH`.
 pub const CLIENT: &str = "claude";
@@ -61,6 +111,8 @@ impl Arm {
             Arm::A2 => "a2",
             Arm::A3 => "a3",
             Arm::A3Eager => "a3-eager",
+            Arm::A3Short => "a3-short",
+            Arm::A3NoTools => "a3-notools",
             Arm::A4 => "a4",
             Arm::B => "b",
             Arm::L0 => "l0",
@@ -71,17 +123,17 @@ impl Arm {
 
     /// Whether a run of this arm starts clawg: its daemon, its bridge, its hooks.
     pub fn has_clawg(self) -> bool {
-        matches!(self, Arm::A2 | Arm::A3 | Arm::A3Eager | Arm::B | Arm::L0 | Arm::L1 | Arm::L2)
+        matches!(self, Arm::A2 | Arm::A3 | Arm::A3Eager | Arm::A3Short | Arm::A3NoTools | Arm::B | Arm::L0 | Arm::L1 | Arm::L2)
     }
 
     /// Whether the arm has the hooks `setup` writes in `settings.json`.
     fn has_setup(self) -> bool {
-        matches!(self, Arm::A3 | Arm::A3Eager | Arm::B | Arm::L0 | Arm::L1 | Arm::L2)
+        matches!(self, Arm::A3 | Arm::A3Eager | Arm::A3Short | Arm::A3NoTools | Arm::B | Arm::L0 | Arm::L1 | Arm::L2)
     }
 
     /// Whether the arm has the protocol block `setup` writes in `CLAUDE.md`.
     fn has_protocol(self) -> bool {
-        matches!(self, Arm::A3 | Arm::A3Eager | Arm::B)
+        matches!(self, Arm::A3 | Arm::A3Eager | Arm::A3Short | Arm::A3NoTools | Arm::B)
     }
 
     /// Whether the arm delivers the seeded rules and, if it does, whether
@@ -150,6 +202,9 @@ pub struct Options {
     pub now_ms: i64,
     /// The rules of other topics every arm with memory is seeded with.
     pub noise: Vec<SeedMemory>,
+    /// The name of that noise, which a run records.
+    pub noise_name: String,
+    pub shape: Shape,
     /// The `agent-eval` binary the hooks of the harness run; absolute.
     pub agent_eval: PathBuf,
 }
@@ -183,20 +238,36 @@ pub struct RunPlan {
     pub daemon: Option<Daemon>,
     /// Commands run before the session, against [`RunPlan::daemon`].
     pub before: Vec<Step>,
-    /// The client session, run in [`Layout::workdir`].
+    /// The first client session, run in [`Layout::workdir`].
     pub client: Step,
+    /// The sessions after the first, in order, each with its own prompt; a
+    /// shape that continues the conversation has `--continue` in them, and a
+    /// fork plans its second session so, which the new one is without it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub later: Vec<Step>,
     /// What every process of the run gets on top of the environment it inherits.
     pub env: Vec<(String, String)>,
     /// Commands run after the session.
     pub after: Vec<Step>,
 }
 
+impl RunPlan {
+    /// Every session of the run, in order.
+    pub fn sessions(&self) -> Vec<&Step> {
+        std::iter::once(&self.client).chain(&self.later).collect()
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ArmError {
+    #[error("{0}")]
+    Shape(String),
     #[error("{0}")]
     Setup(#[from] setup::SetupError),
     #[error("a path of the run is not valid Unicode: {0}")]
     NonUnicode(PathBuf),
+    #[error("the rules that start the session are {chars} characters, and the client injects at most {max} from the output of a hook")]
+    StartupTooLong { chars: usize, max: usize },
 }
 
 fn text(path: &Path) -> Result<String, ArmError> {
@@ -220,6 +291,8 @@ fn add_hook(settings: &mut Value, event: &str, hook: Value) {
 }
 
 pub fn plan(task: &Task, arm: Arm, layout: &Layout, options: &Options) -> Result<RunPlan, ArmError> {
+    let prompts = task.prompts();
+    options.shape.check(prompts.len()).map_err(ArmError::Shape)?;
     let clawg = text(&options.clawg)?;
     let workdir = text(&layout.workdir())?;
     let server_name = options.profile.mcp_server_name();
@@ -239,6 +312,8 @@ pub fn plan(task: &Task, arm: Arm, layout: &Layout, options: &Options) -> Result
             settings: setup::File { path: layout.config_dir().join("settings.json"), text: None },
             instructions: setup::File { path: layout.config_dir().join("CLAUDE.md"), text: None },
             language: options.lang,
+            version: setup::own_version()?,
+            protocol: (arm == Arm::A3Short).then_some(Variant::Short),
         };
         let setup_plan = setup::plan(&state, Mode::Install)?;
         servers.insert(
@@ -247,6 +322,13 @@ pub fn plan(task: &Task, arm: Arm, layout: &Layout, options: &Options) -> Result
         );
         if let (true, FileStep::Write(body)) = (arm.has_setup(), setup_plan.settings) {
             settings = serde_json::from_str(&body).expect("setup writes its settings as JSON");
+            if arm == Arm::A3NoTools {
+                if let Some(hooks) = settings["hooks"].as_object_mut() {
+                    for event in TOOL_HOOK_EVENTS {
+                        hooks.remove(event);
+                    }
+                }
+            }
         }
         if let (true, FileStep::Write(body)) = (arm.has_protocol(), setup_plan.instructions) {
             files.push((state.instructions.path.clone(), body));
@@ -273,13 +355,17 @@ pub fn plan(task: &Task, arm: Arm, layout: &Layout, options: &Options) -> Result
         }
         after.push(Step { program: clawg, args: ["stop", "--profile", options.profile.as_str()].map(String::from).to_vec() });
     }
+    let native_dir = layout.config_dir().join("projects").join(seed::project_slug(&workdir)).join("memory");
     if arm == Arm::A4 && !memories.is_empty() {
-        let dir = layout.config_dir().join("projects").join(seed::project_slug(&workdir)).join("memory");
-        files.push((dir.join("MEMORY.md"), seed::native_memory(&memories)));
+        files.push((native_dir.join("MEMORY.md"), seed::native_memory(&memories)));
     }
     let harness = text(&options.agent_eval)?;
     if let Some(by_file) = arm.rules_by_file() {
         if let Some(rules) = rules::startup(&memories, by_file, options.lang) {
+            let chars = rules.chars().count();
+            if chars > HOOK_CONTEXT_MAX_CHARS {
+                return Err(ArmError::StartupTooLong { chars, max: HOOK_CONTEXT_MAX_CHARS });
+            }
             add_hook(&mut settings, "SessionStart", harness_hook(&harness, "hook-context", &text(&layout.startup_rules())?));
             files.push((layout.startup_rules(), rules));
         }
@@ -288,12 +374,19 @@ pub fn plan(task: &Task, arm: Arm, layout: &Layout, options: &Options) -> Result
         }
     }
     add_hook(&mut settings, "InstructionsLoaded", harness_hook(&harness, "hook-log", &text(&layout.instructions_log())?));
+    // What the run keeps beside the working directory (the task with its checks, the streams of the
+    // sessions before, the other branch of a fork) is readable with the file tools unless the client
+    // denies it. The native memory is a working directory of its arm, or the block would deny it its notes.
+    settings["permissions"]["blockReadsOutsideWorkingDirectories"] = json!(true);
+    if arm == Arm::A4 {
+        settings["permissions"]["additionalDirectories"] = json!([text(&native_dir)?]);
+    }
     files.push((layout.config_dir().join("settings.json"), serde_json::to_string_pretty(&settings).expect("JSON serializes") + "\n"));
     files.push((layout.mcp_config(), serde_json::to_string_pretty(&json!({ "mcpServers": servers })).expect("JSON serializes") + "\n"));
 
     let mut args: Vec<String> = vec![
         "-p".into(),
-        task.prompt.clone(),
+        prompts[0].to_owned(),
         "--output-format".into(),
         "stream-json".into(),
         "--verbose".into(),
@@ -313,13 +406,23 @@ pub fn plan(task: &Task, arm: Arm, layout: &Layout, options: &Options) -> Result
     // Nothing can approve a prompt in `-p`, so without a mode the client denies edits and MCP calls.
     // Edits are approved inside the working directory only; a shell is the one way an unattended
     // session could act outside it, and no task needs one. A denial outranks an allowance.
-    let mut denied: Vec<String> = vec!["Bash".into()];
+    // A task that names shell commands lifts the denial and allows each as a scoped rule, which
+    // leaves every other command denied.
+    let mut denied: Vec<String> = if task.shell.is_empty() { vec!["Bash".into()] } else { Vec::new() };
     if arm == Arm::B {
         denied.extend(READ_TOOLS.iter().map(|t| format!("mcp__{server_name}__{t}")));
     }
-    args.extend(["--permission-mode".into(), "acceptEdits".into(), "--disallowedTools".into(), denied.join(",")]);
+    args.extend(["--permission-mode".into(), "acceptEdits".into()]);
+    if !denied.is_empty() {
+        args.extend(["--disallowedTools".into(), denied.join(",")]);
+    }
+    let mut allowed: Vec<String> = Vec::new();
     if arm.has_clawg() {
-        args.extend(["--allowedTools".into(), format!("mcp__{server_name}")]);
+        allowed.push(format!("mcp__{server_name}"));
+    }
+    allowed.extend(task.shell.iter().map(|command| format!("Bash({command}:*)")));
+    if !allowed.is_empty() {
+        args.extend(["--allowedTools".into(), allowed.join(",")]);
     }
 
     let home = text(&layout.home())?;
@@ -334,6 +437,18 @@ pub fn plan(task: &Task, arm: Arm, layout: &Layout, options: &Options) -> Result
         env.push(("ENABLE_TOOL_SEARCH".to_owned(), "false".to_owned()));
     }
 
+    let later = prompts[1..]
+        .iter()
+        .map(|prompt| {
+            let mut args = args.clone();
+            args[1] = (*prompt).to_owned();
+            if options.shape != Shape::Split {
+                args.push("--continue".into());
+            }
+            Step { program: CLIENT.into(), args }
+        })
+        .collect();
+
     Ok(RunPlan {
         task: task.id.clone(),
         arm: arm.as_str().to_owned(),
@@ -341,6 +456,7 @@ pub fn plan(task: &Task, arm: Arm, layout: &Layout, options: &Options) -> Result
         daemon,
         before,
         client: Step { program: CLIENT.into(), args },
+        later,
         env,
         after,
     })
@@ -375,6 +491,8 @@ mod tests {
             claude_version: Some("2.1.300".into()),
             now_ms: 1_800_000_000_000,
             noise: Vec::new(),
+            noise_name: "noise".into(),
+            shape: Shape::Split,
             agent_eval: harness(),
         }
     }
@@ -415,6 +533,43 @@ mod tests {
     }
 
     #[test]
+    fn the_startup_rules_must_fit_what_the_client_injects() {
+        let rules = |n: usize, paths: &str| -> Vec<SeedMemory> {
+            (0..n)
+                .map(|i| {
+                    serde_json::from_str(&format!(
+                        r#"{{"content": "Rule number {i}\nThe rule says something about case {i} that takes a few words to say.", "rule": {paths}}}"#
+                    ))
+                    .unwrap()
+                })
+                .collect()
+        };
+        let with = |noise: Vec<SeedMemory>, arm: Arm| {
+            let mut opts = options(None);
+            opts.noise = noise;
+            plan(&task(true), arm, &layout(), &opts)
+        };
+
+        assert!(with(rules(15, "{}"), Arm::L1).is_ok());
+        assert!(with(rules(15, "{}"), Arm::L2).is_ok());
+
+        let refused = with(rules(300, "{}"), Arm::L1).unwrap_err();
+        assert!(matches!(refused, ArmError::StartupTooLong { chars, max: 10_000 } if chars > 10_000), "{refused:?}");
+        let said = refused.to_string();
+        let ArmError::StartupTooLong { chars, .. } = refused else { unreachable!() };
+        assert!(said.contains(&chars.to_string()) && said.contains("10000") && said.contains("hook"), "the size and the limit are named: {said}");
+        assert!(matches!(with(rules(300, "{}"), Arm::L2), Err(ArmError::StartupTooLong { .. })), "the rules without globs are delivered at startup by l2 too");
+
+        let by_glob = rules(300, r#"{"paths": ["**/*.py"]}"#);
+        assert!(with(by_glob.clone(), Arm::L2).is_ok(), "l2 delivers the rules with globs by file, so nothing goes at startup");
+        assert!(matches!(with(by_glob, Arm::L1), Err(ArmError::StartupTooLong { .. })));
+
+        for arm in [Arm::A3, Arm::A3Short, Arm::A4, Arm::L0] {
+            assert!(with(rules(300, "{}"), arm).is_ok(), "{arm:?} has no startup hook of the harness");
+        }
+    }
+
+    #[test]
     fn l0_is_a3_without_the_protocol() {
         let a3 = plan(&task(true), Arm::A3, &layout(), &options(None)).unwrap();
         let l0 = plan(&task(true), Arm::L0, &layout(), &options(None)).unwrap();
@@ -424,6 +579,31 @@ mod tests {
             assert_eq!(file(&l0, name), file(&a3, name), "{name}");
         }
         assert_eq!((&l0.daemon, &l0.before, &l0.after, &l0.client.args), (&a3.daemon, &a3.before, &a3.after, &a3.client.args));
+    }
+
+    #[test]
+    fn a3_short_is_a3_with_the_short_block() {
+        let own = setup::own_version().unwrap();
+        let a3 = plan(&task(true), Arm::A3, &layout(), &options(None)).unwrap();
+        let short = plan(&task(true), Arm::A3Short, &layout(), &options(None)).unwrap();
+        let full_block = file(&a3, "CLAUDE.md").unwrap();
+        assert!(full_block.contains(&format!("<!-- clawg {own} -->")) && full_block.contains("## How to write a save"), "a3 keeps the whole block");
+        let block = file(&short, "CLAUDE.md").unwrap();
+        assert!(block.contains(&format!("<!-- clawg {own} protocol=short -->")), "{block}");
+        assert!(block.contains("## Session summary") && block.contains("## After a compaction"), "{block}");
+        assert!(!block.contains("## How to write a save") && block.len() < full_block.len() / 4, "{block}");
+
+        let without_block = |plan: &RunPlan| RunPlan {
+            arm: String::new(),
+            files: plan.files.iter().filter(|(path, _)| !path.ends_with("CLAUDE.md")).cloned().collect(),
+            ..plan.clone()
+        };
+        assert_eq!(without_block(&short), without_block(&a3), "everything but the block is a3's");
+
+        let spanish = plan(&task(true), Arm::A3Short, &layout(), &options(Some(Lang::Es))).unwrap();
+        let block = file(&spanish, "CLAUDE.md").unwrap();
+        assert!(block.contains("## Resumen de sesión") && !block.contains("## Cómo escribir un save"), "{block}");
+        assert!(file(&plan(&task(true), Arm::L0, &layout(), &options(None)).unwrap(), "CLAUDE.md").is_none(), "l0 has none");
     }
 
     #[test]
@@ -480,8 +660,50 @@ mod tests {
             assert!(plan.files.iter().any(|(p, _)| *p == layout().config_dir().join("settings.json")), "{}", arm.as_str());
             let settings = settings(&plan);
             assert_eq!(settings["hooks"]["InstructionsLoaded"], logged, "{}", arm.as_str());
-            let with_setup = matches!(arm, Arm::A3 | Arm::A3Eager | Arm::B | Arm::L0 | Arm::L1 | Arm::L2);
+            let with_setup = matches!(arm, Arm::A3 | Arm::A3Eager | Arm::A3Short | Arm::A3NoTools | Arm::B | Arm::L0 | Arm::L1 | Arm::L2);
             assert_eq!(settings["hooks"]["UserPromptSubmit"].is_array(), with_setup, "setup's hooks stay: {}", arm.as_str());
+        }
+    }
+
+    #[test]
+    fn every_arm_blocks_the_reads_outside_its_working_directory() {
+        for arm in ARMS {
+            let plan = plan(&task(true), arm, &layout(), &options(None)).unwrap();
+            assert_eq!(settings(&plan)["permissions"]["blockReadsOutsideWorkingDirectories"], json!(true), "{}", arm.as_str());
+        }
+        let a3 = plan(&task(true), Arm::A3, &layout(), &options(None)).unwrap();
+        let state = State {
+            exe: options(None).clawg,
+            profile: Profile::Dev,
+            servers: setup::File { path: layout().config_dir().join(".claude.json"), text: None },
+            settings: setup::File { path: layout().config_dir().join("settings.json"), text: None },
+            instructions: setup::File { path: layout().config_dir().join("CLAUDE.md"), text: None },
+            language: None,
+            version: setup::own_version().unwrap(),
+            protocol: None,
+        };
+        let FileStep::Write(body) = setup::plan(&state, Mode::Install).unwrap().settings else { panic!("setup writes its settings") };
+        let installed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let settings = settings(&a3);
+        for (key, value) in installed.as_object().unwrap().iter().filter(|(key, _)| *key != "hooks") {
+            assert_eq!(&settings[key], value, "{key} of setup stays");
+        }
+        for (event, groups) in installed["hooks"].as_object().unwrap() {
+            assert_eq!(&settings["hooks"][event], groups, "the {event} hooks of setup stay");
+        }
+    }
+
+    #[test]
+    fn the_native_memory_is_a_working_directory_of_a4_only() {
+        for arm in ARMS {
+            let plan = plan(&task(true), arm, &layout(), &options(None)).unwrap();
+            let permissions = settings(&plan)["permissions"].clone();
+            if arm == Arm::A4 {
+                let memory = plan.files.iter().find(|(p, _)| p.ends_with("memory/MEMORY.md")).map(|(p, _)| p.parent().unwrap().to_str().unwrap().to_owned()).unwrap();
+                assert_eq!(permissions["additionalDirectories"], json!([memory]), "the only one is where the client keeps its notes");
+            } else {
+                assert!(permissions.get("additionalDirectories").is_none(), "{} has no directory but its working directory", arm.as_str());
+            }
         }
     }
 
@@ -505,7 +727,7 @@ mod tests {
                 Arm::A0 => assert!(seed.is_none() && native.is_none()),
                 Arm::A4 => {
                     let native = native.unwrap();
-                    assert!(native.find("Go errors").unwrap() < native.find("48213").unwrap(), "the newer memory goes first:\n{native}");
+                    assert!(native.find("48213").unwrap() < native.find("Go errors").unwrap(), "the oldest memory goes first:\n{native}");
                 }
                 _ => {
                     let seed = seed.unwrap();
@@ -535,6 +757,37 @@ mod tests {
     }
 
     #[test]
+    fn a3_notools_is_a3_without_the_tool_hooks() {
+        let a3 = plan(&task(true), Arm::A3, &layout(), &options(None)).unwrap();
+        let notools = plan(&task(true), Arm::A3NoTools, &layout(), &options(None)).unwrap();
+        let (full, without) = (settings(&a3), settings(&notools));
+        let mut expected = full.clone();
+        for event in ["PostToolUse", "PostToolUseFailure"] {
+            assert!(full["hooks"][event].is_array(), "a3 has the {event} hooks that setup installs");
+            assert!(without["hooks"].get(event).is_none(), "a3-notools has no {event} hook");
+            expected["hooks"].as_object_mut().unwrap().remove(event);
+        }
+        assert_eq!(without, expected, "nothing else of settings.json differs: the server's hooks and the harness's stay");
+        let others = |plan: &RunPlan| plan.files.iter().filter(|(p, _)| !p.ends_with("settings.json")).cloned().collect::<Vec<_>>();
+        assert_eq!(others(&notools), others(&a3), "the server, the protocol block and the seed are a3's");
+        assert_eq!(
+            (&notools.daemon, &notools.before, &notools.after, &notools.client, &notools.env),
+            (&a3.daemon, &a3.before, &a3.after, &a3.client, &a3.env)
+        );
+        assert_eq!((notools.arm.as_str(), a3.arm.as_str()), ("a3-notools", "a3"));
+        assert!(file(&notools, "CLAUDE.md").is_some(), "it keeps the protocol block of a3");
+    }
+
+    #[test]
+    fn a3_notools_reads_and_prints_by_its_name() {
+        assert_eq!(Arm::parse("a3-notools"), Some(Arm::A3NoTools));
+        assert_eq!(Arm::A3NoTools.as_str(), "a3-notools");
+        assert!(ARMS.contains(&Arm::A3NoTools) && Arm::A3NoTools.has_clawg());
+        let order: Vec<&str> = ARMS.iter().map(|a| a.as_str()).collect();
+        assert!(order.iter().position(|a| *a == "a3-short") < order.iter().position(|a| *a == "a3-notools"), "{order:?}");
+    }
+
+    #[test]
     fn every_arm_has_a_name() {
         for arm in ARMS {
             assert_eq!(Arm::parse(arm.as_str()), Some(arm));
@@ -545,7 +798,7 @@ mod tests {
     #[test]
     fn the_arms_with_clawg_start_a_daemon_of_the_run_on_an_ephemeral_port() {
         let with_daemon: Vec<Arm> = ARMS.into_iter().filter(|arm| plan(&task(true), *arm, &layout(), &options(None)).unwrap().daemon.is_some()).collect();
-        assert_eq!(with_daemon, [Arm::A2, Arm::A3, Arm::A3Eager, Arm::B, Arm::L0, Arm::L1, Arm::L2]);
+        assert_eq!(with_daemon, [Arm::A2, Arm::A3, Arm::A3Eager, Arm::A3Short, Arm::A3NoTools, Arm::B, Arm::L0, Arm::L1, Arm::L2]);
 
         let plan = plan(&task(true), Arm::A3, &layout(), &options(None)).unwrap();
         let daemon = plan.daemon.unwrap();
@@ -674,6 +927,111 @@ mod tests {
             let denied = pair_value(&plan, "--disallowedTools").unwrap();
             assert!(denied.split(',').any(|t| t == "Bash"), "{}: {denied}", arm.as_str());
         }
+    }
+
+    #[test]
+    fn a_task_with_a_shell_allows_its_commands_and_no_other() {
+        let shelled = parse(
+            r#"{"id": "t", "category": "E", "fixture": "tally", "prompt": "Count the files.", "shell": ["eza", "ls"],
+                "checks": [{"kind": "answer_contains", "text": "3"}]}"#,
+        )
+        .unwrap();
+        for arm in ARMS {
+            let plan = plan(&shelled, arm, &layout(), &options(None)).unwrap();
+            let allowed: Vec<&str> = pair_value(&plan, "--allowedTools").unwrap().split(',').collect();
+            assert!(allowed.contains(&"Bash(eza:*)") && allowed.contains(&"Bash(ls:*)"), "{}: {allowed:?}", arm.as_str());
+            assert!(!allowed.contains(&"Bash"), "{}: a bare Bash allows every command", arm.as_str());
+            assert_eq!(allowed.contains(&"mcp__clawg-dev"), arm.has_clawg(), "{}", arm.as_str());
+            let denied = pair_value(&plan, "--disallowedTools");
+            assert!(denied.is_none_or(|d| !d.split(',').any(|t| t == "Bash")), "{}: {denied:?}", arm.as_str());
+        }
+        let b = plan(&shelled, Arm::B, &layout(), &options(None)).unwrap();
+        assert_eq!(
+            pair_value(&b, "--disallowedTools"),
+            Some("mcp__clawg-dev__search_memory,mcp__clawg-dev__read_memory,mcp__clawg-dev__list_memories")
+        );
+        let a0 = plan(&shelled, Arm::A0, &layout(), &options(None)).unwrap();
+        assert_eq!(pair_value(&a0, "--disallowedTools"), None, "nothing to deny");
+        assert_eq!(pair_value(&a0, "--allowedTools"), Some("Bash(eza:*),Bash(ls:*)"));
+    }
+
+    fn two_sessions() -> Task {
+        parse(
+            r#"{"id": "t", "category": "R", "fixture": "tally",
+                "sessions": [{"prompt": "Inventory the timeouts."}, {"prompt": "Apply what was decided."}],
+                "checks": [{"kind": "answer_contains", "text": "done"}]}"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_task_of_one_session_plans_what_it_planned_before() {
+        for shape in [Shape::Split, Shape::Joined] {
+            let mut opts = options(None);
+            opts.shape = shape;
+            let plan = plan(&task(true), Arm::A3, &layout(), &opts);
+            assert_eq!(plan.is_ok(), shape == Shape::Split, "{shape:?}: a task of one session takes only split");
+        }
+        let plan = plan(&task(true), Arm::A3, &layout(), &options(None)).unwrap();
+        assert!(plan.later.is_empty());
+        assert_eq!(plan.sessions(), [&plan.client]);
+        assert!(serde_json::to_value(&plan).unwrap().get("later").is_none(), "an older reader finds the plan it knew");
+        assert!(has_arg_pair(&plan, "-p", "Which port?") && !plan.client.args.contains(&"--continue".to_owned()));
+    }
+
+    #[test]
+    fn each_session_has_its_prompt_and_a_joined_one_continues_the_conversation() {
+        let planned = |shape| {
+            let mut opts = options(None);
+            opts.shape = shape;
+            plan(&two_sessions(), Arm::A3, &layout(), &opts).unwrap()
+        };
+        let split = planned(Shape::Split);
+        let sessions = split.sessions();
+        assert_eq!(sessions.len(), 2);
+        assert_eq!((sessions[0].args[1].as_str(), sessions[1].args[1].as_str()), ("Inventory the timeouts.", "Apply what was decided."));
+        assert!(sessions.iter().all(|s| !s.args.contains(&"--continue".to_owned())));
+        assert_eq!(sessions[0].args[2..], sessions[1].args[2..], "the same arguments");
+
+        let joined = planned(Shape::Joined);
+        let sessions = joined.sessions();
+        assert!(!sessions[0].args.contains(&"--continue".to_owned()));
+        assert_eq!(sessions[1].args.last().map(String::as_str), Some("--continue"));
+        assert_eq!(sessions[1].args[..sessions[1].args.len() - 1], split.sessions()[1].args[..], "only --continue differs");
+
+        let both = planned(Shape::Both);
+        assert_eq!(both.sessions().len(), 2, "a fork plans the second session continued; the new one is that without --continue");
+        assert_eq!(both.later, joined.later);
+        assert_eq!((both.files.len(), both.before.len(), both.after.len()), (split.files.len(), split.before.len(), split.after.len()));
+    }
+
+    #[test]
+    fn a_plan_of_several_sessions_reads_back_and_an_older_plan_reads_as_one() {
+        let mut opts = options(None);
+        opts.shape = Shape::Joined;
+        let plan = plan(&two_sessions(), Arm::A3, &layout(), &opts).unwrap();
+        let back: RunPlan = serde_json::from_str(&serde_json::to_string(&plan).unwrap()).unwrap();
+        assert_eq!(back, plan);
+        let mut older = serde_json::to_value(&plan).unwrap();
+        older.as_object_mut().unwrap().remove("later");
+        let older: RunPlan = serde_json::from_value(older).unwrap();
+        assert_eq!(older.sessions().len(), 1);
+        assert_eq!(older.client, plan.client);
+    }
+
+    #[test]
+    fn the_shape_is_split_joined_or_both_and_both_needs_two_sessions() {
+        assert_eq!(["split", "joined", "both", "sideways"].map(Shape::parse), [Some(Shape::Split), Some(Shape::Joined), Some(Shape::Both), None]);
+        let mut opts = options(None);
+        opts.shape = Shape::Both;
+        let error = plan(&task(true), Arm::A3, &layout(), &opts).unwrap_err().to_string();
+        assert!(error.contains("one session") && error.contains("split"), "{error}");
+        let mut three = two_sessions();
+        three.sessions.push(three.sessions[0].clone());
+        let error = plan(&three, Arm::A3, &layout(), &opts).unwrap_err().to_string();
+        assert!(error.contains("both") && error.contains("two sessions") && error.contains('3'), "{error}");
+        opts.shape = Shape::Joined;
+        assert!(plan(&three, Arm::A3, &layout(), &opts).is_ok());
     }
 
     #[test]

@@ -1,0 +1,16 @@
+change: agent-eval
+objective: "1, 5"
+depends_on: []
+phase: archived
+release: "0.88.0"  # el arnés (AE1 a AE9) entra a la spec de eval; sale con el bump que sigue al archivado de save-pairs, agent-eval-sessions y protocol-block
+artifacts:
+  exploration: draft
+  proposal: done  # el arnés sin gasto; el piloto y su fixture quedan fuera
+  spec: done  # AE1 a AE9
+  design: skipped  # las decisiones están en la propuesta
+  tasks: done
+  apply: done  # grupos 1 a 4, 6 a 8 y 10 a 12
+  verify: done  # la suite y clippy pasan, y el piloto pago corrió el 2026-11-11 con este arnés (verify.md del cambio memory-delivery); las campañas de memory-delivery y de agent-eval-sessions lo usaron después
+  archive: done  # AE1 a AE9 en specs/eval, en «agent-eval: el arnés»; ninguna spec del producto cambia
+updated: 2026-11-17
+main_spec: openspec/specs/eval/spec.md

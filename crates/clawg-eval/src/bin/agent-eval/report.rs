@@ -1,12 +1,14 @@
-//! A directory of runs reported by task and arm. [`aggregate`] and [`render`]
-//! are pure over the results; [`load`] is the file reading around them.
+//! A directory of runs reported by task, arm and shape. [`aggregate`],
+//! [`pairs`], [`costs`], [`calls`] and their renderings are pure over what they
+//! are given; [`load`] and [`load_streams`] are the file reading around them.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use crate::arm::Arm;
-use crate::run::{RunResult, RESULT_FILE};
+use crate::arm::{Arm, Shape};
+use crate::run::{Artifact, ArtifactCause, FactClass, RunResult, Session, RESULT_FILE};
 use crate::score::TracerFate;
-use crate::stream::{ModelUsage, Outcome};
+use crate::stream::{self, ModelUsage, Outcome, Transcript};
 
 /// How many directories below the one given a `result.json` may be.
 const MAX_DEPTH: usize = 3;
@@ -19,20 +21,30 @@ pub enum ReportError {
     Invalid(PathBuf, String),
     #[error("no {RESULT_FILE} below {0}")]
     Empty(PathBuf),
+    #[error("no stream of a session below {0}")]
+    NoStreams(PathBuf),
 }
 
-/// What the runs of one task under one arm add up to.
+/// What the runs of one task under one arm, one shape and one noise add up to,
+/// leaving out those with an artifact.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Row {
     pub task: String,
     pub category: String,
     pub example: bool,
     pub arm: String,
+    pub shape: Shape,
+    /// How many rules of other topics the runs were seeded with.
+    pub noise: usize,
+    /// The runs the row adds up, those without an artifact.
     pub runs: usize,
+    /// The runs of the cell that an artifact left out of the row.
+    pub excluded: usize,
     pub successes: usize,
     /// Runs that did not end: the client reported an error or printed no result.
     pub errors: usize,
-    /// Means over the runs that report the figure; `None` when none does.
+    /// Means over the runs that report the figure, each the sum of the sessions
+    /// of its run; `None` when none does.
     pub cost_usd: Option<f64>,
     pub turns: Option<f64>,
     pub seconds: Option<f64>,
@@ -40,11 +52,26 @@ pub struct Row {
     pub used: usize,
     pub retrieved_but_ignored: usize,
     pub never_reached: usize,
-    /// The median over the runs that report it; `None` when none does.
+    /// The median, over the runs that report it, of the context of the first
+    /// request of their first session; `None` when none does.
     pub first_request_tokens: Option<f64>,
     /// The mean of the instruction files each run loaded for a path the
     /// agent worked on.
     pub rules_by_path: f64,
+    /// The mean number of sessions a run played.
+    pub sessions: f64,
+    /// The median of the context of every request of every run of the row.
+    pub context_tokens: Option<f64>,
+    /// The median of the relay overhead of the runs that carry it: none in a
+    /// row that continues the conversation, whose first request is all of it.
+    pub overhead: Option<f64>,
+    /// The median of what the second session reads again, over the runs that carry it.
+    pub rereads: Option<f64>,
+    /// The facts born in a session, summed over the runs, by what became of them.
+    pub not_saved: usize,
+    pub saved_not_reached: usize,
+    pub reached_not_used: usize,
+    pub facts_used: usize,
 }
 
 /// Tokens summed over runs: of every model a run reports, or of its main loop
@@ -86,9 +113,12 @@ pub struct Report {
     pub rows: Vec<Row>,
     pub runs: usize,
     pub successes: usize,
-    /// The sum of the costs reported; a run that reports none adds 0.
+    /// The sum of the costs reported, of every run whether or not an artifact left
+    /// it out of the rows; a run that reports none adds 0.
     pub cost_usd: f64,
     pub runs_without_cost: usize,
+    /// The runs an artifact left out of the rows.
+    pub excluded: usize,
     pub tokens: Tokens,
 }
 
@@ -97,14 +127,14 @@ fn mean(values: impl Iterator<Item = f64>) -> Option<f64> {
     (n > 0).then(|| sum / f64::from(n))
 }
 
-fn median(values: impl Iterator<Item = u64>) -> Option<f64> {
-    let mut sorted: Vec<u64> = values.collect();
-    sorted.sort_unstable();
+fn median(values: impl Iterator<Item = f64>) -> Option<f64> {
+    let mut sorted: Vec<f64> = values.collect();
+    sorted.sort_by(f64::total_cmp);
     let n = sorted.len();
     match n {
         0 => None,
-        _ if n % 2 == 1 => Some(sorted[n / 2] as f64),
-        _ => Some((sorted[n / 2 - 1] + sorted[n / 2]) as f64 / 2.0),
+        _ if n % 2 == 1 => Some(sorted[n / 2]),
+        _ => Some((sorted[n / 2 - 1] + sorted[n / 2]) / 2.0),
     }
 }
 
@@ -116,67 +146,137 @@ fn arm_rank(arm: &str) -> usize {
     Arm::parse(arm).and_then(|a| crate::arm::ARMS.iter().position(|x| *x == a)).unwrap_or(crate::arm::ARMS.len())
 }
 
+fn shape_rank(shape: Shape) -> usize {
+    [Shape::Split, Shape::Joined, Shape::Both].iter().position(|s| *s == shape).unwrap_or(0)
+}
+
+/// What a run adds up to for a figure its sessions report one each: the sum of
+/// those that report it, `None` when none does.
+fn of_the_run(r: &RunResult, figure: impl Fn(&Outcome) -> Option<f64>) -> Option<f64> {
+    let reported: Vec<f64> = r.records().iter().filter_map(|s| s.outcome.as_ref().and_then(&figure)).collect();
+    (!reported.is_empty()).then(|| reported.iter().sum())
+}
+
+/// The sessions of a run that were its own: a new branch of a fork shares its
+/// first session with the continued one, which counts it.
+fn own_sessions(r: &RunResult) -> Vec<&Session> {
+    let mut sessions = r.records();
+    if r.paired.is_some() && r.shape == Shape::Split && sessions.len() > 1 {
+        sessions.remove(0);
+    }
+    sessions
+}
+
 pub fn aggregate(results: &[RunResult]) -> Report {
-    let mut keys: Vec<(&str, &str)> = results.iter().map(|r| (r.task.as_str(), r.arm.as_str())).collect();
-    keys.sort_by(|a, b| a.0.cmp(b.0).then_with(|| arm_rank(a.1).cmp(&arm_rank(b.1))).then_with(|| a.1.cmp(b.1)));
+    let mut keys: Vec<(&str, &str, Shape, usize)> = results.iter().map(|r| (r.task.as_str(), r.arm.as_str(), r.shape, r.noise_rules)).collect();
+    keys.sort_by(|a, b| {
+        a.0.cmp(b.0)
+            .then_with(|| arm_rank(a.1).cmp(&arm_rank(b.1)))
+            .then_with(|| a.1.cmp(b.1))
+            .then_with(|| shape_rank(a.2).cmp(&shape_rank(b.2)))
+            .then_with(|| a.3.cmp(&b.3))
+    });
     keys.dedup();
     let rows = keys
         .into_iter()
-        .map(|(task, arm)| {
-            let group: Vec<&RunResult> = results.iter().filter(|r| r.task == task && r.arm == arm).collect();
-            let outcome = |r: &&RunResult| r.session.outcome.clone();
+        .map(|(task, arm, shape, noise)| {
+            let cell: Vec<&RunResult> = results.iter().filter(|r| r.task == task && r.arm == arm && r.shape == shape && r.noise_rules == noise).collect();
+            let group: Vec<&RunResult> = cell.iter().copied().filter(|r| r.artifacts.is_empty()).collect();
+            let n = group.len().max(1) as f64;
             let fates = |f: TracerFate| group.iter().map(|r| r.score.tracers.iter().filter(|(_, x)| *x == f).count()).sum();
+            let facts = |c: FactClass| group.iter().map(|r| r.facts.iter().filter(|f| f.class == c).count()).sum();
             Row {
                 task: task.to_owned(),
-                category: group[0].category.clone(),
-                example: group[0].example,
+                category: cell[0].category.clone(),
+                example: cell[0].example,
                 arm: arm.to_owned(),
+                shape,
+                noise,
                 runs: group.len(),
+                excluded: cell.len() - group.len(),
                 successes: group.iter().filter(|r| r.score.success).count(),
                 errors: group.iter().filter(|r| !r.score.ended).count(),
-                cost_usd: mean(group.iter().filter_map(|r| outcome(r)?.total_cost_usd)),
-                turns: mean(group.iter().filter_map(|r| outcome(r)?.num_turns).map(|n| n as f64)),
-                seconds: mean(group.iter().filter_map(|r| outcome(r)?.duration_ms).map(|ms| ms as f64 / 1000.0)),
-                clawg_calls: group.iter().map(|r| r.session.clawg_calls.values().sum::<usize>()).sum::<usize>() as f64 / group.len() as f64,
+                cost_usd: mean(group.iter().filter_map(|r| of_the_run(r, |o| o.total_cost_usd))),
+                turns: mean(group.iter().filter_map(|r| of_the_run(r, |o| o.num_turns.map(|n| n as f64)))),
+                seconds: mean(group.iter().filter_map(|r| of_the_run(r, |o| o.duration_ms.map(|ms| ms as f64 / 1000.0)))),
+                clawg_calls: group.iter().map(|r| r.records().iter().map(|s| s.clawg_calls.values().sum::<usize>()).sum::<usize>()).sum::<usize>() as f64 / n,
                 used: fates(TracerFate::Used),
                 retrieved_but_ignored: fates(TracerFate::RetrievedButIgnored),
                 never_reached: fates(TracerFate::NeverReached),
-                first_request_tokens: median(group.iter().filter_map(|r| r.session.first_request_tokens)),
+                first_request_tokens: median(group.iter().filter_map(|r| r.records()[0].first_request_tokens).map(|t| t as f64)),
                 rules_by_path: group
                     .iter()
-                    .map(|r| r.session.instructions_loaded.iter().filter(|l| l.load_reason == PATH_GLOB_MATCH).count())
+                    .flat_map(|r| r.records())
+                    .map(|s| s.instructions_loaded.iter().filter(|l| l.load_reason == PATH_GLOB_MATCH).count())
                     .sum::<usize>() as f64
-                    / group.len() as f64,
+                    / n,
+                sessions: group.iter().map(|r| r.records().len()).sum::<usize>() as f64 / n,
+                context_tokens: median(group.iter().flat_map(|r| r.records()).flat_map(|s| &s.request_tokens).map(|t| *t as f64)),
+                overhead: if shape == Shape::Joined { None } else { median(group.iter().filter_map(|r| r.overhead).map(|t| t as f64)) },
+                rereads: median(group.iter().filter_map(|r| r.rereads).map(|r| r.again as f64)),
+                not_saved: facts(FactClass::NotSaved),
+                saved_not_reached: facts(FactClass::SavedNotReached),
+                reached_not_used: facts(FactClass::ReachedNotUsed),
+                facts_used: facts(FactClass::Used),
             }
         })
         .collect();
-    let costs = |r: &RunResult| r.session.outcome.as_ref().and_then(|o| o.total_cost_usd);
     let mut tokens = Tokens::default();
-    results.iter().filter_map(|r| r.session.outcome.as_ref()).for_each(|o| tokens.add(o));
+    results.iter().flat_map(own_sessions).filter_map(|s| s.outcome.as_ref()).for_each(|o| tokens.add(o));
+    let cost = |r: &RunResult| own_sessions(r).iter().filter_map(|s| s.outcome.as_ref()?.total_cost_usd).sum::<f64>();
     Report {
         rows,
         runs: results.len(),
         successes: results.iter().filter(|r| r.score.success).count(),
-        cost_usd: results.iter().filter_map(costs).sum(),
-        runs_without_cost: results.iter().filter(|r| costs(r).is_none()).count(),
+        cost_usd: results.iter().map(cost).sum(),
+        runs_without_cost: results.iter().filter(|r| of_the_run(r, |o| o.total_cost_usd).is_none()).count(),
+        excluded: results.iter().filter(|r| !r.artifacts.is_empty()).count(),
         tokens,
     }
+}
+
+/// A run an artifact left out of the rows, by where it was run, with its causes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Excluded {
+    pub run: String,
+    pub causes: Vec<Artifact>,
+}
+
+/// The runs among `runs`, named by where they were run, that have an artifact.
+pub fn excluded(runs: &[(String, RunResult)]) -> Vec<Excluded> {
+    runs.iter().filter(|(_, r)| !r.artifacts.is_empty()).map(|(run, r)| Excluded { run: run.clone(), causes: r.artifacts.clone() }).collect()
+}
+
+/// One line for each run left out, with each cause and the session it happened in.
+pub fn render_excluded(left_out: &[Excluded]) -> String {
+    if left_out.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("Left out of the rows for an artifact:\n");
+    for e in left_out {
+        let causes: Vec<String> = e.causes.iter().map(|a| format!("{} in session {}", a.cause.as_str(), a.session)).collect();
+        out.push_str(&format!("- {}: {}\n", e.run, causes.join(", ")));
+    }
+    out
 }
 
 pub fn render(report: &Report) -> String {
     let figure = |v: Option<f64>, places: usize| v.map_or_else(|| "-".to_owned(), |v| format!("{v:.places$}"));
     let mut out = String::from(
-        "| task | category | arm | runs | successes | errors | cost USD | turns | seconds | clawg calls | used | retrieved_but_ignored | never_reached | first request tokens | rules by path |\n\
-         | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n",
+        "| task | category | arm | shape | noise | runs | excluded | successes | errors | cost USD | turns | seconds | clawg calls | used | retrieved_but_ignored | never_reached | first request tokens | rules by path | sessions | context tokens | relay overhead | rereads | not_saved | saved_not_reached | reached_not_used | facts used |\n\
+         | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n",
     );
     for r in &report.rows {
         out.push_str(&format!(
-            "| {}{} | {} | {} | {} | {}/{} | {} | {} | {} | {} | {:.1} | {} | {} | {} | {} | {:.1} |\n",
+            "| {}{} | {} | {} | {} | {} | {} | {} | {}/{} | {} | {} | {} | {} | {:.1} | {} | {} | {} | {} | {:.1} | {:.1} | {} | {} | {} | {} | {} | {} | {} |\n",
             r.task,
             if r.example { " (example)" } else { "" },
             r.category,
             r.arm,
+            r.shape.as_str(),
+            r.noise,
             r.runs,
+            r.excluded,
             r.successes,
             r.runs,
             r.errors,
@@ -189,10 +289,19 @@ pub fn render(report: &Report) -> String {
             r.never_reached,
             figure(r.first_request_tokens, 0),
             r.rules_by_path,
+            r.sessions,
+            figure(r.context_tokens, 0),
+            figure(r.overhead, 0),
+            figure(r.rereads, 0),
+            r.not_saved,
+            r.saved_not_reached,
+            r.reached_not_used,
+            r.facts_used,
         ));
     }
+    let left_out = if report.excluded > 0 { format!(" ({} left out of the rows)", report.excluded) } else { String::new() };
     out.push_str(&format!(
-        "\nTotals: {} runs, {} successes, cost {:.4} USD ({} runs without a cost)\n",
+        "\nTotals: {} runs{left_out}, {} successes, cost {:.4} USD ({} runs without a cost)\n",
         report.runs, report.successes, report.cost_usd, report.runs_without_cost
     ));
     let t = &report.tokens;
@@ -203,13 +312,147 @@ pub fn render(report: &Report) -> String {
     out
 }
 
-const COSTS_HEADER: &str = "run,task,arm,started_at,ended_at,api_key_source,model,input_tokens,output_tokens,cache_read_input_tokens,cache_creation_input_tokens,cache_creation_5m_input_tokens,cache_creation_1h_input_tokens,cost_usd,cost_basis";
+/// What the forks of one task under one arm add up to: for each, the two
+/// branches that played its second session, continued and new. What is counted
+/// of every pair is its artifacts, its continuation and its compactions; the rest
+/// reads the pairs without an artifact in any branch.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PairRow {
+    pub task: String,
+    pub arm: String,
+    pub pairs: usize,
+    /// The pairs with an artifact in a branch.
+    pub excluded: usize,
+    /// The pairs whose continued branch began with less context than the first session ended with.
+    pub not_continued: usize,
+    /// The pairs with a compaction in a session of a branch.
+    pub compacted: usize,
+    /// The pairs without an artifact: those the rest of the figures read.
+    pub clean: usize,
+    pub joined_passed: usize,
+    pub split_passed: usize,
+    /// Pairs where the continued branch passed and the new one failed.
+    pub continued_only: usize,
+    /// The median of the context of the last request of the first session.
+    pub fork_context: Option<f64>,
+    /// The median of what the new session saved over the continued one: 1 minus
+    /// the cost of its second session over the cost of the continued one's.
+    pub saving: Option<f64>,
+    /// The pairs the saving is of: those whose continuation read at least 80 % of
+    /// its first request from the cache, since a cold one prices the cache
+    /// and not the relay.
+    pub priced: usize,
+    /// The median of the relay overhead of the new branch.
+    pub overhead: Option<f64>,
+    /// The median of what the new branch reads again only to edit.
+    pub to_edit: Option<f64>,
+    /// The median of what the continued branch reads again.
+    pub again: Option<f64>,
+}
+
+/// The continued branch and the new one of a fork.
+type Pair<'a> = (&'a RunResult, &'a RunResult);
+
+/// The share of its first request a continuation reads from the cache for its
+/// cost to be compared with the new session's.
+const WARM_CACHE: f64 = 0.8;
+
+/// The forks among `runs`, named by where they were run: two results of one
+/// directory, one of each shape, that name each other as their pair. A
+/// branch without its partner is no pair.
+pub fn pairs(runs: &[(String, RunResult)]) -> Vec<PairRow> {
+    let parent = |name: &str| name.rsplit_once('/').map_or("", |(dir, _)| dir).to_owned();
+    let mut found: BTreeMap<(String, usize, String), Vec<Pair>> = BTreeMap::new();
+    for (name, joined) in runs.iter().filter(|(_, r)| r.paired.is_some() && r.shape == Shape::Joined) {
+        let dir = parent(name);
+        let partner = runs.iter().find(|(n, r)| r.paired.is_some() && r.shape == Shape::Split && parent(n) == dir && r.task == joined.task && r.arm == joined.arm);
+        if let Some((_, split)) = partner {
+            found.entry((joined.task.clone(), arm_rank(&joined.arm), joined.arm.clone())).or_default().push((joined, split));
+        }
+    }
+    found
+        .into_iter()
+        .map(|((task, _, arm), group)| {
+            let clean: Vec<&Pair> = group.iter().filter(|(joined, split)| joined.artifacts.is_empty() && split.artifacts.is_empty()).collect();
+            let second_cost = |r: &RunResult| r.sessions.get(1).and_then(|s| s.session.outcome.as_ref()?.total_cost_usd);
+            let savings: Vec<f64> = clean
+                .iter()
+                .filter(|(joined, _)| {
+                    let second = joined.sessions.get(1).map(|s| &s.session);
+                    let read = second.and_then(|s| s.first_request_cache_read);
+                    let first = second.and_then(|s| s.first_request_tokens);
+                    matches!((read, first), (Some(read), Some(first)) if first > 0 && read as f64 / first as f64 >= WARM_CACHE)
+                })
+                .filter_map(|(joined, split)| match (second_cost(joined), second_cost(split)) {
+                    (Some(continued), Some(new)) if continued > 0.0 => Some(1.0 - new / continued),
+                    _ => None,
+                })
+                .collect();
+            PairRow {
+                task,
+                arm,
+                pairs: group.len(),
+                excluded: group.len() - clean.len(),
+                not_continued: group.iter().filter(|(j, _)| j.artifacts.iter().any(|a| a.cause == ArtifactCause::NotContinued)).count(),
+                compacted: group.iter().filter(|(j, s)| j.records().into_iter().chain(s.records()).any(|session| session.compactions > 0)).count(),
+                clean: clean.len(),
+                joined_passed: clean.iter().filter(|(j, _)| j.score.success).count(),
+                split_passed: clean.iter().filter(|(_, s)| s.score.success).count(),
+                continued_only: clean.iter().filter(|(j, s)| j.score.success && !s.score.success).count(),
+                fork_context: median(clean.iter().filter_map(|(j, _)| j.sessions.first()?.session.request_tokens.last()).map(|t| *t as f64)),
+                saving: median(savings.iter().copied()),
+                priced: savings.len(),
+                overhead: median(clean.iter().filter_map(|(_, s)| s.overhead).map(|t| t as f64)),
+                to_edit: median(clean.iter().filter_map(|(_, s)| s.rereads).map(|r| r.to_edit as f64)),
+                again: median(clean.iter().filter_map(|(j, _)| j.rereads).map(|r| r.again as f64)),
+            }
+        })
+        .collect()
+}
+
+pub fn render_pairs(rows: &[PairRow]) -> String {
+    if rows.is_empty() {
+        return String::new();
+    }
+    let figure = |v: Option<f64>| v.map_or_else(|| "-".to_owned(), |v| format!("{v:.0}"));
+    let mut out = String::from(
+        "| task | arm | pairs | with an artifact | not continued | compacted | joined passed | split passed | joined passed and split failed | context at the fork | cost saving | pairs priced | avoidable relay overhead | rereads to edit | rereads of the continued |\n\
+         | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n",
+    );
+    for r in rows {
+        out.push_str(&format!(
+            "| {} | {} | {} | {} | {} | {} | {}/{} | {}/{} | {} | {} | {} | {} | {} | {} | {} |\n",
+            r.task,
+            r.arm,
+            r.pairs,
+            r.excluded,
+            r.not_continued,
+            r.compacted,
+            r.joined_passed,
+            r.clean,
+            r.split_passed,
+            r.clean,
+            r.continued_only,
+            figure(r.fork_context),
+            r.saving.map_or_else(|| "-".to_owned(), |s| format!("{:.1}%", s * 100.0)),
+            r.priced,
+            figure(r.overhead),
+            figure(r.to_edit),
+            figure(r.again),
+        ));
+    }
+    out
+}
+
+const COSTS_HEADER: &str = "run,task,arm,started_at,ended_at,api_key_source,model,input_tokens,output_tokens,cache_read_input_tokens,cache_creation_input_tokens,cache_creation_5m_input_tokens,cache_creation_1h_input_tokens,cost_usd,cost_basis,session,shape";
 
 /// A CSV with a line per session and model, to price the sessions by their
-/// tokens and to find each one in the console's usage by its times. The cache
-/// writes by duration are the main loop's, so they go on the line of the
-/// session's model only. A session that printed no result has a line without
-/// figures.
+/// tokens and to find each one in the console's usage by its times, each with
+/// its number in its run and the shape the run was played in. The cache writes
+/// by duration are the main loop's, so they go on the line of the session's
+/// model only. A session that printed no result has a line without figures.
+/// The first session of the new branch of a fork is not listed: it is the one
+/// the continued branch lists.
 pub fn costs(runs: &[(String, RunResult)]) -> String {
     let field = |v: Option<&str>| match v {
         Some(s) if s.contains([',', '"', '\n']) => format!("\"{}\"", s.replace('"', "\"\"")),
@@ -219,43 +462,98 @@ pub fn costs(runs: &[(String, RunResult)]) -> String {
     let mut out = String::from(COSTS_HEADER);
     out.push('\n');
     for (name, r) in runs {
-        let s = &r.session;
-        let head = [Some(name.as_str()), Some(r.task.as_str()), Some(r.arm.as_str()), s.started_at.as_deref(), s.ended_at.as_deref(), s.api_key_source.as_deref()]
-            .map(field)
-            .join(",");
-        let Some(outcome) = &s.outcome else {
-            out.push_str(&format!("{head}{}\n", ",".repeat(9)));
-            continue;
-        };
-        let u = &outcome.usage;
-        let durations = format!("{},{}", u.cache_creation_5m_input_tokens, u.cache_creation_1h_input_tokens);
-        let mut line = |model: Option<&str>, m: &ModelUsage, durations: &str| {
-            out.push_str(&format!(
-                "{head},{},{},{},{},{},{durations},{},{}\n",
-                field(model),
-                m.input_tokens,
-                m.output_tokens,
-                m.cache_read_input_tokens,
-                m.cache_creation_input_tokens,
-                m.cost_usd.map(|c| c.to_string()).unwrap_or_default(),
-                field(m.cost_basis.as_deref()),
-            ));
-        };
-        if outcome.model_usage.is_empty() {
-            let main = ModelUsage {
-                input_tokens: u.input_tokens,
-                output_tokens: u.output_tokens,
-                cache_read_input_tokens: u.cache_read_input_tokens,
-                cache_creation_input_tokens: u.cache_creation_input_tokens,
-                cost_usd: outcome.total_cost_usd,
-                cost_basis: None,
+        let skipped = r.records().len() - own_sessions(r).len();
+        for (i, s) in r.records().into_iter().enumerate().skip(skipped) {
+            let head = [Some(name.as_str()), Some(r.task.as_str()), Some(r.arm.as_str()), s.started_at.as_deref(), s.ended_at.as_deref(), s.api_key_source.as_deref()]
+                .map(field)
+                .join(",");
+            let tail = format!("{},{}", i + 1, r.shape.as_str());
+            let Some(outcome) = &s.outcome else {
+                out.push_str(&format!("{head}{},{tail}\n", ",".repeat(9)));
+                continue;
             };
-            line(s.model.as_deref(), &main, &durations);
+            let u = &outcome.usage;
+            let durations = format!("{},{}", u.cache_creation_5m_input_tokens, u.cache_creation_1h_input_tokens);
+            let mut line = |model: Option<&str>, m: &ModelUsage, durations: &str| {
+                out.push_str(&format!(
+                    "{head},{},{},{},{},{},{durations},{},{},{tail}\n",
+                    field(model),
+                    m.input_tokens,
+                    m.output_tokens,
+                    m.cache_read_input_tokens,
+                    m.cache_creation_input_tokens,
+                    m.cost_usd.map(|c| c.to_string()).unwrap_or_default(),
+                    field(m.cost_basis.as_deref()),
+                ));
+            };
+            if outcome.model_usage.is_empty() {
+                let main = ModelUsage {
+                    input_tokens: u.input_tokens,
+                    output_tokens: u.output_tokens,
+                    cache_read_input_tokens: u.cache_read_input_tokens,
+                    cache_creation_input_tokens: u.cache_creation_input_tokens,
+                    cost_usd: outcome.total_cost_usd,
+                    cost_basis: None,
+                };
+                line(s.model.as_deref(), &main, &durations);
+            }
+            for (model, m) in &outcome.model_usage {
+                let own = s.model.as_deref() == Some(model.as_str());
+                line(Some(model), m, if own { &durations } else { "," });
+            }
         }
-        for (model, m) in &outcome.model_usage {
-            let own = s.model.as_deref() == Some(model.as_str());
-            line(Some(model), m, if own { &durations } else { "," });
-        }
+    }
+    out
+}
+
+/// What the calls to one tool add up to.
+#[derive(Default)]
+struct ToolStats {
+    calls: usize,
+    /// The tokens each call that could be measured alone added to the context.
+    added: Vec<u64>,
+    /// The bytes of the result of each call that has one.
+    results: Vec<usize>,
+    /// It is a tool of an MCP server, not one of the client's.
+    server: bool,
+}
+
+/// The median of the tokens a tool adds over which it is noted as a candidate
+/// for a diet: twice what `search_memory` measures in agent-view.
+const DIET_MEDIAN: f64 = 1500.0;
+
+/// A table by tool, over every session of `transcripts`: its calls, those that
+/// carry tokens of their own, the median and p90 of those tokens, and the median
+/// of the size of the results at 4 bytes a token. What a call adds holds the
+/// words the model wrote in that message, so a tool is noted as a candidate for a
+/// diet only when its results are big too.
+pub fn calls(transcripts: &[Transcript]) -> String {
+    let mut tools: BTreeMap<String, ToolStats> = BTreeMap::new();
+    for call in transcripts.iter().flat_map(|t| &t.calls) {
+        let stats = tools.entry(stream::tool_name(&call.name).to_owned()).or_default();
+        stats.calls += 1;
+        stats.server |= call.name.starts_with("mcp__");
+        stats.added.extend(call.added_tokens);
+        stats.results.extend(call.result.as_deref().map(str::len));
+    }
+    let mut rows: Vec<(String, ToolStats)> = tools.into_iter().collect();
+    rows.sort_by(|a, b| b.1.calls.cmp(&a.1.calls).then_with(|| a.0.cmp(&b.0)));
+    let mut out = String::from("| tool | calls | with tokens | median tokens | p90 tokens | median result tokens | note |\n| --- | ---: | ---: | ---: | ---: | ---: | --- |\n");
+    for (name, mut stats) in rows {
+        stats.added.sort_unstable();
+        let adds = median(stats.added.iter().map(|t| *t as f64));
+        let p90 = (!stats.added.is_empty()).then(|| stats.added[(stats.added.len() * 9).div_ceil(10) - 1]);
+        let result = median(stats.results.iter().map(|b| *b as f64)).map(|bytes| bytes / 4.0);
+        let heavy = |m: Option<f64>| m.is_some_and(|m| m > DIET_MEDIAN);
+        let note = if stats.server && heavy(adds) && heavy(result) { "candidate for a diet" } else { "" };
+        out.push_str(&format!(
+            "| {name} | {} | {} | {} | {} | {} | {note} |\n",
+            stats.calls,
+            stats.added.len(),
+            adds.map_or_else(|| "-".to_owned(), |m| format!("{m:.0}")),
+            p90.map_or_else(|| "-".to_owned(), |p| p.to_string()),
+            result.map_or_else(|| "-".to_owned(), |r| format!("{r:.0}")),
+        ));
     }
     out
 }
@@ -286,11 +584,6 @@ fn find(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) -> Result<(), ReportEr
     Ok(())
 }
 
-/// Every result below `dir`.
-pub fn load(dir: &Path) -> Result<Vec<RunResult>, ReportError> {
-    Ok(load_named(dir)?.into_iter().map(|(_, r)| r).collect())
-}
-
 /// Every result below `dir`, each named by the path of its run below `dir`,
 /// with `/` between directories.
 pub fn load_named(dir: &Path) -> Result<Vec<(String, RunResult)>, ReportError> {
@@ -311,11 +604,47 @@ pub fn load_named(dir: &Path) -> Result<Vec<(String, RunResult)>, ReportError> {
         .collect()
 }
 
+/// Whether `name` is the stream of a session: `stream.jsonl`, or `stream-K.jsonl`.
+fn is_stream_file(name: &str) -> bool {
+    name == crate::run::STREAM_FILE || name.strip_prefix("stream-").and_then(|rest| rest.strip_suffix(".jsonl")).is_some_and(|k| k.parse::<usize>().is_ok())
+}
+
+/// The stream of every session below `dir`, down to a branch of a fork: one
+/// more level than the results [`find`] looks for.
+fn find_streams(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) -> Result<(), ReportError> {
+    let mut entries: Vec<_> = std::fs::read_dir(dir).map_err(|source| ReportError::Io { path: dir.to_owned(), source })?.collect::<Result<_, _>>().map_err(|source| ReportError::Io { path: dir.to_owned(), source })?;
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    for entry in entries {
+        let path = entry.path();
+        let kind = entry.file_type().map_err(|source| ReportError::Io { path: path.clone(), source })?;
+        if kind.is_dir() && depth <= MAX_DEPTH {
+            find_streams(&path, depth + 1, out)?;
+        } else if kind.is_file() && is_stream_file(&entry.file_name().to_string_lossy()) {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
+/// Every session stream below `dir`, read.
+pub fn load_streams(dir: &Path) -> Result<Vec<Transcript>, ReportError> {
+    let mut paths = Vec::new();
+    find_streams(dir, 1, &mut paths)?;
+    if paths.is_empty() {
+        return Err(ReportError::NoStreams(dir.to_owned()));
+    }
+    paths
+        .into_iter()
+        .map(|path| std::fs::read_to_string(&path).map(|text| stream::parse(&text)).map_err(|source| ReportError::Io { path, source }))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::arm::Shape;
     use crate::hooks::Loaded;
-    use crate::run::Session;
+    use crate::run::{Artifact, ArtifactCause, Session};
     use crate::score::{CheckResult, Score};
     use crate::stream::{ModelUsage, Outcome, Usage};
 
@@ -371,7 +700,11 @@ mod tests {
                 unknown_lines: 0,
                 invalid_lines: vec![],
                 first_request_tokens: None,
+                request_tokens: vec![],
+                first_request_cache_read: None,
                 instructions_loaded: vec![],
+                untouched: vec![],
+                outside_reads: vec![],
                 outcome: Some(Outcome {
                     subtype: "success".to_owned(),
                     is_error: false,
@@ -388,6 +721,14 @@ mod tests {
                 tracers: vec![("t1".to_owned(), s.fates[0]), ("t2".to_owned(), s.fates[1])],
             },
             saves: vec![],
+            sessions: vec![],
+            shape: Shape::Split,
+            noise_rules: 0,
+            facts: vec![],
+            overhead: None,
+            rereads: None,
+            artifacts: vec![],
+            paired: None,
         }
     }
 
@@ -439,10 +780,10 @@ mod tests {
     fn the_table_is_markdown_with_the_example_marked() {
         let text = render(&aggregate(&sample()));
         let lines: Vec<&str> = text.lines().collect();
-        assert!(lines[0].starts_with("| task | category | arm | runs | successes | errors | cost USD |"));
+        assert!(lines[0].starts_with("| task | category | arm | shape | noise | runs | excluded | successes | errors | cost USD |"));
         assert!(lines[1].starts_with("| --- |"));
-        assert_eq!(lines[2], "| a-count | K1 | a0 | 1 | 1/1 | 0 | 0.2500 | 4.0 | 10.0 | 2.0 | 1 | 0 | 1 | - | 0.0 |");
-        assert_eq!(lines[3], "| b-port | K1 | a3 | 3 | 1/3 | 1 | 0.2500 | 5.3 | 13.3 | 1.3 | 2 | 2 | 2 | - | 0.0 |");
+        assert_eq!(lines[2], "| a-count | K1 | a0 | split | 0 | 1 | 0 | 1/1 | 0 | 0.2500 | 4.0 | 10.0 | 2.0 | 1 | 0 | 1 | - | 0.0 | 1.0 | - | - | - | 0 | 0 | 0 | 0 |");
+        assert_eq!(lines[3], "| b-port | K1 | a3 | split | 0 | 3 | 0 | 1/3 | 1 | 0.2500 | 5.3 | 13.3 | 1.3 | 2 | 2 | 2 | - | 0.0 | 1.0 | - | - | - | 0 | 0 | 0 | 0 |");
         assert!(lines[5].starts_with("| z-example (example) | K1 | a0 |"));
         assert_eq!(lines[7], "Totals: 6 runs, 4 successes, cost 1.2500 USD (1 runs without a cost)");
     }
@@ -476,8 +817,8 @@ mod tests {
         assert_eq!(report.rows[1].first_request_tokens, Some(200.0), "an even count takes the mean of the middle two");
         assert_eq!(report.rows[0].first_request_tokens, None);
         let text = render(&report);
-        assert!(text.lines().next().unwrap().ends_with("| never_reached | first request tokens | rules by path |"), "{text}");
-        assert!(text.lines().nth(5).unwrap().ends_with("| 200 | 1.0 |"), "{text}");
+        assert!(text.lines().next().unwrap().ends_with("| never_reached | first request tokens | rules by path | sessions | context tokens | relay overhead | rereads | not_saved | saved_not_reached | reached_not_used | facts used |"), "{text}");
+        assert!(text.lines().nth(5).unwrap().ends_with("| 200 | 1.0 | 1.0 | - | - | - | 0 | 0 | 0 | 0 |"), "{text}");
     }
 
     fn model(input: u64, output: u64, read: u64, write: u64, cost: f64) -> ModelUsage {
@@ -545,17 +886,17 @@ mod tests {
         let lines: Vec<&str> = csv.lines().collect();
         assert_eq!(
             lines[0],
-            "run,task,arm,started_at,ended_at,api_key_source,model,input_tokens,output_tokens,cache_read_input_tokens,cache_creation_input_tokens,cache_creation_5m_input_tokens,cache_creation_1h_input_tokens,cost_usd,cost_basis"
+            "run,task,arm,started_at,ended_at,api_key_source,model,input_tokens,output_tokens,cache_read_input_tokens,cache_creation_input_tokens,cache_creation_5m_input_tokens,cache_creation_1h_input_tokens,cost_usd,cost_basis,session,shape"
         );
         assert_eq!(
             lines[1],
-            "humo/b-port.a3.1,b-port,a3,2026-11-11 15:00:00 UTC,2026-11-11 15:04:30 UTC,ANTHROPIC_API_KEY,claude-haiku-5-5,400,20,0,0,,,0.0012,list"
+            "humo/b-port.a3.1,b-port,a3,2026-11-11 15:00:00 UTC,2026-11-11 15:04:30 UTC,ANTHROPIC_API_KEY,claude-haiku-5-5,400,20,0,0,,,0.0012,list,1,split"
         );
         assert_eq!(
             lines[2],
-            "humo/b-port.a3.1,b-port,a3,2026-11-11 15:00:00 UTC,2026-11-11 15:04:30 UTC,ANTHROPIC_API_KEY,claude-sonnet-5-5,30,800,50000,12000,11000,1000,0.09,list"
+            "humo/b-port.a3.1,b-port,a3,2026-11-11 15:00:00 UTC,2026-11-11 15:04:30 UTC,ANTHROPIC_API_KEY,claude-sonnet-5-5,30,800,50000,12000,11000,1000,0.09,list,1,split"
         );
-        assert_eq!(lines[3], "humo/b-port.a4.1,b-port,a4,,,,,,,,,,,,", "a session cut short is listed without figures");
+        assert_eq!(lines[3], "humo/b-port.a4.1,b-port,a4,,,,,,,,,,,,,1,split", "a session cut short is listed without figures");
         assert_eq!(lines.len(), 4);
     }
 
@@ -565,7 +906,7 @@ mod tests {
         r.session.model = Some("m".to_owned());
         r.session.outcome.as_mut().unwrap().usage = Usage { input_tokens: 5, output_tokens: 7, ..Usage::default() };
         let csv = costs(&[("r".to_owned(), r)]);
-        assert_eq!(csv.lines().nth(1), Some("r,a-count,a0,,,,m,5,7,0,0,0,0,0.25,"));
+        assert_eq!(csv.lines().nth(1), Some("r,a-count,a0,,,,m,5,7,0,0,0,0,0.25,,1,split"));
     }
 
     #[test]
@@ -588,18 +929,368 @@ mod tests {
     #[test]
     fn load_reads_a_written_result_back_and_names_a_directory_without_any() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(matches!(load(dir.path()), Err(ReportError::Empty(_))));
+        assert!(matches!(load_named(dir.path()), Err(ReportError::Empty(_))));
 
         let original = result(&spec("t", "a0"));
         let run = dir.path().join("runs").join("r1");
         std::fs::create_dir_all(&run).unwrap();
         std::fs::write(run.join(RESULT_FILE), serde_json::to_string_pretty(&original).unwrap()).unwrap();
-        assert_eq!(load(dir.path()).unwrap(), std::slice::from_ref(&original));
         assert_eq!(load_named(dir.path()).unwrap(), [("runs/r1".to_owned(), original)], "a run is named by its path below the directory");
 
         let broken = dir.path().join("broken");
         std::fs::create_dir_all(&broken).unwrap();
         std::fs::write(broken.join(RESULT_FILE), "{}").unwrap();
-        assert!(matches!(load(dir.path()), Err(ReportError::Invalid(..))));
+        assert!(matches!(load_named(dir.path()), Err(ReportError::Invalid(..))));
+    }
+
+    /// One session of a staged run: what it cost, how many turns, the context
+    /// of each of its requests and how much of its first one the cache gave.
+    struct Part {
+        cost: f64,
+        turns: u64,
+        requests: &'static [u64],
+        cached: Option<u64>,
+    }
+
+    fn part(cost: f64, turns: u64, requests: &'static [u64]) -> Part {
+        Part { cost, turns, requests, cached: None }
+    }
+
+    /// A run of `shape` made of `parts`, which `paired` names the other branch of.
+    fn staged(task: &'static str, arm: &'static str, shape: Shape, paired: Option<&str>, success: bool, parts: &[Part]) -> RunResult {
+        let mut r = result(&Spec { success, ..spec(task, arm) });
+        let sessions: Vec<crate::run::SessionResult> = parts
+            .iter()
+            .map(|p| {
+                let mut session = r.session.clone();
+                let outcome = session.outcome.as_mut().unwrap();
+                outcome.total_cost_usd = Some(p.cost);
+                outcome.num_turns = Some(p.turns);
+                outcome.duration_ms = Some(p.turns * 1000);
+                session.request_tokens = p.requests.to_vec();
+                session.first_request_tokens = p.requests.first().copied();
+                session.first_request_cache_read = p.cached;
+                crate::run::SessionResult { session, score: r.score.clone(), followed: vec![], saved: vec![], native_memory_writes: 0, saves: vec![] }
+            })
+            .collect();
+        r.session = sessions.last().unwrap().session.clone();
+        r.sessions = sessions;
+        r.shape = shape;
+        r.paired = paired.map(str::to_owned);
+        r
+    }
+
+    fn fact(tracer: &str, class: crate::run::FactClass) -> crate::run::Fact {
+        crate::run::Fact { tracer: tracer.to_owned(), born: 1, class }
+    }
+
+    #[test]
+    fn rows_are_split_by_the_shape_of_the_run_and_add_up_its_sessions() {
+        use crate::run::FactClass;
+        let mut first = staged("relay", "a3", Shape::Split, None, true, &[part(0.10, 3, &[1000, 2000]), part(0.20, 4, &[1500, 2500])]);
+        first.overhead = Some(300);
+        first.facts = vec![fact("a", FactClass::Used)];
+        let mut second = staged("relay", "a3", Shape::Split, None, false, &[part(0.30, 5, &[1000]), part(0.40, 6, &[3000])]);
+        second.overhead = Some(100);
+        second.facts = vec![fact("a", FactClass::NotSaved)];
+        let mut joined = staged("relay", "a3", Shape::Joined, None, true, &[part(0.10, 3, &[100, 200]), part(0.10, 3, &[300])]);
+        joined.facts = vec![fact("a", FactClass::SavedNotReached)];
+        let single = result(&spec("short", "a3"));
+
+        let report = aggregate(&[joined, first, single, second]);
+
+        let keys: Vec<(&str, &str)> = report.rows.iter().map(|r| (r.task.as_str(), r.shape.as_str())).collect();
+        assert_eq!(keys, [("relay", "split"), ("relay", "joined"), ("short", "split")], "a row for each task, arm and shape");
+        let split = &report.rows[0];
+        assert_eq!((split.runs, split.successes, split.sessions), (2, 1, 2.0));
+        assert!((split.cost_usd.unwrap() - 0.5).abs() < 1e-9, "the mean of the cost of the whole run, the sum of its sessions: {:?}", split.cost_usd);
+        assert_eq!((split.turns, split.seconds), (Some(9.0), Some(9.0)));
+        assert_eq!(split.context_tokens, Some(1750.0), "the median of the context of every request of the row");
+        assert_eq!(split.overhead, Some(200.0));
+        assert_eq!((split.facts_used, split.not_saved, split.saved_not_reached, split.reached_not_used), (1, 1, 0, 0));
+        let joined = &report.rows[1];
+        assert_eq!((joined.context_tokens, joined.overhead, joined.saved_not_reached), (Some(200.0), None, 1));
+        let short = &report.rows[2];
+        assert_eq!((short.sessions, short.cost_usd, short.turns), (1.0, Some(0.25), Some(4.0)), "a result of one session reports as before");
+
+        let text = render(&report);
+        let header = text.lines().next().unwrap();
+        assert!(header.starts_with("| task | category | arm | shape | noise | runs |"), "{header}");
+        assert!(header.ends_with("| sessions | context tokens | relay overhead | rereads | not_saved | saved_not_reached | reached_not_used | facts used |"), "{header}");
+        assert!(text.lines().nth(2).unwrap().starts_with("| relay | K1 | a3 | split | 0 | 2 | 0 | 1/2 |"), "{text}");
+        assert!(text.lines().nth(2).unwrap().ends_with("| 2.0 | 1750 | 200 | - | 1 | 0 | 0 | 1 |"), "{text}");
+    }
+
+    fn with_artifacts(mut r: RunResult, found: &[(ArtifactCause, usize)]) -> RunResult {
+        r.artifacts = found.iter().map(|(cause, session)| Artifact { cause: *cause, session: *session }).collect();
+        r
+    }
+
+    #[test]
+    fn rows_are_split_by_the_noise_of_the_run() {
+        let with_noise = |rules: usize, success: bool| RunResult { noise_rules: rules, ..result(&Spec { success, ..spec("scale", "a3") }) };
+        let report = aggregate(&[with_noise(300, true), with_noise(15, true), with_noise(15, false), with_noise(300, false), with_noise(300, true)]);
+        let cells: Vec<(usize, usize, usize)> = report.rows.iter().map(|r| (r.noise, r.runs, r.successes)).collect();
+        assert_eq!(cells, [(15, 2, 1), (300, 3, 2)], "a row for each noise, the smaller first");
+        let text = render(&report);
+        assert!(text.lines().nth(2).unwrap().starts_with("| scale | K1 | a3 | split | 15 | 2 | 0 | 1/2 |"), "{text}");
+        assert!(text.lines().nth(3).unwrap().starts_with("| scale | K1 | a3 | split | 300 | 3 | 0 | 2/3 |"), "{text}");
+    }
+
+    #[test]
+    fn rows_leave_out_the_runs_with_an_artifact_and_list_them() {
+        use ArtifactCause::{CompactedEarly, ReadOutside, SessionFailed};
+        let clean = result(&spec("relay", "a3"));
+        let read = with_artifacts(result(&Spec { cost: Some(0.75), ..spec("relay", "a3") }), &[(ReadOutside, 1), (CompactedEarly, 1)]);
+        let failed = with_artifacts(result(&Spec { success: false, ..spec("relay", "a3") }), &[(SessionFailed, 2)]);
+        let alone = with_artifacts(result(&spec("other", "a0")), &[(ReadOutside, 1)]);
+        let named = vec![("p/1".to_owned(), clean), ("p/2".to_owned(), read), ("p/3".to_owned(), failed), ("q/1".to_owned(), alone)];
+        let results: Vec<RunResult> = named.iter().map(|(_, r)| r.clone()).collect();
+
+        let report = aggregate(&results);
+
+        let other = &report.rows[0];
+        assert_eq!((other.task.as_str(), other.runs, other.excluded, other.successes), ("other", 0, 1, 0), "a cell whose runs were all left out still has its row");
+        assert_eq!(other.cost_usd, None);
+        let relay = &report.rows[1];
+        assert_eq!((relay.runs, relay.excluded, relay.successes, relay.errors), (1, 2, 1, 0), "the rows read the runs without an artifact");
+        assert_eq!(relay.cost_usd, Some(0.25), "the cost of a run left out does not enter its row");
+        assert_eq!((report.runs, report.successes), (4, 3), "the totals are of every run, which cost what it cost");
+        assert!((report.cost_usd - 1.5).abs() < 1e-9, "{}", report.cost_usd);
+
+        let text = render(&report);
+        assert!(text.lines().next().unwrap().contains("| noise | runs | excluded | successes |"), "{text}");
+        assert!(text.lines().nth(2).unwrap().starts_with("| other | K1 | a0 | split | 0 | 0 | 1 | 0/0 |"), "{text}");
+        assert!(text.lines().nth(3).unwrap().starts_with("| relay | K1 | a3 | split | 0 | 1 | 2 | 1/1 |"), "{text}");
+
+        let left_out = excluded(&named);
+        assert_eq!(
+            left_out.iter().map(|e| (e.run.as_str(), e.causes.len())).collect::<Vec<_>>(),
+            [("p/2", 2), ("p/3", 1), ("q/1", 1)],
+            "each run with an artifact, in the order given"
+        );
+        let listed = render_excluded(&left_out);
+        assert!(listed.contains("- p/2: read_outside in session 1, compacted_early in session 1\n"), "{listed}");
+        assert!(listed.contains("- p/3: session_failed in session 2\n") && listed.contains("- q/1: read_outside in session 1\n"), "{listed}");
+        assert_eq!(render_excluded(&excluded(&named[..1])), "", "nothing left out, nothing listed");
+    }
+
+    #[test]
+    fn a_joined_row_has_rereads_and_no_relay_overhead() {
+        use crate::run::Rereads;
+        let run = |shape: Shape, overhead: Option<u64>, again: u64| {
+            let mut r = staged("relay", "a3", shape, None, true, &[part(0.1, 3, &[100, 200]), part(0.1, 3, &[300])]);
+            r.overhead = overhead;
+            r.rereads = Some(Rereads { again, to_edit: 5 });
+            r
+        };
+        let report = aggregate(&[run(Shape::Joined, Some(999), 700), run(Shape::Joined, None, 300), run(Shape::Split, Some(1000), 100), run(Shape::Split, Some(3000), 300)]);
+        let (split, joined) = (&report.rows[0], &report.rows[1]);
+        assert_eq!((split.shape, joined.shape), (Shape::Split, Shape::Joined));
+        assert_eq!((joined.overhead, joined.rereads), (None, Some(500.0)), "its first request is the whole conversation: no overhead, even in a result that carries one");
+        assert_eq!((split.overhead, split.rereads), (Some(2000.0), Some(200.0)));
+        let text = render(&report);
+        assert!(text.lines().nth(2).unwrap().contains("| 2000 | 200 |"), "{text}");
+        assert!(text.lines().nth(3).unwrap().contains("| - | 500 |"), "{text}");
+    }
+
+    #[test]
+    fn the_pairs_table_tells_what_was_excluded_continued_compacted_and_read_again() {
+        use crate::run::Rereads;
+        use ArtifactCause::{NotContinued, ReadOutside};
+        let make = |run: &str, split_overhead: u64, to_edit: u64, again: u64| {
+            let [mut joined, mut split] = pair(run, (true, true), &[100_000, 150_000], (0.35, Some(148_000)), 0.25);
+            joined.1.rereads = Some(Rereads { again, to_edit: 0 });
+            split.1.overhead = Some(split_overhead);
+            split.1.rereads = Some(Rereads { again: 1, to_edit });
+            [joined, split]
+        };
+        let mut runs: Vec<(String, RunResult)> = [make("p1", 1000, 200, 400), make("p2", 3000, 600, 800), make("p3", 2000, 400, 600)].concat();
+        runs[5].1.sessions[1].session.compactions = 1;
+        let [joined, split] = make("p4", 9000, 900, 900);
+        runs.extend([joined, (split.0, with_artifacts(split.1, &[(ReadOutside, 2)]))]);
+        let [joined, split] = make("p5", 9000, 900, 900);
+        runs.extend([(joined.0, with_artifacts(joined.1, &[(NotContinued, 2)])), split]);
+        runs[0].1.sessions[1].session.compactions = 2;
+
+        let found = pairs(&runs);
+
+        let row = &found[0];
+        assert_eq!(row.pairs, 5);
+        assert_eq!((row.excluded, row.not_continued, row.compacted), (2, 1, 2), "of every pair: those with an artifact in a branch, those that did not continue, those with a compaction in any session");
+        assert_eq!(row.clean, 3);
+        assert_eq!((row.joined_passed, row.split_passed), (3, 3), "the rest reads the pairs without an artifact");
+        assert_eq!((row.overhead, row.to_edit, row.again), (Some(2000.0), Some(400.0), Some(600.0)), "medians of the avoidable overhead and the reads to edit of the new branch, and the rereads of the continued one");
+        let text = render_pairs(&found);
+        assert!(text.contains("| relay | a3 | 5 | 2 | 1 | 2 | 3/3 | 3/3 | 0 |"), "{text}");
+        assert!(text.trim_end().ends_with("| 2000 | 400 | 600 |"), "{text}");
+    }
+
+    /// The two branches of one fork, named by where they were run.
+    fn pair(run: &str, passes: (bool, bool), fork: &'static [u64], joined: (f64, Option<u64>), split_cost: f64) -> [(String, RunResult); 2] {
+        let first = || Part { cost: 0.65, turns: 10, requests: fork, cached: None };
+        let continued = Part { cost: joined.0, turns: 6, requests: &[150_000], cached: joined.1 };
+        [
+            (format!("{run}/joined"), staged("relay", "a3", Shape::Joined, Some("split"), passes.0, &[first(), continued])),
+            (format!("{run}/split"), staged("relay", "a3", Shape::Split, Some("joined"), passes.1, &[first(), part(split_cost, 5, &[20_000])])),
+        ]
+    }
+
+    #[test]
+    fn a_forked_run_reports_its_pairs_and_what_the_new_session_saved() {
+        let runs: Vec<(String, RunResult)> = [
+            pair("r1", (true, true), &[100_000, 150_000], (0.35, Some(148_000)), 0.25),
+            pair("r2", (true, false), &[100_000, 160_000], (0.40, Some(150_000)), 0.20),
+            pair("r3", (false, false), &[100_000, 140_000], (0.50, Some(149_000)), 0.30),
+        ]
+        .concat();
+        let mut with_noise = runs.clone();
+        with_noise.push(("alone".to_owned(), result(&spec("relay", "a3"))));
+        with_noise.push(("lone/joined".to_owned(), staged("relay", "a3", Shape::Joined, Some("split"), true, &[part(0.1, 1, &[10]), part(0.1, 1, &[10])])));
+
+        let found = pairs(&with_noise);
+
+        assert_eq!(found.len(), 1);
+        let row = &found[0];
+        assert_eq!((row.task.as_str(), row.arm.as_str(), row.pairs), ("relay", "a3", 3), "a run without a partner and a run that did not fork are no pair");
+        assert_eq!((row.joined_passed, row.split_passed, row.continued_only), (2, 1, 1));
+        assert_eq!(row.fork_context, Some(150_000.0), "the median of the last request of the first session");
+        let savings = [1.0 - 0.25 / 0.35, 1.0 - 0.20 / 0.40, 1.0 - 0.30 / 0.50];
+        assert!((row.saving.unwrap() - savings[2]).abs() < 1e-9, "the median saving of the new session over the continued one: {:?}", row.saving);
+        assert_eq!(row.priced, 3);
+
+        let text = render_pairs(&found);
+        assert!(
+            text.lines().next().unwrap().starts_with("| task | arm | pairs | with an artifact | not continued | compacted | joined passed | split passed | joined passed and split failed | context at the fork | cost saving | pairs priced | avoidable relay overhead | rereads to edit | rereads of the continued |"),
+            "{text}"
+        );
+        assert!(text.contains("| relay | a3 | 3 | 0 | 0 | 0 | 2/3 | 1/3 | 1 | 150000 | 40.0% | 3 | - | - | - |"), "{text}");
+
+        let report = aggregate(&runs.iter().map(|(_, r)| r.clone()).collect::<Vec<_>>());
+        assert!((report.cost_usd - (3.0 * 0.65 + 0.35 + 0.25 + 0.40 + 0.20 + 0.50 + 0.30)).abs() < 1e-9, "the first session of a fork is paid once: {}", report.cost_usd);
+    }
+
+    #[test]
+    fn a_pair_that_continued_cold_does_not_count_for_the_cost() {
+        let runs: Vec<(String, RunResult)> = [
+            pair("warm", (true, true), &[1, 2], (0.40, Some(120_000)), 0.20),
+            pair("cold", (true, true), &[1, 2], (0.30, Some(10_000)), 0.30),
+            pair("none", (true, true), &[1, 2], (0.30, None), 0.30),
+        ]
+        .concat();
+        let row = &pairs(&runs)[0];
+        assert_eq!(row.pairs, 3);
+        assert_eq!(row.priced, 1, "only the pair that read 80 % of its first request from the cache is priced");
+        assert!((row.saving.unwrap() - 0.5).abs() < 1e-9, "{:?}", row.saving);
+        assert_eq!((row.joined_passed, row.split_passed), (3, 3), "a cold continuation still counts for the success");
+
+        let cold: Vec<(String, RunResult)> = pair("cold", (true, true), &[1, 2], (0.30, Some(10_000)), 0.30).into();
+        let row = &pairs(&cold)[0];
+        assert_eq!((row.priced, row.saving), (0, None));
+        assert!(render_pairs(&pairs(&cold)).contains("| - | 0 | - | - | - |"), "{}", render_pairs(&pairs(&cold)));
+    }
+
+    #[test]
+    fn the_costs_count_the_sessions_of_a_run_that_failed() {
+        let [joined, mut split] = pair("r1", (true, false), &[1000], (0.35, Some(900)), 0.25);
+        let failed = split.1.sessions.last_mut().unwrap();
+        failed.session.outcome = None;
+        failed.session.started_at = Some("2026-11-11 15:00:00 UTC".to_owned());
+        split.1.session = failed.session.clone();
+        let csv = costs(&[joined, split]);
+        let keyed: Vec<(String, String)> = csv.lines().skip(1).map(|l| (l.split(',').next().unwrap().to_owned(), l.rsplit(',').take(2).collect::<Vec<_>>().join(","))).collect();
+        assert_eq!(
+            keyed,
+            [("r1/joined".into(), "joined,1".into()), ("r1/joined".into(), "joined,2".into()), ("r1/split".into(), "split,2".into())],
+            "the failed session has its line, without figures, and the shared first session is listed once: {csv}"
+        );
+        let last = csv.lines().last().unwrap();
+        assert!(last.contains("2026-11-11 15:00:00 UTC") && last.ends_with(",,,,,,,,,,2,split"), "{last}");
+    }
+
+    #[test]
+    fn the_costs_have_a_line_per_session_with_its_number_and_shape() {
+        let fork = pair("r1", (true, true), &[1000], (0.35, Some(900)), 0.25);
+        let mut once = result(&spec("short", "a0"));
+        once.session.model = Some("m".to_owned());
+        let named: Vec<(String, RunResult)> = fork.into_iter().chain([("short".to_owned(), once)]).collect();
+
+        let csv = costs(&named);
+        let lines: Vec<&str> = csv.lines().collect();
+
+        assert!(lines[0].ends_with(",cost_usd,cost_basis,session,shape"), "{}", lines[0]);
+        let keyed: Vec<(&str, &str, &str)> = lines[1..]
+            .iter()
+            .map(|l| {
+                let f: Vec<&str> = l.split(',').collect();
+                (f[0], f[f.len() - 2], f[f.len() - 1])
+            })
+            .collect();
+        assert_eq!(
+            keyed,
+            [("r1/joined", "1", "joined"), ("r1/joined", "2", "joined"), ("r1/split", "2", "split"), ("short", "1", "split")],
+            "the first session of a fork is listed once, with the branch that ran it first"
+        );
+    }
+
+    #[test]
+    fn the_calls_table_tells_what_each_tool_adds() {
+        let message = |id: &str, context: u64, call: &str, tool: &str| {
+            format!(
+                "{}\n{}\n",
+                serde_json::json!({"type": "assistant", "message": {"id": id, "content": [{"type": "tool_use", "id": call, "name": tool, "input": {}}], "usage": {"input_tokens": context}}}),
+                serde_json::json!({"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": call, "content": "x"}]}})
+            )
+        };
+        let end = |id: &str, context: u64| format!("{}\n", serde_json::json!({"type": "assistant", "message": {"id": id, "content": [], "usage": {"input_tokens": context}}}));
+        let first = message("m1", 1000, "a", "mcp__clawg__search_memory")
+            + &message("m2", 3000, "b", "Read")
+            + &message("m3", 3100, "c", "mcp__clawg__search_memory")
+            + &message("m4", 3300, "d", "mcp__clawg__recall_context")
+            + &end("m5", 6000);
+        let second = message("n1", 500, "e", "mcp__clawg__search_memory") + &end("n2", 800);
+        let transcripts = [crate::stream::parse(&first), crate::stream::parse(&second)];
+
+        let text = calls(&transcripts);
+
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], "| tool | calls | with tokens | median tokens | p90 tokens | median result tokens | note |");
+        assert_eq!(lines[2], "| search_memory | 3 | 3 | 300 | 2000 | 0 |  |", "its calls added 2000, 200 and 300 tokens: {text}");
+        assert!(text.contains("| recall_context | 1 | 1 | 2700 | 2700 | 0 |  |"), "what a call adds holds the model's own words, so alone it marks no diet: {text}");
+        assert!(text.contains("| Read | 1 | 1 | 100 | 100 | 0 |  |"), "{text}");
+    }
+
+    #[test]
+    fn the_calls_table_gives_the_size_of_a_result_beside_what_a_call_adds() {
+        // A result of `bytes` bytes, which the table counts at 4 bytes a token.
+        let message = |id: &str, context: u64, call: &str, tool: &str, bytes: Option<usize>| {
+            let mut text = format!(
+                "{}\n",
+                serde_json::json!({"type": "assistant", "message": {"id": id, "content": [{"type": "tool_use", "id": call, "name": tool, "input": {}}], "usage": {"input_tokens": context}}})
+            );
+            if let Some(bytes) = bytes {
+                text.push_str(&format!(
+                    "{}\n",
+                    serde_json::json!({"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": call, "content": "z".repeat(bytes)}]}})
+                ));
+            }
+            text
+        };
+        let end = |id: &str, context: u64| format!("{}\n", serde_json::json!({"type": "assistant", "message": {"id": id, "content": [], "usage": {"input_tokens": context}}}));
+        let stream = message("m1", 1000, "a", "mcp__clawg__search_memory", Some(400))
+            + &message("m2", 1300, "b", "mcp__clawg__search_memory", Some(8000))
+            + &message("m3", 3300, "c", "mcp__clawg__search_memory", Some(40))
+            + &message("m4", 3400, "d", "mcp__clawg__recall_context", Some(12000))
+            + &message("m5", 6400, "e", "mcp__clawg__recall_context", Some(9000))
+            + &message("m6", 9400, "f", "mcp__clawg__read_memory", Some(400))
+            + &message("m7", 12400, "g", "mcp__clawg__list_memories", None)
+            + &end("m8", 12500);
+
+        let text = calls(&[crate::stream::parse(&stream)]);
+
+        assert!(text.contains("| search_memory | 3 | 3 | 300 | 2000 | 100 |  |"), "the median of the results is 100 tokens, 400 bytes: {text}");
+        assert!(text.contains("| recall_context | 2 | 2 | 3000 | 3000 | 2625 | candidate for a diet |"), "both medians pass 1500: {text}");
+        assert!(text.contains("| read_memory | 1 | 1 | 3000 | 3000 | 100 |  |"), "it adds a lot with a small result: the model thought in that message: {text}");
+        assert!(text.contains("| list_memories | 1 | 1 | 100 | 100 | - |  |"), "a call without a result has no size: {text}");
     }
 }
