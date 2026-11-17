@@ -1,6 +1,6 @@
 # save-pairs — Especificación
 
-Se suma a [`specs/disputes`](../../specs/disputes/spec.md) («El detector anota candidatas», R3), [`specs/pieces`](../../specs/pieces/spec.md) (R3) y [`specs/storage`](../../specs/storage/spec.md) («Un replay retoma donde quedó»).
+Se suma a [`specs/disputes`](../../../specs/disputes/spec.md) («El detector anota candidatas», R3), [`specs/pieces`](../../../specs/pieces/spec.md) (R3) y [`specs/storage`](../../../specs/storage/spec.md) («Un replay retoma donde quedó»).
 
 ## R1. Un save reanudado se empareja una vez con cada save
 

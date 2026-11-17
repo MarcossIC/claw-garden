@@ -68,7 +68,7 @@ Cuando un save largo termina sin falla, el worker MUST escribir, en una sola tra
 
 Un save de un pedazo MUST NOT dejar vínculos. Un save que se corta a mitad de camino (`IngestReport.failure`, `worker.rs:84`, o una pausa del apagado, `IngestReport.paused`) MUST NOT dejar vínculos todavía: sus filas quedan sueltas mientras tanto. Si tiene fila en el outbox, la fila MUST quedar aunque el que guardó esperaba la respuesta (que es `202 partially_saved`, [`specs/ingest`](../ingest/spec.md), «Un fallo del worker llega al que guardó»), y el siguiente arranque retoma después de las piezas ya guardadas y escribe el vínculo al terminar ([`specs/storage`](../storage/spec.md), «Un replay retoma donde quedó»); si llega a `failed`, `clawg outbox discard` borra las que insertó ([`specs/storage`](../storage/spec.md), «Una fila `failed` se reintenta o se descarta»). Sin fila (tests y evaluación), al guardarlo de nuevo los pedazos se absorben y el vínculo se escribe entonces.
 
-Si escribir el vínculo falla, el save MUST seguir informándose como guardado: sus filas ya están y se encuentran igual. La falla va al log (`worker.rs:998`, y `worker.rs:725` con una fila en el outbox, que entonces queda para que el próximo arranque la termine).
+Si escribir el vínculo falla (la transacción de `outbox_finish`, o la de `finish_save` para un evento sin fila), el save MUST seguir informándose como guardado, sin `failure` y con sus `memories`: sus filas ya están y se encuentran igual. La falla va al log (`process_tracked`, `worker.rs:745`, y `finish_save`, `worker.rs:1182`, que devuelve el error). Pero el informe MUST llevar `related` y `replaced` vacíos y `revision_candidate` en `None`: un par lo tiene una sola pieza, que el agente no puede juzgar por el primer id de la respuesta mientras el vínculo no existe, y el aviso nombraría una marca que nadie escribió. La respuesta de `POST /v1/memories` es entonces `201 saved` sin `related`, `replaced` ni `revision_candidate`, y `save_memory` no agrega la línea `close to earlier memories` ni la del aviso. Con una fila del outbox, la fila MUST quedar `pending` con todas sus piezas anotadas, y el siguiente arranque la termina: enlaza las piezas y borra la fila. Ese replay no escribe la marca `topic_key_warned`: todas sus piezas vuelven reanudadas, ninguna se prueba, y sin `related` no hay revisión que avisar.
 
 Guardar otra vez exactamente las mismas filas, en el mismo orden, MUST devolver el `save_id` que ya forman (`existing_save`, `pieces.rs:267`) y no escribir nada: el mismo save no se vincula dos veces.
 
@@ -83,7 +83,16 @@ Guardar otra vez exactamente las mismas filas, en el mismo orden, MUST devolver 
 - WHEN se guarda
 - THEN `memory_piece` no cambia
 
-**Test:** `a_long_save_links_its_pieces_in_order`, `an_absorbed_piece_is_linked_without_context`, `a_save_cut_short_leaves_no_link` y `the_same_long_save_again_links_the_rows_it_left` (`worker.rs`); `link_pieces_numbers_saves_in_order` y `linking_the_same_rows_again_answers_the_save_they_already_form` (`pieces.rs`).
+#### Escenario: el enlace falla
+- GIVEN una fila vieja O, y un save largo con fila en el outbox cuya segunda pieza cae en la banda de O
+- AND el store rechaza escribir en `memory_piece`
+- WHEN el worker termina el save
+- THEN el informe nombra las piezas, sin `failure` ni `related`
+- AND la fila del outbox sigue con todas las piezas anotadas
+- WHEN el store vuelve a aceptar la escritura y se corre el replay
+- THEN las piezas quedan enlazadas, la fila desaparece, y juzgar `(keep = la primera pieza, other = O)` con `supersedes` funciona
+
+**Test:** `a_long_save_links_its_pieces_in_order`, `an_absorbed_piece_is_linked_without_context`, `a_save_cut_short_leaves_no_link`, `the_same_long_save_again_links_the_rows_it_left` y `a_save_whose_finish_fails_names_no_pairs`, que provoca el fallo con un `TEMP TRIGGER` sobre `memory_piece` y lo quita antes del replay (`worker.rs`); `link_pieces_numbers_saves_in_order` y `linking_the_same_rows_again_answers_the_save_they_already_form` (`pieces.rs`).
 
 ## R4. Un hit por save
 

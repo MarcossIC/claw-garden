@@ -37,17 +37,17 @@ Strict TDD: en cada tarea con conducta nueva, el test va primero y falla por la 
 
 - [ ] `cargo clean --workspace --target-dir target-test` antes de la primera corrida del cambio.
 - [x] `cargo test --workspace --target-dir target-test` y `cargo clippy --workspace --all-targets --target-dir target-test -- -D warnings`, en Windows, sobre el último commit.
-- [ ] El CI en verde en Linux y Windows.
+- [x] El CI en verde en Linux y Windows (`e4401434`, que incluye `c1653516`).
 - [x] `verify.md`: que la suite pasa, y qué test cubre cada requisito. Este cambio no toca el ranking, así que no corre `rag-eval`.
 
 ## 5. Archive
 
-- [ ] Llevar los requisitos a las specs:
+- [x] Llevar los requisitos a las specs:
   - `specs/disputes`, «El detector anota candidatas», con R1;
   - `specs/pieces` R3, el párrafo «Si escribir el vínculo falla…», con R2;
   - `specs/storage`, «Un replay retoma donde quedó», con la siembra de R1;
   - `specs/mcp` o `specs/disputes` R6, con el test de R3.
-- [ ] En `docs/reference/daemon.md`, la línea del outbox: qué responde un save cuyo cierre falló.
-- [ ] `git mv` a `changes/archive/AAAA-MM-DD-save-pairs`, y `state.yaml` archivado.
-- [ ] La fila 130 del `README.md` de openspec y la línea del `ROADMAP.md`.
-- [ ] Subir el minor, con `cargo update --workspace`, en un commit `chore: bump version to X.Y.Z`.
+- [x] En `docs/reference/daemon.md`, la línea del outbox: qué responde un save cuyo cierre falló.
+- [x] `git mv` a `changes/archive/2026-11-17-save-pairs`, y `state.yaml` archivado.
+- [x] La fila 130 del `README.md` de openspec y la línea del `ROADMAP.md`.
+- [ ] Subir el minor, con `cargo update --workspace`, en un commit `chore: bump version to X.Y.Z`. Va aparte, después del archivado.

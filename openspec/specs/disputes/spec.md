@@ -30,7 +30,9 @@ Cada fila que el detector encuentra en la banda ("Umbral y banda del detector") 
 
 Una candidata escala cuando `needs_user` (`contradiction.rs:103`), que es pura, devuelve verdadero: si la distancia no se conoce; si es menor que `ESCALATE_BELOW` y los dos lados son filas protegidas; o si es menor que `IDENTIFIER_ESCALATE_BELOW` y los dos textos comparten un identificador (`shares_identifier`, `contradiction.rs:115`, que usa `identifier_tokens` de `search.rs`). Dos `semantic_fact` cercanos que no llegan a ese corte no escalan, ni un hecho cerca de una preferencia o una decisión: los ve el agente en la respuesta del save, que le pide una llamada sólo si el save reemplaza una (VR1); `memory_status` cuenta sólo los pares escalados. El agente no puede reemplazar una fila protegida sin declarar la respuesta del usuario, en ningún estado del par (R3), así que una decisión no se pierde porque su par no escaló.
 
-Dentro de un pedazo, el detector MUST quedarse con la candidata más cercana de cada save (`SaveKey`, `contradiction.rs:89`: el save de `memory_piece`, o la fila si no es un pedazo). Un save nuevo MUST anotar a lo sumo un par con cada save anterior: entre sus pedazos, gana el primero que encuentra a ese save (`worker.rs:913` y `:913`). Los pedazos hermanos siguen sin emparejarse (R8).
+Dentro de un pedazo, el detector MUST quedarse con la candidata más cercana de cada save (`SaveKey`, `contradiction.rs:89`: el save de `memory_piece`, o la fila si no es un pedazo). Un save nuevo MUST anotar a lo sumo un par con cada save anterior: entre sus pedazos, gana el primero que encuentra a ese save (`paired`, en `store_pieces`, `worker.rs:1069`). Un pedazo suma su save a `paired` sólo después de quedar insertado: uno que absorbe un gemelo aparecido mientras se calculaba su vector no escribe candidatas, así que tampoco marca su save, y el pedazo siguiente anota el par. Los pedazos hermanos siguen sin emparejarse (R8).
+
+Lo mismo vale cuando el save se guarda en más de una toma (una pausa del apagado, un proceso muerto, `clawg outbox retry`; [`specs/storage`](../storage/spec.md), «Un replay retoma donde quedó»). Antes de probar la primera pieza de la toma, el worker MUST tratar como ya emparejado cada save que tiene un par en `memory_conflict` con alguna pieza que una toma anterior de este save insertó (`NotedPiece.inserted`), de cualquiera de los dos lados: ese save es el `SaveKey` de la otra fila del par. Una pieza que se prueba en esta toma MUST NOT anotar un par con esos saves, así que entre dos saves queda a lo sumo un par, igual que si el save se hubiera guardado en una sola toma. Una pieza reanudada que el dedup absorbió (`inserted` falso) MUST NOT sembrar: sus pares los anotó otro save. La lectura va en una sola llamada (`saves_already_paired`, `contradiction.rs:267`), y el paso de los pares y los vínculos a los `SaveKey` es una función pura (`saves_paired_with`, `contradiction.rs:248`) con la misma regla que `detect_contradiction` (`save_key`, `contradiction.rs:242`).
 
 #### Escenario: hechos cercanos sin identificador común
 - GIVEN un `semantic_fact` guardado
@@ -47,7 +49,26 @@ Dentro de un pedazo, el detector MUST quedarse con la candidata más cercana de 
 - WHEN se guarda un `semantic_fact` a distancia menor que `ESCALATE_BELOW`, sin un identificador compartido a menos de `IDENTIFIER_ESCALATE_BELOW`
 - THEN las dos quedan `active` y el par está `pending`
 
-**Tests:** `a_close_fact_is_a_pending_candidate_and_both_stay_active`, `a_close_preference_escalates_and_disputes`, `a_long_save_pairs_once_with_an_earlier_save` y `a_chunk_still_pairs_with_an_older_row` en `worker.rs`; `insert_writes_one_conflict_row_per_candidate` y `pending_candidates_alone_leave_the_row_active` en `store_insert.rs`; `needs_user_cases` (la tabla tipo × distancia × identificador), `escalate_below_pins_the_shipped_value`, `identifier_escalate_below_pins_the_shipped_value` e `identifiers_are_shared_only_when_both_texts_hold_one` en `contradiction.rs`.
+#### Escenario: una pausa entre dos piezas cercanas a la misma vieja
+- GIVEN una fila vieja O, y un save largo explícito cuya segunda pieza y cuya última pieza caen en la banda del detector de O
+- AND la primera toma guarda las dos primeras piezas y se corta antes de la tercera
+- WHEN la toma siguiente termina el save
+- THEN `memory_conflict` tiene un solo par entre el save y O, el de la segunda pieza
+- AND juzgar `(keep = la primera pieza, other = O)` con `supersedes` juzga ese par, sin `SeveralPairs`
+
+#### Escenario: un save que se emparejó con una pieza mientras el save estaba pausado
+- GIVEN un save largo cortado después de su segunda pieza
+- AND otro save X, guardado en el medio, que anotó un par con esa segunda pieza
+- WHEN la toma siguiente termina el save, y una pieza posterior cae en la banda de X
+- THEN entre el save y X queda un solo par, el que anotó X
+
+#### Escenario: una pieza reanudada que se había absorbido
+- GIVEN una fila R con un par anotado contra una fila vieja O, y un save largo cuya segunda pieza tiene el texto exacto de R
+- AND la primera toma absorbió esa pieza en R y se cortó antes de la tercera
+- WHEN la toma siguiente termina el save, y una pieza posterior cae en la banda de O
+- THEN esa pieza anota su par con O
+
+**Tests:** `a_close_fact_is_a_pending_candidate_and_both_stay_active`, `a_close_preference_escalates_and_disputes`, `a_long_save_pairs_once_with_an_earlier_save`, `a_piece_absorbed_by_a_twin_does_not_mark_its_save_as_paired`, `a_resumed_save_pairs_once_with_an_earlier_save`, `a_resumed_save_pairs_once_with_a_save_made_while_it_waited`, `a_resumed_absorbed_piece_does_not_seed_the_pairs` y `a_chunk_still_pairs_with_an_older_row` en `worker.rs`; `the_saves_a_resumed_save_already_paired_with` en `contradiction.rs`; `insert_writes_one_conflict_row_per_candidate` y `pending_candidates_alone_leave_the_row_active` en `store_insert.rs`; `needs_user_cases` (la tabla tipo × distancia × identificador), `escalate_below_pins_the_shipped_value`, `identifier_escalate_below_pins_the_shipped_value` e `identifiers_are_shared_only_when_both_texts_hold_one` en `contradiction.rs`.
 
 ## Las candidatas en la respuesta del save
 
@@ -264,7 +285,7 @@ La NOTE de ACTIVE CONFLICTS (una vez por bloque; [`specs/retrieval`](../retrieva
 - WHEN se llama `resolve_conflict` con `keep = N`, `other = O` y `verdict = supersedes`
 - THEN el texto dice que N queda y O queda reemplazada por N, y `list_memories` lo muestra
 
-**Test:** `resolve_supersedes_the_other_row`, `resolve_rejects_the_same_row`, `resolve_unknown_row_is_not_found`, `resolve_rows_without_a_dispute_conflict`, `judge_records_a_verdict`, `judge_refuses_scoped_without_reason`, `resolve_with_keep_both_still_works`, `disputes_lists_the_pending_pairs_an_agent_reaches_in_a_project` y `a_protected_verdict_without_the_answer_is_a_409` en `crates/clawg-cli/tests/api.rs`; `resolve_conflict_reports_the_outcome`, `resolve_conflict_against_an_older_daemon_asks_for_a_restart`, `resolve_conflict_sends_the_users_answer`, `memory_status_counts_only_the_pairs_that_wait_for_the_user`, `another_agent_resolves_a_conflict_unless_hidden`, `the_instructions_carry_the_saving_habits` y el conteo de herramientas en `crates/clawg-cli/src/mcp/server.rs`; `the_conflict_note_names_the_tool` y `the_conflict_note_does_not_claim_a_contradiction` en `crates/clawg-core/src/memory/retrieval/prompt_builder.rs`.
+**Test:** `resolve_supersedes_the_other_row`, `resolve_rejects_the_same_row`, `resolve_unknown_row_is_not_found`, `resolve_rows_without_a_dispute_conflict`, `judge_records_a_verdict`, `judge_refuses_scoped_without_reason`, `resolve_with_keep_both_still_works`, `disputes_lists_the_pending_pairs_an_agent_reaches_in_a_project` y `a_protected_verdict_without_the_answer_is_a_409` en `crates/clawg-cli/tests/api.rs`; `resolve_conflict_reports_the_outcome`, `resolve_conflict_against_an_older_daemon_asks_for_a_restart`, `resolve_conflict_sends_the_users_answer`, `a_long_save_is_judged_through_the_first_id_it_answers` (el primer id de `saved #…` juzga el par que la línea `close to earlier memories` nombra, aunque lo tenga otra pieza, R3), `memory_status_counts_only_the_pairs_that_wait_for_the_user`, `another_agent_resolves_a_conflict_unless_hidden`, `the_instructions_carry_the_saving_habits` y el conteo de herramientas en `crates/clawg-cli/src/mcp/server.rs`; `the_conflict_note_names_the_tool` y `the_conflict_note_does_not_claim_a_contradiction` en `crates/clawg-core/src/memory/retrieval/prompt_builder.rs`.
 
 ## R7. El workspace no muestra filas reemplazadas
 

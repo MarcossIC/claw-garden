@@ -76,7 +76,7 @@ La reimportación del historial ya se hizo, el 2026-11-08 y antes del piloto ([h
 
 **Instalación y distribución:** [claude-code-plugin](changes/claude-code-plugin/exploration.md), que decide si servidor y hooks se distribuyen como plugin de Claude Code y si el bloque de protocolo de `CLAUDE.md` sobra. Acerca la meta, pero el piloto corre con `--local`: sube si instalar a mano en el segundo repositorio resulta engorroso.
 
-**Calidad de lo guardado:** memory-anchors, y una política de olvido para `memory`, que hoy no existe y todavía no tiene cambio. [save-pairs](changes/save-pairs/proposal.md) (130) cierra los dos casos en que el primer id de un save largo todavía da 409: un save reanudado que se empareja dos veces y un cierre fallido que nombra pares sin enlazar. Es chico, no toca datos y no espera al piloto.
+**Calidad de lo guardado:** memory-anchors, y una política de olvido para `memory`, que hoy no existe y todavía no tiene cambio. [save-pairs](changes/archive/2026-11-17-save-pairs/proposal.md) (130) cerró los dos casos en que el primer id de un save largo todavía daba 409: un save reanudado que se emparejaba dos veces y un cierre fallido que nombraba pares sin enlazar. Está archivado el 2026-11-17, y la versión sube aparte.
 
 **Organización de los proyectos:** [project-groups](changes/project-groups/exploration.md) (123), que agrupa proyectos en un árbol para guardar y leer a nivel de grupo. Agrega una columna a `project`, así que va después del corte, cuando los datos ya se tocaron.
 

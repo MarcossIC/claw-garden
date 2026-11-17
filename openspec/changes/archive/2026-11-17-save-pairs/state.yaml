@@ -1,0 +1,16 @@
+change: save-pairs
+objective: "1"
+depends_on: []
+phase: archived
+release: pending  # la versión sube aparte, después del archivado
+artifacts:
+  exploration: skipped  # el análisis es docs/completed-impl/hipotesis/A1/informe.md
+  proposal: done
+  spec: done
+  design: skipped  # dos decisiones chicas, con sus alternativas en la propuesta
+  tasks: done
+  apply: done
+  verify: done  # la suite y los dos clippy pasan en Windows y el CI de Linux y Windows pasa; el corte de un save largo real con el modelo real queda pendiente (verify.md)
+  archive: done  # R1 en specs/disputes y specs/storage, R2 en specs/pieces R3 y en docs/reference/daemon.md, R3 en los tests de specs/disputes R6
+main_spec: openspec/specs/disputes/spec.md
+updated: 2026-11-17

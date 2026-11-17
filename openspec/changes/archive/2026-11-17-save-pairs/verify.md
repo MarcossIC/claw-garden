@@ -40,10 +40,16 @@ Informado por la implementación, sobre el último commit de código y en Window
 
 ## Pendiente en local
 
-- El CI en verde en Linux y Windows.
 - Los tests usan vectores ubicados a mano o el embedder falso. Con el modelo real no se comprobó que un save largo real se corte y retome, y no deje dos pares con la misma vieja. Hay tres formas de cortarlo: una pausa del apagado, un proceso muerto a mitad del save, o `clawg outbox retry` de una fila `failed`. La comprobación: después del arranque siguiente, `memory_conflict` tiene a lo sumo un par entre el save y cada vieja, y `resolve_conflict` con el primer id no da `SeveralPairs`.
 - El fallo del cierre sólo se provoca con un trigger. No hay forma de verlo con un save real sin romper el store a propósito.
 
 ## Arreglos después de la verificación
 
 El punto 3 de los matices se arregló en `c1653516`: `store_pieces` junta las claves nuevas y las suma a `paired` sólo después de `Insert::Inserted`, así que una pieza absorbida por un gemelo no marca su save como emparejado y la pieza siguiente anota el par. Lo fija `a_piece_absorbed_by_a_twin_does_not_mark_its_save_as_paired`, que restaura el gemelo de la pieza 0 mientras se calcula su vector.
+
+## Al archivar
+
+- El CI de Linux y Windows pasa sobre `e4401434`, que incluye el arreglo `c1653516`.
+- WARNING 1: `specs/pieces` R3 dice que el replay de un save cuyo cierre falló enlaza las piezas y borra la fila, y que no escribe la marca `topic_key_warned`.
+- WARNING 2: la línea del outbox de `docs/reference/daemon.md` dice que ese save responde `201 saved` sin `related`, `replaced` ni `revision_candidate`, y que un save reanudado no anota un segundo par.
+- R1 está en `specs/disputes` («El detector anota candidatas», con el arreglo de `c1653516` y los tres escenarios) y en `specs/storage` («Un replay retoma donde quedó»). R2 está en `specs/pieces` R3, con su escenario. El test de R3 está en la lista de `specs/disputes` R6.
