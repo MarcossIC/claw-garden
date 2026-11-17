@@ -103,3 +103,33 @@ Ninguno.
 | S4 y S5, visibilidad y comentarios | `5e6d7052` | `pub(crate)` en lo que sólo usa `clawg-cli`; `RULES_BLOCK_MAX` en el módulo de tests; los comentarios de `INPUT_LIMIT` y de `respond_reading` |
 
 Quedan abiertos W3 (el p95 de la tanda con firma, que juzga la puerta de latencia) y S2, S3, S6, S7 y S8. Con W1 arreglado, una respuesta con `stderr` vacío y la firma en `stdout`, sin `2>&1`, cuenta como llamada sin firma: un shell no escribe ahí su `command not found`, así que es lo buscado.
+
+## La campaña
+
+Corrió con el build de agent-eval-sessions, Claude Code 2.1.322 y Sonnet 5.5. Fueron `shelf-eza-missing` bajo `a3` y `a3-notools` (5 corridas cada uno) y la tarea N bajo los dos (2 cada uno). `a0` es el de la fase 4 de agent-eval-sessions. Ninguna corrida tuvo un artefacto. Gasto: 1,25 USD de los 3 del tope.
+
+**Antes de la tarea 4.** En la fase 4, `a3-notools` intenta `eza` en la sesión 3 en 3 de 3: la memoria de hoy no evita el fallo, y el bloque del arranque se construye, como se hizo.
+
+| Condición | `a3` | `a3-notools` | Pasa |
+|---|---|---|---|
+| A: `tool_failed_count(eza) = 0` en la sesión 3, en 4 de 5 o más | 2 de 5 | 0 de 5 | **no** |
+| A: responde bien al menos tantas veces | 5 de 5 | 5 de 5 | sí |
+| A: el primer pedido de la sesión 3, de media, no más de 300 tokens por encima | 26.141 | 26.106 | sí (+35) |
+| B: en las sesiones 1 y 2, los fallos después del primero de cada sesión, a lo sumo la mitad | 0 | 0 | sí, sin discriminar |
+| La tarea discrimina: `a3-notools` falla en la sesión 3 en 3 de 5 o más | — | 5 de 5 | sí |
+| Control N: `a3` no recibe ninguna línea sobre programas ausentes | ninguna | — | sí |
+| Control N: la mediana del costo no sube más de un 5 % | 0,0331 | 0,0304 | **no** (+8,8 %) |
+
+**A no pasa, y la causa no es la redacción.** La regla llegó al arranque de la sesión 3 en 2 de las 5 corridas (repeticiones 2 y 4), y en las dos la sesión 3 no llamó a `eza`. En las otras tres no llegó, porque el libro no anotó el fallo de la sesión 1:
+- En las repeticiones 1, 3 y 5, la sesión 1 corrió `eza -1 -f src | wc -l`. La tubería sale con 0, así que el cliente corre `PostToolUse` y no `PostToolUseFailure`.
+- La respuesta que el cliente da al hook para Bash trae el texto del shell en `stdout` y deja `stderr` vacío. El transcript de la sesión lo muestra: `{"stdout": "/usr/bin/bash: line 1: eza: command not found\n0", "stderr": "", "interrupted": false, …}`.
+- `response_texts` (`crates/clawg-cli/src/tool_failures.rs:95`) lee sólo `stderr` cuando el campo existe, desde el arreglo de W1 (`77f7bd6d`). No encuentra la firma y no anota el fallo.
+- En la repetición 1, la sesión 3 corrió `eza -f docs | wc -l`: el mismo caso, que `observe` además anotó como un éxito de `eza` (`ok` en `tool-failures.jsonl`). Ese `ok` anula la regla por 30 días.
+
+La regla dice que, si A no pasa con la línea presente en el stream, se cambia una vez la redacción. Acá la línea faltó, así que la redacción no es lo que hay que cambiar. Cuando llegó, se cumplió 2 de 2. El arreglo va en `response_texts`: con un `stderr` vacío, la firma se busca en todos los textos. `observe` ya exige que el programa sea una palabra de comando del propio comando, y eso cubre el caso de W1, un programa que imprime la firma de un log. Después del arreglo, A se mide una vez más sobre `a3`, con la misma tarea y 5 corridas.
+
+Lo que no decide:
+- B pasa sin medir nada: ningún brazo repite `eza` en Bash dentro de una sesión. Los reintentos van a la herramienta PowerShell, que el cliente frena pidiendo una aprobación, y el libro no los ve.
+- El control N no pasa por costo, pero no por el hook. Ninguna sesión de `a3` recibió la línea, y el primer pedido es el mismo (20.464 contra 20.470). Una de las dos corridas de `a3` tuvo un turno más (4 contra 3), y con 2 corridas por brazo ese turno solo mueve la mediana un 8,8 %.
+
+Esto cierra el pendiente de la tarea 8 sobre la forma real de `tool_response` de Bash. Después de una llamada que terminó bien, la salida del shell está entera en `stdout`. Después de una que falló, el texto llega en `error`, por ejemplo `Exit code 127\n/usr/bin/bash: line 1: eza: command not found`. El cliente corre `PostToolUseFailure` con matcher `Bash` y lee su `additionalContext`: la línea del mismo turno llegó en las sesiones con `Exit code 127`.
