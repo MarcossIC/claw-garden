@@ -2,7 +2,7 @@ change: save-pairs
 objective: "1"
 depends_on: []
 phase: archived
-release: pending  # la versión sube aparte, después del archivado
+release: "0.88.0"  # el detector no anota un segundo par con un save reanudado y un cierre fallido no nombra pares sin enlazar; sale con el archivado de agent-eval, agent-eval-sessions y protocol-block
 artifacts:
   exploration: skipped  # el análisis es docs/completed-impl/hipotesis/A1/informe.md
   proposal: done

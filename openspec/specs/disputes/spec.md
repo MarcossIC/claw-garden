@@ -10,6 +10,7 @@ Fuente de verdad del comportamiento actual de los pares que encuentra el detecto
 - [protected-verdicts](../../changes/archive/2026-10-20-protected-verdicts/proposal.md), archivado el 2026-10-20 (la guarda de las filas protegidas y la declaración en R3, y lo que cambia en `conflicts`, R6 y «Datos de la versión anterior»).
 - [agent-authorship](../../changes/archive/2026-10-22-agent-authorship/proposal.md), archivado el 2026-10-22: el detector compara con el alcance del que guarda, y los pares se juzgan y se cuentan por lector y proyecto (R6, «Umbral y banda del detector»).
 - [verdict-on-replace](../../changes/archive/2026-11-12-verdict-on-replace/proposal.md), archivado el 2026-11-12, que sale en 0.85.0 (VR1, en «Las candidatas en la respuesta del save», y lo que cambia en R6 y en la apertura del protocolo). Los requisitos de ese cambio se numeran R1 a R6 allí y VR1 a VR5 acá, para no chocar con los ids de cada spec; VR2 a VR5 viven en [`specs/mcp`](../mcp/spec.md).
+- [save-pairs](../../changes/archive/2026-11-17-save-pairs/proposal.md), archivado el 2026-11-17, que sale en 0.88.0 (el detector anota un solo par por save también en un save reanudado, en «El detector anota candidatas», y la lista de tests de R6). El enlace de las piezas que falla está en [`specs/pieces`](../pieces/spec.md), R3, y lo que retoma un replay en [`specs/storage`](../storage/spec.md).
 
 ## Definiciones
 
