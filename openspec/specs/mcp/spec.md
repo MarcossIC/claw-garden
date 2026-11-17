@@ -444,7 +444,7 @@ Juntar los textos entre comillas invertidas MUST ser una función pura (`code_sp
 
 ## El schema de `memory_type` declara los tipos
 
-En el `inputSchema` de `save_memory` y de `update_memory`, la propiedad `memory_type` MUST declarar `enum` con los siete tipos de `MemoryType::ALL`, en su orden, más `null`, para que el `default` declarado (`null`) siga siendo válido (`memory_type_enum`, `server.rs:148-152`, aplicado con `#[schemars(transform = …)]` en `server.rs:165` y `server.rs:324`). Sus descripciones MUST NOT repetir la lista: dicen que es uno de los valores listados y que cualquier otro se rechaza. La de `save_memory` MUST decir además que una `architectural_decision` es una elección de diseño y su motivo, y que lo hecho, hallado o medido es un `semantic_fact`, aunque siga a una decisión: el tipo decide qué par se le pregunta al usuario ([`specs/disputes`](../disputes/spec.md)).
+En el `inputSchema` de `save_memory` y de `update_memory`, la propiedad `memory_type` MUST declarar `enum` con los siete tipos de `MemoryType::ALL`, en su orden, y nada más: el agente toma el tipo por defecto dejando el argumento afuera, y el esquema servido no ofrece `null` ([«Los esquemas sin el ruido del generador»](#los-esquemas-sin-el-ruido-del-generador)) (`memory_type_enum` en `server.rs`, aplicado con `#[schemars(transform = …)]` en `SaveMemoryArgs` y `UpdateMemoryArgs`). Sus descripciones MUST NOT repetir la lista: dicen que es uno de los valores listados y que cualquier otro se rechaza. La de `save_memory` MUST decir además que una `architectural_decision` es una elección de diseño y su motivo, y que lo hecho, hallado o medido es un `semantic_fact`, aunque siga a una decisión: el tipo decide qué par se le pregunta al usuario ([`specs/disputes`](../disputes/spec.md)).
 
 Al deserializar, el argumento MUST seguir siendo una cadena libre (`Option<String>`): un valor desconocido llega al daemon y vuelve como `not saved: unknown memory_type …` con los siete tipos ([`specs/ingest`](../ingest/spec.md), «El tipo de memoria se valida al guardar»), no como un error de protocolo que el modelo no puede leer. El `enum` le muestra los tipos al modelo antes de llamar; la validación de verdad es la del daemon.
 
@@ -454,6 +454,19 @@ Al deserializar, el argumento MUST seguir siendo una cadena libre (`Option<Strin
 - THEN la respuesta es un error que empieza con `not saved: unknown memory_type "bug_fix"` y nombra los siete tipos, y no se guarda nada
 
 **Tests:** `the_save_memory_schema_names_the_accepted_memory_types` (`server.rs`), que compara el `enum` de las dos herramientas con `MemoryType::ALL`; `the_save_memory_schema_says_what_a_decision_is` (`server.rs`); `save_memory_says_an_unknown_type_was_not_saved` (`server.rs`). El schema lo fija también `the_agent_contract_matches_its_file` ([`specs/quality`](../quality/spec.md)).
+
+## Los esquemas sin el ruido del generador
+
+El `inputSchema` de cada herramienta, como lo manda `tools/list` y en los dos idiomas, MUST NOT llevar lo que rmcp y schemars escriben sin decirle nada al modelo: `$schema`, `"default": null`, `"null"` como segundo tipo (`["string", "null"]` se sirve como `"string"`), ni el `format` de un número (`int64`, `uint`, `uint32`, `double`), con el `minimum: 0` que implica uno sin signo. Una herramienta cargada viaja en cada pedido desde ese momento, y ese ruido eran unos 1.850 caracteres de las 13. Lo demás MUST quedar igual: las descripciones, los nombres, `required`, los `enum`, un `default` que no sea `null` (`"default": false`), un `minimum` distinto de 0 y el `format` de una cadena. Lo que queda se lee igual en draft-07 y en 2020-12, así que el esquema no necesita nombrar su dialecto.
+
+La limpieza MUST ser una función pura sobre el JSON del esquema (`strip_noise`, `crates/clawg-cli/src/mcp/schema.rs`), que `served_router` (`server.rs`) aplica una vez al armar el router, antes de que `with_language` ponga las descripciones en español. Cada argumento opcional MUST seguir siendo `Option<T>`: un cliente que mande `null` explícito para un argumento que no quiere pasar MUST leerse igual que si lo dejara afuera.
+
+#### Escenario: un parámetro opcional
+- GIVEN `limit` de `search_memory`, un `Option<usize>`
+- THEN su esquema servido es `{"description": …, "type": "integer"}`, sin `default`, `format`, `minimum` ni `null`
+- AND un `save_memory` con `"topic_key": null` se lee como uno sin `topic_key`
+
+**Tests:** los puros `strip_noise_drops_what_the_generator_adds`, `strip_noise_keeps_what_the_model_reads` y `strip_noise_leaves_a_schema_with_no_properties_alone` (`schema.rs`); `the_served_schemas_carry_no_generator_noise`, en los dos idiomas, y `an_optional_argument_reads_the_same_absent_or_null` (`server.rs`). Los dos contratos lo fijan ([`specs/quality`](../quality/spec.md)).
 
 ## La descripción de `save_memory` pide título y "dónde"
 

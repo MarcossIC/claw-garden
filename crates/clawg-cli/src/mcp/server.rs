@@ -50,6 +50,7 @@ use crate::client::{
 };
 use crate::mcp::protocol::{self, opening};
 use crate::mcp::roots;
+use crate::mcp::schema;
 use crate::mcp::startup::{on_failure, ClientHandle, Next};
 use crate::mcp::tools::{
     format_docs, format_language, format_recall, format_resolution, format_rows, format_save, format_search, format_sharing,
@@ -126,6 +127,18 @@ fn describe(router: &mut ToolRouter<ClawgMcp>, table: &[(&str, Option<&str>, &'s
     }
 }
 
+/// Every tool as the model reads it: its input schema without what the
+/// generator adds and tells the model nothing ([`schema::strip_noise`]).
+fn served_router() -> ToolRouter<ClawgMcp> {
+    let mut router = ClawgMcp::tool_router();
+    for route in router.map.values_mut() {
+        let mut schema = (*route.attr.input_schema).clone();
+        schema::strip_noise(&mut schema);
+        route.attr.input_schema = std::sync::Arc::new(schema);
+    }
+    router
+}
+
 /// The client name a request reads and writes under: the one it declares,
 /// else the last one a client declared to this bridge. Blank names count as
 /// none.
@@ -144,8 +157,7 @@ fn client_name<'a>(declared: Option<&'a str>, remembered: Option<&'a str>) -> Op
 /// argument stays a free string: an unknown one then reaches the daemon and
 /// comes back as its sentence, not as a protocol error the model cannot read.
 fn memory_type_enum(schema: &mut schemars::Schema) {
-    let mut values: Vec<serde_json::Value> = MemoryType::ALL.iter().map(|t| t.as_str().into()).collect();
-    values.push(serde_json::Value::Null);
+    let values: Vec<serde_json::Value> = MemoryType::ALL.iter().map(|t| t.as_str().into()).collect();
     schema.insert("enum".into(), values.into());
 }
 
@@ -589,7 +601,7 @@ impl ClawgMcp {
             registered: Arc::default(),
             profile,
             language: None,
-            tool_router: Self::tool_router(),
+            tool_router: served_router(),
         }
     }
 
@@ -3182,14 +3194,13 @@ mod tests {
 
     /// The model has to pick `memory_type` from the set the store recognises;
     /// the daemon refuses any other, so the schema lists them for the model to
-    /// see before it calls. `null` stays valid because it is the declared
-    /// default.
+    /// see before it calls. Leaving the argument out is how it takes the
+    /// default, so `null` is not one of them.
     #[tokio::test]
     async fn the_save_memory_schema_names_the_accepted_memory_types() {
         let (b, _d) = bridge().await;
-        let mut expected: Vec<serde_json::Value> =
+        let expected: Vec<serde_json::Value> =
             MemoryType::ALL.iter().map(|t| serde_json::Value::from(t.as_str())).collect();
-        expected.push(serde_json::Value::Null);
         for name in ["save_memory", "update_memory"] {
             let schema = tool(&b, name).input_schema;
             let declared = &schema["properties"]["memory_type"]["enum"];
@@ -3266,6 +3277,42 @@ mod tests {
         let r = b.save_here("agent-mcp", args).await.expect("save");
         assert!(is_error(&r), "{}", text(&r));
         assert!(text(&r).contains("424242"), "{}", text(&r));
+    }
+
+    /// A loaded tool travels in every request; what the schema generator adds
+    /// and the model gains nothing from must not travel with it, in either
+    /// language.
+    #[tokio::test]
+    async fn the_served_schemas_carry_no_generator_noise() {
+        let (b, _d) = bridge().await;
+        let spanish = b.clone().with_language(Some(Lang::Es));
+        for b in [&b, &spanish] {
+            for t in b.tool_router.list_all() {
+                let schema = serde_json::to_string(&t.input_schema).expect("schema");
+                for noise in ["\"$schema\"", "\"default\":null", "\"null\"", "\"format\"", "\"minimum\":0"] {
+                    assert!(!schema.contains(noise), "{} carries {noise}: {schema}", t.name);
+                }
+            }
+        }
+    }
+
+    /// The schemas no longer offer `null`, but a client that sends it for an
+    /// argument it does not want to pass is read as if it left it out.
+    #[test]
+    fn an_optional_argument_reads_the_same_absent_or_null() {
+        let read = |json: serde_json::Value| serde_json::from_value::<SaveMemoryArgs>(json).expect("the arguments deserialize");
+        let absent = read(serde_json::json!({ "content": "a fact" }));
+        let null = read(serde_json::json!({
+            "content": "a fact", "topic_key": null, "importance": null, "memory_type": null, "derived_from": null, "all_projects": null,
+        }));
+        for args in [&absent, &null] {
+            assert_eq!(
+                (&args.topic_key, args.importance, &args.memory_type, &args.derived_from, args.all_projects),
+                (&None, None, &None, &None, None)
+            );
+        }
+        let set = read(serde_json::json!({ "content": "a fact", "topic_key": "storage/engine", "importance": 7.0 }));
+        assert_eq!((set.topic_key.as_deref(), set.importance), (Some("storage/engine"), Some(7.0)));
     }
 
     /// A tool with no description is a tool the model will not reach for.
