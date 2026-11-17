@@ -411,6 +411,17 @@ fn record(t: &Transcript, profile: Profile, loaded: Vec<Loaded>, untouched: Vec<
     }
 }
 
+/// The outcome of session `k` with only what it spent: a session that continued
+/// the conversation of the one before reports the spending of both.
+fn own_outcome(played: &[Played], k: usize, shape: Shape) -> Option<Outcome> {
+    let now = played[k].transcript.result.as_ref()?;
+    let before = k.checked_sub(1).and_then(|j| played[j].transcript.result.as_ref());
+    match before {
+        Some(before) if shape == Shape::Joined => Some(now.after(before)),
+        _ => Some(now.clone()),
+    }
+}
+
 /// The run of `task` scored from the sessions it `played`, each on its own and
 /// all together, with the path of each fact and the cost of the relay.
 ///
@@ -429,6 +440,7 @@ pub fn evaluate(task: &Task, info: &RunInfo, played: &[Played], read_file: impl 
         .map(|(k, (p, s))| SessionResult {
             session: Session {
                 outside_reads: outside_reads(&p.transcript.calls, info.workdir, info.additional_dirs, p.transcript.session_id.as_deref()),
+                outcome: own_outcome(played, k, info.shape),
                 ..record(&p.transcript, info.profile, p.loaded.clone(), p.untouched.clone())
             },
             score: s.score,
@@ -2614,6 +2626,25 @@ mod tests {
         assert_eq!(r.rereads, Some(Rereads { again: 100, to_edit: 0 }));
         assert_eq!(r.overhead, None, "its first request is the whole conversation");
         assert_eq!(evaluate(&two_sessions(), &info, &played_of(session_of(1000, &[]), session_of(1000, &[]))[..1], |_| None).rereads, None, "a run of one session reads nothing again");
+    }
+
+    #[test]
+    fn a_continued_session_costs_what_it_spent_after_the_one_before() {
+        let stream = |cost: f64, output: u64| {
+            format!(
+                "{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s\"}}\n{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"x\",\"total_cost_usd\":{cost},\"usage\":{{\"output_tokens\":40}},\"modelUsage\":{{\"m\":{{\"outputTokens\":{output},\"costUSD\":{cost}}}}}}}\n"
+            )
+        };
+        let played = [played(&stream(0.32, 1500)), played(&stream(0.40, 1900))];
+        let cost = |shape: Shape| {
+            let r = evaluate(&two_sessions(), &RunInfo { shape, ..info("a3", Profile::Dev) }, &played, |_| None);
+            r.sessions.iter().map(|s| s.session.outcome.as_ref().map(|o| (o.total_cost_usd.unwrap(), o.model_usage["m"].output_tokens))).collect::<Vec<_>>()
+        };
+        let joined = cost(Shape::Joined);
+        assert_eq!(joined[0], Some((0.32, 1500)));
+        let (second, output) = joined[1].unwrap();
+        assert!((second - 0.08).abs() < 1e-9 && output == 400, "the client reports a continued conversation's cost and usage by model from its start: {:?}", joined[1]);
+        assert_eq!(cost(Shape::Split), [Some((0.32, 1500)), Some((0.40, 1900))], "a new conversation reports only its own");
     }
 
     const OLD_RESULT: &str = r#"{"task": "t", "category": "K1", "example": false, "arm": "a3", "client": "replay", "lang": null,

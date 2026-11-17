@@ -86,6 +86,31 @@ pub struct Outcome {
     pub model_usage: BTreeMap<String, ModelUsage>,
 }
 
+impl Outcome {
+    /// What this outcome spent after `before`, the outcome of the session whose
+    /// conversation it continued. Claude Code reports the cost and the usage by
+    /// model of a continued conversation from its start, and the turns, the
+    /// duration and the usage of the main loop of the session alone. Without the
+    /// cost before, the whole cost stays: a figure too high stops a cap sooner.
+    pub fn after(&self, before: &Outcome) -> Outcome {
+        let less = |now: Option<f64>, then: Option<f64>| match (now, then) {
+            (Some(now), Some(then)) => Some((now - then).max(0.0)),
+            (now, _) => now,
+        };
+        let mut own = self.clone();
+        own.total_cost_usd = less(self.total_cost_usd, before.total_cost_usd);
+        for (model, m) in &mut own.model_usage {
+            let Some(b) = before.model_usage.get(model) else { continue };
+            m.input_tokens = m.input_tokens.saturating_sub(b.input_tokens);
+            m.output_tokens = m.output_tokens.saturating_sub(b.output_tokens);
+            m.cache_read_input_tokens = m.cache_read_input_tokens.saturating_sub(b.cache_read_input_tokens);
+            m.cache_creation_input_tokens = m.cache_creation_input_tokens.saturating_sub(b.cache_creation_input_tokens);
+            m.cost_usd = less(m.cost_usd, b.cost_usd);
+        }
+        own
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct HookEvent {
     pub subtype: String,
@@ -382,6 +407,35 @@ not json
         assert_eq!((sonnet.cost_usd, sonnet.cost_basis.as_deref()), (Some(0.09), Some("list")));
         let haiku = &outcome.model_usage["claude-haiku-5-5"];
         assert_eq!((haiku.input_tokens, haiku.cost_usd, haiku.cost_basis.as_deref()), (400, Some(0.0012), None));
+    }
+
+    #[test]
+    fn what_a_continued_outcome_spent_after_the_one_before_is_its_cost_and_model_usage_less_theirs() {
+        let model = |output: u64, cost: Option<f64>| ModelUsage { input_tokens: 10, output_tokens: output, cache_read_input_tokens: 5000, cache_creation_input_tokens: 900, cost_usd: cost, cost_basis: Some("list".into()) };
+        let before = Outcome {
+            total_cost_usd: Some(0.30),
+            model_usage: BTreeMap::from([("sonnet".to_owned(), model(1500, Some(0.30)))]),
+            ..Outcome::default()
+        };
+        let now = Outcome {
+            num_turns: Some(9),
+            total_cost_usd: Some(0.40),
+            usage: Usage { output_tokens: 400, ..Usage::default() },
+            model_usage: BTreeMap::from([
+                ("sonnet".to_owned(), ModelUsage { input_tokens: 18, output_tokens: 1900, cache_read_input_tokens: 9000, cache_creation_input_tokens: 1000, ..model(0, Some(0.39)) }),
+                ("haiku".to_owned(), model(20, Some(0.01))),
+            ]),
+            ..Outcome::default()
+        };
+        let own = now.after(&before);
+        assert!((own.total_cost_usd.unwrap() - 0.10).abs() < 1e-9, "{:?}", own.total_cost_usd);
+        let sonnet = &own.model_usage["sonnet"];
+        assert_eq!((sonnet.input_tokens, sonnet.output_tokens, sonnet.cache_read_input_tokens, sonnet.cache_creation_input_tokens), (8, 400, 4000, 100));
+        assert!((sonnet.cost_usd.unwrap() - 0.09).abs() < 1e-9, "{:?}", sonnet.cost_usd);
+        assert_eq!(own.model_usage["haiku"], model(20, Some(0.01)), "a model the one before did not use is all its own");
+        assert_eq!((own.num_turns, own.usage.output_tokens), (Some(9), 400), "the turns and the usage of the main loop are the session's own already");
+        let unpriced = Outcome { total_cost_usd: None, ..before };
+        assert_eq!(now.after(&unpriced).total_cost_usd, Some(0.40), "without the cost before, the whole cost stays");
     }
 
     #[test]
