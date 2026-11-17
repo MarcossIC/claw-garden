@@ -71,3 +71,30 @@ Ninguno.
 | S1 y S2 | `6bb07af9` | la documentación de `parse_agent` y de `parse_protocol` en su función; `DEFAULT_VARIANT` privado |
 
 W2 queda como está: al consolidar PB6 en `specs/setup` se escribe que `setup cursor --protocol` sale con 1. S3 lo comprueba la guía de la campaña.
+
+## La campaña
+
+Corrieron las 18 corridas de `a3-short` y `l0`: R bifurcada, D partida y la K larga, 3 por celda, con 15 reglas de ruido. Ninguna tuvo un artefacto, y ocho intentos de `Bash` fuera de `work/` los negó el cliente. Gasto: 5,46 USD de los 15 del tope.
+
+`a3` sale de agent-eval-sessions. Usa el mismo `clawg.exe` y el mismo texto del protocolo, porque entre los dos builds sólo cambió el conteo de costos de agent-eval (`9f933ab0`). Ninguna sesión de los brazos con bloque trajo el aviso del bloque viejo en su `SessionStart` (S3). **Falta una celda de `a3`: la K larga con 15 reglas.** Es de la fase 3 de agent-eval-sessions, que no corrió. Las métricas de `a3` son de R y D; las de las variantes se dan de R y D y, entre paréntesis, con la K.
+
+| Métrica | `a3` | `a3-short` | `l0` |
+|---|---|---|---|
+| E, corridas que aprueban | 9 de 9 (R continua 3, R nueva 3, D 3) | 9 de 9 (12 de 12) | 7 de 9 (7 de 12: R nueva 1 de 3, K 0 de 3) |
+| B, buscan antes de su primer `Write` o `Edit` | 4 de 9 | 0 de 9 (3 de 12) | 2 de 9 (2 de 12) |
+| G, hechos guardados antes de usarse | 18 de 18 | 18 de 18 | 8 de 18 |
+| S, `session_summary` completos | 0 de 9 | 0 de 9 | 0 de 9 |
+| J, `resolve_conflict` por save con cercanas | 0 / 2 = 0 | 5 / 6 = 0,83 | 1 / 1 = 1 |
+| T, mediana por sesión de los tokens de entrada | 156.340 | 111.482 (131.177) | 111.618 (148.193) |
+
+**`off` no pasa** por E (7 contra 9 − 1) y por G (8 contra 18 − 1). La celda que falta sólo puede sumarle a `a3`, así que no cambia nada.
+
+**`short` no pasa** por B (0 contra 4 − 1) y por J (0,83 contra 0 + 0,5). Con la K, B(`short`) es 3. Alcanzaría sólo si ninguna K de `a3` buscara antes de editar, y la K de `a3` del humo buscó. J cambiaría sólo si las K de `a3` llamaran a `resolve_conflict`, y ninguna K de ningún brazo guardó nada.
+
+**El valor por defecto queda en `full`.** Lo confirma del todo la celda K de `a3` con 15 reglas, que corre en la fase 3 de agent-eval-sessions.
+
+Lo que muestran los datos y no decide:
+- J separa las variantes por `topic_key`. Bajo `a3`, los seis saves de la decisión de D llevan `topic_key`: la versión revisada reemplaza sola a la primera y nadie llama a `resolve_conflict`. Bajo `a3-short`, tres de los seis van sin `topic_key`, salen con cercanas y el agente resuelve a mano. Cuatro de sus cinco veredictos son `supersedes` correctos, y uno es el `compatible` innecesario que J vigila.
+- `a3-short` aprueba todo, y su sobrecosto del relevo es de 70 tokens: la memoria llegó en el arranque y la sesión nueva no releyó `TIMEOUTS.md`. Pierde en B porque no busca, no porque le falte el dato.
+- Ninguna sesión de ningún brazo guardó un `session_summary`: S no separa `short` de `off` en tareas con `-p`.
+- Un bloque corto que conserve la parte de `topic_key` es una hipótesis nueva, no otra lectura de D6.
