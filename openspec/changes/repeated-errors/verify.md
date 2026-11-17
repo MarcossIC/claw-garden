@@ -135,3 +135,19 @@ Lo que no decide:
 Esto cierra el pendiente de la tarea 8 sobre la forma real de `tool_response` de Bash. Después de una llamada que terminó bien, la salida del shell está entera en `stdout`. Después de una que falló, el texto llega en `error`, por ejemplo `Exit code 127\n/usr/bin/bash: line 1: eza: command not found`. El cliente corre `PostToolUseFailure` con matcher `Bash` y lee su `additionalContext`: la línea del mismo turno llegó en las sesiones con `Exit code 127`.
 
 **Arreglado.** `response_texts` busca la firma en todos los textos cuando `stderr` está vacío: después de una llamada que terminó bien el cliente deja las palabras del shell en `stdout` y `stderr` llega vacío, así que un `eza -1 -f src | wc -l` registraba un `ok` falso. Un `stderr` con texto sigue siendo el único lugar donde se lee, y `observe` sigue exigiendo que el programa sea una palabra de mando del comando. Tests `a_pipe_that_exits_zero_with_the_shell_words_in_stdout_is_a_failure`, `the_signature_is_read_only_where_the_shell_reports_it` y `two_sessions_with_the_shell_words_in_stdout_teach_the_third`.
+
+### A, medida otra vez
+
+Con el `clawg.exe` arreglado (`9a76a8ec`), 5 corridas de `shelf-eza-missing` bajo `a3` en una fase propia, ninguna excluida, 0,51 USD. `a3-notools` es el de la primera medición: no usa el hook, así que el arreglo no lo cambia.
+
+| Condición | `a3` | `a3-notools` | Pasa |
+|---|---|---|---|
+| `tool_failed_count(eza) = 0` en la sesión 3, en 4 de 5 o más | 4 de 5 | 0 de 5 | **sí** |
+| Responde bien al menos tantas veces | 5 de 5 | 5 de 5 | sí |
+| El primer pedido de la sesión 3, de media, no más de 300 tokens por encima | 26.184 | 26.106 | sí (+78) |
+
+**A pasa.** La regla llegó al arranque de la sesión 3 en 4 corridas, y en las cuatro la sesión 3 no llamó a `eza`: el primer pedido de esas sesiones mide 26.206 tokens, contra 26.097 sin la línea. Queda el bloque del arranque, con la redacción de hoy.
+
+Lo que no decide:
+- En la repetición 5 la regla no llegó por otra vía que la de la primera medición. La sesión 1 falló en Bash y quedó anotada, pero la sesión 2 probó `eza` sólo en la herramienta PowerShell, que el cliente frena pidiendo una aprobación. El libro vio un solo fallo antes de la sesión 3, y la sesión 3 llamó a `eza` en Bash.
+- Ninguna sesión 1 ni 2 de esta medición usó una tubería (`eza -1 -f src`, `eza -1 src`): todas salieron con 127 y el cliente corrió `PostToolUseFailure`. El caso que arregló `response_texts`, la tubería que sale con 0, no se volvió a dar en la campaña; lo cubren los tres tests de arriba.
