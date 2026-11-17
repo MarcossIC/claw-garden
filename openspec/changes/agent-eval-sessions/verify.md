@@ -179,3 +179,53 @@ Los topes de `--max-budget-usd` por tarea y la cuenta contra el tope de la campa
 | W1 y el error de puntuar | `5bf17808` | `Command::Score` hace absoluta su ruta; un error de `score_dir` tras un fallo se suma al mensaje. Test `score_reads_a_relative_run_as_absolute`; la rama del mensaje no tiene test propio |
 
 Sobre `5bf17808`, en `target-test`: `cargo test --workspace` pasa, los dos `cargo clippy` pasan y `agent-eval tasks` sale con 0 y lista los dos ruidos. W4 queda como se dijo: la regla de H1 no cambia y la revisión informa `again` por herramienta.
+
+## La campaña
+
+Se corrieron el humo (6 corridas), la fase 2 (20) y la fase 4 (9), con Claude Code 2.1.322 y Sonnet 5.5 en esfuerzo `high`. **La fase 3 no corrió**: H2 y H4 quedan sin veredicto. Ninguna corrida tuvo un artefacto, ninguna sesión compactó y las lecturas de afuera que se intentaron las negó el cliente, también en las corridas (la sonda salió negada). Gasto según `agent-eval costs`: 1,00 USD el humo, 7,09 la fase 2 y 0,91 la fase 4, 9,01 de los 30 del tope; el estimado de esas tres fases era 19,36.
+
+Las celdas son las de las fases 2 y 4. Las corridas del humo no suman a su celda: después del humo cambió el arnés (las cuentas de la rama continua, `9f933ab0`).
+
+### H1, el relevo
+
+El contexto al bifurcar fue de 62.180 (`a0`), 66.865 (`a3`) y 69.734 (`a4`) tokens de mediana, no los 150.000 de la condición de validez. El resultado se informa como **régimen de unos 66.000 tokens**. Las dos tareas son válidas: la forma continua de R aprueba 3 de 3 en los tres brazos, y D continua bajo `a0` aprueba 2 de 2.
+
+| Brazo | R: pares con la continua aprobada y la nueva fallada | D partida | Sobrecosto evitable (mediana) | Veredicto |
+|---|---:|---:|---:|---|
+| `a0` | 0 de 3 | 0 de 3 | 4.418 | no es seguro |
+| `a3` | 0 de 3 | 3 de 3 | 3.491 | **rinde** |
+| `a4` | 1 de 3 | 3 de 3 | 4.482 | no es seguro |
+
+Bajo las mismas reglas, en la campaña de protocol-block: `a3-short` rinde (0 de 3, D 3 de 3, 70 tokens) y `l0` no es seguro (2 de 3 pares con la nueva fallada).
+
+Lo que es por construcción o no decide:
+- `a0` es seguro en R y no en D. En R la decisión viaja por `TIMEOUTS.md`, que escribe la sesión 1, y la sesión nueva la encuentra sin memoria. En D, el 0 de 3 de `a0` es por construcción: sin memoria, la sesión 3 no tiene de dónde saber la decisión revisada.
+- El par que falla en `a4` (repetición 3) encontró la decisión en `TIMEOUTS.md` y se detuvo a preguntar por una duda que la sesión 1 dejó abierta ahí. No es un artefacto: cuenta como falla.
+- `again` va de 186 a 4.968 tokens por rama nueva. `result.json` no lo separa por herramienta. Bajo `a0`, que no tiene herramientas de memoria, es todo `Read`. W4 sigue valiendo: lo que `a0` vuelve a encontrar con `Grep` no se cuenta.
+- El ahorro de cada par sale negativo en los tres brazos (`a0` −74,5 %, `a3` −32,5 %, `a4` −49,3 %): con la caché caliente y 66.000 tokens de contexto, seguir la conversación costó menos que empezar una nueva.
+
+Qué sigue, según la regla: `a3` rinde y `a0` no es seguro, así que se propone el aviso de corte y el resumen de relevo sobre lo que clawg ya tiene. El resultado vale para el régimen medido. Con ahorros negativos a 66.000 tokens, el umbral del aviso no puede salir de esta campaña: hace falta una R que llegue a 150.000 tokens o más.
+
+### H2, la escala, y H4, el orden del `MEMORY.md`
+
+Sin veredicto, porque la fase 3 no corrió. El canario sí pasó: Δ = 19.454 − 17.740 = 1.714 tokens, dentro de 500 a 3.000, así que el modelo de carga de 200 líneas cuadra.
+
+### H3, el ciclo de vida
+
+- `a3` mantiene los hechos que deciden. `FORK_DEFAULT_TIMEOUT` sale `usado` en 3 de 3 en las dos ramas de R. `_:_` sale `usado` en 3 de 3 en D. `[hidden]` sale `llegó y no se usó` en 3 de 3, y ninguna corrida `usó la primera`.
+- `a4` no escribió su memoria nativa en R: los dos hechos salen `no guardado` en las seis ramas, y el relevo pasó por `TIMEOUTS.md`. En D mantiene `_:_` (3 de 3), y `[hidden]` sale `no guardado`.
+- En `a0` todo sale `no guardado`, por construcción.
+
+### H5, el costo por llamada
+
+Ninguna herramienta de clawg queda como candidata a una dieta.
+- `save_memory` agrega 716 tokens de mediana en la fase 2 y 504 en protocol-block, con un resultado de 2 a 23 tokens.
+- `search_memory`, `recall_context` y `search_project` no se pudieron medir solas.
+- El resultado de `search_project` tiene 2.252 tokens de mediana en protocol-block, por encima de 1.500, pero sin la medida de lo que agrega no entra en la regla. Queda para mirar.
+
+### H6, el error repetido
+
+- **Hay efecto:** bajo `a0`, la sesión 3 intenta `eza` en 3 de 3.
+- **La memoria de hoy no lo evita:** `a3-notools` y `a4` intentan `eza` en la sesión 3 en 3 de 3 cada uno.
+
+repeated-errors tiene su línea base y su meta: 0 intentos en 3 de 3. El texto del shell fue `/usr/bin/bash: line 1: eza: command not found` en todas las sesiones. Después de fallar en Bash, el agente casi siempre prueba `eza` en la herramienta PowerShell, que pide una aprobación que nadie da, y termina contando con `Glob`. H6 cuenta sólo Bash, igual en todos los brazos.
