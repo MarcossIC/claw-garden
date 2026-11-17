@@ -182,7 +182,7 @@ Sobre `5bf17808`, en `target-test`: `cargo test --workspace` pasa, los dos `carg
 
 ## La campaña
 
-Se corrieron el humo (6 corridas), la fase 2 (20) y la fase 4 (9), con Claude Code 2.1.322 y Sonnet 5.5 en esfuerzo `high`. **La fase 3 no corrió**: H2 y H4 quedan sin veredicto. Ninguna corrida tuvo un artefacto, ninguna sesión compactó y las lecturas de afuera que se intentaron las negó el cliente, también en las corridas (la sonda salió negada). Gasto según `agent-eval costs`: 1,00 USD el humo, 7,09 la fase 2 y 0,91 la fase 4, 9,01 de los 30 del tope; el estimado de esas tres fases era 19,36.
+Se corrieron el humo (6 corridas), la fase 2 (20) y la fase 4 (9), con Claude Code 2.1.322 y Sonnet 5.5 en esfuerzo `high`. La fase 3 (60) corrió después, con los mismos programas: está en [H2 y H4](#h2-la-escala-y-h4-el-orden-del-memorymd). Ninguna corrida tuvo un artefacto, ninguna sesión compactó y las lecturas de afuera que se intentaron las negó el cliente, también en las corridas (la sonda salió negada). Gasto según `agent-eval costs`: 1,00 USD el humo, 7,09 la fase 2 y 0,91 la fase 4, 9,01 de los 30 del tope; el estimado de esas tres fases era 19,36.
 
 Las celdas son las de las fases 2 y 4. Las corridas del humo no suman a su celda: después del humo cambió el arnés (las cuentas de la rama continua, `9f933ab0`).
 
@@ -208,7 +208,28 @@ Qué sigue, según la regla: `a3` rinde y `a0` no es seguro, así que se propone
 
 ### H2, la escala, y H4, el orden del `MEMORY.md`
 
-Sin veredicto, porque la fase 3 no corrió. El canario sí pasó: Δ = 19.454 − 17.740 = 1.714 tokens, dentro de 500 a 3.000, así que el modelo de carga de 200 líneas cuadra.
+El canario pasó en el humo: Δ = 19.454 − 17.740 = 1.714 tokens, dentro de 500 a 3.000, así que el modelo de carga de 200 líneas cuadra y la fase 3 podía empezar.
+
+La fase 3 corrió después, con los mismos programas de las otras fases: 60 corridas, ninguna excluida, 3,37 USD de los 8 del tope (el estimado era unos 5).
+
+**H2: clawg no aguanta, según la regla.** Es medible: `a3` con 15 reglas aprueba la K larga 3 de 3.
+
+| Condición de «clawg aguanta» | Resultado | Cumple |
+|---|---|---|
+| K larga: `a3` con 300 aprueba al menos tantas como con 15 | 3 de 3 contra 3 de 3 | sí |
+| S, C y N con 300: `a3` y `l0` aprueban 2 de 2 | S 2 y 2, N 2 y 2, **C bajo `a3` 1 de 2**, C bajo `l0` 2 de 2 | **no** |
+| K larga: la mediana del primer pedido de `a3` con 300 no supera en más de 500 tokens a la de 15 | 20.576 contra 20.524 (+52) | sí |
+
+Sin «aguanta» no hay «ventaja en escala». En la K larga con 300, `a3` aprueba 3 y `a4` 1: la diferencia de 2 corridas estaba, pero la regla la pide sobre un clawg que aguanta.
+
+La C que falla no la decide la escala sino el arnés. La sesión buscó, recibió las dos decisiones opuestas sobre los paquetes internos (`==` y `~=`), leyó las dos con `read_memory` y eligió `~=` «porque tiene el id más alto y se lee como la respuesta a la primera». `seed.rs` numera las memorias de la más nueva a la más vieja (`seeded` y `id: i + 1`), así que en el fixture un id más alto es una memoria más vieja, al revés que en un store real. Con 300 reglas la decisión vigente quedó en `#9` y la vieja en `#142`. Las causas de exclusión no incluyen este caso, así que cuenta como falla y el veredicto queda. La otra corrida de C bajo `a3` no buscó y aprobó.
+
+Lo que muestran los datos y no decide:
+- Con 300 reglas `a3` falla K1, K2 y K3 (0 de 6), como con 15 en el piloto (0 de 6): no es un efecto de la escala.
+- `a4` con 300 falla K1, K2 y K3 (0 de 6) y la K larga 2 de 3, contra 6 de 6 y 3 de 3 con 15. Es por construcción: con 300 reglas la memoria de la tarea queda fuera de las 200 líneas, y en las dos K largas que fallan el agente no la fue a buscar al archivo.
+- Con 300 reglas aparece `synthesize`: 19 llamadas (12 de `l0`, 7 de `a3`), al terminar la tarea, porque la apertura avisa que hay memorias sin revisar. Con 15 reglas nadie lo llama. Agrega 1.776 tokens de mediana y su resultado tiene 1.302, por debajo de 1.500: según H5 no es candidata a una dieta, pero es un costo que crece con el store y no hace la tarea.
+
+**H4: C bajo `a4` con 15 reglas y el orden corregido aprueba 2 de 2.** Se informa junto al 2 de 2 del piloto y al 0 de 2 de la campaña anterior: el 0 de 2 era el orden del archivo. No decide nada.
 
 ### H3, el ciclo de vida
 
