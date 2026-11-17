@@ -2,7 +2,7 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| medición (1, 5) | M–L, sólo en `crates/clawg-eval` (el binario `agent-eval` y sus datos) | [agent-eval](../agent-eval/proposal.md) (96); sigue a [memory-delivery](../archive/2026-11-13-memory-delivery/verify.md) (127, archivado) | tareas 1 a 14 aplicadas y verificadas; la [segunda verificación](verify.md#segunda-verificación) pidió las enmiendas de las tareas 15 a 28, sin aplicar. La campaña paga no corre antes de ellas |
+| medición (1, 5) | M–L, sólo en `crates/clawg-eval` (el binario `agent-eval` y sus datos) | [agent-eval](../archive/2026-11-17-agent-eval/proposal.md) (96); sigue a [memory-delivery](../archive/2026-11-13-memory-delivery/verify.md) (127, archivado) | tareas 1 a 14 aplicadas y verificadas; la [segunda verificación](verify.md#segunda-verificación) pidió las enmiendas de las tareas 15 a 28, sin aplicar. La campaña paga no corre antes de ellas |
 
 ## Problema
 

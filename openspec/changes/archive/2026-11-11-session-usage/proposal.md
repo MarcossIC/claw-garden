@@ -18,7 +18,7 @@ Con esto no se puede contestar cuánto se usa clawg: cuántas sesiones hay por p
 
 ## Objetivo que sirve
 
-Transversal. Sirve a 1, 2 y 4 porque dice qué sesiones buscan, guardan y cierran con resumen, por proyecto y por agente, en uso real y no sólo en las corridas controladas de [agent-eval](../../agent-eval/proposal.md).
+Transversal. Sirve a 1, 2 y 4 porque dice qué sesiones buscan, guardan y cierran con resumen, por proyecto y por agente, en uso real y no sólo en las corridas controladas de [agent-eval](../2026-11-17-agent-eval/proposal.md).
 
 ## Decisiones
 

@@ -2,7 +2,7 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| transversal (instalar, prender por repo y actualizar el cliente de uso diario; toca 1 y 4 por el ruido de contexto y por el reparto entre clientes) | M (el plugin y la detección en `setup` son S; la medición del protocolo es M) | [setup-local-hooks](../archive/2026-11-08-setup-local-hooks/proposal.md) (archivado); la medición usa [agent-eval](../agent-eval/proposal.md) (96) | exploración (borrador) |
+| transversal (instalar, prender por repo y actualizar el cliente de uso diario; toca 1 y 4 por el ruido de contexto y por el reparto entre clientes) | M (el plugin y la detección en `setup` son S; la medición del protocolo es M) | [setup-local-hooks](../archive/2026-11-08-setup-local-hooks/proposal.md) (archivado); la medición usa [agent-eval](../archive/2026-11-17-agent-eval/proposal.md) (96) | exploración (borrador) |
 
 **Tesis.** Un plugin de Claude Code sirve para la caja (servidor MCP y hooks) y no resuelve el binario ni el protocolo. Lo que da de verdad es un solo interruptor por repositorio para servidor y hooks, y que Claude Code gestione la actualización. Hoy eso lo hacen tres escrituras de `clawg setup claude-code` que el usuario no ve, y un `--local` que prende sólo los hooks. El costo está en la coexistencia: si el plugin y `setup` conviven, los hooks corren dos veces, y eso sí está documentado. El bloque del protocolo es un tema aparte: no se decide leyendo, se decide midiendo, y el arnés ya tiene los brazos para hacerlo con una sola incorporación.
 
