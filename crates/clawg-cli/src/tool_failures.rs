@@ -87,15 +87,17 @@ pub(crate) fn texts(value: &serde_json::Value) -> Vec<&str> {
 }
 
 /// The texts of a shell tool's `response` where the shell's own words can be.
-/// When the response has a `stderr`, the shell reports a missing program
-/// there; its `stdout` is what the programs printed, and a program that reads
-/// a log can print the signature without any program missing. Only a command
-/// that sends one stream to the other (`2>&1`, `|&`) puts the shell's words in
-/// `stdout`, and then every text counts.
+/// When the response has a `stderr` with text, the shell reports a missing
+/// program there; its `stdout` is what the programs printed, and a program that
+/// reads a log can print the signature without any program missing. Every text
+/// counts when the command sends one stream to the other (`2>&1`, `|&`) and
+/// when `stderr` is empty: after a call that ended well the client puts the
+/// shell's words in `stdout` and leaves `stderr` empty. `observe` still asks
+/// the missing program to be a command word of the command itself.
 pub(crate) fn response_texts<'a>(response: &'a serde_json::Value, command: &str) -> Vec<&'a str> {
     let merged = command.contains("2>&1") || command.contains("|&");
     match response.get("stderr").and_then(serde_json::Value::as_str) {
-        Some(stderr) if !merged => vec![stderr],
+        Some(stderr) if !merged && !stderr.trim().is_empty() => vec![stderr],
         _ => texts(response),
     }
 }
@@ -552,10 +554,13 @@ mod tests {
     #[test]
     fn the_signature_is_read_only_where_the_shell_reports_it() {
         let response = serde_json::json!({ "stdout": BASH, "stderr": "", "interrupted": false });
-        assert_eq!(response_texts(&response, "rg \"command not found\" build.log"), [""], "stdout is the program's output, not the shell's");
-        for redirected in ["eza 2>&1", "eza |& head"] {
-            assert!(response_texts(&response, redirected).contains(&BASH), "{redirected}: the redirect carries the shell's words to stdout");
+        for command in ["eza | head", "eza 2>&1", "eza |& head"] {
+            assert!(response_texts(&response, command).contains(&BASH), "{command}: an empty stderr leaves the shell's words in stdout");
         }
+        let printed = observe("Bash", "rg \"command not found\" build.log", &response_texts(&response, "rg \"command not found\" build.log"), After::Success);
+        assert_eq!(fails(&printed), Vec::<&str>::new(), "a program that printed the signature is no missing program");
+        let log_line = serde_json::json!({ "stdout": BASH, "stderr": "warning: slow disk", "interrupted": false });
+        assert_eq!(response_texts(&log_line, "eza | head"), ["warning: slow disk"], "a stderr with text is where the shell reports");
         let on_stderr = serde_json::json!({ "stdout": "", "stderr": BASH });
         assert_eq!(response_texts(&on_stderr, "eza | head"), [BASH]);
         let plain = serde_json::json!(BASH);
@@ -575,6 +580,18 @@ mod tests {
         assert_eq!(fails(&observe("Bash", "eza | head", &texts(&plain), After::Success)), ["eza"], "a response that is only text");
         let nested = serde_json::json!({ "content": [{ "type": "text", "text": BASH }], "n": 3, "ok": true, "none": null });
         assert_eq!(texts(&nested), ["text", BASH], "every string leaf, at any depth, and nothing else");
+    }
+
+    #[test]
+    fn a_pipe_that_exits_zero_with_the_shell_words_in_stdout_is_a_failure() {
+        let command = "eza -1 -f src | wc -l";
+        let response = serde_json::json!({
+            "stdout": "/usr/bin/bash: line 1: eza: command not found\n0",
+            "stderr": "", "interrupted": false, "isImage": false, "noOutputExpected": false,
+        });
+        let observed = observe("Bash", command, &response_texts(&response, command), After::Success);
+        assert_eq!(fails(&observed), ["eza"]);
+        assert_eq!(oks(&observed), Vec::<&str>::new(), "no success for eza or for wc");
     }
 
     #[test]

@@ -1907,6 +1907,27 @@ async fn two_sessions_teach_the_third() {
 }
 
 #[tokio::test]
+async fn two_sessions_with_the_shell_words_in_stdout_teach_the_third() {
+    let sandbox = Sandbox::new();
+    let set = sandbox.run(&["preferences", "set", "language", "es", "--profile", "dev"]);
+    assert_eq!(set.status.code(), Some(0), "{}", stderr_of(&set));
+    let program = "eza-absent-xyz";
+    let command = format!("{program} -1 -f src | wc -l");
+    let response = json!({
+        "stdout": format!("/usr/bin/bash: line 1: {program}: command not found\n0"),
+        "stderr": "", "interrupted": false, "isImage": false, "noOutputExpected": false,
+    });
+
+    for session in ["s1", "s2"] {
+        let out = hook(&sandbox, &["post-tool-use", "--agent", "claude-code", "--profile", "dev"], &bash_ended(session, &command, response.clone()));
+        assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+    }
+    let start = start_of(&sandbox, "s3");
+
+    assert!(start.contains(&format!("`{program}` (2 sesiones, último fallo hoy)")), "{start}");
+}
+
+#[tokio::test]
 async fn one_session_teaches_nothing() {
     let sandbox = Sandbox::new();
     let set = sandbox.run(&["preferences", "set", "language", "es", "--profile", "dev"]);
