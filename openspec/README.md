@@ -46,6 +46,8 @@ La tabla tiene sólo lo que todavía no está en `changes/archive/`. Las filas d
 | 125 | [project-concept-map](changes/project-concept-map/exploration.md) | 3 | L, por pasos y con puerta | —; se coordina con 98 y alimenta a 126 | exploración (borrador); prioridad baja. Pregunta si vale registrar un mapa del proyecto; empieza por una puerta sin código |
 | 126 | [project-architecture-map](changes/project-architecture-map/exploration.md) | 3 | sin estimar | 125 | exploración (borrador); pregunta de viabilidad, prioridad baja. Se retoma cuando 125 tenga su puerta medida |
 | 131 | [repeated-errors](changes/repeated-errors/proposal.md) | 1 y 5 | M | — para el producto; 129 para la campaña | tareas escritas. Hooks de Bash avisan de los programas que no existen en la máquina y `session-start` los nombra; puerta de latencia p95 ≤ 60 ms |
+| 133 | [contract-diet](changes/contract-diet/exploration.md) | transversal | S (el ruido del esquema) – M (el bloque `lean`) | 132 (archivado); 134 para sacar las secciones del resumen | exploración (borrador). Lo que clawg le hace leer al modelo, con menos tokens: primero el ruido del esquema, sin cambiar palabras; después un bloque `lean` que conserva las reglas, medido con un brazo de agent-eval |
+| 134 | [memory-links](changes/memory-links/exploration.md) | 1 y 5 | S (las dos puertas) – sin estimar | — | exploración (borrador). Dos preguntas con puerta medida antes de cualquier código: qué aporta un `session_summary` que no aporten las memorias sueltas, y si los enlaces entre memorias traen algo que la búsqueda no trae |
 
 Objetivos del producto:
 
