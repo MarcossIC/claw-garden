@@ -2759,6 +2759,7 @@ struct DeleteRequest {
 fn delete_error(app: &AppCtx, e: DeleteError) -> ApiError {
     let conflict = |code: &str, e: &DeleteError| ApiError { detail: Some(e.to_string()), ..ApiError::conflict(code) };
     match e {
+        DeleteError::ConfirmWithoutRows => ApiError::bad_request(e.to_string()),
         DeleteError::UnknownProject(_) | DeleteError::UnknownDelete(_) => ApiError::not_found(e.to_string()),
         DeleteError::Merged { .. } => conflict("project_merged", &e),
         DeleteError::Deleted { .. } => conflict("project_deleted", &e),
@@ -2788,9 +2789,6 @@ async fn delete_projects(
             undo_delete_core(store, embedder.as_deref(), &backups, delete_id, dry_run).await
         }
         DeleteRequest { undo: None, project_id: Some(project_id), with_memories, confirm, dry_run: false } => {
-            if confirm.is_some() && !with_memories {
-                return Err(ApiError::bad_request("confirm goes with with_memories: it is the code of the report of a delete with its rows"));
-            }
             let deleted = delete_core(store, &workspaces, &backups, &project_id, with_memories, confirm.as_deref()).await;
             // So that a deleted project leaves no trace: its sessions go too.
             if let Ok(DeleteReport { delete_id: Some(_), project_id, .. }) = &deleted {
