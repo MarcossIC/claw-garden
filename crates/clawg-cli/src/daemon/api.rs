@@ -54,8 +54,9 @@ use clawg_core::memory::subfolder::{declare_subfolder, SubfolderError};
 use clawg_core::memory::merge::{canonical, merge_core, undo_merge_core, MergeError, MergeReport};
 use clawg_core::memory::project_delete::{delete_core, undo_delete_core, DeleteError, DeleteReport};
 use clawg_core::memory::registry::{
-    find_project, keep_apart, list_deletes, list_projects, own_folder_count, pending_suggestions, rename_project, resolve_project, suggestion_between,
-    Born, KeepApartError, KeptApart, ListedDelete, ListedProject, ListedSuggestion, Named, Project, RenameError,
+    check_folder, find_project, keep_apart, list_deletes, list_projects, locate_folder, pending_suggestions, rename_project, resolve_project,
+    suggestion_between, Born, KeepApartError, KeptApart, ListedDelete, ListedProject, ListedSuggestion, LocateError, Located, Named, Project,
+    RenameError,
     Resolution as ProjectResolution, ResolveError as ProjectResolveError, ResolveOptions,
 };
 use clawg_core::memory::relocate::{move_memories_core, undo_move_core, MoveError, MoveFilter, MoveReport, ProjectFilter};
@@ -2986,9 +2987,8 @@ pub struct LocatedBody {
 /// and this is its only folder, is merged into the named one. A project
 /// with other folders would take them along, which nobody named.
 async fn locate_project(State(app): State<Arc<AppCtx>>, Json(body): Json<LocateRequest>) -> ApiResult<Json<LocatedBody>> {
-    if !std::path::Path::new(&body.root_path).is_dir() {
-        return Err(ApiError::bad_request(format!("{} is not a directory: name a directory of the project", body.root_path)));
-    }
+    let folder = std::path::Path::new(&body.root_path);
+    check_folder(folder, std::path::Path::is_dir).map_err(located_refused)?;
     let subfolder = if body.subfolder { Some(subfolder_of(&body.root_path).await?) } else { None };
     let store = &app.runtime.store;
     let target = match find_project(store, &body.project).await.map_err(ApiError::internal)? {
@@ -3005,34 +3005,38 @@ async fn locate_project(State(app): State<Arc<AppCtx>>, Json(body): Json<LocateR
         return declare(&app, &root, &subpath, &target).await.map(Json);
     }
     let registered = register_root(&app, &body.root_path, None, &[], false, true).await?;
-    let (own, root_id) = (registered.project_id, registered.root_id);
-    let located = |already: bool, merge: Option<MergeReport>| LocatedBody {
-        project_id: target.clone(),
-        root_id: root_id.clone(),
-        already,
+    let backups = clawg_core::paths::backups_dir(&app.runtime.base_dir);
+    let located = locate_folder(store, &app.runtime.workspaces(), &backups, folder, &registered.project_id, &target)
+        .await
+        .map_err(located_refused)?;
+    let merge = match located {
+        Located::Already => None,
+        Located::Merged(merged) => {
+            sessions_follow(&app, &merged);
+            Some(merged)
+        }
+    };
+    Ok(Json(LocatedBody {
+        already: merge.is_none(),
+        project_id: target,
+        root_id: registered.root_id,
         merge,
         repository_id: None,
         subpath: None,
         removed: false,
         previous: None,
-    };
-    if own == target {
-        return Ok(Json(located(true, None)));
+    }))
+}
+
+/// The status a folder that was not located answers with: a shared folder
+/// is a conflict, and a refused merge answers as `POST /v1/projects/merge`.
+fn located_refused(e: LocateError) -> ApiError {
+    match e {
+        LocateError::NotADirectory(_) => ApiError::bad_request(e.to_string()),
+        LocateError::FolderShared { .. } => ApiError { detail: Some(e.to_string()), ..ApiError::conflict("folder_shared") },
+        LocateError::Merge(e) => merge_error(e),
+        LocateError::Store(e) => ApiError::internal(e),
     }
-    let folders = own_folder_count(store, &own).await.map_err(ApiError::internal)?;
-    if folders > 1 {
-        return Err(ApiError {
-            detail: Some(format!(
-                "{} leads to project {own}, which has {folders} folders; `clawg projects merge {own} --into {target}` merges them all",
-                body.root_path
-            )),
-            ..ApiError::conflict("folder_shared")
-        });
-    }
-    let backups = clawg_core::paths::backups_dir(&app.runtime.base_dir);
-    let merged = merge_core(store, &app.runtime.workspaces(), &backups, &own, &target, false).await.map_err(merge_error)?;
-    sessions_follow(&app, &merged);
-    Ok(Json(located(false, Some(merged))))
 }
 
 /// The root of the checkout `path` is in and the subpath of `path` there,
