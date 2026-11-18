@@ -45,7 +45,7 @@ Están en [design.md](design.md): `lean` es una variante nueva (D2), la apertura
 - `a3-lean` es `a3` salvo el `CLAUDE.md` (`arm.rs`).
 - El contrato del agente no cambia.
 
-**El tamaño**, medido sobre los archivos: `lean` son 7.068 caracteres en inglés y 7.663 en español, el 66 % y el 68 % de `full` (−3.623 y −3.608). Con la regla de dedo de la exploración (unos 4,6 tokens de T por carácter de bloque) se esperan unos −16.600 tokens de T por sesión, cerca del 10,6 % de `a3`: menos que el 15 % que estimaba la exploración, porque la apertura, la viñeta de `topic_key`, la regla del idioma y las dos secciones del resumen quedan enteras y suman unos 4.300 caracteres.
+**El tamaño**, medido sobre los archivos: `lean` son 7.068 caracteres en inglés y 7.663 en español, el 66 % y el 68 % de `full` (−3.623 y −3.608). Con la regla de dedo de la exploración (unos 4,6 tokens de T por carácter de bloque) se esperan unos −16.700 tokens de T por sesión, cerca del 10,7 % de `a3`: menos que el 15 % que estimaba la exploración, porque la apertura, la viñeta de `topic_key`, la regla del idioma y las dos secciones del resumen quedan enteras y suman unos 4.300 caracteres.
 
 **La decisión**, con la campaña y la regla de [design](design.md#la-regla-de-decisión): las seis condiciones de D6 de protocol-block y además T(`lean`) ≤ 0,9 × T(`a3`).
 

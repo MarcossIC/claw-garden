@@ -42,7 +42,7 @@ Las decisiones llevan el número de la [exploración](exploration.md#decisiones-
 |---|---|
 | Sólo T(V) < T(`a3`), como D6 | Cualquier ahorro, por chico que sea, pagaría el riesgo de cambiar lo que el agente lee |
 | 5 % | Está dentro del ruido de una campaña de 12 corridas por brazo |
-| 15 % | Es lo que estimaba la exploración para un bloque de unos 6.000 caracteres; con las reglas enteras `lean` queda en unos 7.000 (D10) y se espera cerca del 10,6 %, así que sería decidir por adelantado que no pasa |
+| 15 % | Es lo que estimaba la exploración para un bloque de unos 6.000 caracteres; con las reglas enteras `lean` queda en unos 7.000 (D10) y se espera cerca del 10,7 %, así que sería decidir por adelantado que no pasa |
 | **10 %** | Debajo, el ahorro no justifica ni el riesgo ni la campaña |
 
 ## D6. `a3-lean` es un brazo del arnés
