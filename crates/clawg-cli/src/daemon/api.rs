@@ -1958,12 +1958,12 @@ async fn restore_memory(
     let reader = named_reader(&app, q.agent.as_deref());
     match restore_memory_core(&app.runtime.store, embedder.as_ref(), id, reader.as_ref()).await {
         Ok(row) => Ok(Json(row.into())),
-        Err(RestoreError::NotFound(_)) => Err(ApiError::not_found(format!("no deleted memory row with id {id}"))),
+        Err(e @ RestoreError::NotFound(_)) => Err(ApiError::not_found(e.to_string())),
         Err(e @ (RestoreError::LiveTwin { .. } | RestoreError::TopicTaken { .. } | RestoreError::HoldsSecret { .. })) => {
             Err(ApiError::conflict(e.to_string()))
         }
         Err(RestoreError::Embed(_, e)) => Err(embed_failure(e)),
-        Err(e) => Err(ApiError::internal(e)),
+        Err(e @ RestoreError::Store(_)) => Err(ApiError::internal(e)),
     }
 }
 
