@@ -646,6 +646,90 @@ pub async fn keep_apart(store: &MemoryStore, a: &str, b: &str) -> Result<KeptApa
         .map_err(failed_call(ClosedAs::AsIs))
 }
 
+/// The answers a suggestion takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SuggestionAnswer {
+    Merge,
+    Apart,
+}
+
+/// Why a suggestion was not answered.
+#[derive(Debug, thiserror::Error)]
+pub enum AnswerError {
+    #[error("answer must be one of: merge, apart (got {0:?})")]
+    UnknownAnswer(String),
+    #[error("answering a suggestion is the user's call: send user_answered with the user's answer in reason")]
+    NeedsUser,
+    #[error("no suggestion is pending between {project_id} and {other_id}")]
+    NoSuggestion { project_id: String, other_id: String },
+    /// One of the two is not a live project, or they are the same one.
+    #[error(transparent)]
+    Pair(#[from] KeepApartError),
+    #[error(transparent)]
+    Merge(#[from] MergeError),
+}
+
+/// The person's answer to a suggestion, as an agent relays it: only
+/// [`UserAnswer::new`] makes one, so nothing answers a suggestion without
+/// the person's word.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UserAnswer {
+    answer: SuggestionAnswer,
+}
+
+impl UserAnswer {
+    /// Reads `answer`, then refuses it unless the caller declares the user
+    /// answered (`user_answered`) and relays their words in `reason`. Nothing
+    /// records the reason: it only shows the answer was asked for.
+    pub fn new(answer: &str, user_answered: bool, reason: Option<&str>) -> Result<Self, AnswerError> {
+        let answer = match answer {
+            "merge" => SuggestionAnswer::Merge,
+            "apart" => SuggestionAnswer::Apart,
+            other => return Err(AnswerError::UnknownAnswer(other.to_string())),
+        };
+        if !user_answered || reason.is_none_or(|r| r.trim().is_empty()) {
+            return Err(AnswerError::NeedsUser);
+        }
+        Ok(Self { answer })
+    }
+}
+
+/// What answering a suggestion did.
+#[derive(Debug)]
+#[expect(clippy::large_enum_variant, reason = "one per answer, matched as soon as it returns; none is stored")]
+pub enum Answered {
+    /// The two are kept from being suggested again.
+    Apart,
+    /// The other project was merged into the project.
+    Merged(MergeReport),
+}
+
+/// Answers the suggestion pending between `project_id` and `other_id`:
+/// `apart` as [`keep_apart`] does, `merge` by merging `other_id` into
+/// `project_id` as `projects merge` does. Only a suggestion nobody answered
+/// is answered, so an agent merges no projects nobody suggested; without one
+/// nothing is written.
+pub async fn answer_suggestion_core(
+    store: &MemoryStore,
+    workspaces: &WorkspaceManager,
+    backups: &Path,
+    project_id: &str,
+    other_id: &str,
+    answer: UserAnswer,
+) -> Result<Answered, AnswerError> {
+    if suggestion_between(store, project_id, other_id).await?.is_none() {
+        return Err(AnswerError::NoSuggestion { project_id: project_id.to_string(), other_id: other_id.to_string() });
+    }
+    match answer.answer {
+        SuggestionAnswer::Apart => {
+            keep_apart(store, project_id, other_id).await?;
+            Ok(Answered::Apart)
+        }
+        SuggestionAnswer::Merge => Ok(Answered::Merged(merge_core(store, workspaces, backups, other_id, project_id, false).await?)),
+    }
+}
+
 /// What tells two names apart for a person: the name in Unicode lower case,
 /// without anything that is not a letter or a digit. `Mi App`, `mi-app` and
 /// `mi_app` have one key.
@@ -766,6 +850,10 @@ pub struct Resolution {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ResolveError {
+    /// `new_project` overrides the similar projects that keep a name from
+    /// being created; without `create` there is nothing to override.
+    #[error("new_project goes with create: it creates a project apart from the similar ones")]
+    NewProjectWithoutCreate,
     #[error(transparent)]
     Name(#[from] NameError),
     #[error("every id a project named {0:?} may take is taken")]
@@ -896,8 +984,12 @@ fn own_folders_dated_in(c: &Connection, project: &str) -> rusqlite::Result<Vec<(
 /// `options.create` a name nothing holds or resembles, or with
 /// `options.new_project` one that only resembles others, becomes a project
 /// without a folder, in the same transaction that looked. Nothing else is
-/// written.
+/// written. `new_project` without `create` is refused before anything is
+/// read.
 pub async fn resolve_project(store: &MemoryStore, reference: &str, options: ResolveOptions) -> Result<Resolution, ResolveError> {
+    if options.new_project && !options.create {
+        return Err(ResolveError::NewProjectWithoutCreate);
+    }
     let reference = reference.trim().to_string();
     store
         .conn
@@ -1937,5 +2029,212 @@ mod tests {
         let refused = f.locate("/work/a", "a-0001", "ideas").await.expect_err("the count fails");
 
         assert!(matches!(refused, LocateError::Store(_)), "{refused:?}");
+    }
+
+    /// A store with the projects `app-1a2b` and `copia-85a9`, with a
+    /// suggestion pending between them, `web-0001` and `notas-0002`, with
+    /// none, `old-0004`, merged into `app-1a2b`, and `gone-7a8b`, deleted;
+    /// the directory its workspaces and snapshots go in.
+    struct Answering {
+        store: MemoryStore,
+        ws: crate::memory::retrieval::workspace::WorkspaceManager,
+        backups: PathBuf,
+        _dir: crate::test_dir::TestDir,
+    }
+
+    impl Answering {
+        async fn new() -> Self {
+            let store = MemoryStore::new_for_test().await.unwrap();
+            let dir = crate::test_dir::test_dir();
+            let ws = crate::memory::retrieval::workspace::WorkspaceManager::new(dir.path().join("workspaces"));
+            let backups = dir.path().join("backups");
+            store
+                .conn
+                .call(|c| {
+                    c.execute_batch(
+                        "INSERT INTO project (id, name, born, reviewed, created_at) VALUES \
+                             ('app-1a2b', 'app', 'user', 1, 1), ('copia-85a9', 'copia', 'user', 1, 2), \
+                             ('web-0001', 'web', 'user', 1, 3), ('notas-0002', 'notas', 'user', 1, 4), \
+                             ('gone-7a8b', 'gone', 'user', 1, 1);
+                         INSERT INTO project (id, name, born, reviewed, created_at, merged_into, merged_at) VALUES \
+                             ('old-0004', 'old', 'user', 1, 1, 'app-1a2b', 2);
+                         INSERT INTO project_suggestion (project_id, other_id, reason, created_at) VALUES \
+                             ('copia-85a9', 'app-1a2b', 'root_commit', 2);",
+                    )
+                })
+                .await
+                .unwrap();
+            mark_deleted(&store, "gone-7a8b", 1).await;
+            Answering { store, ws, backups, _dir: dir }
+        }
+
+        async fn answer(&self, project: &str, other: &str, answer: &str) -> Result<Answered, AnswerError> {
+            let answer = UserAnswer::new(answer, true, Some("the user said so")).expect("the user's answer");
+            answer_suggestion_core(&self.store, &self.ws, &self.backups, project, other, answer).await
+        }
+
+        async fn merged_into(&self, id: &'static str) -> Option<String> {
+            self.store.conn.call(move |c| c.query_row("SELECT merged_into FROM project WHERE id = ?1", [id], |r| r.get(0))).await.unwrap()
+        }
+
+        async fn answers(&self) -> Vec<(String, String, Option<String>)> {
+            self.store
+                .conn
+                .call(|c| {
+                    let mut stmt = c.prepare("SELECT project_id, other_id, answer FROM project_suggestion ORDER BY rowid")?;
+                    let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+                    rows.collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .await
+                .unwrap()
+        }
+    }
+
+    #[test]
+    fn an_answer_is_merge_or_apart() {
+        let answer = |raw: &str| UserAnswer::new(raw, true, Some("the user said so")).map(|a| a.answer);
+        assert_eq!(answer("merge").expect("merge"), SuggestionAnswer::Merge);
+        assert_eq!(answer("apart").expect("apart"), SuggestionAnswer::Apart);
+        for raw in ["later", "Merge", " apart", ""] {
+            assert!(matches!(answer(raw), Err(AnswerError::UnknownAnswer(ref got)) if got == raw), "{raw:?}");
+        }
+        let refused = UserAnswer::new("later", false, None).map(|a| a.answer);
+        assert!(matches!(refused, Err(AnswerError::UnknownAnswer(_))), "the answer is read first: {refused:?}");
+    }
+
+    #[test]
+    fn an_answer_is_the_users_word() {
+        for (user_answered, reason) in [(false, Some("the user said so")), (true, None), (true, Some("")), (true, Some(" \n"))] {
+            let refused = UserAnswer::new("merge", user_answered, reason).map(|a| a.answer);
+            assert!(matches!(refused, Err(AnswerError::NeedsUser)), "{user_answered} {reason:?}: {refused:?}");
+        }
+        let answer = UserAnswer::new("apart", true, Some("the user said they are two")).expect("the user's word");
+        assert_eq!(answer.answer, SuggestionAnswer::Apart);
+    }
+
+    #[test]
+    fn each_answer_refusal_keeps_its_text() {
+        let cases = [
+            (AnswerError::UnknownAnswer("later".into()), "answer must be one of: merge, apart (got \"later\")"),
+            (
+                AnswerError::NeedsUser,
+                "answering a suggestion is the user's call: send user_answered with the user's answer in reason",
+            ),
+            (
+                AnswerError::NoSuggestion { project_id: "web-0001".into(), other_id: "notas-0002".into() },
+                "no suggestion is pending between web-0001 and notas-0002",
+            ),
+            (AnswerError::Pair(KeepApartError::NotFound("nobody-0000".into())), "no project has the id nobody-0000"),
+            (AnswerError::Merge(MergeError::SameProject("app-1a2b".into())), &MergeError::SameProject("app-1a2b".into()).to_string()),
+        ];
+        for (refused, text) in cases {
+            assert_eq!(refused.to_string(), text, "{refused:?}");
+        }
+        assert_eq!(serde_json::to_value([SuggestionAnswer::Merge, SuggestionAnswer::Apart]).unwrap(), serde_json::json!(["merge", "apart"]));
+    }
+
+    #[tokio::test]
+    async fn an_answer_needs_a_pending_suggestion() {
+        let f = Answering::new().await;
+        let before = f.answers().await;
+
+        for answer in ["apart", "merge"] {
+            let refused = f.answer("web-0001", "notas-0002", answer).await.expect_err("nobody suggested them");
+            assert!(
+                matches!(&refused, AnswerError::NoSuggestion { project_id, other_id } if project_id == "web-0001" && other_id == "notas-0002"),
+                "{answer}: {refused:?}"
+            );
+        }
+
+        assert_eq!(f.answers().await, before, "nothing is written");
+        assert_eq!((f.merged_into("web-0001").await, f.merged_into("notas-0002").await), (None, None));
+    }
+
+    #[tokio::test]
+    async fn an_answer_checks_both_projects() {
+        let f = Answering::new().await;
+
+        let refused = f.answer("nobody-0000", "app-1a2b", "merge").await.expect_err("unknown");
+        assert!(matches!(&refused, AnswerError::Pair(KeepApartError::NotFound(id)) if id == "nobody-0000"), "{refused:?}");
+        let refused = f.answer("app-1a2b", "app-1a2b", "merge").await.expect_err("the same");
+        assert!(matches!(&refused, AnswerError::Pair(KeepApartError::Same(id)) if id == "app-1a2b"), "{refused:?}");
+        let refused = f.answer("old-0004", "copia-85a9", "merge").await.expect_err("a tombstone");
+        assert!(matches!(&refused, AnswerError::Pair(KeepApartError::Merged { id, into }) if id == "old-0004" && into == "app-1a2b"), "{refused:?}");
+        let refused = f.answer("app-1a2b", "gone-7a8b", "apart").await.expect_err("deleted");
+        assert!(matches!(&refused, AnswerError::Pair(KeepApartError::Deleted { id, delete_id: Some(1) }) if id == "gone-7a8b"), "{refused:?}");
+        assert_eq!(f.merged_into("copia-85a9").await, None);
+    }
+
+    #[tokio::test]
+    async fn apart_keeps_the_two_from_being_suggested_again() {
+        let f = Answering::new().await;
+
+        let answered = f.answer("app-1a2b", "copia-85a9", "apart").await.expect("answered");
+
+        assert!(matches!(answered, Answered::Apart), "{answered:?}");
+        assert_eq!(f.answers().await, [("copia-85a9".into(), "app-1a2b".into(), Some("apart".into()))]);
+        assert!(suggestion_between(&f.store, "app-1a2b", "copia-85a9").await.unwrap().is_none());
+        assert_eq!(f.merged_into("copia-85a9").await, None);
+    }
+
+    #[tokio::test]
+    async fn merge_merges_the_other_into_the_project() {
+        let f = Answering::new().await;
+
+        let answered = f.answer("app-1a2b", "copia-85a9", "merge").await.expect("answered");
+
+        let Answered::Merged(report) = answered else { panic!("a merge: {answered:?}") };
+        assert_eq!(
+            (report.source.as_str(), report.target.as_str(), report.dry_run, report.suggestions),
+            ("copia-85a9", "app-1a2b", false, 1)
+        );
+        assert!(report.merge_id.is_some(), "{report:?}");
+        assert_eq!(f.merged_into("copia-85a9").await.as_deref(), Some("app-1a2b"));
+    }
+
+    #[tokio::test]
+    async fn a_refused_merge_refuses_the_answer() {
+        let f = Answering::new().await;
+        f.store
+            .conn
+            .call(|c| {
+                c.execute_batch(
+                    r#"INSERT INTO ingest_outbox (operation_id, agent_id, content, event, created_at, updated_at)
+                       VALUES ('op-copia', 'agent-a', 'a save', '{"agent_id":"agent-a","project_id":"copia-85a9","content":""}', 1, 1);"#,
+                )
+            })
+            .await
+            .unwrap();
+
+        let refused = f.answer("app-1a2b", "copia-85a9", "merge").await.expect_err("a save of copia is pending");
+
+        assert!(matches!(refused, AnswerError::Merge(MergeError::SavesPending(1))), "{refused:?}");
+        assert_eq!(f.merged_into("copia-85a9").await, None);
+        assert!(suggestion_between(&f.store, "app-1a2b", "copia-85a9").await.unwrap().is_some(), "still pending");
+    }
+
+    #[tokio::test]
+    async fn a_store_that_fails_refuses_the_answer() {
+        let f = Answering::new().await;
+        f.store.conn.clone().close().await.unwrap();
+
+        let refused = f.answer("app-1a2b", "copia-85a9", "merge").await.expect_err("the store is closed");
+
+        assert!(matches!(refused, AnswerError::Pair(KeepApartError::Store(_))), "{refused:?}");
+    }
+
+    #[tokio::test]
+    async fn new_project_without_create_is_refused_before_anything_is_read() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        store.conn.clone().close().await.unwrap();
+
+        let options = ResolveOptions { create: false, new_project: true, born: Born::User };
+        let refused = resolve_project(&store, "ideas", options).await.expect_err("new_project goes with create");
+
+        assert!(matches!(refused, ResolveError::NewProjectWithoutCreate), "{refused:?}");
+        assert_eq!(refused.to_string(), "new_project goes with create: it creates a project apart from the similar ones");
+        let options = ResolveOptions { create: false, new_project: false, born: Born::User };
+        let failed = resolve_project(&store, "ideas", options).await.expect_err("the store is closed");
+        assert!(matches!(failed, ResolveError::Store(_)), "{failed:?}");
     }
 }

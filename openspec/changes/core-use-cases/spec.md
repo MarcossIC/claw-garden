@@ -1,6 +1,6 @@
 # core-use-cases — Especificación
 
-Son requisitos sobre [`specs/ingest`](../../specs/ingest/spec.md), [`specs/synthesis`](../../specs/synthesis/spec.md), [`specs/provenance`](../../specs/provenance/spec.md) y [`specs/project`](../../specs/project/spec.md), y se consolidan al archivar. Lo que no se nombra acá sigue como está. R1 a R7 cubren la primera parte del cambio, el guardado (`POST /v1/memories`); R8 a R11, la segunda, las escrituras de proyectos ([«Parte 2»](#parte-2-las-escrituras-de-proyectos)). Las partes siguientes traen sus requisitos.
+Son requisitos sobre [`specs/ingest`](../../specs/ingest/spec.md), [`specs/synthesis`](../../specs/synthesis/spec.md), [`specs/provenance`](../../specs/provenance/spec.md) y [`specs/project`](../../specs/project/spec.md), y se consolidan al archivar. Lo que no se nombra acá sigue como está. R1 a R7 cubren la primera parte del cambio, el guardado (`POST /v1/memories`); R8 a R11, la segunda, las escrituras de proyectos ([«Parte 2»](#parte-2-las-escrituras-de-proyectos)); R12 a R15, la tercera, las otras escrituras ([«Parte 3»](#parte-3-las-otras-escrituras)). La parte 4 no trae requisitos: es un paso mecánico.
 
 Términos:
 
@@ -201,4 +201,89 @@ Ninguna respuesta del daemon (estado, cuerpo), del puente MCP (texto, esquema, d
 **Tests:**
 - `each_refused_registration_keeps_its_status_and_body`, `each_located_folder_keeps_its_status_and_body` y `each_refused_project_delete_keeps_its_status_and_body` (`mod tests` de `crates/clawg-cli/src/daemon/api.rs`), que llaman al handler con un `AppCtx` de prueba y comparan el estado y el cuerpo entero. Se escriben primero y pasan sobre el código de `develop`.
 - La suite entera, sin editar `crates/clawg-cli/tests/api.rs` ni los tests de `crates/clawg-cli/src/mcp/`; entre ellos `locating_a_folder_merges_its_own_project_into_the_named_one`, `a_folder_shared_by_its_project_is_not_located` y `registering_a_missing_root_to_index_it_is_a_bad_request`.
+- `the_agent_contract_matches_its_file` y `the_spanish_agent_contract_matches_its_file`, sin `CLAWG_BLESS`.
+
+## Parte 3. Las otras escrituras
+
+Términos:
+
+- **Las otras escrituras:** `PATCH /v1/memories/{kind}/{id}` (`update_memory`), `DELETE /v1/memories/{kind}/{id}` (`delete_memory`), `POST /v1/memories/{kind}/{id}/restore` (`restore_memory`), `POST /v1/disputes/resolve` (`resolve_dispute`), `POST /v1/projects/suggestions/answer` (`answer_suggestion`) y `POST /v1/projects/resolve` (`resolve_projects`).
+- **Una respuesta a una sugerencia:** el cuerpo de `answer_suggestion` (`AnswerRequest`): los dos proyectos, la respuesta, `user_answered` y `reason`.
+
+De las seis rutas, sólo `answer_suggestion` y `resolve_projects` deciden reglas del dominio en el handler ([D15](design.md#d15-lo-que-deciden-las-otras-escrituras)). R12 a R14 las bajan; R15 fija lo que ve un cliente de las seis.
+
+## R12. Una sugerencia la responde la persona
+
+`UserAnswer::new(answer, user_answered, reason)` (`crates/clawg-core/src/memory/projects/registry.rs`) MUST ser una función pura que devuelve la respuesta o el primer rechazo, en este orden, que es el de hoy:
+
+| # | Regla | Rechazo | Texto |
+|---|---|---|---|
+| 1 | `answer` que no es `merge` ni `apart` | `AnswerError::UnknownAnswer(answer)` | `answer must be one of: merge, apart (got "<answer>")` |
+| 2 | sin `user_answered`, o sin `reason`, o con un `reason` sin nada más que espacios | `AnswerError::NeedsUser` | `answering a suggestion is the user's call: send user_answered with the user's answer in reason` |
+
+`UserAnswer` MUST tener sus campos privados: sólo sale de `new`, así ningún llamador del núcleo responde una sugerencia sin la palabra de la persona. `SuggestionAnswer` (`merge`, `apart`) MUST pasar al núcleo con su forma serializada de hoy.
+
+#### Escenario: el orden
+- GIVEN una respuesta `"later"` sin `user_answered`
+- WHEN se comprueba
+- THEN el rechazo es `UnknownAnswer("later")`
+
+#### Escenario: la palabra de la persona
+- GIVEN una respuesta `"merge"` con `user_answered` y un `reason` de espacios
+- WHEN se comprueba
+- THEN el rechazo es `NeedsUser`; con `"the user said they are one"` pasa y es `SuggestionAnswer::Merge`
+
+**Tests** (`registry.rs`, sin HTTP): `an_answer_is_merge_or_apart`, `an_answer_is_the_users_word` y `each_answer_refusal_keeps_its_text`. Hoy no compilan: `UserAnswer` no existe.
+
+## R13. Sólo se responde una sugerencia pendiente
+
+`answer_suggestion_core(store, workspaces, backups, project_id, other_id, answer)` (`registry.rs`), con `answer` un `UserAnswer`, MUST:
+
+1. comprobar los dos proyectos y leer la sugerencia pendiente entre ellos como `suggestion_between`; su rechazo MUST ser `AnswerError::Pair(KeepApartError)`, con el error tal cual;
+2. sin sugerencia pendiente, rechazar con `AnswerError::NoSuggestion { project_id, other_id }` (`no suggestion is pending between <project_id> and <other_id>`) sin escribir nada;
+3. con `apart`, responder como `keep_apart` (su rechazo, `Pair`) y devolver `Answered::Apart`;
+4. con `merge`, unir `other_id` en `project_id` como `merge_core` sin prueba en seco y devolver `Answered::Merged(informe)`. Una unión rechazada MUST ser `AnswerError::Merge(MergeError)`, con el error tal cual.
+
+#### Escenario
+- GIVEN los proyectos `app` y `copia` con una sugerencia pendiente, y `web` y `notas` sin ninguna
+- WHEN se responde `apart` entre `web` y `notas`, y `merge` entre `app` y `copia`
+- THEN la primera da `NoSuggestion` y no escribe nada, y la segunda da `Merged` con `copia` unida en `app`
+
+**Tests** (`registry.rs`, sin HTTP): `an_answer_needs_a_pending_suggestion`, `an_answer_checks_both_projects`, `apart_keeps_the_two_from_being_suggested_again`, `merge_merges_the_other_into_the_project`, `a_refused_merge_refuses_the_answer` y `a_store_that_fails_refuses_the_answer`. Hoy no compilan: `answer_suggestion_core` no existe.
+
+## R14. `new_project` va con `create`
+
+`resolve_project` (`registry.rs`) con `new_project` y sin `create` MUST rechazar con `ResolveError::NewProjectWithoutCreate` (`new_project goes with create: it creates a project apart from the similar ones`) antes de leer el store. Hoy el núcleo ignora `new_project` sin `create` y responde la referencia como si no lo llevara (`Unknown` o `Similar`), y sólo el handler lo impide.
+
+#### Escenario
+- GIVEN un store cerrado
+- WHEN se resuelve `"ideas"` con `new_project` y sin `create`
+- THEN el rechazo es `NewProjectWithoutCreate`, no `Store`
+
+**Test:** `new_project_without_create_is_refused_before_anything_is_read` (`registry.rs`). Hoy no compila: la variante no existe.
+
+## R15. Lo que ve un cliente de las otras escrituras no cambia
+
+Es de conservación: sus tests pasan antes y después.
+
+Los handlers MUST traducir cada rechazo así, y no decidir ninguna de las reglas de R12 a R14:
+
+| Rechazo | Respuesta |
+|---|---|
+| `AnswerError::UnknownAnswer`, `NeedsUser` | `400 {"error": "<texto>"}` |
+| `AnswerError::NoSuggestion` | `404 {"error": "no_suggestion", "detail": "<texto>"}` |
+| `AnswerError::Pair(e)` | lo que `kept_apart_error` responde por `e` en `POST /v1/projects/keep-apart` |
+| `AnswerError::Merge(e)` | lo que `merge_error` responde por `e` en `POST /v1/projects/merge` |
+| `ResolveError::NewProjectWithoutCreate` (de proyectos) | `400 {"error": "<texto>"}` |
+| `RestoreError::NotFound` | `404 {"error": "<texto>"}`, que es el de hoy (`no deleted memory row with id <id>`) |
+
+`Answered::Apart` y `Answered::Merged` MUST dar el mismo `AnsweredBody` de hoy: `answer` en `apart` sin `merge`, o en `merge` con el informe de la unión y `trajectories` y `skills` en 0. Las sesiones siguen la unión en el daemon (`sessions_follow`), como hoy.
+
+`update_memory`, `delete_memory`, `restore_memory` y `resolve_dispute` ya sólo leen la forma del cuerpo y traducen respuestas tipadas del núcleo ([D15](design.md#d15-lo-que-deciden-las-otras-escrituras)): sus estados, cuerpos y el orden en que rechazan MUST quedar como hoy.
+
+Ninguna respuesta del daemon (estado, cuerpo), del puente MCP (texto, esquema, descripción) ni de la CLI MUST cambiar.
+
+**Tests:**
+- `each_memory_update_keeps_its_status_and_body`, `each_memory_delete_and_restore_keeps_its_status_and_body`, `each_resolved_dispute_keeps_its_status_and_body`, `each_answered_suggestion_keeps_its_status_and_body` y `each_resolved_project_keeps_its_status_and_body` (`mod tests` de `crates/clawg-cli/src/daemon/api.rs`), que llaman al handler con un `AppCtx` de prueba y comparan el estado y el cuerpo JSON entero de cada rechazo y de cada respuesta aceptada. Se escriben primero y pasan sobre el código de `develop`.
+- La suite entera, sin editar `crates/clawg-cli/tests/api.rs` ni los tests de `crates/clawg-cli/src/mcp/`.
 - `the_agent_contract_matches_its_file` y `the_spanish_agent_contract_matches_its_file`, sin `CLAWG_BLESS`.

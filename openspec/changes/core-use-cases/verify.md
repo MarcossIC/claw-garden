@@ -1,6 +1,6 @@
 # core-use-cases — Verificación
 
-**Resultado:** las partes 1 (el guardado completo) y 2 (las escrituras de proyectos) aplicadas y verificadas en Linux. En cada una, la suite entera y los dos clippy pasan sobre el último commit de código, y ningún test de respuestas ni ninguno de los dos contratos del agente cambió. Queda lo que se lista en [«Pendiente»](#pendiente) y en el [«Pendiente» de la parte 2](#pendiente-de-la-parte-2). Las partes 3 y 4 están en [`tasks.md`](tasks.md#partes-siguientes).
+**Resultado:** las partes 1 (el guardado completo), 2 (las escrituras de proyectos) y 3 (las otras escrituras) aplicadas y verificadas en Linux. En cada una, la suite entera y los dos clippy pasan sobre el último commit de código, y ningún test de respuestas ni ninguno de los dos contratos del agente cambió. Queda lo que se lista en [«Pendiente»](#pendiente), en el [«Pendiente» de la parte 2](#pendiente-de-la-parte-2) y en el [de la parte 3](#pendiente-de-la-parte-3). La parte 4 está en [`tasks.md`](tasks.md#partes-siguientes).
 
 ## Qué se corrió
 
@@ -134,3 +134,73 @@ Las líneas de producción quedan iguales porque entran dos traducciones nuevas,
 - **El modelo real.** No hace falta: ninguna de las tres rutas lo usa salvo el `--undo` de un borrado, que no cambió.
 - **`rag-eval`.** No corre: el cambio no toca la recuperación.
 - **Al archivar:** consolidar R8 a R10 en `specs/project` con ids nuevos (R11 es de conservación) y corregir SB3, que dice que `locate_project` decide con `own_folder_count` (`api.rs:3097`): ahora decide `locate_folder`, y `own_folder_count` es privada de `registry.rs`. PL24 dice que el `confirm` sin `with_memories` es un `400`, lo que sigue siendo cierto; la regla vive ahora en `delete_core`.
+
+## Parte 3. Las otras escrituras
+
+### Qué se corrió
+
+Sobre el último commit de código (`refactor(daemon): answer a refused restore by its variant`), en Linux, con un único directorio de build (`target`):
+
+| Comando | Resultado |
+|---|---|
+| `cargo test --workspace` | pasa, sin ningún fallo; incluye los doctests |
+| `cargo clippy --workspace --all-targets -- -D warnings` | sin hallazgos |
+| `cargo clippy -p clawg-cli -- -D warnings` | sin hallazgos |
+
+Cada commit de código pasó antes los tests de los archivos que cambia, los de su tarea en [`tasks.md`](tasks.md#parte-3-las-otras-escrituras), y además `cargo test -p clawg-cli --test api` con los filtros `suggest`, `resolv` y `restor`, `--test conventions` y `cargo check --workspace --all-targets`, que compila `eval_api` con su `match` sobre `ResolveError`.
+
+### Los tests en rojo
+
+Todos en `crates/clawg-core/src/memory/projects/registry.rs`, sin `AppCtx`, router ni `StatusCode`. Se escribieron antes del código y no compilaban:
+
+| Test | Qué se vio antes del código |
+|---|---|
+| `an_answer_is_merge_or_apart`, `an_answer_is_the_users_word` y `each_answer_refusal_keeps_its_text` (R12) | `SuggestionAnswer`, `UserAnswer` y `AnswerError` no existían en el núcleo |
+| `an_answer_needs_a_pending_suggestion`, `an_answer_checks_both_projects`, `apart_keeps_the_two_from_being_suggested_again`, `merge_merges_the_other_into_the_project`, `a_refused_merge_refuses_the_answer` y `a_store_that_fails_refuses_the_answer` (R13) | `answer_suggestion_core` y `Answered` no existían; 30 errores del compilador entre los nueve |
+| `new_project_without_create_is_refused_before_anything_is_read` (R14) | la variante `ResolveError::NewProjectWithoutCreate` no existía |
+
+Los tres puros prueban `UserAnswer::new` sin store; los de R13 y R14, sobre `MemoryStore::new_for_test` con las filas sembradas con SQL. La unión rechazada es una fila `pending` del outbox con el proyecto que se une (`SavesPending(1)`), y el store que falla es uno cerrado.
+
+### La caracterización
+
+Los cinco tests de `mod tests` de `crates/clawg-cli/src/daemon/api.rs` se commitearon antes de tocar un handler (`test(daemon): pin the status and body of every update, delete, restore, dispute, answer and project resolve`) y pasan sobre el código de `develop`. El borrador llevaba un marcador en los cinco `500` de un store cerrado y en el informe de la unión, para leer el texto que da `develop`; dos literales más (el `404` de un movimiento a un proyecto no registrado y el `503` de un restore sin embedder, que pedía un runtime sin el `FakeEmbedder` de `new_for_test`, `daemon_without_embedder`) se corrigieron con lo que respondió el código de ese momento, antes del commit. Fijan, con el cuerpo JSON entero:
+
+- **`each_memory_update_keeps_its_status_and_body`:** el `kind` retirado y el desconocido (antes que el cuerpo vacío), los dos destinos juntos, un nombre ambiguo que responde `409` antes que una importancia fuera de escala, el cambio vacío (también con sólo `user_answered`), la importancia fuera de 0 a 10, el tipo desconocido y que la importancia va antes, que el formato va antes que la fila, la fila que no existe, la borrada y la oculta por `sharing.json`, los dos `409` de una preferencia (el tipo y el proyecto), el `404` de un proyecto no registrado, cuatro cambios aceptados (la importancia, el tipo de otro agente, el tipo de una preferencia con `user_answered`, el proyecto ida y vuelta con su `move_id`) y el `500`;
+- **`each_memory_delete_and_restore_keeps_its_status_and_body`:** el borrado con el `kind` desconocido, la fila que no existe, la oculta, el aceptado (`{"deleted": 1}`) y el segundo `404`; el restore con el `kind` desconocido, la fila que no existe, la viva, la oculta, los tres `409` (un secreto, un gemelo vivo, un tema ocupado), el aceptado y el segundo `404`; sin embedder, el `kind` antes que el `503 embedder_not_ready` y el `503 embedder_failed`; y los dos `500`;
+- **`each_resolved_dispute_keeps_its_status_and_body`:** la misma fila (también con ids que no existen), las dos filas que no existen en su orden, la oculta, el par que no está en disputa, la fila reemplazada por otra, la preferencia sin la palabra de la persona, `keep_both`, el reemplazo y su vuelta, y el `500`;
+- **`each_answered_suggestion_keeps_its_status_and_body`:** la respuesta desconocida antes que la palabra de la persona, las cinco formas sin esa palabra (también con proyectos que no existen), los dos proyectos que no existen, el mismo, el fusionado, el borrado, `no_suggestion`, el `apart` aceptado y que no se responde dos veces, el `merge` aceptado con el informe entero (salvo `merge_id`, un número, y `snapshot`, un camino `pre-merge`) y después `project_merged`, el `500`, y con el store cerrado la palabra de la persona antes de leerlo;
+- **`each_resolved_project_keeps_its_status_and_body`:** `new_project` sin `create` antes que el nombre vacío, los tres `NameError`, los tres `refused` (`ambiguous` aun con `create`, `similar` aun con `create`, `unknown`), el id de un fusionado, el nombre con otra forma, el borrado, el creado y su segunda lectura, `new_project` con `create` al lado de uno parecido, y con el store cerrado `new_project` antes de leerlo y el `500`.
+
+Después de los tres commits de código pasan sin haberse tocado.
+
+### Las comprobaciones de D19
+
+1. **Los tests de respuestas.** `git diff develop...HEAD -- crates/clawg-cli/tests/ crates/clawg-cli/src/mcp/` no muestra nada. Los dos tests de contrato pasan sin `CLAWG_BLESS`.
+2. **El diff de `api.rs`.** Ninguna línea con `StatusCode` se va; las que llegan son de los tests nuevos. Los textos que se van del handler (`answer must be one of: …`, `answering a suggestion is the user's call: …`, `no suggestion is pending between …`, `new_project goes with create: …` y `no deleted memory row with id …`) llegan como el `Display` de `AnswerError`, `ResolveError::NewProjectWithoutCreate` y `RestoreError::NotFound`, y el código `no_suggestion` sigue en `answer_refused`.
+3. **Los tests del núcleo** no construyen un `AppCtx`, un router ni un `StatusCode`.
+
+### Los handlers
+
+Contadas de la línea de la firma a la llave que cierra, y las de producción de `api.rs` hasta `mod tests`:
+
+| | `develop` | Después |
+|---|---:|---:|
+| `answer_suggestion` | 37 líneas | 18 |
+| `resolve_projects` | 14 líneas | 11 |
+| `update_memory`, `delete_memory`, `restore_memory`, `resolve_dispute` | 28, 16, 18 y 11 | iguales |
+| líneas de producción de `api.rs` | 3.306 | 3.288 |
+| usos de `bad_request` en producción | 59 | 57 |
+
+`answer_suggestion` ya no nombra `suggestion_between`, `keep_apart` ni `merge_core`, y `SuggestionAnswer` es del núcleo. Entra una traducción, `answer_refused`.
+
+### Lo que se resolvió distinto de lo escrito
+
+- **`daemon_on` y `daemon_without_embedder`.** El `AppCtx` de prueba que arma `daemon_embedding_with` pasó a `daemon_on`, para un daemon cuyo runtime no tiene embedder: `MemoryRuntime::new_for_test` ya siembra un `FakeEmbedder`, y sin eso el `503` de un restore no se alcanza. Entró en el commit de la caracterización.
+- **`each_answer_refusal_keeps_its_text`** comprueba también la forma serializada de `SuggestionAnswer` (`merge`, `apart`), que es la que lleva `AnsweredBody`.
+
+### Pendiente de la parte 3
+
+- **Windows.** La suite y los dos clippy no se corrieron en Windows; lo hace el job `test (windows-latest)` del CI del PR. El cambio no agrega código `cfg(windows)` ni toca caminos de archivos: el informe de la unión se compara sin su `snapshot`.
+- **El modelo real.** No hace falta: de las seis rutas sólo el restore embebe, con el `FakeEmbedder`, y su código no cambió salvo el texto del `404`, que es el mismo.
+- **`rag-eval`.** No corre: el cambio no toca la recuperación.
+- **Al archivar:** consolidar R12 a R14 en `specs/project` con ids nuevos (R15 es de conservación). PL37 y PL32 siguen siendo ciertas como conducta (el `400` sin la palabra de la persona, el `404 no_suggestion`, `new_project` con `create`); las reglas viven ahora en `UserAnswer::new`, `answer_suggestion_core` y `resolve_project`, y `resolve_project` rechaza `new_project` sin `create` en lugar de ignorarlo.
