@@ -1,6 +1,6 @@
 # core-use-cases — Diseño
 
-Los enfoques de fondo están en la [exploración](exploration.md#enfoques-posibles); se toma el **A**, un caso de uso por operación, empezando por el guardado. Acá van sus tres decisiones abiertas (D3, D4 y D6), qué handlers entran (D7) y las decisiones de implementación. D10 a D14 son de la segunda parte, las escrituras de proyectos. Las citas `ruta:línea` son de `develop` al escribir cada parte.
+Los enfoques de fondo están en la [exploración](exploration.md#enfoques-posibles); se toma el **A**, un caso de uso por operación, empezando por el guardado. Acá van sus tres decisiones abiertas (D3, D4 y D6), qué handlers entran (D7) y las decisiones de implementación. D10 a D14 son de la segunda parte, las escrituras de proyectos; D15 a D19, de la tercera, las otras escrituras. Las citas `ruta:línea` son de `develop` al escribir cada parte.
 
 ## D1. Dónde vive cada parte
 
@@ -166,3 +166,85 @@ Como [D8](#d8-cómo-se-comprueba-que-nada-de-lo-que-ve-un-cliente-cambia):
 2. **Los tests de respuestas no se tocan:** `git diff develop...HEAD -- crates/clawg-cli/tests/ crates/clawg-cli/src/mcp/` vacío, y los dos contratos del agente pasan sin `CLAWG_BLESS`.
 3. **El diff de `api.rs`** no cambia ningún `StatusCode` ni el texto de ningún `ApiError`: los textos que se van del handler llegan como `Display` de las variantes.
 4. **Los tests del núcleo**, sin HTTP: `check_root` y `check_folder` con un `is_dir` de prueba; `locate_folder` y `delete_core` con `MemoryStore::new_for_test` y las filas sembradas con SQL, como los tests de `registry.rs` y `project_delete.rs`; el store que falla es uno cerrado.
+
+## D15. Lo que deciden las otras escrituras
+
+Las citas de D15 a D19 son de `develop` al empezar la tercera parte: `update_memory` está en `api.rs:1852-1879`, `delete_memory` en `:1931-1946`, `restore_memory` en `:1951-1968`, `resolve_dispute` en `:2013-2023` (con `resolve_error` en `:1999-2011`), `resolve_projects` en `:2837-2850` y `answer_suggestion` en `:2908-2944`.
+
+La clasificación es la de [D13](#d13-lo-que-deciden-las-demás-rutas-de-proyectos): la **forma del cuerpo** y la **traducción** de una respuesta tipada quedan en el handler; una **regla** sobre lo que el núcleo escribe baja, cuando otro llamador del núcleo la necesitaría para no escribir algo que nadie pidió.
+
+| Ruta | Qué decide el handler | Clase | Queda o baja |
+|---|---|---|---|
+| Corregir (`update_memory`) | `parse_kind` sobre el segmento de la ruta | forma | queda |
+| | `project_id` o `no_project`, no los dos (`UpdateRequest::destination`, `400 pass project_id or no_project, not both`), con su test `an_update_names_one_destination_at_most` | forma: dos campos para un `Option<Option<String>>` | queda |
+| | `target_named` traduce `Named` antes de armar el cambio, así un nombre ambiguo responde `409 project_ambiguous` aunque el cambio también esté mal | traducción | queda, con su orden |
+| | el cambio vacío, la importancia fuera de 0 a 10 y el tipo: los decide `MemoryPatch::new` (`admin.rs:66-81`), que ya parsea `memory_type` una vez, guarda `Option<MemoryType>` y rechaza con `PatchError`; el handler responde `400` con su `Display` | ya en el núcleo; traducción | queda |
+| | `UpdateError` a `409`, `move_error` o `500`; `None` del núcleo (la fila no está, está borrada o fuera del alcance) a `404 no memory row with id <id>` | traducción | queda |
+| Borrar (`delete_memory`) | `parse_kind`; `deleted: 0` a `404 no memory row with id <id>` | forma; traducción | queda |
+| Restaurar (`restore_memory`) | `parse_kind` antes del embedder; `ready_embedder` responde `503` con el estado del embedder | forma; estado del daemon | queda |
+| | `RestoreError` a `404`, `409`, `embed_failure` o `500`. El `404` arma a mano el texto que ya es el `Display` de `NotFound`, y un comodín toma `Store` | traducción | queda, con el `Display` de `NotFound` y sin comodín |
+| Resolver una disputa (`resolve_dispute`) | `keep_both` elige el `Outcome`; `resolve_error` traduce `ResolveError`. La misma fila, la fila que no está, el par que no está en disputa, la preferencia que sólo se reemplaza con la palabra de la persona: todo lo decide `judge_pair` | forma; traducción | queda |
+| Responder una sugerencia (`answer_suggestion`) | la respuesta es `merge` o `apart` (`:2912-2916`) | regla: el vocabulario de la respuesta, como `Verdict` lo es de un juicio | baja ([R12](spec.md#r12-una-sugerencia-la-responde-la-persona)) |
+| | responder es cosa de la persona: `user_answered` con un `reason` (`:2917-2921`) | regla: protege una unión de proyectos que nadie pidió | baja (R12) |
+| | sólo se responde una sugerencia pendiente (`:2922-2929`) | regla: un agente no une proyectos que nadie sugirió | baja ([R13](spec.md#r13-sólo-se-responde-una-sugerencia-pendiente)) |
+| | `apart` como `keep_apart`, `merge` como `merge_core` (`:2930-2942`) | el caso de uso | baja (R13) |
+| | las sesiones siguen la unión (`sessions_follow`) | estado del daemon | queda |
+| Resolver un proyecto (`resolve_projects`) | `new_project` va con `create` (`:2841-2843`) | regla: `resolve_project` con `(false, true)` ignora `new_project` y responde `Unknown` o `Similar` (`registry.rs:945-949`) | baja ([R14](spec.md#r14-new_project-va-con-create)) |
+| | `ProjectResolveError` a `400`, `409 no_free_project_id` o `500` | traducción | queda |
+
+**Descartado:**
+
+- **Un `UpdateError::NotFound` y un `Deleted::NotFound`.** El núcleo ya responde tipado (`None`, `deleted: 0`), y `get_memory` y `get_save` responden el mismo `404` del mismo `None`: una variante para dos de las cuatro rutas partiría un texto en dos lugares. No protege ninguna escritura.
+- **Comprobar el cambio antes de `target_named`.** Es el orden más natural, pero cambia qué responde un cuerpo con un nombre ambiguo y un cambio mal formado: hoy el `409`, y sería el `400`.
+- **Bajar `ready_embedder` a `restore_memory_core`.** El núcleo ya pide un `&dyn Embedder` por su tipo; qué embedder hay y en qué estado es del daemon, como en `NeedsModel` ([D13](#d13-lo-que-deciden-las-demás-rutas-de-proyectos)).
+- **Pasar `judge_dispute` por esta parte.** No está en el alcance; comparte `resolve_error` con `resolve_dispute`, que no cambia.
+
+## D16. Dónde vive cada parte de la tercera
+
+| Parte | Lugar | Por qué |
+|---|---|---|
+| `SuggestionAnswer`, `UserAnswer`, `AnswerError`, `Answered` y `answer_suggestion_core` | `crates/clawg-core/src/memory/projects/registry.rs`, junto a `suggestion_between` y `keep_apart` | Son los dos pasos que el handler encadena, y `registry` ya nombra `merge` (`merge_core`, por `locate_folder`): no abre ningún ciclo de `MEMORY_CYCLES` |
+| `ResolveError::NewProjectWithoutCreate` | `registry.rs`, al entrar a `resolve_project` | Es el núcleo el que hoy ignora `new_project` sin `create` |
+
+`SuggestionAnswer` pasa del daemon al núcleo con su `Serialize` en `snake_case`. Nadie fuera de `api.rs` la nombra, así que el daemon la importa y no la reexporta. `AnsweredBody` y `AnsweredMerge` quedan en el daemon: son la forma de la respuesta, con los `trajectories` y `skills` en 0 que pide un puente anterior a V32.
+
+**Descartado:**
+
+- **Un módulo `projects/suggestion.rs`.** Un módulo para una función y sus tipos; `registry.rs` ya tiene las sugerencias (`suggestion_between`, `keep_apart`, `pending_suggestions_in`).
+- **Un `ResolveOptions::new` que compruebe la regla.** `ResolveOptions` tiene sus campos públicos y `Default`, y lo arman `eval_api` y los tests; un constructor obliga a cerrar los campos y a tocar esos llamadores, y la regla igual tiene que vivir en `resolve_project`, que es lo que escribe.
+
+## D17. Responder una sugerencia en dos pasos
+
+Como [D2](#d2-dos-pasos-y-la-sesión-entre-los-dos), un paso puro y uno que lee el store, y el daemon al final:
+
+```rust
+let answer = UserAnswer::new(&body.answer, body.user_answered, body.reason.as_deref()).map_err(answer_refused)?;
+let answered = answer_suggestion_core(store, &workspaces, &backups, &body.project_id, &body.other_id, answer).await.map_err(answer_refused)?;
+// Answered::Merged: sessions_follow, como hoy
+```
+
+- **`UserAnswer` tiene el campo privado.** `answer_suggestion_core` no se puede llamar sin pasar por las dos reglas de R12, que son las que protegen la unión: un llamador del núcleo no la salta. Es lo que hace `NewSave` en la parte 1.
+- **El `reason` no viaja.** Hoy sólo se comprueba: ni `keep_apart` ni `merge_core` lo guardan. Llevarlo en `UserAnswer` sería un campo sin uso.
+- **`Answered` es un `enum`** (`Apart`, `Merged(MergeReport)`), como `Located` en [D12](#d12-ubicar-una-carpeta-en-dos-pasos): no hay un `apart` con una unión. Lleva `#[expect(clippy::large_enum_variant)]` con el mismo motivo que `Located`. `Apart` no lleva el `KeptApart` de `keep_apart`, que el handler no usa.
+- **`AnswerError::Pair` lleva el `KeepApartError`** de `suggestion_between` y de `keep_apart`, y el handler lo traduce con `kept_apart_error`, como hoy. `AnswerError::Merge` lleva el `MergeError`, que traduce `merge_error`.
+- **`sessions_follow` queda en el handler:** `SessionRegistry` es estado del daemon.
+
+**Descartado:**
+
+- **Un `SuggestionAnswer: FromStr` y la regla de la persona dentro de `answer_suggestion_core`.** La respuesta se podría parsear sin la palabra de la persona, y la regla pura sólo se probaría con un store.
+- **Una sola función con los textos del cuerpo.** Mezcla las reglas puras con la lectura del store, y sus tests necesitarían un store para comprobar un texto.
+
+## D18. `new_project` sin `create`, en `resolve_project`
+
+`resolve_project` rechaza `(create: false, new_project: true)` con `NewProjectWithoutCreate` antes de abrir su transacción, como `delete_core` con `ConfirmWithoutRows` ([R10](spec.md#r10-un-código-de-confirmación-va-con-las-filas)). El `match` de `refused` sigue igual: el brazo `(false, _, true)` deja de ver un `new_project` en `true`, pero el patrón no cambia.
+
+`eval_api` llama a `resolve_project` con `ResolveOptions::default()`, que no lleva `new_project`, y su `match` ya tiene un comodín: no cambia. El handler agrega la variante al brazo del `400`, junto a `Name`, sin comodín.
+
+## D19. Cómo se comprueba la tercera parte
+
+Como [D14](#d14-cómo-se-comprueba-la-segunda-parte):
+
+1. **Caracterización primero.** `each_memory_update_keeps_its_status_and_body`, `each_memory_delete_and_restore_keeps_its_status_and_body`, `each_resolved_dispute_keeps_its_status_and_body`, `each_answered_suggestion_keeps_its_status_and_body` y `each_resolved_project_keeps_its_status_and_body`, en el `mod tests` de `api.rs`, llaman a cada handler con el `AppCtx` de `daemon_for_jobs` (o de `daemon_embedding_with` con `FakeEmbedder`, para restaurar) y comparan el estado y el cuerpo JSON entero de cada rechazo, en su orden, y de cada respuesta aceptada. Un store cerrado da los `500`. Se commitean antes de tocar un handler y pasan sobre el código de `develop`.
+2. **Los tests de respuestas no se tocan:** `git diff develop...HEAD -- crates/clawg-cli/tests/ crates/clawg-cli/src/mcp/` vacío, y los dos contratos del agente pasan sin `CLAWG_BLESS`.
+3. **El diff de `api.rs`** no cambia ningún `StatusCode` ni el texto de ningún `ApiError`: los textos que se van del handler llegan como `Display` de las variantes.
+4. **Los tests del núcleo**, sin HTTP: `UserAnswer::new` puro; `answer_suggestion_core` y `resolve_project` sobre `MemoryStore::new_for_test` con las filas sembradas con SQL, como los demás tests de `registry.rs`; el store que falla es uno cerrado.

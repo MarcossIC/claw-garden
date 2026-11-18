@@ -1,15 +1,15 @@
 change: core-use-cases
 objective: "transversal"
 depends_on: [memory-module-layout]  # aplicado en develop
-phase: verify  # las partes 1 (el guardado) y 2 (las escrituras de proyectos) aplicadas y verificadas en Linux; falta el CI de Windows
+phase: apply  # las partes 1 (el guardado) y 2 (las escrituras de proyectos) aplicadas y verificadas en Linux; la parte 3 (las otras escrituras), en curso
 artifacts:
   exploration: done  # el borrador del 2026-11-01, revisado contra develop el 2026-11-12: rutas, líneas y conteos
   proposal: done  # el enfoque A; la parte 1 es POST /v1/memories
-  spec: done  # R1 a R7, del guardado; R8 a R11, de los proyectos
-  design: done  # D1 a D9 de la parte 1; D10 a D14 de la parte 2, con la revisión de las demás rutas en D13
-  tasks: done  # tareas 1 a 5 de la parte 1 (la 3 y la 4 en un commit); 6 a 11 de la parte 2; las partes 3 y 4, en «Partes siguientes»
-  apply: done  # parte 1: la caracterización, memory::save, admit y el handler; parte 2: la caracterización, check_root, locate_folder, ConfirmWithoutRows y los handlers
-  verify: done  # las dos partes: la suite y los dos clippy pasan en Linux; Windows y lo de archivar en «Pendiente» de verify.md
+  spec: done  # R1 a R7, del guardado; R8 a R11, de los proyectos; R12 a R15, de las otras escrituras
+  design: done  # D1 a D9 de la parte 1; D10 a D14 de la parte 2, con la revisión de las demás rutas en D13; D15 a D19 de la parte 3, con la revisión de sus rutas en D15
+  tasks: done  # tareas 1 a 5 de la parte 1 (la 3 y la 4 en un commit); 6 a 11 de la parte 2; 12 a 17 de la parte 3; la parte 4, en «Partes siguientes»
+  apply: partial  # parte 1: la caracterización, memory::save, admit y el handler; parte 2: la caracterización, check_root, locate_folder, ConfirmWithoutRows y los handlers; parte 3: pendiente
+  verify: partial  # las partes 1 y 2: la suite y los dos clippy pasan en Linux; Windows y lo de archivar en «Pendiente» de verify.md; la parte 3, sin verificar
   archive: pending
 decisions:
   error_texts: display_and_data  # cada SaveRejected muestra el texto de hoy y lleva sus datos (D3)
@@ -20,4 +20,6 @@ decisions:
   root_checks: check_root  # la raíz vacía y la que no es un directorio, en project.rs antes de leer el checkout (D10, D11)
   locate: two_steps  # check_folder antes de todo y locate_folder después del registro del daemon (D12)
   project_routes: confirm_only  # de las demás rutas de proyectos sólo baja confirm sin with_memories (D13)
+  other_writes: answer_and_new_project  # de las otras escrituras bajan la respuesta a una sugerencia y new_project sin create; update, delete, restore y resolve ya sólo traducen (D15)
+  answer: two_steps  # UserAnswer::new puro y answer_suggestion_core después (D17)
 updated: 2026-11-18

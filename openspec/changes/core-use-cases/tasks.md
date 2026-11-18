@@ -7,7 +7,7 @@
 - **Commits.** Cada tarea es un commit convencional que compila y pasa los tests de los archivos que cambia, nombrados al final de la tarea. La suite entera y los dos clippy corren una vez, sobre el último commit (tarea 5).
 - **Windows.** Cada `cargo` lleva `--target-dir target-test`.
 
-La parte 1, el guardado completo, son las tareas 1 a 5; la 3 y la 4 quedaron en un solo commit ([tarea 3](#3-el-guardado-en-el-núcleo-r1-a-r7)). La parte 2, las escrituras de proyectos, son las tareas 6 a 11 ([«Parte 2»](#parte-2-las-escrituras-de-proyectos)). Lo demás está en [«Partes siguientes»](#partes-siguientes).
+La parte 1, el guardado completo, son las tareas 1 a 5; la 3 y la 4 quedaron en un solo commit ([tarea 3](#3-el-guardado-en-el-núcleo-r1-a-r7)). La parte 2, las escrituras de proyectos, son las tareas 6 a 11 ([«Parte 2»](#parte-2-las-escrituras-de-proyectos)). La parte 3, las otras escrituras, son las tareas 12 a 17 ([«Parte 3»](#parte-3-las-otras-escrituras)). Lo demás está en [«Partes siguientes»](#partes-siguientes).
 
 ## 1. Artefactos
 
@@ -178,10 +178,91 @@ Los requisitos son R8 a R11 de [`spec.md`](spec.md#parte-2-las-escrituras-de-pro
 - [x] `verify.md`, con la parte 2 y su «Pendiente».
 - Commit: `docs(openspec): record core-use-cases part 2 applied`
 
+## Parte 3. Las otras escrituras
+
+Los requisitos son R12 a R15 de [`spec.md`](spec.md#parte-3-las-otras-escrituras) y las decisiones, D15 a D19 de [`design.md`](design.md#d15-lo-que-deciden-las-otras-escrituras). El método es el de las partes 1 y 2: la caracterización pasa sobre el código de `develop` antes de tocar un handler, cada regla empieza con su test en rojo en `clawg-core`, y el handler queda en traducir.
+
+## 12. Artefactos de la parte 3
+
+- [x] R12 a R15 en `spec.md`, D15 a D19 en `design.md`, con la clasificación de cada ruta (D15), estas tareas, `state.yaml` y el alcance de la parte 3 en `proposal.md`.
+- Commit: `docs(openspec): add the other writes to core-use-cases`
+
+## 13. Caracterización de las otras escrituras (R15)
+
+- [ ] `each_memory_update_keeps_its_status_and_body`, `each_memory_delete_and_restore_keeps_its_status_and_body`, `each_resolved_dispute_keeps_its_status_and_body`, `each_answered_suggestion_keeps_its_status_and_body` y `each_resolved_project_keeps_its_status_and_body` (`mod tests` de `crates/clawg-cli/src/daemon/api.rs`): el estado y el cuerpo entero de cada rechazo y de cada respuesta aceptada, con los literales que da `develop`. Pasan antes de seguir.
+- Commit: `test(daemon): pin the status and body of every update, delete, restore, dispute, answer and project resolve`
+- Tests al cerrar:
+
+  ```bash
+  cargo test -p clawg-cli --lib daemon::api
+  ```
+
+## 14. Responder una sugerencia, en el núcleo (R12, R13)
+
+- [ ] **Tests en rojo** en `crates/clawg-core/src/memory/projects/registry.rs`: `an_answer_is_merge_or_apart`, `an_answer_is_the_users_word`, `each_answer_refusal_keeps_its_text`, `an_answer_needs_a_pending_suggestion`, `an_answer_checks_both_projects`, `apart_keeps_the_two_from_being_suggested_again`, `merge_merges_the_other_into_the_project`, `a_refused_merge_refuses_the_answer` y `a_store_that_fails_refuses_the_answer`.
+- [ ] `SuggestionAnswer` (del daemon), `UserAnswer`, `AnswerError`, `Answered` y `answer_suggestion_core` ([D16](design.md#d16-dónde-vive-cada-parte-de-la-tercera), [D17](design.md#d17-responder-una-sugerencia-en-dos-pasos)).
+- [ ] `answer_suggestion` llama a `UserAnswer::new` y a `answer_suggestion_core`, y traduce con `answer_refused`; ya no nombra `suggestion_between`, `keep_apart` ni `merge_core`.
+- Commit: `refactor(core): answer a project suggestion in the core`
+- Tests al cerrar:
+
+  ```bash
+  cargo test -p clawg-core --lib memory::projects::registry
+  ```
+
+  ```bash
+  cargo test -p clawg-cli --lib daemon::api
+  ```
+
+## 15. `new_project` con `create`, en el núcleo (R14)
+
+- [ ] **Test en rojo** en `registry.rs`: `new_project_without_create_is_refused_before_anything_is_read`.
+- [ ] `ResolveError::NewProjectWithoutCreate`, que `resolve_project` devuelve antes de leer el store ([D18](design.md#d18-new_project-sin-create-en-resolve_project)).
+- [ ] `resolve_projects` deja de comprobarlo y traduce la variante a `400`, sin comodín.
+- Commit: `refactor(core): refuse new_project without create in resolve_project`
+- Tests al cerrar:
+
+  ```bash
+  cargo test -p clawg-core --lib memory::projects::registry
+  ```
+
+  ```bash
+  cargo test -p clawg-cli --lib daemon::api
+  ```
+
+## 16. Un restore rechazado, por su variante (R15)
+
+- [ ] `restore_memory` responde el `404` con el `Display` de `RestoreError::NotFound` y nombra `RestoreError::Store` en lugar del comodín ([D15](design.md#d15-lo-que-deciden-las-otras-escrituras)).
+- Commit: `refactor(daemon): answer a refused restore by its variant`
+- Tests al cerrar:
+
+  ```bash
+  cargo test -p clawg-cli --lib daemon::api
+  ```
+
+## 17. Verificación de la parte 3
+
+- [ ] Sobre el último commit de código, en Linux:
+
+  ```bash
+  cargo test --workspace
+  ```
+
+  ```bash
+  cargo clippy --workspace --all-targets -- -D warnings
+  ```
+
+  ```bash
+  cargo clippy -p clawg-cli -- -D warnings
+  ```
+
+- [ ] Las comprobaciones de [D19](design.md#d19-cómo-se-comprueba-la-tercera-parte).
+- [ ] `verify.md`, con la parte 3 y su «Pendiente».
+- Commit: `docs(openspec): record core-use-cases part 3 applied`
+
 ## Partes siguientes
 
 Cada una es un PR, con sus requisitos agregados a `spec.md` y sus decisiones a `design.md` antes de aplicar, y el mismo método: caracterización, tests en rojo en core, el handler que sólo traduce.
 
-- **Parte 3. Las otras escrituras.** `PATCH /v1/memories/...` (que también parsea `memory_type`), restaurar, borrar y las disputas (`resolve`). Y las dos rutas de proyectos que la revisión de [D13](design.md#d13-lo-que-deciden-las-demás-rutas-de-proyectos) encontró con reglas del dominio: `answer_suggestion` (la respuesta, `user_answered` con `reason`, la sugerencia pendiente) y `resolve_projects` (`new_project` va con `create`).
+- **Parte 3. Las otras escrituras**, en [«Parte 3»](#parte-3-las-otras-escrituras): `PATCH /v1/memories/...` (que también parsea `memory_type`), restaurar, borrar y las disputas (`resolve`), y las dos rutas de proyectos que la revisión de [D13](design.md#d13-lo-que-deciden-las-demás-rutas-de-proyectos) encontró con reglas del dominio, `answer_suggestion` y `resolve_projects`.
 - **Parte 4. Partir `api.rs`** en `crates/clawg-cli/src/daemon/routes/`, un archivo por dominio, como paso mecánico sin cambio de conducta.
 - **Fuera:** `context`, salvo que storage-read-side le dé un caso de uso ([D7](design.md#d7-qué-handlers-entran)), y `eval_api` ([D6](design.md#d6-eval_api-no-cambia)).
