@@ -1,6 +1,6 @@
 # core-use-cases — Especificación
 
-Son requisitos sobre [`specs/ingest`](../../specs/ingest/spec.md), [`specs/synthesis`](../../specs/synthesis/spec.md) y [`specs/provenance`](../../specs/provenance/spec.md), y se consolidan al archivar. Lo que no se nombra acá sigue como está. Cubren la primera parte del cambio, el guardado (`POST /v1/memories`); las partes siguientes traen sus requisitos.
+Son requisitos sobre [`specs/ingest`](../../specs/ingest/spec.md), [`specs/synthesis`](../../specs/synthesis/spec.md), [`specs/provenance`](../../specs/provenance/spec.md) y [`specs/project`](../../specs/project/spec.md), y se consolidan al archivar. Lo que no se nombra acá sigue como está. R1 a R7 cubren la primera parte del cambio, el guardado (`POST /v1/memories`); R8 a R11, la segunda, las escrituras de proyectos ([«Parte 2»](#parte-2-las-escrituras-de-proyectos)). Las partes siguientes traen sus requisitos.
 
 Términos:
 
@@ -116,3 +116,89 @@ Ninguna respuesta del daemon (estado, cuerpo), del puente MCP (texto, esquema, d
 - `each_refused_save_keeps_its_status_and_body` (`mod tests` de `crates/clawg-cli/src/daemon/api.rs`), que llama al handler con un `AppCtx` de prueba y compara el estado y el cuerpo entero de un caso por fila de la tabla y por regla. Se escribe primero y pasa sobre el código de `develop`.
 - La suite entera, sin editar `crates/clawg-cli/tests/api.rs` ni los tests de `crates/clawg-cli/src/mcp/`.
 - `the_agent_contract_matches_its_file` y `the_spanish_agent_contract_matches_its_file` (`crates/clawg-cli/src/mcp/server.rs`), sin `CLAWG_BLESS`.
+
+## Parte 2. Las escrituras de proyectos
+
+Términos:
+
+- **Un registro:** el cuerpo de `POST /v1/projects` (`RegisterRequest`), y el registro que `POST /v1/projects/locate` hace de la raíz que ubica.
+- **Ubicar una carpeta:** `POST /v1/projects/locate` sin `subfolder` (`LocateRequest`, [`specs/project`](../../specs/project/spec.md), PL39).
+- **Su proyecto:** el que el registro le da a la carpeta que se ubica. **El nombrado:** el proyecto al que lleva el `project` del cuerpo (`find_project`).
+
+## R8. La raíz de un registro se comprueba en el núcleo
+
+`check_root(root_path, index_docs, is_dir)` (`crates/clawg-core/src/memory/projects/project.rs`) MUST devolver la raíz que nombra `root_path` o el primer rechazo, en este orden, que es el de hoy:
+
+| # | Regla | Rechazo | Texto |
+|---|---|---|---|
+| 1 | `root_path` sin nada más que espacios | `RegisterError::EmptyRoot` | `root_path must not be empty` |
+| 2 | con `index_docs`, una raíz que `is_dir` no da por directorio | `RegisterError::NotADirectory(raíz)` | `<root_path> is not a directory, so it has no files to index` |
+
+`is_dir` es lo único que lee el disco, y sin `index_docs` MUST NOT llamarse. El daemon MUST llamar a `check_root` antes de leer el checkout de la raíz y antes de `register_project`, así un `InvalidLegacyId` sigue después de las dos reglas.
+
+#### Escenario: el orden
+- GIVEN un registro con `root_path` `"  "` e `index_docs`
+- WHEN se comprueba
+- THEN el rechazo es `EmptyRoot`, y `is_dir` no se llamó
+
+#### Escenario: sólo la raíz que se indexa
+- GIVEN una raíz que no es un directorio
+- WHEN se comprueba sin `index_docs`
+- THEN pasa, y `is_dir` no se llamó; con `index_docs` el rechazo es `NotADirectory`
+
+**Tests** (`project.rs`, sin HTTP): `an_empty_root_is_not_registered`, `only_a_root_to_index_must_be_a_directory` y `each_root_refusal_keeps_its_text`. Hoy no compilan: `check_root` no existe.
+
+## R9. Ubicar una carpeta se decide en el núcleo
+
+`check_folder(folder, is_dir)` (`crates/clawg-core/src/memory/projects/registry.rs`) MUST rechazar con `LocateError::NotADirectory(folder)` (`<root_path> is not a directory: name a directory of the project`) una carpeta que `is_dir` no da por directorio. El daemon MUST llamarla antes que cualquier otra cosa de la ruta, como hoy.
+
+`locate_folder(store, workspaces, backups, folder, own, target)` (`registry.rs`), con `own` su proyecto y `target` el nombrado, MUST:
+
+1. con `own` igual a `target`, devolver `Located::Already` sin leer el store;
+2. si `own` tiene más de una carpeta (`own_folder_count`, SB3 de `specs/project`), rechazar con `LocateError::FolderShared { folder, own, folders, target }`, cuyo texto es el `detail` de hoy: `<root_path> leads to project <own>, which has <N> folders; `clawg projects merge <own> --into <target>` merges them all`;
+3. si no, unir `own` en `target` como `merge_core` sin prueba en seco, y devolver `Located::Merged(informe)`. Una unión rechazada MUST ser `LocateError::Merge(MergeError)`, con el error de la unión tal cual.
+
+Un error de la cuenta MUST ser `LocateError::Store(StorageError)`, con el texto del `StorageError`. `own_folder_count` MUST quedar privada de `registry.rs`: el daemon no la nombra.
+
+#### Escenario
+- GIVEN el proyecto `a` con una carpeta, el `b` con dos y el nombrado `ideas`
+- WHEN se ubica la carpeta de `b`, la de `a` y otra vez la de `a`
+- THEN la de `b` da `FolderShared` con 2 carpetas y no une nada, la de `a` da `Merged` con `a` unido en `ideas`, y la segunda vez su proyecto ya es `ideas` y da `Already`
+
+**Tests** (`registry.rs`, sin HTTP): `a_folder_that_is_not_a_directory_is_not_located`, `a_folder_already_in_the_named_project_is_left_as_it_is`, `a_folder_shared_by_its_project_is_not_merged`, `the_only_folder_of_a_project_merges_it_into_the_named_one`, `a_refused_merge_refuses_the_locate` y `a_store_that_fails_refuses_the_locate`. Hoy no compilan: `locate_folder` no existe.
+
+## R10. Un código de confirmación va con las filas
+
+`delete_core` (`crates/clawg-core/src/memory/projects/project_delete.rs`) con `with_memories` en `false` y un `confirm` MUST rechazar con `DeleteError::ConfirmWithoutRows` (`confirm goes with with_memories: it is the code of the report of a delete with its rows`) antes de leer el store. Hoy el núcleo ignora el código y borra el proyecto como vacío, y sólo el handler lo impide.
+
+#### Escenario
+- GIVEN un proyecto que no existe
+- WHEN se borra sin `with_memories` y con un `confirm`
+- THEN el rechazo es `ConfirmWithoutRows`, no `UnknownProject`
+
+**Test:** `a_confirm_without_the_rows_is_refused_before_anything_is_read` (`project_delete.rs`). Hoy no compila: la variante no existe.
+
+## R11. Lo que ve un cliente de los proyectos no cambia
+
+Es de conservación: sus tests pasan antes y después.
+
+Los handlers MUST traducir cada rechazo así, y no decidir ninguna de las reglas de R8 a R10:
+
+| Rechazo | Respuesta |
+|---|---|
+| `RegisterError::EmptyRoot`, `NotADirectory`, `InvalidLegacyId` | `400 {"error": "<texto>"}` |
+| `RegisterError::RootCollision`, `NoFreeId`, `Store` | como hoy: `409 project_root_collision` con uno de sus dos `detail`, `409 no_free_project_id`, `500` |
+| `LocateError::NotADirectory` | `400 {"error": "<texto>"}` |
+| `LocateError::FolderShared` | `409 {"error": "folder_shared", "detail": "<texto>"}` |
+| `LocateError::Merge(e)` | lo que `merge_error` responde por `e` en `POST /v1/projects/merge` |
+| `LocateError::Store` | `500 {"error": "<texto del StorageError>"}` |
+| `DeleteError::ConfirmWithoutRows` | `400 {"error": "<texto>"}` |
+
+`Located::Already` y `Located::Merged` MUST dar el mismo `LocatedBody` de hoy: `already` en `true` sin `merge`, o en `false` con el informe de la unión. Las sesiones siguen la unión en el daemon (`sessions_follow`), como hoy.
+
+Ninguna respuesta del daemon (estado, cuerpo), del puente MCP (texto, esquema, descripción) ni de la CLI MUST cambiar.
+
+**Tests:**
+- `each_refused_registration_keeps_its_status_and_body`, `each_located_folder_keeps_its_status_and_body` y `each_refused_project_delete_keeps_its_status_and_body` (`mod tests` de `crates/clawg-cli/src/daemon/api.rs`), que llaman al handler con un `AppCtx` de prueba y comparan el estado y el cuerpo entero. Se escriben primero y pasan sobre el código de `develop`.
+- La suite entera, sin editar `crates/clawg-cli/tests/api.rs` ni los tests de `crates/clawg-cli/src/mcp/`; entre ellos `locating_a_folder_merges_its_own_project_into_the_named_one`, `a_folder_shared_by_its_project_is_not_located` y `registering_a_missing_root_to_index_it_is_a_bad_request`.
+- `the_agent_contract_matches_its_file` y `the_spanish_agent_contract_matches_its_file`, sin `CLAWG_BLESS`.

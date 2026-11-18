@@ -1,6 +1,6 @@
 # core-use-cases — Diseño
 
-Los enfoques de fondo están en la [exploración](exploration.md#enfoques-posibles); se toma el **A**, un caso de uso por operación, empezando por el guardado. Acá van sus tres decisiones abiertas (D3, D4 y D6), qué handlers entran (D7) y las decisiones de implementación. Las citas `ruta:línea` son de `develop` al escribir esto.
+Los enfoques de fondo están en la [exploración](exploration.md#enfoques-posibles); se toma el **A**, un caso de uso por operación, empezando por el guardado. Acá van sus tres decisiones abiertas (D3, D4 y D6), qué handlers entran (D7) y las decisiones de implementación. D10 a D14 son de la segunda parte, las escrituras de proyectos. Las citas `ruta:línea` son de `develop` al escribir cada parte.
 
 ## D1. Dónde vive cada parte
 
@@ -76,8 +76,8 @@ Lo que deja de pasar es el segundo parseo de `api.rs:1482`, que tiraba el error:
 | Handler | ¿Entra? | Motivo |
 |---|---|---|
 | `save_memory` (`api.rs:1420-1552`) | Sí, en este PR | Decide cuatro reglas de dominio y parsea el tipo dos veces |
-| `locate_project` (`api.rs:3097-3145`) | Parte 2 | Decide una regla: una carpeta cuyo proyecto tiene otras no se fusiona (`409 folder_shared`, `:3131-3140`). Store-boundary ya bajó la cuenta (`own_folder_count`); falta la decisión, y va con las demás rutas de proyectos |
-| `register_root` (`api.rs:2687-2757`) | Parte 2 | Casi todo ya es del núcleo: `register_project` devuelve un `RegisterError` tipado, y el handler lo traduce. Quedan dos reglas de formato (`root_path` vacío, `index_docs` sobre algo que no es un directorio) y efectos del daemon (despertar el embedder, refrescar los docs) |
+| `locate_project` (`api.rs:3097-3145`) | Parte 2 ([D12](#d12-ubicar-una-carpeta-en-dos-pasos)) | Decide una regla: una carpeta cuyo proyecto tiene otras no se fusiona (`409 folder_shared`, `:3131-3140`). Store-boundary ya bajó la cuenta (`own_folder_count`); falta la decisión, y va con las demás rutas de proyectos |
+| `register_root` (`api.rs:2687-2757`) | Parte 2 ([D10](#d10-dónde-vive-cada-parte-de-los-proyectos)) | Casi todo ya es del núcleo: `register_project` devuelve un `RegisterError` tipado, y el handler lo traduce. Quedan dos reglas de formato (`root_path` vacío, `index_docs` sobre algo que no es un directorio) y efectos del daemon (despertar el embedder, refrescar los docs) |
 | `context` (`api.rs:1690-1779`) | No | Es de sólo lectura y no rechaza nada: sus decisiones son cómo se degrada una respuesta (una cuenta que falla es 0, un `regen` que falla no emite ids). La exploración deja fuera las rutas de sólo lectura sin reglas; si storage-read-side le da un caso de uso, es ese cambio |
 
 Bajar también `locate_project` y `register_root` en este PR duplicaría el diff sin que el guardado dependa de ellos, y el pedido es aplicar primero la parte coherente. Las partes siguientes están en [`tasks.md`](tasks.md#partes-siguientes).
@@ -94,3 +94,75 @@ Bajar también `locate_project` y `register_root` en este PR duplicaría el diff
 - **`save.rs`:** tests puros sobre `NewSave::parse` y `check_operation_id`, más el texto de cada variante.
 - **`runtime.rs`:** `MemoryRuntime::new_for_test` sobre `crate::test_dir::test_dir()`, con las filas sembradas con SQL como los demás tests del archivo, `sharing.json` escrito en el directorio del runtime, el estado del embedder cambiado con `embedder_status.send`, y un proyecto fusionado como una fila de `project` con `merged_into`. Cada test cierra el runtime (`close`).
 - El store que falla es un runtime cerrado: `admit` con `derived_from` da `Store`.
+
+## D10. Dónde vive cada parte de los proyectos
+
+Las citas de D10 a D14 son de `develop` al empezar la segunda parte: `register_root` está en `api.rs:2580-2650`, `delete_projects` en `:2780-2805` y `locate_project` en `:2990-3038`.
+
+| Parte | Lugar | Por qué |
+|---|---|---|
+| `check_root` y las variantes `RegisterError::EmptyRoot` y `NotADirectory` | `crates/clawg-core/src/memory/projects/project.rs`, junto a `register_project` | Son rechazos de un registro, y el handler ya traduce `RegisterError` (`api.rs:2612-2629`). Con dos variantes más, su `match` sigue sin comodín |
+| `check_folder`, `locate_folder`, `Located` y `LocateError` | `crates/clawg-core/src/memory/projects/registry.rs`, junto a `own_folder_count` | Es lo que hace que una carpeta lleve a un proyecto, y `own_folder_count` (`registry.rs:816`), que sólo usa esta decisión, pasa a privada ahí. `registry` ya nombra `merge` (`canonical_in`), así que llamar a `merge_core` no abre ningún ciclo de `MEMORY_CYCLES` |
+| `DeleteError::ConfirmWithoutRows` | `crates/clawg-core/src/memory/projects/project_delete.rs`, al entrar a `delete_core` | Es el núcleo el que hoy ignora el código ([D13](#d13-lo-que-deciden-las-demás-rutas-de-proyectos)) |
+
+**Descartado:**
+
+- **Las dos reglas de la raíz dentro de `register_project`.** El daemon lee el checkout de la raíz antes de llamarlo (`api.rs:2597-2608`): una raíz vacía se leería (un `.git` relativo al directorio del daemon) y dejaría su línea de log «is not in the checkout» antes del `400`. `check_root` va antes de esa lectura, en el lugar de hoy.
+- **Un módulo `projects/locate.rs`.** Un módulo para una función y su error; `registry.rs` ya tiene la cuenta que la decide.
+- **`Ground::is_dir`.** Cuatro implementaciones (`Disk`, `ReadAhead`, `FakeGround`, `Watched`) para una sola lectura que sólo hacen el registro y la ubicación del daemon ([D11](#d11-el-disco-entra-como-una-función)).
+
+## D11. El disco entra como una función
+
+`check_root` y `check_folder` reciben `is_dir: impl FnOnce(&Path) -> bool`; el daemon les pasa `Path::is_dir`. Así la decisión es pura y sus tests no tocan el disco, como pide `openspec/config.yaml`, y `check_root` llama a `is_dir` sólo con `index_docs`, que es el corte de hoy (`index_docs && !root.is_dir()`, `api.rs:2592`).
+
+Los textos siguen la regla de [D3](#d3-un-error-con-el-texto-de-hoy-y-sus-datos): el `Display` de cada variante es el texto que hoy responde el daemon, y la variante lleva la raíz como `PathBuf`, como `RegisterError::NoFreeId`. El texto de hoy pone `root_path` tal como llegó; una `PathBuf` hecha de ese `String` se muestra igual con `display()`.
+
+**Descartado:** un `is_dir: bool` calculado antes. El handler tendría que repetir el corte (`index_docs && root.is_dir()`), o leer el disco también sin `index_docs`.
+
+## D12. Ubicar una carpeta en dos pasos
+
+El orden de hoy es: la carpeta es un directorio, la subcarpeta (con `subfolder`), el nombrado (`find_project`), el registro, y la decisión con su proyecto. El registro es del daemon: `register_root` despierta el embedder y lanza el refresco de los docs (`api.rs:2638-2648`). Por eso, como en [D2](#d2-dos-pasos-y-la-sesión-entre-los-dos), el núcleo entra dos veces y el daemon queda en medio:
+
+```rust
+check_folder(&folder, Path::is_dir).map_err(located_refused)?;
+// la subcarpeta y el nombrado, como hoy
+let registered = register_root(&app, &body.root_path, None, &[], false, true).await?;
+let located = locate_folder(store, &workspaces, &backups, &folder, &registered.project_id, &target).await.map_err(located_refused)?;
+```
+
+- **`Located` es un `enum`** (`Already`, `Merged(MergeReport)`) y no un par `already`/`merge`: no hay un `already` con una unión. El handler arma `LocatedBody` con el `root_id` del registro, como hoy.
+- **`LocateError::Merge` lleva el `MergeError`**, y el handler lo traduce con `merge_error`, como ya hace `SubfolderError::Merge` (`api.rs:3073`).
+- **`LocateError::Store` es `#[error(transparent)]` sobre `StorageError`,** el error de `own_folder_count` (SB3), así el `500` lleva el mismo texto que hoy da `ApiError::internal`.
+- **`sessions_follow` queda en el handler:** `SessionRegistry` es estado del daemon ([D2](#d2-dos-pasos-y-la-sesión-entre-los-dos)).
+
+**Descartado:**
+
+- **Un `LocateError` para el nombrado que no existe o es ambiguo.** `find_project` ya responde un `Named` tipado, y las dos rutas que lo usan lo traducen distinto: `locate_project` responde `404` a un nombre que nadie tiene, y `target_named` (`api.rs:1883`) lo deja seguir para que el movimiento responda su propio `404`. Es traducción.
+- **`check_folder` dentro de `locate_folder`.** `locate_folder` corre después del registro, y una carpeta que no es un directorio con un nombrado que no existe daría el `404` en lugar del `400` de hoy.
+
+## D13. Lo que deciden las demás rutas de proyectos
+
+Cada handler hace una de tres cosas: lee la **forma del cuerpo** (qué campos van juntos y qué operación pide), que es de HTTP y queda; **traduce** una respuesta tipada del núcleo, que queda; o decide una **regla** sobre lo que el núcleo escribe, que baja. Una regla baja cuando otro llamador del núcleo la necesitaría para no escribir algo que nadie pidió.
+
+| Ruta | Qué decide el handler | Clase | Queda o baja |
+|---|---|---|---|
+| Renombrar (`rename`, `api.rs:2674-2688`) | nada: traduce `RenameError` | traducción | queda |
+| Fusionar (`merge_projects`, `:2721-2739`) | `undo` o `source` y `target` (`400 name a source and a target, or a merge to undo`); que las sesiones sigan la unión | forma; estado del daemon | queda |
+| Borrar (`delete_projects`, `:2780-2805`) | `undo` o `project_id`, y `dry_run` sólo con `undo` | forma | queda |
+| | `confirm` sin `with_memories` (`:2792-2794`) | regla: `delete_core` con `(false, Some(_))` borra el proyecto como vacío e ignora el código (`project_delete.rs:592-593`) | baja ([R10](spec.md#r10-un-código-de-confirmación-va-con-las-filas)) |
+| | `NeedsModel` responde con el estado del embedder (`delete_error`, `:2770`); el borrado quita las sesiones del proyecto | traducción; estado del daemon | queda |
+| Mover (`move_memories`, `:1912-1928`) | `MoveRequest::plan` (`:985-1011`), puro y con su test `a_move_asks_for_one_target_or_an_undo`; `target_named` traduce `Named` | forma; traducción | queda |
+| Subcarpetas (`subfolder_of` y `declare`, `:3043-3089`) | un camino en lo alto de un checkout o fuera de uno no es una subcarpeta: el `400` le dice al cliente que pidió la otra operación de la ruta («`locate` without `subfolder` locates the folder's root»); `declare` traduce `SubfolderError` | forma; traducción | queda |
+
+Al revisar aparecieron dos rutas de proyectos fuera de esta lista con reglas del dominio: `answer_suggestion` (`:2911-2947`: la respuesta es `merge` o `apart`, responder es cosa de la persona y lleva `user_answered` con `reason`, y sólo se responde una sugerencia pendiente) y `resolve_projects` (`:2840-2853`: `new_project` va con `create`). Van con la parte 3 ([`tasks.md`](tasks.md#partes-siguientes)).
+
+**Descartado:** bajar la regla de las subcarpetas a `subfolder.rs`. Lee el disco con `ProjectIdentity::resolve`, que sube por los padres del camino, y un test del núcleo sobre `test_dir()` daría otro resultado si el directorio temporal estuviera dentro de un checkout. Y no protege ninguna escritura: `declare_subfolder` recibe un `subpath` ya medido.
+
+## D14. Cómo se comprueba la segunda parte
+
+Como [D8](#d8-cómo-se-comprueba-que-nada-de-lo-que-ve-un-cliente-cambia):
+
+1. **Caracterización primero.** `each_refused_registration_keeps_its_status_and_body`, `each_located_folder_keeps_its_status_and_body` y `each_refused_project_delete_keeps_its_status_and_body`, en el `mod tests` de `api.rs`, llaman a `register`, `locate_project` y `delete_projects` con el `AppCtx` de `daemon_for_jobs` y comparan el estado y el cuerpo JSON entero: cada rechazo de R8 a R10 y su orden, las traducciones de `RegisterError` que quedan (los dos `detail` de `project_root_collision`), el nombrado que no existe o es ambiguo, una unión rechazada por un nombrado borrado, y los dos cuerpos de una ubicación que se acepta. Se commitean antes de tocar los handlers y pasan sobre el código de `develop`.
+2. **Los tests de respuestas no se tocan:** `git diff develop...HEAD -- crates/clawg-cli/tests/ crates/clawg-cli/src/mcp/` vacío, y los dos contratos del agente pasan sin `CLAWG_BLESS`.
+3. **El diff de `api.rs`** no cambia ningún `StatusCode` ni el texto de ningún `ApiError`: los textos que se van del handler llegan como `Display` de las variantes.
+4. **Los tests del núcleo**, sin HTTP: `check_root` y `check_folder` con un `is_dir` de prueba; `locate_folder` y `delete_core` con `MemoryStore::new_for_test` y las filas sembradas con SQL, como los tests de `registry.rs` y `project_delete.rs`; el store que falla es uno cerrado.
