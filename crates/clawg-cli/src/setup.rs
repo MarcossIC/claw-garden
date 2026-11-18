@@ -690,6 +690,7 @@ fn assemble(eol: &str, language: Option<Lang>, variant: Variant, stamp: Option<S
     let text = match variant {
         Variant::Full => protocol::text(language).replace("\r\n", "\n"),
         Variant::Short => protocol::short(language),
+        Variant::Lean => protocol::lean(language),
         Variant::Off => String::new(),
     };
     let body = text.trim_end();

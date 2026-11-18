@@ -1,4 +1,5 @@
 //! What the agent is told about memory: `protocol.md` and `protocol.es.md`,
+//! the sections of their lean variant (`protocol.lean.md`, `protocol.lean.es.md`),
 //! compiled in, and the two sentences on language that a preference for
 //! English rewrites.
 //!
@@ -33,16 +34,18 @@ const SAVE_RULE: &str = "Write it in English, and search in English too. A memor
 pub enum Variant {
     Full,
     Short,
+    Lean,
     Off,
 }
 
 impl Variant {
-    pub const ALL: [Variant; 3] = [Variant::Full, Variant::Short, Variant::Off];
+    pub const ALL: [Variant; 4] = [Variant::Full, Variant::Short, Variant::Lean, Variant::Off];
 
     pub fn as_str(self) -> &'static str {
         match self {
             Variant::Full => "full",
             Variant::Short => "short",
+            Variant::Lean => "lean",
             Variant::Off => "off",
         }
     }
@@ -80,11 +83,16 @@ pub fn opening(protocol: &str) -> String {
 /// The new sentence of the opening keeps it within the 2048 characters older
 /// clients read.
 pub fn text(language: Option<Lang>) -> Cow<'static, str> {
-    let lang = match language {
-        None => return Cow::Borrowed(PROTOCOL),
-        Some(Lang::Es) => return Cow::Borrowed(PROTOCOL_ES),
-        Some(lang @ Lang::En) => lang,
-    };
+    match language {
+        None => Cow::Borrowed(PROTOCOL),
+        Some(Lang::Es) => Cow::Borrowed(PROTOCOL_ES),
+        Some(lang @ Lang::En) => Cow::Owned(in_language(PROTOCOL, lang)),
+    }
+}
+
+/// `protocol`, written in English, with its two rules on language asking to
+/// save, search and answer in `lang`.
+fn in_language(protocol: &str, lang: Lang) -> String {
     let (name, other) = (lang.name(), lang.other().name());
     let opening_rule = format!(
         "Save memories and search in {name}: a memory is found best by a query in its own language. \
@@ -94,8 +102,33 @@ pub fn text(language: Option<Lang>) -> Cow<'static, str> {
         "Write it in {name}, and search in {name} too. A memory saved in one language and searched in another \
          is often missed; when a search says memories are still in {other}, search again with the query in {other}."
     );
-    let text = replace_spaced(PROTOCOL, OPENING_RULE, &opening_rule);
-    Cow::Owned(replace_spaced(&text, SAVE_RULE, &save_rule))
+    let text = replace_spaced(protocol, OPENING_RULE, &opening_rule);
+    replace_spaced(&text, SAVE_RULE, &save_rule)
+}
+
+/// The sections of the lean protocol, each with the heading and the rules of
+/// its section in `protocol.md`, without what the opening or the tools'
+/// descriptions already say.
+const LEAN: &str = include_str!("protocol.lean.md");
+
+const LEAN_ES: &str = include_str!("protocol.lean.es.md");
+
+/// The lean protocol for `language`: the title and the opening of the whole
+/// protocol, as they are, and the sections of [`LEAN`], with `\n` line
+/// endings. The file in English for any language but Spanish, with its rules
+/// on language rewritten as [`text`] rewrites them.
+pub fn lean(language: Option<Lang>) -> String {
+    let (protocol, sections) = match language {
+        Some(Lang::Es) => (PROTOCOL_ES, LEAN_ES),
+        _ => (PROTOCOL, LEAN),
+    };
+    let protocol = protocol.replace("\r\n", "\n");
+    let head = protocol.find("\n## ").map_or(protocol.as_str(), |end| &protocol[..=end]);
+    let lean = format!("{head}{}", sections.replace("\r\n", "\n"));
+    match language {
+        Some(lang @ Lang::En) => in_language(&lean, lang),
+        _ => lean,
+    }
 }
 
 /// What the short block says of the rest, in place of the rules the server's
@@ -236,10 +269,12 @@ mod tests {
 
     #[test]
     fn the_spanish_protocol_has_the_sections_and_spans_of_the_english_one() {
-        assert_eq!(sections(PROTOCOL_ES), sections(PROTOCOL));
-        assert_eq!(names_and_markers(PROTOCOL_ES), names_and_markers(PROTOCOL));
-        for marker in ["ACTIVE CONFLICTS", "LAST SESSION", "supersedes", "compatible", "scoped", "conflicts", "inferred"] {
-            assert_eq!(PROTOCOL_ES.contains(marker), PROTOCOL.contains(marker), "{marker}");
+        for (es, en) in [(PROTOCOL_ES.to_string(), PROTOCOL.to_string()), (lean(Some(Lang::Es)), lean(None))] {
+            assert_eq!(sections(&es), sections(&en));
+            assert_eq!(names_and_markers(&es), names_and_markers(&en));
+            for marker in ["ACTIVE CONFLICTS", "LAST SESSION", "supersedes", "compatible", "scoped", "conflicts", "inferred"] {
+                assert_eq!(es.contains(marker), en.contains(marker), "{marker}");
+            }
         }
     }
 
@@ -252,10 +287,23 @@ mod tests {
         body.find("\n## ").map_or(body, |end| &body[..end]).to_string()
     }
 
+    /// The full protocol and the lean one in each language, with the
+    /// headings of their sections on types and on projects.
+    fn every_text() -> [(String, &'static str, &'static str); 4] {
+        let en = ("Type and importance", "Projects");
+        let es = ("Tipo e importancia", "Proyectos");
+        [
+            (PROTOCOL.to_string(), en.0, en.1),
+            (PROTOCOL_ES.to_string(), es.0, es.1),
+            (lean(None), en.0, en.1),
+            (lean(Some(Lang::Es)), es.0, es.1),
+        ]
+    }
+
     #[test]
     fn the_protocol_says_which_preferences_open_every_session() {
-        for (text, heading) in [(PROTOCOL, "Type and importance"), (PROTOCOL_ES, "Tipo e importancia")] {
-            let types = section(text, heading);
+        for (text, heading, _) in every_text() {
+            let types = section(&text, heading);
             for name in ["`user_stated`", "`all_projects`", "inferred"] {
                 assert!(types.contains(name), "{heading} names {name}:\n{types}");
             }
@@ -264,8 +312,8 @@ mod tests {
 
     #[test]
     fn the_protocol_says_where_a_call_without_a_project_goes() {
-        for (text, heading) in [(PROTOCOL, "Projects"), (PROTOCOL_ES, "Proyectos")] {
-            let projects = section(text, heading);
+        for (text, _, heading) in every_text() {
+            let projects = section(&text, heading);
             for name in [
                 "`project_path`",
                 "`project`",
@@ -279,8 +327,8 @@ mod tests {
                 assert!(projects.contains(name), "{heading} names {name}:\n{projects}");
             }
         }
-        for text in [PROTOCOL, PROTOCOL_ES] {
-            let opening = opening(text);
+        for (text, _, _) in every_text() {
+            let opening = opening(&text);
             for name in ["`project_path`", "`project`", "`all_projects`"] {
                 assert!(opening.contains(name), "the opening names {name} for a save's project:\n{opening}");
             }
@@ -334,8 +382,91 @@ mod tests {
         for variant in Variant::ALL {
             assert_eq!(Variant::parse(variant.as_str()), Some(variant));
         }
+        assert_eq!(Variant::ALL.map(Variant::as_str), ["full", "short", "lean", "off"]);
+        assert_eq!(Variant::parse("lean"), Some(Variant::Lean));
         assert_eq!(Variant::parse("tiny"), None);
         assert_eq!(Variant::parse("Full"), None);
+    }
+
+    const LANGUAGES: [Option<Lang>; 3] = [None, Some(Lang::En), Some(Lang::Es)];
+
+    /// The text up to its first section, its title and its opening, with
+    /// `\n` line breaks.
+    fn head(text: &str) -> String {
+        let text = text.replace("\r\n", "\n");
+        text.find("\n## ").map_or(text.clone(), |end| text[..=end].to_string())
+    }
+
+    fn headings(text: &str) -> Vec<&str> {
+        text.lines().filter(|l| l.starts_with("## ")).collect()
+    }
+
+    /// The bullet of `text` that starts with `words`, up to the next bullet or
+    /// paragraph, with `\n` line breaks.
+    fn bullet(text: &str, words: &str) -> String {
+        let text = text.replace("\r\n", "\n");
+        let start = text.find(&format!("\n- {words}")).unwrap_or_else(|| panic!("no bullet {words}")) + 1;
+        let rest = &text[start..];
+        let end = [rest.find("\n- "), rest.find("\n\n")].into_iter().flatten().min().unwrap_or(rest.len());
+        rest[..end].to_string()
+    }
+
+    #[test]
+    fn the_lean_protocol_keeps_the_head_of_the_full_one() {
+        for language in LANGUAGES {
+            let (full, lean) = (text(language), lean(language));
+            assert_eq!(head(&lean), head(&full), "{language:?}");
+            assert_eq!(opening(&lean), opening(&full), "{language:?}: the server's instructions");
+            assert_eq!(headings(&lean), headings(&full), "{language:?}");
+            assert!(!lean.contains('\r'));
+        }
+    }
+
+    #[test]
+    fn the_lean_protocol_keeps_the_topic_key_rule_and_the_session_summary() {
+        for language in LANGUAGES {
+            let (full, lean) = (text(language), lean(language));
+            let (key, kept) = match language {
+                Some(Lang::Es) => ("Una decisión o una preferencia que puede cambiar lleva un `topic_key`", SHORT_SECTIONS_ES),
+                _ => ("A decision or a preference that may change later gets a `topic_key`", SHORT_SECTIONS),
+            };
+            assert_eq!(bullet(&lean, key), bullet(&full, key), "{language:?}");
+            for heading in kept {
+                assert_eq!(section(&lean, heading), section(&full, heading), "{language:?}: {heading}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_lean_protocol_names_what_the_full_one_names() {
+        for language in LANGUAGES {
+            let (full, lean) = (text(language), lean(language));
+            assert_eq!(names_and_markers(&lean), names_and_markers(&full), "{language:?}");
+            for marker in ["ACTIVE CONFLICTS", "LAST SESSION", "supersedes", "conflicts", "inferred", "imported", "conclusion", "merge", "apart"] {
+                assert_eq!(lean.contains(marker), full.contains(marker), "{language:?}: {marker}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_language_rewrites_both_rules_of_the_lean_protocol() {
+        assert_eq!(find_spaced(LEAN, SAVE_RULE).len(), 1, "{SAVE_RULE}");
+        let plain = lean(None);
+        let en = lean(Some(Lang::En));
+        assert!(en.contains("Save memories and search in English:") && en.contains("Reply to the user in English unless"), "{en}");
+        assert!(en.contains("still in Spanish, search again with the query in Spanish."), "{en}");
+        assert!(!plain.contains("Save memories and search in English:") && en.len() < plain.len() + 200, "only the two rules change");
+        let es = lean(Some(Lang::Es));
+        assert!(es.contains("Escríbela en español, y busca en español también."), "{es}");
+    }
+
+    #[test]
+    fn the_lean_protocol_is_at_most_seventy_percent_of_the_full_one() {
+        for language in LANGUAGES {
+            let (full, lean, short) = (text(language).len(), lean(language).len(), short(language).len());
+            assert!(lean * 10 <= full * 7, "{language:?}: {lean} of {full} bytes");
+            assert!(lean > short, "{language:?}: lean keeps more than short");
+        }
     }
 
     #[test]
