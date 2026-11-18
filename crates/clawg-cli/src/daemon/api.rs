@@ -2838,12 +2838,9 @@ async fn resolve_projects(
     State(app): State<Arc<AppCtx>>,
     Json(body): Json<ProjectResolveRequest>,
 ) -> ApiResult<Json<ProjectResolution>> {
-    if body.new_project && !body.create {
-        return Err(ApiError::bad_request("new_project goes with create: it creates a project apart from the similar ones"));
-    }
     let options = ResolveOptions { create: body.create, new_project: body.new_project, born: body.born };
     resolve_project(&app.runtime.store, &body.project, options).await.map(Json).map_err(|e| match e {
-        ProjectResolveError::Name(_) => ApiError::bad_request(e.to_string()),
+        ProjectResolveError::NewProjectWithoutCreate | ProjectResolveError::Name(_) => ApiError::bad_request(e.to_string()),
         ProjectResolveError::NoFreeId(_) => ApiError { detail: Some(e.to_string()), ..ApiError::conflict("no_free_project_id") },
         ProjectResolveError::Store(_) => ApiError::internal(e),
     })

@@ -850,6 +850,10 @@ pub struct Resolution {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ResolveError {
+    /// `new_project` overrides the similar projects that keep a name from
+    /// being created; without `create` there is nothing to override.
+    #[error("new_project goes with create: it creates a project apart from the similar ones")]
+    NewProjectWithoutCreate,
     #[error(transparent)]
     Name(#[from] NameError),
     #[error("every id a project named {0:?} may take is taken")]
@@ -980,8 +984,12 @@ fn own_folders_dated_in(c: &Connection, project: &str) -> rusqlite::Result<Vec<(
 /// `options.create` a name nothing holds or resembles, or with
 /// `options.new_project` one that only resembles others, becomes a project
 /// without a folder, in the same transaction that looked. Nothing else is
-/// written.
+/// written. `new_project` without `create` is refused before anything is
+/// read.
 pub async fn resolve_project(store: &MemoryStore, reference: &str, options: ResolveOptions) -> Result<Resolution, ResolveError> {
+    if options.new_project && !options.create {
+        return Err(ResolveError::NewProjectWithoutCreate);
+    }
     let reference = reference.trim().to_string();
     store
         .conn
@@ -2213,5 +2221,20 @@ mod tests {
         let refused = f.answer("app-1a2b", "copia-85a9", "merge").await.expect_err("the store is closed");
 
         assert!(matches!(refused, AnswerError::Pair(KeepApartError::Store(_))), "{refused:?}");
+    }
+
+    #[tokio::test]
+    async fn new_project_without_create_is_refused_before_anything_is_read() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        store.conn.clone().close().await.unwrap();
+
+        let options = ResolveOptions { create: false, new_project: true, born: Born::User };
+        let refused = resolve_project(&store, "ideas", options).await.expect_err("new_project goes with create");
+
+        assert!(matches!(refused, ResolveError::NewProjectWithoutCreate), "{refused:?}");
+        assert_eq!(refused.to_string(), "new_project goes with create: it creates a project apart from the similar ones");
+        let options = ResolveOptions { create: false, new_project: false, born: Born::User };
+        let failed = resolve_project(&store, "ideas", options).await.expect_err("the store is closed");
+        assert!(matches!(failed, ResolveError::Store(_)), "{failed:?}");
     }
 }
