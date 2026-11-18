@@ -151,3 +151,38 @@ Con el `clawg.exe` arreglado (`9a76a8ec`), 5 corridas de `shelf-eza-missing` baj
 Lo que no decide:
 - En la repetición 5 la regla no llegó por otra vía que la de la primera medición. La sesión 1 falló en Bash y quedó anotada, pero la sesión 2 probó `eza` sólo en la herramienta PowerShell, que el cliente frena pidiendo una aprobación. El libro vio un solo fallo antes de la sesión 3, y la sesión 3 llamó a `eza` en Bash.
 - Ninguna sesión 1 ni 2 de esta medición usó una tubería (`eza -1 -f src`, `eza -1 src`): todas salieron con 127 y el cliente corrió `PostToolUseFailure`. El caso que arregló `response_texts`, la tubería que sale con 0, no se volvió a dar en la campaña; lo cubren los tres tests de arriba.
+
+## La puerta de latencia, con un release
+
+Medida sobre `ffc3206d` (`clawg 0.88.0`) con un release que lleva la feature `testing` de clawg-core: `cargo build --release -p clawg-cli --features clawg-core/testing --target-dir target-test`. La feature hace falta porque un release sin ella ignora `CLAWG_TEST_HOME` (`home_dir`, `crates/clawg-core/src/paths.rs`) y la tanda con firma escribiría en el libro de un perfil real. En el camino del hook, lo único que cambia es cómo se busca el home. El home es temporal y tiene el `tool-failures.jsonl` de una corrida de la campaña: dos `fail` de `eza`, de sesiones distintas, 236 bytes. Las entradas y el método de cronometraje son los de la tarea 8: 200 corridas por tanda, desde Git Bash, con `date +%s%N` y el stdin por un pipe. p50 y p95 son los elementos 100 y 190.
+
+**No pasa: la tanda sin firma da un p95 de 156 a 159 ms, contra los 60 que pide la puerta.** Con estos números la puerta no juzga el hook, porque el piso de la máquina ya la pasa solo. En el mismo día, `/usr/bin/true` dio un p95 de 122 a 131 ms. Un sondeo de 60 corridas de `true` por minuto, durante 45 minutos, nunca bajó de 95 ms. El 2026-11-17 había dado 56 ms, y el 2026-11-13, 28 ms por corrida.
+
+| Tanda | p50 | p95 |
+|---|---|---|
+| `/usr/bin/true` | 103 | 122 |
+| `clawg --version` | 124 | 142 |
+| `hook post-tool-use`, sin firma | 137 | 156 |
+| `hook post-tool-use-failure`, con firma | 141 | 163 |
+
+Es la primera de dos tandas seguidas. La segunda dio, en el mismo orden, 112/131, 134/158, 138/159 y 148/168.
+
+Lo que el hook agrega, que es lo que se puede comparar entre días: sobre `--version`, unos 14 ms de p95 sin firma y 21 con firma. Sobre `true`, 34 y 41. Con el build debug de la medición anterior, la tanda sin firma agregaba 33 ms sobre `--version` y 41 sobre `true`.
+
+**W3.** La tanda con firma cuesta lo mismo que la tanda sin firma, dentro del ruido. En la medición alternada de abajo, el p95 es 156 en las dos con el binario de `ffc3206d`. Compilar los `PATTERNS` de `redact` no se ve en el proceso. Con esto, W3 se puede cerrar aceptando el costo. Al cerrarlo, la justificación de D4 («costaría su compilación en cada proceso de hook») tiene que decir que ese costo existe pero no se distingue del ruido de arrancar el proceso.
+
+### S7: un runtime `current_thread` para `clawg hook`
+
+Se probó con TDD: `Command::runs_on_one_thread` en `cli.rs`, con el test `only_the_hook_runs_on_one_thread`, y `main.rs` armando `new_current_thread` para `hook`. Pasaron los tests de `cli.rs` y `tests/binary.rs`. Se midió el binario de antes contra el de después, alternados en cada ronda: 200 rondas, y en cada una `true`, `--version` y las dos entradas de cada binario, cada binario con su propio home. Así la carga de la máquina pesa igual sobre todas las series.
+
+| Tanda | Antes p50 | Antes p95 | Después p50 | Después p95 |
+|---|---|---|---|---|
+| `clawg --version` | 125 | 145 | 124 | 143 |
+| sin firma | 141 | 156 | 140 | 158 |
+| con firma | 136 | 156 | 135 | 149 |
+
+`/usr/bin/true` en la misma medición dio p50 108 y p95 126. El p50 baja 1 ms en las tres tandas, y el p95 se mueve para los dos lados. S7 no da una ganancia que se pueda medir, así que no se commitea.
+
+### Lo que queda por decidir
+
+La puerta, tal como está escrita, no pasa con esta medición, así que el cambio no se archiva. Con lo que dice la tarea 8, `PostToolUse` no se publica instalado mientras no pase.
