@@ -7,7 +7,7 @@
 //! [`project_name`] does.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rusqlite::{Connection, OptionalExtension};
@@ -16,9 +16,10 @@ use serde::{Deserialize, Serialize};
 use crate::memory::store::error::{ClosedAs, failed_call};
 use crate::memory::domain::clock::TimestampMs;
 use crate::memory::projects::identity::Ground;
-use crate::memory::projects::merge::{canonical_in, MAX_MERGE_HOPS};
+use crate::memory::projects::merge::{canonical_in, merge_core, MergeError, MergeReport, MAX_MERGE_HOPS};
 use crate::memory::projects::project::is_project_id;
 use crate::memory::projects::project_delete::{deleted_in, deleted_message};
+use crate::memory::retrieval::workspace::WorkspaceManager;
 use crate::memory::{store::error::MemoryError, store::db::MemoryStore, store::error::StorageError};
 
 /// The name a project has until someone gives it one: its id without the
@@ -813,9 +814,65 @@ fn folders_of_in(c: &Connection, project: &str) -> rusqlite::Result<Vec<Resolved
 
 /// How many folders lead to `project`: those recorded with its id, and one
 /// from before folders named their project, whose own id is the project's.
-pub async fn own_folder_count(store: &MemoryStore, project: &str) -> Result<usize, StorageError> {
+async fn own_folder_count(store: &MemoryStore, project: &str) -> Result<usize, StorageError> {
     let project = project.to_string();
     Ok(store.conn.call(move |c| own_folders_in(c, &project)).await?.len())
+}
+
+/// Why a folder was not located in a project.
+#[derive(Debug, thiserror::Error)]
+pub enum LocateError {
+    #[error("{} is not a directory: name a directory of the project", .0.display())]
+    NotADirectory(PathBuf),
+    /// The folder's project has other folders, which a merge would take
+    /// along, and nobody named them.
+    #[error(
+        "{} leads to project {own}, which has {folders} folders; `clawg projects merge {own} --into {target}` merges them all",
+        folder.display()
+    )]
+    FolderShared { folder: PathBuf, own: String, folders: usize, target: String },
+    #[error(transparent)]
+    Merge(#[from] MergeError),
+    #[error(transparent)]
+    Store(#[from] StorageError),
+}
+
+/// What locating a folder did.
+#[derive(Debug)]
+#[expect(clippy::large_enum_variant, reason = "one per locate, matched as soon as it returns; none is stored")]
+pub enum Located {
+    /// The folder led to the named project already: nothing was written.
+    Already,
+    /// The folder's own project was merged into the named one.
+    Merged(MergeReport),
+}
+
+/// Refuses a folder to locate that `is_dir` does not find to be a directory,
+/// before anything else is read.
+pub fn check_folder(folder: &Path, is_dir: impl FnOnce(&Path) -> bool) -> Result<(), LocateError> {
+    if is_dir(folder) { Ok(()) } else { Err(LocateError::NotADirectory(folder.to_path_buf())) }
+}
+
+/// Makes `folder`, whose registration gave it the project `own`, lead to
+/// `target`: when `own` is `target` nothing is read; when `own` has other
+/// folders it is refused, since a merge would take them along; else `own` is
+/// merged into `target` as `projects merge` does.
+pub async fn locate_folder(
+    store: &MemoryStore,
+    workspaces: &WorkspaceManager,
+    backups: &Path,
+    folder: &Path,
+    own: &str,
+    target: &str,
+) -> Result<Located, LocateError> {
+    if own == target {
+        return Ok(Located::Already);
+    }
+    let folders = own_folder_count(store, own).await?;
+    if folders > 1 {
+        return Err(LocateError::FolderShared { folder: folder.to_path_buf(), own: own.to_string(), folders, target: target.to_string() });
+    }
+    Ok(Located::Merged(merge_core(store, workspaces, backups, own, target, false).await?))
 }
 
 fn own_folders_in(c: &Connection, project: &str) -> rusqlite::Result<Vec<ResolvedFolder>> {
@@ -1758,5 +1815,127 @@ mod tests {
         assert_eq!(find_project(&store, "gone").await.unwrap(), Named::Unknown, "a deleted project's name is free");
         assert_eq!(find_project(&store, "gone-7a8b").await.unwrap(), Named::Project("gone-7a8b".into()), "its id is not");
         assert_eq!(find_project(&store, "nobody").await.unwrap(), Named::Unknown);
+    }
+
+    /// A store with the projects `a-0001`, with one folder and a memory,
+    /// `b-0002`, with two folders, `ideas` without any, and `gone-7a8b`,
+    /// deleted; the directory its workspaces and snapshots go in.
+    struct Locating {
+        store: MemoryStore,
+        ws: crate::memory::retrieval::workspace::WorkspaceManager,
+        backups: PathBuf,
+        _dir: crate::test_dir::TestDir,
+    }
+
+    impl Locating {
+        async fn new() -> Self {
+            let store = MemoryStore::new_for_test().await.unwrap();
+            let dir = crate::test_dir::test_dir();
+            let ws = crate::memory::retrieval::workspace::WorkspaceManager::new(dir.path().join("workspaces"));
+            let backups = dir.path().join("backups");
+            store
+                .conn
+                .call(|c| {
+                    c.execute_batch(
+                        "INSERT INTO project (id, name, born, reviewed, created_at) VALUES \
+                             ('a-0001', 'a', 'root', 1, 1), ('b-0002', 'b', 'root', 1, 1), ('ideas', 'ideas', 'user', 1, 1), \
+                             ('gone-7a8b', 'gone', 'user', 1, 1);
+                         INSERT INTO project_path (id, root_path, created_at, project_id) VALUES \
+                             ('a-0001', '/work/a', 1, 'a-0001'), ('b-0002', '/work/b', 1, 'b-0002'), ('b-0009', '/work/b-clone', 2, 'b-0002');
+                         INSERT INTO memory \
+                          (scope, agent_id, project_id, content, memory_type, source, created_at, created_by_type, created_by_ref, \
+                           last_modified_at, last_accessed_at, importance, tier, status) \
+                          VALUES ('agent', 'x', 'a-0001', 'the notes of the week', 'semantic_fact', 'explicit', 1, 'agent', 'x', \
+                           1, 1, 5.0, 3, 'active');",
+                    )
+                })
+                .await
+                .unwrap();
+            mark_deleted(&store, "gone-7a8b", 1).await;
+            Locating { store, ws, backups, _dir: dir }
+        }
+
+        async fn locate(&self, folder: &str, own: &str, target: &str) -> Result<Located, LocateError> {
+            locate_folder(&self.store, &self.ws, &self.backups, Path::new(folder), own, target).await
+        }
+
+        async fn merged_into(&self, id: &'static str) -> Option<String> {
+            self.store.conn.call(move |c| c.query_row("SELECT merged_into FROM project WHERE id = ?1", [id], |r| r.get(0))).await.unwrap()
+        }
+    }
+
+    #[test]
+    fn a_folder_that_is_not_a_directory_is_not_located() {
+        assert!(check_folder(Path::new("/work/notes"), |_| true).is_ok());
+        let mut asked = Vec::new();
+        let refused = check_folder(Path::new("/work/notes.txt"), |folder| {
+            asked.push(folder.to_path_buf());
+            false
+        })
+        .expect_err("a file is no folder of a project");
+        assert!(matches!(refused, LocateError::NotADirectory(ref f) if f == Path::new("/work/notes.txt")), "{refused:?}");
+        assert_eq!(refused.to_string(), "/work/notes.txt is not a directory: name a directory of the project");
+        assert_eq!(asked, [PathBuf::from("/work/notes.txt")]);
+    }
+
+    #[tokio::test]
+    async fn a_folder_already_in_the_named_project_is_left_as_it_is() {
+        let f = Locating::new().await;
+        f.store.conn.clone().close().await.unwrap();
+
+        let located = f.locate("/work/b", "b-0002", "b-0002").await;
+
+        assert!(matches!(located, Ok(Located::Already)), "the store is not read: {located:?}");
+    }
+
+    #[tokio::test]
+    async fn a_folder_shared_by_its_project_is_not_merged() {
+        let f = Locating::new().await;
+
+        let refused = f.locate("/work/b", "b-0002", "ideas").await.expect_err("two folders lead to b");
+
+        assert!(
+            matches!(&refused, LocateError::FolderShared { folder, own, folders: 2, target }
+                if folder == Path::new("/work/b") && own == "b-0002" && target == "ideas"),
+            "{refused:?}"
+        );
+        assert_eq!(
+            refused.to_string(),
+            "/work/b leads to project b-0002, which has 2 folders; `clawg projects merge b-0002 --into ideas` merges them all"
+        );
+        assert_eq!(f.merged_into("b-0002").await, None, "nothing is merged");
+    }
+
+    #[tokio::test]
+    async fn the_only_folder_of_a_project_merges_it_into_the_named_one() {
+        let f = Locating::new().await;
+
+        let located = f.locate("/work/a", "a-0001", "ideas").await.expect("located");
+
+        let Located::Merged(report) = located else { panic!("a merge: {located:?}") };
+        assert_eq!((report.source.as_str(), report.target.as_str(), report.dry_run, report.memories), ("a-0001", "ideas", false, 1));
+        assert!(report.merge_id.is_some(), "{report:?}");
+        assert_eq!(f.merged_into("a-0001").await.as_deref(), Some("ideas"));
+    }
+
+    #[tokio::test]
+    async fn a_refused_merge_refuses_the_locate() {
+        let f = Locating::new().await;
+
+        let refused = f.locate("/work/a", "a-0001", "gone-7a8b").await.expect_err("a deleted project takes no merge");
+
+        assert!(matches!(&refused, LocateError::Merge(MergeError::Deleted { id, .. }) if id == "gone-7a8b"), "{refused:?}");
+        assert_eq!(refused.to_string(), "project gone-7a8b is deleted, in delete 1: undo it with `clawg projects delete --undo 1`");
+        assert_eq!(f.merged_into("a-0001").await, None);
+    }
+
+    #[tokio::test]
+    async fn a_store_that_fails_refuses_the_locate() {
+        let f = Locating::new().await;
+        f.store.conn.clone().close().await.unwrap();
+
+        let refused = f.locate("/work/a", "a-0001", "ideas").await.expect_err("the count fails");
+
+        assert!(matches!(refused, LocateError::Store(_)), "{refused:?}");
     }
 }

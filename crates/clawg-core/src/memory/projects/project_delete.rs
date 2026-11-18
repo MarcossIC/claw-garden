@@ -68,6 +68,10 @@ pub(crate) fn deleted_in(c: &Connection, id: &str) -> rusqlite::Result<Option<De
 /// Why a delete was refused. Nothing is written.
 #[derive(Debug, thiserror::Error)]
 pub enum DeleteError {
+    /// A code is the one of the report of a delete with its rows: without
+    /// them it would delete the project as an empty one.
+    #[error("confirm goes with with_memories: it is the code of the report of a delete with its rows")]
+    ConfirmWithoutRows,
     #[error("no project {0}")]
     UnknownProject(String),
     #[error("project {id} was merged into {into}")]
@@ -568,7 +572,8 @@ fn delete_pass(c: &Connection, project_id: &str, step: &Step, now: TimestampMs) 
 /// Deletes `project_id`, or reports what deleting it would take. Without
 /// `with_memories` a project with no live rows is deleted in one transaction,
 /// after waiting up to `SAVES_WAIT` for its saves in the outbox, and one with
-/// live rows is refused as `not_empty`; a `confirm` there is ignored. With
+/// live rows is refused as `not_empty`; a `confirm` there is refused before
+/// anything is read, as [`DeleteError::ConfirmWithoutRows`]. With
 /// `with_memories` and no `confirm`, the answer is the report of its set and
 /// the code of that set, and nothing is written. With both, the code is
 /// compared with the set's in a first pass that writes nothing, a `pre-delete`
@@ -590,7 +595,8 @@ pub async fn delete_core(
         async move { retrying(store, write, move |c| delete_pass(c, &id, &step, TimestampMs::now())).await }
     };
     let mut report = match (with_memories, confirm) {
-        (false, _) => pass(Step::Empty, true).await?,
+        (false, Some(_)) => return Err(DeleteError::ConfirmWithoutRows),
+        (false, None) => pass(Step::Empty, true).await?,
         (true, None) => pass(Step::Report, false).await?,
         (true, Some(code)) => {
             let code = code.to_string();
@@ -912,6 +918,22 @@ mod tests {
     async fn run(store: &MemoryStore, batch: &str) {
         let batch = batch.to_string();
         store.conn.call(move |c| c.execute_batch(&batch)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_confirm_without_the_rows_is_refused_before_anything_is_read() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let dir = crate::test_dir::test_dir();
+        let ws = WorkspaceManager::new(dir.path().join("workspaces"));
+        let backups = dir.path().join("backups");
+
+        let refused = delete_core(&store, &ws, &backups, "nobody-0000", false, Some("ABC123")).await.expect_err("refused");
+        assert!(matches!(refused, DeleteError::ConfirmWithoutRows), "not UnknownProject: {refused:?}");
+        assert_eq!(refused.to_string(), "confirm goes with with_memories: it is the code of the report of a delete with its rows");
+
+        store.conn.clone().close().await.unwrap();
+        let refused = delete_core(&store, &ws, &backups, "nobody-0000", false, Some("ABC123")).await.expect_err("refused");
+        assert!(matches!(refused, DeleteError::ConfirmWithoutRows), "the store is not read: {refused:?}");
     }
 
     fn memory(id: i64, project: &str, deleted_at: &str) -> String {

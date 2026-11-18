@@ -49,13 +49,14 @@ use clawg_core::memory::portability::{
     UndoReport, MAX_IMPORT_BYTES,
 };
 use clawg_core::memory::identity::{Disk, Ground, ProjectIdentity};
-use clawg_core::memory::project::{register_project, RegisterError, RegisterOutcome, Registration};
+use clawg_core::memory::project::{check_root, register_project, RegisterError, RegisterOutcome, Registration};
 use clawg_core::memory::subfolder::{declare_subfolder, SubfolderError};
 use clawg_core::memory::merge::{canonical, merge_core, undo_merge_core, MergeError, MergeReport};
 use clawg_core::memory::project_delete::{delete_core, undo_delete_core, DeleteError, DeleteReport};
 use clawg_core::memory::registry::{
-    find_project, keep_apart, list_deletes, list_projects, own_folder_count, pending_suggestions, rename_project, resolve_project, suggestion_between,
-    Born, KeepApartError, KeptApart, ListedDelete, ListedProject, ListedSuggestion, Named, Project, RenameError,
+    check_folder, find_project, keep_apart, list_deletes, list_projects, locate_folder, pending_suggestions, rename_project, resolve_project,
+    suggestion_between, Born, KeepApartError, KeptApart, ListedDelete, ListedProject, ListedSuggestion, LocateError, Located, Named, Project,
+    RenameError,
     Resolution as ProjectResolution, ResolveError as ProjectResolveError, ResolveOptions,
 };
 use clawg_core::memory::relocate::{move_memories_core, undo_move_core, MoveError, MoveFilter, MoveReport, ProjectFilter};
@@ -2572,6 +2573,25 @@ async fn register(
     Ok(Json(RegisteredBody { project_id, root_id: outcome.root_id, rekeyed: outcome.rekeyed }))
 }
 
+/// The status a refused registration of `root_path` answers with. A
+/// collision names the root as the caller sent it, and tells a root stored
+/// under another id from one whose id another root holds.
+fn register_refused(e: RegisterError, root_path: &str) -> ApiError {
+    match e {
+        RegisterError::EmptyRoot | RegisterError::NotADirectory(_) | RegisterError::InvalidLegacyId(_) => ApiError::bad_request(e.to_string()),
+        RegisterError::RootCollision { id, existing } if existing == root_path => ApiError {
+            detail: Some(format!("{root_path} derives the project id {id}, but the daemon gives that root another one; a newer bridge uses it")),
+            ..ApiError::conflict("project_root_collision")
+        },
+        RegisterError::RootCollision { id, existing } => ApiError {
+            detail: Some(format!("{root_path} gets the project id {id}, which already belongs to {existing}")),
+            ..ApiError::conflict("project_root_collision")
+        },
+        RegisterError::NoFreeId(_) => ApiError { detail: Some(e.to_string()), ..ApiError::conflict("no_free_project_id") },
+        RegisterError::Store(_) => ApiError::internal(e),
+    }
+}
+
 /// Registers `root_path` as [`register`] does, for it and for what places a
 /// folder in a project. `path`, where the caller works, is measured from the
 /// top of its checkout on the thread that reads the checkout; one that is not
@@ -2585,13 +2605,7 @@ async fn register_root(
     index_docs: bool,
     assigned: bool,
 ) -> ApiResult<RegisterOutcome> {
-    if root_path.trim().is_empty() {
-        return Err(ApiError::bad_request("root_path must not be empty"));
-    }
-    let root = std::path::Path::new(root_path);
-    if index_docs && !root.is_dir() {
-        return Err(ApiError::bad_request(format!("{root_path} is not a directory, so it has no files to index")));
-    }
+    let root = check_root(root_path, index_docs, std::path::Path::is_dir).map_err(|e| register_refused(e, root_path))?;
     // A caller that derives its id joins no remote, but what is at the root
     // still tells whether it is the repository its folder was given to.
     let (checkout, subpath) = {
@@ -2610,22 +2624,7 @@ async fn register_root(
     let backups = clawg_core::paths::backups_dir(&app.runtime.base_dir);
     let outcome = register_project(&app.runtime.store, &app.runtime.workspaces(), &backups, registration, Arc::new(Disk))
         .await
-        .map_err(|e| match e {
-            RegisterError::InvalidLegacyId(_) => ApiError::bad_request(e.to_string()),
-            RegisterError::RootCollision { id, existing } if existing == root_path => ApiError {
-                detail: Some(format!(
-                    "{} derives the project id {id}, but the daemon gives that root another one; a newer bridge uses it",
-                    root.display()
-                )),
-                ..ApiError::conflict("project_root_collision")
-            },
-            RegisterError::RootCollision { id, existing } => ApiError {
-                detail: Some(format!("{} gets the project id {id}, which already belongs to {existing}", root.display())),
-                ..ApiError::conflict("project_root_collision")
-            },
-            RegisterError::NoFreeId(_) => ApiError { detail: Some(e.to_string()), ..ApiError::conflict("no_free_project_id") },
-            RegisterError::Store(_) => ApiError::internal(e),
-        })?;
+        .map_err(|e| register_refused(e, root_path))?;
     if outcome.rekeyed > 0 {
         log::info!(
             "{} joined {} rows of its earlier ids into project {}{}{}",
@@ -2760,6 +2759,7 @@ struct DeleteRequest {
 fn delete_error(app: &AppCtx, e: DeleteError) -> ApiError {
     let conflict = |code: &str, e: &DeleteError| ApiError { detail: Some(e.to_string()), ..ApiError::conflict(code) };
     match e {
+        DeleteError::ConfirmWithoutRows => ApiError::bad_request(e.to_string()),
         DeleteError::UnknownProject(_) | DeleteError::UnknownDelete(_) => ApiError::not_found(e.to_string()),
         DeleteError::Merged { .. } => conflict("project_merged", &e),
         DeleteError::Deleted { .. } => conflict("project_deleted", &e),
@@ -2789,9 +2789,6 @@ async fn delete_projects(
             undo_delete_core(store, embedder.as_deref(), &backups, delete_id, dry_run).await
         }
         DeleteRequest { undo: None, project_id: Some(project_id), with_memories, confirm, dry_run: false } => {
-            if confirm.is_some() && !with_memories {
-                return Err(ApiError::bad_request("confirm goes with with_memories: it is the code of the report of a delete with its rows"));
-            }
             let deleted = delete_core(store, &workspaces, &backups, &project_id, with_memories, confirm.as_deref()).await;
             // So that a deleted project leaves no trace: its sessions go too.
             if let Ok(DeleteReport { delete_id: Some(_), project_id, .. }) = &deleted {
@@ -2988,9 +2985,8 @@ pub struct LocatedBody {
 /// and this is its only folder, is merged into the named one. A project
 /// with other folders would take them along, which nobody named.
 async fn locate_project(State(app): State<Arc<AppCtx>>, Json(body): Json<LocateRequest>) -> ApiResult<Json<LocatedBody>> {
-    if !std::path::Path::new(&body.root_path).is_dir() {
-        return Err(ApiError::bad_request(format!("{} is not a directory: name a directory of the project", body.root_path)));
-    }
+    let folder = std::path::Path::new(&body.root_path);
+    check_folder(folder, std::path::Path::is_dir).map_err(located_refused)?;
     let subfolder = if body.subfolder { Some(subfolder_of(&body.root_path).await?) } else { None };
     let store = &app.runtime.store;
     let target = match find_project(store, &body.project).await.map_err(ApiError::internal)? {
@@ -3007,34 +3003,38 @@ async fn locate_project(State(app): State<Arc<AppCtx>>, Json(body): Json<LocateR
         return declare(&app, &root, &subpath, &target).await.map(Json);
     }
     let registered = register_root(&app, &body.root_path, None, &[], false, true).await?;
-    let (own, root_id) = (registered.project_id, registered.root_id);
-    let located = |already: bool, merge: Option<MergeReport>| LocatedBody {
-        project_id: target.clone(),
-        root_id: root_id.clone(),
-        already,
+    let backups = clawg_core::paths::backups_dir(&app.runtime.base_dir);
+    let located = locate_folder(store, &app.runtime.workspaces(), &backups, folder, &registered.project_id, &target)
+        .await
+        .map_err(located_refused)?;
+    let merge = match located {
+        Located::Already => None,
+        Located::Merged(merged) => {
+            sessions_follow(&app, &merged);
+            Some(merged)
+        }
+    };
+    Ok(Json(LocatedBody {
+        already: merge.is_none(),
+        project_id: target,
+        root_id: registered.root_id,
         merge,
         repository_id: None,
         subpath: None,
         removed: false,
         previous: None,
-    };
-    if own == target {
-        return Ok(Json(located(true, None)));
+    }))
+}
+
+/// The status a folder that was not located answers with: a shared folder
+/// is a conflict, and a refused merge answers as `POST /v1/projects/merge`.
+fn located_refused(e: LocateError) -> ApiError {
+    match e {
+        LocateError::NotADirectory(_) => ApiError::bad_request(e.to_string()),
+        LocateError::FolderShared { .. } => ApiError { detail: Some(e.to_string()), ..ApiError::conflict("folder_shared") },
+        LocateError::Merge(e) => merge_error(e),
+        LocateError::Store(e) => ApiError::internal(e),
     }
-    let folders = own_folder_count(store, &own).await.map_err(ApiError::internal)?;
-    if folders > 1 {
-        return Err(ApiError {
-            detail: Some(format!(
-                "{} leads to project {own}, which has {folders} folders; `clawg projects merge {own} --into {target}` merges them all",
-                body.root_path
-            )),
-            ..ApiError::conflict("folder_shared")
-        });
-    }
-    let backups = clawg_core::paths::backups_dir(&app.runtime.base_dir);
-    let merged = merge_core(store, &app.runtime.workspaces(), &backups, &own, &target, false).await.map_err(merge_error)?;
-    sessions_follow(&app, &merged);
-    Ok(Json(located(false, Some(merged))))
 }
 
 /// The root of the checkout `path` is in and the subpath of `path` there,
@@ -4368,6 +4368,230 @@ mod tests {
                 (StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": message })),
                 "{body}"
             );
+        }
+    }
+
+    /// The status and the JSON body of a handler's answer.
+    async fn status_and_body(response: Response) -> (StatusCode, serde_json::Value) {
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.expect("the body");
+        (status, serde_json::from_slice(&bytes).expect("a JSON body"))
+    }
+
+    async fn run_sql(app: &AppCtx, sql: String) {
+        app.runtime.store.conn_for_test().call(move |c| c.execute_batch(&sql)).await.expect("run the SQL");
+    }
+
+    /// The status and the whole body `register` answers a refused
+    /// registration with, for every rule and in the order it checks them.
+    #[tokio::test]
+    async fn each_refused_registration_keeps_its_status_and_body() {
+        use serde_json::{json, Value};
+
+        async fn refused(app: &Arc<AppCtx>, body: Value) -> (StatusCode, Value) {
+            let body: RegisterRequest = serde_json::from_value(body).expect("a registration");
+            status_and_body(register(State(app.clone()), Json(body)).await.expect_err("the registration is refused").into_response()).await
+        }
+        let bad = |message: &str| (StatusCode::BAD_REQUEST, json!({ "error": message }));
+
+        let (app, _dir) = daemon_for_jobs().await;
+        let base = tempfile::tempdir().expect("tempdir");
+        let file = base.path().join("notes.txt");
+        std::fs::write(&file, "not a folder").expect("a file");
+        let file = file.to_string_lossy().into_owned();
+        let not_a_dir = |root: &str| bad(&format!("{root} is not a directory, so it has no files to index"));
+
+        let cases = [
+            (json!({ "root_path": "  " }), bad("root_path must not be empty")),
+            (json!({ "root_path": "", "index_docs": true, "legacy_ids": ["nope"] }), bad("root_path must not be empty")),
+            (json!({ "root_path": "/no/such/dir", "index_docs": true }), not_a_dir("/no/such/dir")),
+            (json!({ "root_path": file, "index_docs": true, "assigned": true }), not_a_dir(&file)),
+            (json!({ "root_path": "/no/such/dir", "index_docs": true, "legacy_ids": ["nope"] }), not_a_dir("/no/such/dir")),
+            (json!({ "root_path": "/no/such/dir", "legacy_ids": ["nope"] }), bad("\"nope\" is not a project id")),
+        ];
+        for (body, expected) in cases {
+            assert_eq!(refused(&app, body.clone()).await, expected, "{body}");
+        }
+
+        let taken = clawg_core::memory::derive_project_id(std::path::Path::new("/work/repo"));
+        run_sql(&app, format!("INSERT INTO project_path (id, root_path, created_at) VALUES ('{taken}', '/elsewhere/repo', 0)")).await;
+        assert_eq!(
+            refused(&app, json!({ "root_path": "/work/repo" })).await,
+            (
+                StatusCode::CONFLICT,
+                json!({
+                    "error": "project_root_collision",
+                    "detail": format!("/work/repo gets the project id {taken}, which already belongs to /elsewhere/repo"),
+                })
+            )
+        );
+        let assigned = RegisterRequest {
+            root_path: "/work/repo".into(),
+            legacy_ids: Vec::new(),
+            index_docs: false,
+            assigned: true,
+            path: None,
+        };
+        let given = register(State(app.clone()), Json(assigned)).await.expect("an assigned registration gets an id of its own").0;
+        assert_ne!(given.root_id, taken);
+        run_sql(&app, format!("DELETE FROM project_path WHERE id = '{taken}'")).await;
+        assert_eq!(
+            refused(&app, json!({ "root_path": "/work/repo" })).await,
+            (
+                StatusCode::CONFLICT,
+                json!({
+                    "error": "project_root_collision",
+                    "detail": format!(
+                        "/work/repo derives the project id {taken}, but the daemon gives that root another one; a newer bridge uses it"
+                    ),
+                })
+            )
+        );
+    }
+
+    /// The status and the whole body `locate_project` answers with, for every
+    /// refusal in the order it checks them and for a folder it locates.
+    #[tokio::test]
+    async fn each_located_folder_keeps_its_status_and_body() {
+        use serde_json::{json, Value};
+
+        async fn located(app: &Arc<AppCtx>, body: Value) -> (StatusCode, Value) {
+            let body: LocateRequest = serde_json::from_value(body).expect("a locate");
+            let answer = match locate_project(State(app.clone()), Json(body)).await {
+                Ok(located) => located.into_response(),
+                Err(e) => e.into_response(),
+            };
+            status_and_body(answer).await
+        }
+        async fn registered(app: &Arc<AppCtx>, root: &std::path::Path) -> RegisteredBody {
+            let ask = RegisterRequest {
+                root_path: root.to_string_lossy().into_owned(),
+                legacy_ids: Vec::new(),
+                index_docs: false,
+                assigned: true,
+                path: None,
+            };
+            register(State(app.clone()), Json(ask)).await.expect("registered").0
+        }
+        let bad = |message: String| (StatusCode::BAD_REQUEST, json!({ "error": message }));
+
+        let (app, _dir) = daemon_for_jobs().await;
+        let options = ResolveOptions { create: true, new_project: false, born: Born::default() };
+        let ideas = resolve_project(&app.runtime.store, "ideas", options).await.expect("ideas").project_id.expect("an id");
+        run_sql(
+            &app,
+            "INSERT INTO project (id, name, born, reviewed, created_at) VALUES ('twin-0001', 'twin', 'user', 1, 1), ('twin-0002', 'twin', 'user', 1, 2);
+             INSERT INTO project (id, name, born, reviewed, created_at, deleted_at) VALUES ('gone-7a8b', 'gone', 'user', 1, 1, 5);"
+                .to_string(),
+        )
+        .await;
+        let base = tempfile::tempdir().expect("tempdir");
+        let dir = |name: &str| {
+            let path = base.path().join(name);
+            std::fs::create_dir_all(&path).expect("a folder");
+            path
+        };
+        let (notes, one, two, three, repo) = (dir("notes"), dir("one"), dir("two"), dir("three"), dir("repo"));
+        std::fs::create_dir(repo.join(".git")).expect("a .git");
+        let file = base.path().join("notes.txt");
+        std::fs::write(&file, "not a folder").expect("a file");
+        let path = |p: &std::path::Path| p.to_string_lossy().into_owned();
+        let not_a_dir = |root: &str| bad(format!("{root} is not a directory: name a directory of the project"));
+
+        let cases = [
+            (json!({ "project": "ideas", "root_path": "/no/such/dir" }), not_a_dir("/no/such/dir")),
+            (json!({ "project": "nothing here", "root_path": path(&file), "subfolder": true }), not_a_dir(&path(&file))),
+            (
+                json!({ "project": "nothing here", "root_path": path(&repo), "subfolder": true }),
+                bad(format!(
+                    "{} is the top of a checkout or outside a repository, so it is no subfolder of one; \
+                     `locate` without `subfolder` locates the folder's root",
+                    path(&repo)
+                )),
+            ),
+            (
+                json!({ "project": "nothing here", "root_path": path(&notes) }),
+                (StatusCode::NOT_FOUND, json!({ "error": "no project has the id or the name \"nothing here\"" })),
+            ),
+            (
+                json!({ "project": "Twin", "root_path": path(&notes) }),
+                (
+                    StatusCode::CONFLICT,
+                    json!({ "error": "project_ambiguous", "detail": "\"Twin\" is the name of twin-0001, twin-0002: name one of them by its id" }),
+                ),
+            ),
+        ];
+        for (body, expected) in cases {
+            assert_eq!(located(&app, body.clone()).await, expected, "{body}");
+        }
+
+        let own = registered(&app, &one).await.project_id;
+        let second = registered(&app, &two).await.root_id;
+        run_sql(&app, format!("UPDATE project_path SET project_id = '{own}' WHERE id = '{second}'")).await;
+        assert_eq!(
+            located(&app, json!({ "project": "ideas", "root_path": path(&one) })).await,
+            (
+                StatusCode::CONFLICT,
+                json!({
+                    "error": "folder_shared",
+                    "detail": format!(
+                        "{} leads to project {own}, which has 2 folders; `clawg projects merge {own} --into {ideas}` merges them all",
+                        path(&one)
+                    ),
+                })
+            )
+        );
+        assert_eq!(
+            located(&app, json!({ "project": "gone-7a8b", "root_path": path(&three) })).await,
+            (StatusCode::CONFLICT, json!({ "error": "project_deleted", "detail": "project gone-7a8b is deleted" }))
+        );
+
+        let notes_folder = registered(&app, &notes).await;
+        let (status, mut body) = located(&app, json!({ "project": "Ideas", "root_path": path(&notes) })).await;
+        let merge = body.as_object_mut().expect("an object").remove("merge").expect("the merge");
+        assert_eq!(
+            (status, body),
+            (StatusCode::OK, json!({ "project_id": ideas, "root_id": notes_folder.root_id, "already": false, "removed": false }))
+        );
+        assert_eq!(
+            (&merge["source"], &merge["target"], &merge["dry_run"], merge["merge_id"].is_i64()),
+            (&json!(notes_folder.project_id), &json!(ideas), &json!(false), true),
+            "{merge}"
+        );
+        assert_eq!(
+            located(&app, json!({ "project": "ideas", "root_path": path(&notes) })).await,
+            (StatusCode::OK, json!({ "project_id": ideas, "root_id": notes_folder.root_id, "already": true, "removed": false }))
+        );
+    }
+
+    /// The status and the whole body `delete_projects` answers a refused
+    /// delete with, before and at its first read of the store.
+    #[tokio::test]
+    async fn each_refused_project_delete_keeps_its_status_and_body() {
+        use serde_json::{json, Value};
+
+        async fn refused(app: &Arc<AppCtx>, body: Value) -> (StatusCode, Value) {
+            let body: DeleteRequest = serde_json::from_value(body).expect("a delete");
+            status_and_body(delete_projects(State(app.clone()), Json(body)).await.expect_err("the delete is refused").into_response()).await
+        }
+        let bad = |message: &str| (StatusCode::BAD_REQUEST, json!({ "error": message }));
+        let shape = bad("name a project to delete, or a delete to undo (dry_run goes with undo)");
+        let confirm = bad("confirm goes with with_memories: it is the code of the report of a delete with its rows");
+
+        let (app, _dir) = daemon_for_jobs().await;
+        let cases = [
+            (json!({}), shape.clone()),
+            (json!({ "project_id": "nobody-0000", "undo": 1 }), shape.clone()),
+            (json!({ "project_id": "nobody-0000", "dry_run": true }), shape.clone()),
+            (json!({ "project_id": "nobody-0000", "confirm": "ABC123", "dry_run": true }), shape.clone()),
+            (json!({ "undo": 1, "confirm": "ABC123" }), shape),
+            (json!({ "project_id": "nobody-0000", "confirm": "ABC123" }), confirm.clone()),
+            (json!({ "project_id": "nobody-0000", "confirm": "ABC123", "with_memories": false }), confirm),
+            (json!({ "project_id": "nobody-0000" }), (StatusCode::NOT_FOUND, json!({ "error": "no project nobody-0000" }))),
+            (json!({ "undo": 99 }), (StatusCode::NOT_FOUND, json!({ "error": "no delete 99" }))),
+        ];
+        for (body, expected) in cases {
+            assert_eq!(refused(&app, body.clone()).await, expected, "{body}");
         }
     }
 }
