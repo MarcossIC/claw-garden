@@ -1482,6 +1482,7 @@ mod tests {
         let chosen = Stamp { version: v("0.9.12"), choice: Some(Variant::Off) };
         assert_eq!(Stamp::parse("<!-- clawg 0.88.0 -->"), Some(plain));
         assert_eq!(Stamp::parse("<!-- clawg 0.9.12 protocol=off -->"), Some(chosen));
+        assert_eq!(Stamp::parse("<!-- clawg 0.88.0 protocol=lean -->"), Some(Stamp { choice: Some(Variant::Lean), ..plain }));
         assert_eq!(plain.line(), "<!-- clawg 0.88.0 -->");
         assert_eq!(chosen.line(), "<!-- clawg 0.9.12 protocol=off -->");
         for unreadable in [
@@ -1543,10 +1544,16 @@ mod tests {
             assert!(short.contains(protocol::short(language).trim_end()));
             assert!(short.len() < 2000 && short.len() < full.len() / 4, "{} bytes", short.len());
 
+            let lean = block("\n", language, Variant::Lean, stamp(Some(Variant::Lean)));
+            assert!(lean.starts_with(&format!("{BEGIN_MARKER}\n<!-- clawg 0.88.0 protocol=lean -->\n")), "{lean}");
+            assert!(lean.ends_with(&format!("\n{END_MARKER}")), "{lean}");
+            assert!(lean.contains(protocol::lean(language).trim_end()));
+            assert!(lean.len() < full.len() && lean.len() > short.len(), "{} bytes", lean.len());
+
             let off = block("\n", language, Variant::Off, stamp(Some(Variant::Off)));
             assert_eq!(off, format!("{BEGIN_MARKER}\n<!-- clawg 0.88.0 protocol=off -->\n{END_MARKER}"));
 
-            for (text, choice) in [(&full, None), (&short, Some(Variant::Short)), (&off, Some(Variant::Off))] {
+            for (text, choice) in [(&full, None), (&short, Some(Variant::Short)), (&lean, Some(Variant::Lean)), (&off, Some(Variant::Off))] {
                 assert_eq!(freshness(text, language, own), Freshness::Current, "{choice:?} is what its own stamp asks for");
                 assert_eq!(read_stamp(text), Some(stamp(choice)));
             }
@@ -1555,6 +1562,21 @@ mod tests {
         }
         let short = block("\n", None, Variant::Short, stamp(Some(Variant::Short)));
         assert_eq!(freshness(&short, Some(Lang::Es), own), Freshness::Stale, "the other language is other text");
+        let lean = block("\n", None, Variant::Lean, stamp(Some(Variant::Lean)));
+        assert_eq!(freshness(&lean, Some(Lang::Es), own), Freshness::Stale, "the other language is other text");
+    }
+
+    #[test]
+    fn a_stamp_with_an_unknown_variant_reads_as_stale() {
+        let own = v("0.88.0");
+        let unknown = "<!-- clawg 0.99.0 protocol=leaner -->";
+        assert_eq!(Stamp::parse(unknown), None, "a variant this binary does not know");
+        let lean = block("\n", None, Variant::Lean, Stamp { version: v("0.99.0"), choice: Some(Variant::Lean) });
+        let later = lean.replacen("<!-- clawg 0.99.0 protocol=lean -->", unknown, 1);
+        assert_eq!(read_stamp(&later), None, "its stamp reads as none");
+        assert_eq!(freshness(&later, None, own), Freshness::Stale, "stale, not newer: the version is never read");
+        let plan_ = plan(&asking_for(None, &later), Mode::Install).unwrap();
+        assert_eq!((plan_.block, plan_.variant), (BlockStep::Rewritten, Some(Variant::Full)), "setup writes the default over it");
     }
 
     fn asking_for(protocol: Option<Variant>, instructions: &str) -> State {
@@ -1566,7 +1588,7 @@ mod tests {
         let mine = |block: &str| format!("# Mine\n\nSome rules.\n\n{block}\n\nAfter.\n");
         let before_stamps = mine(&unstamped(None, Variant::Full));
 
-        for variant in [Variant::Short, Variant::Off, Variant::Full] {
+        for variant in [Variant::Short, Variant::Lean, Variant::Off, Variant::Full] {
             let chosen = plan(&asking_for(Some(variant), &before_stamps), Mode::Install).unwrap();
             assert_eq!((chosen.block, chosen.variant), (BlockStep::Rewritten, Some(variant)), "{variant:?}");
             let stamp = Stamp { version: v("0.88.0"), choice: Some(variant) };
@@ -1599,7 +1621,9 @@ mod tests {
 
     #[test]
     fn a_new_version_with_the_same_text_rewrites_nothing() {
-        for (choice, requested) in [(None, None), (Some(Variant::Short), None), (Some(Variant::Short), Some(Variant::Short)), (Some(Variant::Off), None)] {
+        for (choice, requested) in
+            [(None, None), (Some(Variant::Short), None), (Some(Variant::Short), Some(Variant::Short)), (Some(Variant::Lean), None), (Some(Variant::Off), None)]
+        {
             let variant = choice.unwrap_or(Variant::Full);
             let older = block("\n", None, variant, Stamp { version: v("0.87.0"), choice });
             let plan_ = plan(&asking_for(requested, &older), Mode::Install).unwrap();
