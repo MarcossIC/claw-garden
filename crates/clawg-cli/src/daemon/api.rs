@@ -54,10 +54,10 @@ use clawg_core::memory::subfolder::{declare_subfolder, SubfolderError};
 use clawg_core::memory::merge::{canonical, merge_core, undo_merge_core, MergeError, MergeReport};
 use clawg_core::memory::project_delete::{delete_core, undo_delete_core, DeleteError, DeleteReport};
 use clawg_core::memory::registry::{
-    check_folder, find_project, keep_apart, list_deletes, list_projects, locate_folder, pending_suggestions, rename_project, resolve_project,
-    suggestion_between, Born, KeepApartError, KeptApart, ListedDelete, ListedProject, ListedSuggestion, LocateError, Located, Named, Project,
-    RenameError,
-    Resolution as ProjectResolution, ResolveError as ProjectResolveError, ResolveOptions,
+    answer_suggestion_core, check_folder, find_project, keep_apart, list_deletes, list_projects, locate_folder, pending_suggestions,
+    rename_project, resolve_project, AnswerError, Answered, Born, KeepApartError, KeptApart, ListedDelete, ListedProject, ListedSuggestion,
+    LocateError, Located, Named, Project, RenameError,
+    Resolution as ProjectResolution, ResolveError as ProjectResolveError, ResolveOptions, SuggestionAnswer, UserAnswer,
 };
 use clawg_core::memory::relocate::{move_memories_core, undo_move_core, MoveError, MoveFilter, MoveReport, ProjectFilter};
 use clawg_core::memory::prompt_builder::{
@@ -2849,14 +2849,6 @@ async fn resolve_projects(
     })
 }
 
-/// The answers a suggestion takes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SuggestionAnswer {
-    Merge,
-    Apart,
-}
-
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AnswerRequest {
@@ -2909,38 +2901,31 @@ async fn answer_suggestion(
     State(app): State<Arc<AppCtx>>,
     Json(body): Json<AnswerRequest>,
 ) -> ApiResult<Json<AnsweredBody>> {
-    let answer = match body.answer.as_str() {
-        "merge" => SuggestionAnswer::Merge,
-        "apart" => SuggestionAnswer::Apart,
-        other => return Err(ApiError::bad_request(format!("answer must be one of: merge, apart (got {other:?})"))),
-    };
-    if !body.user_answered || body.reason.as_deref().is_none_or(|r| r.trim().is_empty()) {
-        return Err(ApiError::bad_request(
-            "answering a suggestion is the user's call: send user_answered with the user's answer in reason",
-        ));
-    }
-    let store = &app.runtime.store;
-    let pending = suggestion_between(store, &body.project_id, &body.other_id).await.map_err(kept_apart_error)?;
-    if pending.is_none() {
-        return Err(ApiError {
-            detail: Some(format!("no suggestion is pending between {} and {}", body.project_id, body.other_id)),
-            ..ApiError::not_found("no_suggestion")
-        });
-    }
-    let merge = match answer {
-        SuggestionAnswer::Apart => {
-            keep_apart(store, &body.project_id, &body.other_id).await.map_err(kept_apart_error)?;
-            None
-        }
-        SuggestionAnswer::Merge => {
-            let backups = clawg_core::paths::backups_dir(&app.runtime.base_dir);
-            let merged = merge_core(store, &app.runtime.workspaces(), &backups, &body.other_id, &body.project_id, false).await;
-            let merged = merged.map_err(merge_error)?;
+    let answer = UserAnswer::new(&body.answer, body.user_answered, body.reason.as_deref()).map_err(answer_refused)?;
+    let backups = clawg_core::paths::backups_dir(&app.runtime.base_dir);
+    let answered = answer_suggestion_core(&app.runtime.store, &app.runtime.workspaces(), &backups, &body.project_id, &body.other_id, answer)
+        .await
+        .map_err(answer_refused)?;
+    let (answer, merge) = match answered {
+        Answered::Apart => (SuggestionAnswer::Apart, None),
+        Answered::Merged(merged) => {
             sessions_follow(&app, &merged);
-            Some(AnsweredMerge { report: merged, trajectories: 0, skills: 0 })
+            (SuggestionAnswer::Merge, Some(AnsweredMerge { report: merged, trajectories: 0, skills: 0 }))
         }
     };
     Ok(Json(AnsweredBody { project_id: body.project_id, other_id: body.other_id, answer, merge }))
+}
+
+/// The status a refused answer to a suggestion answers with: the checks of
+/// the two projects as `keep-apart` answers them, a refused merge as
+/// `projects merge` does.
+fn answer_refused(e: AnswerError) -> ApiError {
+    match e {
+        AnswerError::UnknownAnswer(_) | AnswerError::NeedsUser => ApiError::bad_request(e.to_string()),
+        AnswerError::NoSuggestion { .. } => ApiError { detail: Some(e.to_string()), ..ApiError::not_found("no_suggestion") },
+        AnswerError::Pair(e) => kept_apart_error(e),
+        AnswerError::Merge(e) => merge_error(e),
+    }
 }
 
 #[derive(Debug, Deserialize)]
