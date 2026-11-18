@@ -98,7 +98,7 @@ Los requisitos son R8 a R11 de [`spec.md`](spec.md#parte-2-las-escrituras-de-pro
 
 ## 7. Caracterización de los proyectos (R11)
 
-- [ ] `each_refused_registration_keeps_its_status_and_body`, `each_located_folder_keeps_its_status_and_body` y `each_refused_project_delete_keeps_its_status_and_body` (`mod tests` de `crates/clawg-cli/src/daemon/api.rs`): el estado y el cuerpo entero, con los literales que da `develop`. Pasan antes de seguir.
+- [x] `each_refused_registration_keeps_its_status_and_body`, `each_located_folder_keeps_its_status_and_body` y `each_refused_project_delete_keeps_its_status_and_body` (`mod tests` de `crates/clawg-cli/src/daemon/api.rs`): el estado y el cuerpo entero, con los literales que da `develop`. Pasan antes de seguir.
 - Commit: `test(daemon): pin the status and body of every refused registration, locate and project delete`
 - Tests al cerrar:
 
@@ -108,9 +108,9 @@ Los requisitos son R8 a R11 de [`spec.md`](spec.md#parte-2-las-escrituras-de-pro
 
 ## 8. La raíz de un registro, en el núcleo (R8)
 
-- [ ] **Tests en rojo** en `crates/clawg-core/src/memory/projects/project.rs`: `an_empty_root_is_not_registered`, `only_a_root_to_index_must_be_a_directory` y `each_root_refusal_keeps_its_text`.
-- [ ] `check_root` y las variantes `RegisterError::EmptyRoot` y `NotADirectory` ([D10](design.md#d10-dónde-vive-cada-parte-de-los-proyectos), [D11](design.md#d11-el-disco-entra-como-una-función)).
-- [ ] `register_root` llama a `check_root` con `Path::is_dir` y traduce las dos variantes a `400` en el `match` de `RegisterError`, sin comodín.
+- [x] **Tests en rojo** en `crates/clawg-core/src/memory/projects/project.rs`: `an_empty_root_is_not_registered`, `only_a_root_to_index_must_be_a_directory` y `each_root_refusal_keeps_its_text`.
+- [x] `check_root` y las variantes `RegisterError::EmptyRoot` y `NotADirectory` ([D10](design.md#d10-dónde-vive-cada-parte-de-los-proyectos), [D11](design.md#d11-el-disco-entra-como-una-función)).
+- [x] `register_root` llama a `check_root` con `Path::is_dir` y traduce las dos variantes a `400` en el `match` de `RegisterError`, sin comodín.
 - Commit: `refactor(core): check the root of a registration in the core`
 - Tests al cerrar:
 
@@ -124,9 +124,9 @@ Los requisitos son R8 a R11 de [`spec.md`](spec.md#parte-2-las-escrituras-de-pro
 
 ## 9. Ubicar una carpeta, en el núcleo (R9)
 
-- [ ] **Tests en rojo** en `crates/clawg-core/src/memory/projects/registry.rs`: `a_folder_that_is_not_a_directory_is_not_located`, `a_folder_already_in_the_named_project_is_left_as_it_is`, `a_folder_shared_by_its_project_is_not_merged`, `the_only_folder_of_a_project_merges_it_into_the_named_one`, `a_refused_merge_refuses_the_locate` y `a_store_that_fails_refuses_the_locate`.
-- [ ] `check_folder`, `locate_folder`, `Located` y `LocateError`; `own_folder_count` pasa a privada ([D12](design.md#d12-ubicar-una-carpeta-en-dos-pasos)).
-- [ ] `locate_project` llama a `check_folder` y a `locate_folder`, y traduce con `located_refused`; ya no nombra `own_folder_count` ni `merge_core`.
+- [x] **Tests en rojo** en `crates/clawg-core/src/memory/projects/registry.rs`: `a_folder_that_is_not_a_directory_is_not_located`, `a_folder_already_in_the_named_project_is_left_as_it_is`, `a_folder_shared_by_its_project_is_not_merged`, `the_only_folder_of_a_project_merges_it_into_the_named_one`, `a_refused_merge_refuses_the_locate` y `a_store_that_fails_refuses_the_locate`.
+- [x] `check_folder`, `locate_folder`, `Located` y `LocateError`; `own_folder_count` pasa a privada ([D12](design.md#d12-ubicar-una-carpeta-en-dos-pasos)).
+- [x] `locate_project` llama a `check_folder` y a `locate_folder`, y traduce con `located_refused`; ya no nombra `own_folder_count` ni `merge_core`.
 - Commit: `refactor(core): decide where a located folder goes in the core`
 - Tests al cerrar:
 
@@ -144,9 +144,9 @@ Los requisitos son R8 a R11 de [`spec.md`](spec.md#parte-2-las-escrituras-de-pro
 
 ## 10. El código de confirmación, en el núcleo (R10)
 
-- [ ] **Test en rojo** en `crates/clawg-core/src/memory/projects/project_delete.rs`: `a_confirm_without_the_rows_is_refused_before_anything_is_read`.
-- [ ] `DeleteError::ConfirmWithoutRows`, que `delete_core` devuelve antes de leer el store.
-- [ ] `delete_projects` deja de comprobarlo, y `delete_error` lo traduce a `400`.
+- [x] **Test en rojo** en `crates/clawg-core/src/memory/projects/project_delete.rs`: `a_confirm_without_the_rows_is_refused_before_anything_is_read`.
+- [x] `DeleteError::ConfirmWithoutRows`, que `delete_core` devuelve antes de leer el store.
+- [x] `delete_projects` deja de comprobarlo, y `delete_error` lo traduce a `400`.
 - Commit: `refactor(core): refuse a confirm without its rows in delete_core`
 - Tests al cerrar:
 
@@ -160,7 +160,7 @@ Los requisitos son R8 a R11 de [`spec.md`](spec.md#parte-2-las-escrituras-de-pro
 
 ## 11. Verificación de la parte 2
 
-- [ ] Sobre el último commit de código, en Linux:
+- [x] Sobre el último commit de código, en Linux:
 
   ```bash
   cargo test --workspace
@@ -174,8 +174,8 @@ Los requisitos son R8 a R11 de [`spec.md`](spec.md#parte-2-las-escrituras-de-pro
   cargo clippy -p clawg-cli -- -D warnings
   ```
 
-- [ ] Las comprobaciones de [D14](design.md#d14-cómo-se-comprueba-la-segunda-parte).
-- [ ] `verify.md`, con la parte 2 y su «Pendiente».
+- [x] Las comprobaciones de [D14](design.md#d14-cómo-se-comprueba-la-segunda-parte).
+- [x] `verify.md`, con la parte 2 y su «Pendiente».
 - Commit: `docs(openspec): record core-use-cases part 2 applied`
 
 ## Partes siguientes

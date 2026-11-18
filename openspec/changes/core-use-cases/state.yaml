@@ -1,15 +1,15 @@
 change: core-use-cases
 objective: "transversal"
 depends_on: [memory-module-layout]  # aplicado en develop
-phase: apply  # la parte 1, el guardado, aplicada y verificada; la parte 2, las escrituras de proyectos, en curso
+phase: verify  # las partes 1 (el guardado) y 2 (las escrituras de proyectos) aplicadas y verificadas en Linux; falta el CI de Windows
 artifacts:
   exploration: done  # el borrador del 2026-11-01, revisado contra develop el 2026-11-12: rutas, líneas y conteos
   proposal: done  # el enfoque A; la parte 1 es POST /v1/memories
   spec: done  # R1 a R7, del guardado; R8 a R11, de los proyectos
   design: done  # D1 a D9 de la parte 1; D10 a D14 de la parte 2, con la revisión de las demás rutas en D13
   tasks: done  # tareas 1 a 5 de la parte 1 (la 3 y la 4 en un commit); 6 a 11 de la parte 2; las partes 3 y 4, en «Partes siguientes»
-  apply: in_progress  # la parte 1 aplicada; la parte 2 en curso
-  verify: pending  # la parte 1 verificada en Linux; la parte 2 pendiente
+  apply: done  # parte 1: la caracterización, memory::save, admit y el handler; parte 2: la caracterización, check_root, locate_folder, ConfirmWithoutRows y los handlers
+  verify: done  # las dos partes: la suite y los dos clippy pasan en Linux; Windows y lo de archivar en «Pendiente» de verify.md
   archive: pending
 decisions:
   error_texts: display_and_data  # cada SaveRejected muestra el texto de hoy y lleva sus datos (D3)
