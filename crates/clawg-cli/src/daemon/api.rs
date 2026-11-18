@@ -49,7 +49,7 @@ use clawg_core::memory::portability::{
     UndoReport, MAX_IMPORT_BYTES,
 };
 use clawg_core::memory::identity::{Disk, Ground, ProjectIdentity};
-use clawg_core::memory::project::{register_project, RegisterError, RegisterOutcome, Registration};
+use clawg_core::memory::project::{check_root, register_project, RegisterError, RegisterOutcome, Registration};
 use clawg_core::memory::subfolder::{declare_subfolder, SubfolderError};
 use clawg_core::memory::merge::{canonical, merge_core, undo_merge_core, MergeError, MergeReport};
 use clawg_core::memory::project_delete::{delete_core, undo_delete_core, DeleteError, DeleteReport};
@@ -2572,6 +2572,25 @@ async fn register(
     Ok(Json(RegisteredBody { project_id, root_id: outcome.root_id, rekeyed: outcome.rekeyed }))
 }
 
+/// The status a refused registration of `root_path` answers with. A
+/// collision names the root as the caller sent it, and tells a root stored
+/// under another id from one whose id another root holds.
+fn register_refused(e: RegisterError, root_path: &str) -> ApiError {
+    match e {
+        RegisterError::EmptyRoot | RegisterError::NotADirectory(_) | RegisterError::InvalidLegacyId(_) => ApiError::bad_request(e.to_string()),
+        RegisterError::RootCollision { id, existing } if existing == root_path => ApiError {
+            detail: Some(format!("{root_path} derives the project id {id}, but the daemon gives that root another one; a newer bridge uses it")),
+            ..ApiError::conflict("project_root_collision")
+        },
+        RegisterError::RootCollision { id, existing } => ApiError {
+            detail: Some(format!("{root_path} gets the project id {id}, which already belongs to {existing}")),
+            ..ApiError::conflict("project_root_collision")
+        },
+        RegisterError::NoFreeId(_) => ApiError { detail: Some(e.to_string()), ..ApiError::conflict("no_free_project_id") },
+        RegisterError::Store(_) => ApiError::internal(e),
+    }
+}
+
 /// Registers `root_path` as [`register`] does, for it and for what places a
 /// folder in a project. `path`, where the caller works, is measured from the
 /// top of its checkout on the thread that reads the checkout; one that is not
@@ -2585,13 +2604,7 @@ async fn register_root(
     index_docs: bool,
     assigned: bool,
 ) -> ApiResult<RegisterOutcome> {
-    if root_path.trim().is_empty() {
-        return Err(ApiError::bad_request("root_path must not be empty"));
-    }
-    let root = std::path::Path::new(root_path);
-    if index_docs && !root.is_dir() {
-        return Err(ApiError::bad_request(format!("{root_path} is not a directory, so it has no files to index")));
-    }
+    let root = check_root(root_path, index_docs, std::path::Path::is_dir).map_err(|e| register_refused(e, root_path))?;
     // A caller that derives its id joins no remote, but what is at the root
     // still tells whether it is the repository its folder was given to.
     let (checkout, subpath) = {
@@ -2610,22 +2623,7 @@ async fn register_root(
     let backups = clawg_core::paths::backups_dir(&app.runtime.base_dir);
     let outcome = register_project(&app.runtime.store, &app.runtime.workspaces(), &backups, registration, Arc::new(Disk))
         .await
-        .map_err(|e| match e {
-            RegisterError::InvalidLegacyId(_) => ApiError::bad_request(e.to_string()),
-            RegisterError::RootCollision { id, existing } if existing == root_path => ApiError {
-                detail: Some(format!(
-                    "{} derives the project id {id}, but the daemon gives that root another one; a newer bridge uses it",
-                    root.display()
-                )),
-                ..ApiError::conflict("project_root_collision")
-            },
-            RegisterError::RootCollision { id, existing } => ApiError {
-                detail: Some(format!("{} gets the project id {id}, which already belongs to {existing}", root.display())),
-                ..ApiError::conflict("project_root_collision")
-            },
-            RegisterError::NoFreeId(_) => ApiError { detail: Some(e.to_string()), ..ApiError::conflict("no_free_project_id") },
-            RegisterError::Store(_) => ApiError::internal(e),
-        })?;
+        .map_err(|e| register_refused(e, root_path))?;
     if outcome.rekeyed > 0 {
         log::info!(
             "{} joined {} rows of its earlier ids into project {}{}{}",
