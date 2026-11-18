@@ -3483,8 +3483,19 @@ mod tests {
             }
             None => runtime,
         };
+        (daemon_on(runtime), dir)
+    }
+
+    /// The same daemon before its embedder loaded.
+    async fn daemon_without_embedder() -> (Arc<AppCtx>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (runtime, _rx) = MemoryRuntime::new_for_test(dir.path().to_path_buf()).await;
+        (daemon_on(MemoryRuntime { embedder: Default::default(), ..runtime }), dir)
+    }
+
+    fn daemon_on(runtime: MemoryRuntime) -> Arc<AppCtx> {
         let (shutdown, _) = tokio::sync::watch::channel(false);
-        let app = Arc::new(AppCtx {
+        Arc::new(AppCtx {
             runtime,
             token: "job-token".to_string(),
             profile: Profile::Dev,
@@ -3493,8 +3504,7 @@ mod tests {
             save_timeout: SAVE_CONFIRM_TIMEOUT,
             sessions: Default::default(),
             imports: Default::default(),
-        });
-        (app, dir)
+        })
     }
 
     /// A clawg export of `rows` rows.
@@ -4593,5 +4603,575 @@ mod tests {
         for (body, expected) in cases {
             assert_eq!(refused(&app, body.clone()).await, expected, "{body}");
         }
+    }
+
+    /// The status and the JSON body of a handler's answer, accepted or refused.
+    async fn answer_of<T: Serialize>(answer: ApiResult<Json<T>>) -> (StatusCode, serde_json::Value) {
+        status_and_body(match answer {
+            Ok(body) => body.into_response(),
+            Err(e) => e.into_response(),
+        })
+        .await
+    }
+
+    /// A live row of `memory` saved by `agent`.
+    async fn seed_memory(app: &AppCtx, agent: &str, memory_type: &str, content: &str) -> i64 {
+        let (agent, memory_type, content) = (agent.to_string(), memory_type.to_string(), content.to_string());
+        app.runtime
+            .store
+            .conn_for_test()
+            .call(move |c| {
+                c.execute(
+                    "INSERT INTO memory (scope, agent_id, content, memory_type, source, created_at, created_by_type, \
+                     created_by_ref, last_modified_at, last_accessed_at, importance, tier, status) \
+                     VALUES ('agent', ?1, ?2, ?3, 'explicit', 1, 'agent', ?1, 1, 1, 5.0, 3, 'active')",
+                    [&agent, &content, &memory_type],
+                )?;
+                Ok::<_, rusqlite::Error>(c.last_insert_rowid())
+            })
+            .await
+            .expect("seed a row")
+    }
+
+    fn reader_query(agent: Option<&str>) -> Query<ReaderQuery> {
+        Query(ReaderQuery { agent: agent.map(str::to_string) })
+    }
+
+    /// The status and the whole body `update_memory` answers with, for every
+    /// refusal in the order it checks them and for each kind of change.
+    #[tokio::test]
+    async fn each_memory_update_keeps_its_status_and_body() {
+        use serde_json::{json, Value};
+
+        async fn updated(app: &Arc<AppCtx>, kind: &str, id: i64, agent: Option<&str>, body: Value) -> (StatusCode, Value) {
+            let body: UpdateRequest = serde_json::from_value(body).expect("an update");
+            answer_of(update_memory(State(app.clone()), Path((kind.to_string(), id)), reader_query(agent), Json(body)).await).await
+        }
+        let bad = |message: &str| (StatusCode::BAD_REQUEST, json!({ "error": message }));
+        let missing = |id: i64| (StatusCode::NOT_FOUND, json!({ "error": format!("no memory row with id {id}") }));
+        let types = "semantic_fact, user_preference, architectural_decision, session_summary, code_block, chat_message, tool_error";
+
+        let (app, dir) = daemon_for_jobs().await;
+        let options = ResolveOptions { create: true, new_project: false, born: Born::default() };
+        let ideas = resolve_project(&app.runtime.store, "ideas", options).await.expect("ideas").project_id.expect("an id");
+        run_sql(
+            &app,
+            "INSERT INTO project (id, name, born, reviewed, created_at) VALUES ('twin-0001', 'twin', 'user', 1, 1), ('twin-0002', 'twin', 'user', 1, 2);"
+                .to_string(),
+        )
+        .await;
+        let fact = seed_memory(&app, "a", "semantic_fact", "a fact").await;
+        let preference = seed_memory(&app, "a", "user_preference", "a preference").await;
+        let deleted = seed_memory(&app, "a", "semantic_fact", "a deleted fact").await;
+        let theirs = seed_memory(&app, "b", "semantic_fact", "their fact").await;
+        run_sql(&app, format!("UPDATE memory SET deleted_at = 2 WHERE id = {deleted}")).await;
+        std::fs::write(dir.path().join("sharing.json"), r#"{"version":1,"hides":{"a":["b"]}}"#).expect("write the policy");
+
+        let cases = [
+            (
+                ("episodic", fact, None, json!({ "importance": 3 })),
+                bad(
+                    "kind \"episodic\" no longer exists: episodic and procedural rows are memory rows now, of type semantic_fact, \
+                     each with a new id; find them with search_memory (POST /v1/search)",
+                ),
+            ),
+            (("bogus", fact, None, json!({ "importance": 3 })), bad("unknown kind \"bogus\": the only kind is \"memory\"")),
+            (("bogus", fact, None, json!({})), bad("unknown kind \"bogus\": the only kind is \"memory\"")),
+            (
+                ("memory", fact, None, json!({ "project_id": "twin-0001", "no_project": true })),
+                bad("pass project_id or no_project, not both"),
+            ),
+            (
+                ("memory", fact, None, json!({ "importance": 11, "project_id": "Twin" })),
+                (
+                    StatusCode::CONFLICT,
+                    json!({ "error": "project_ambiguous", "detail": "\"Twin\" is the name of twin-0001, twin-0002: name one of them by its id" }),
+                ),
+            ),
+            (
+                ("memory", fact, None, json!({})),
+                bad("nothing to change: pass importance, memory_type, a project to move to, or none"),
+            ),
+            (
+                ("memory", fact, None, json!({ "user_answered": true })),
+                bad("nothing to change: pass importance, memory_type, a project to move to, or none"),
+            ),
+            (("memory", fact, None, json!({ "importance": 11 })), bad("importance must be a number from 0 to 10, got 11")),
+            (("memory", fact, None, json!({ "importance": -0.5 })), bad("importance must be a number from 0 to 10, got -0.5")),
+            (
+                ("memory", fact, None, json!({ "memory_type": "preference" })),
+                bad(&format!("unknown memory_type \"preference\"; expected one of {types}")),
+            ),
+            (
+                ("memory", fact, None, json!({ "importance": 11, "memory_type": "preference" })),
+                bad("importance must be a number from 0 to 10, got 11"),
+            ),
+            (
+                ("memory", 999_999, None, json!({ "importance": 3, "memory_type": "preference" })),
+                bad(&format!("unknown memory_type \"preference\"; expected one of {types}")),
+            ),
+            (("memory", 999_999, None, json!({ "importance": 3 })), missing(999_999)),
+            (("memory", deleted, None, json!({ "importance": 3 })), missing(deleted)),
+            (("memory", theirs, Some("a"), json!({ "importance": 3 })), missing(theirs)),
+            (
+                ("memory", preference, None, json!({ "memory_type": "semantic_fact" })),
+                (
+                    StatusCode::CONFLICT,
+                    json!({
+                        "error": format!(
+                            "memory {preference} is a user_preference, so it loses that type only on the user's word: \
+                             ask the user, then call again with `user_answered`"
+                        ),
+                    }),
+                ),
+            ),
+            (
+                ("memory", preference, None, json!({ "project_id": "ideas" })),
+                (
+                    StatusCode::CONFLICT,
+                    json!({
+                        "error": format!(
+                            "memory {preference} is a user_preference, so it changes project only on the user's word: \
+                             ask the user, then call again with `user_answered`"
+                        ),
+                    }),
+                ),
+            ),
+            (
+                ("memory", fact, None, json!({ "project_id": "nowhere" })),
+                (
+                    StatusCode::NOT_FOUND,
+                    json!({ "error": "no project nowhere is registered: register its root first (`clawg projects add`, or a bridge started in it)" }),
+                ),
+            ),
+        ];
+        for ((kind, id, agent, body), expected) in cases {
+            assert_eq!(updated(&app, kind, id, agent, body.clone()).await, expected, "{kind} {id} {agent:?} {body}");
+        }
+
+        let row = |id: i64, importance: f64, memory_type: &str, tier: i64, project_id: Value| {
+            json!({ "updated": 1, "kind": "memory", "id": id, "importance": importance, "memory_type": memory_type, "tier": tier, "project_id": project_id })
+        };
+        assert_eq!(
+            updated(&app, "memory", fact, None, json!({ "importance": 7 })).await,
+            (StatusCode::OK, row(fact, 7.0, "semantic_fact", 3, Value::Null))
+        );
+        assert_eq!(
+            updated(&app, "memory", theirs, Some("b"), json!({ "memory_type": "code_block" })).await,
+            (StatusCode::OK, row(theirs, 5.0, "code_block", 3, Value::Null))
+        );
+        assert_eq!(
+            updated(&app, "memory", preference, None, json!({ "memory_type": "semantic_fact", "user_answered": true })).await,
+            (StatusCode::OK, row(preference, 5.0, "semantic_fact", 3, Value::Null))
+        );
+        let (status, mut body) = updated(&app, "memory", fact, None, json!({ "project_id": "Ideas" })).await;
+        let move_id = body.as_object_mut().expect("an object").remove("move_id").expect("the move");
+        assert!(move_id.is_i64(), "{move_id}");
+        assert_eq!((status, body), (StatusCode::OK, row(fact, 7.0, "semantic_fact", 3, json!(ideas))));
+        let (status, mut body) = updated(&app, "memory", fact, None, json!({ "no_project": true })).await;
+        let back = body.as_object_mut().expect("an object").remove("move_id").expect("the move");
+        assert!(back.is_i64() && back != move_id, "{back}");
+        assert_eq!((status, body), (StatusCode::OK, row(fact, 7.0, "semantic_fact", 3, Value::Null)));
+
+        app.runtime.close().await.expect("the store closes");
+        assert_eq!(
+            updated(&app, "memory", fact, None, json!({ "importance": 3 })).await,
+            (StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": "memory backend channel error: connection closed during update_memory_core" }))
+        );
+    }
+
+    /// The status and the whole body `delete_memory` and `restore_memory`
+    /// answer with, for every refusal in the order they check them and for a
+    /// delete and a restore that go through.
+    #[tokio::test]
+    async fn each_memory_delete_and_restore_keeps_its_status_and_body() {
+        use serde_json::json;
+
+        async fn deleted(app: &Arc<AppCtx>, kind: &str, id: i64, agent: Option<&str>) -> (StatusCode, serde_json::Value) {
+            answer_of(delete_memory(State(app.clone()), Path((kind.to_string(), id)), reader_query(agent)).await).await
+        }
+        async fn restored(app: &Arc<AppCtx>, kind: &str, id: i64, agent: Option<&str>) -> (StatusCode, serde_json::Value) {
+            answer_of(restore_memory(State(app.clone()), Path((kind.to_string(), id)), reader_query(agent)).await).await
+        }
+        let unknown_kind = (StatusCode::BAD_REQUEST, json!({ "error": "unknown kind \"bogus\": the only kind is \"memory\"" }));
+        let not_deleted = |id: i64| (StatusCode::NOT_FOUND, json!({ "error": format!("no deleted memory row with id {id}") }));
+
+        let (app, dir) = daemon_for_jobs().await;
+        let fact = seed_memory(&app, "a", "semantic_fact", "a fact").await;
+        let theirs = seed_memory(&app, "b", "semantic_fact", "their fact").await;
+        std::fs::write(dir.path().join("sharing.json"), r#"{"version":1,"hides":{"a":["b"]}}"#).expect("write the policy");
+
+        assert_eq!(deleted(&app, "bogus", fact, None).await, unknown_kind);
+        let gone = (StatusCode::NOT_FOUND, json!({ "error": "no memory row with id 999999" }));
+        assert_eq!(deleted(&app, "memory", 999_999, None).await, gone);
+        assert_eq!(
+            deleted(&app, "memory", theirs, Some("a")).await,
+            (StatusCode::NOT_FOUND, json!({ "error": format!("no memory row with id {theirs}") }))
+        );
+        assert_eq!(deleted(&app, "memory", fact, Some("a")).await, (StatusCode::OK, json!({ "deleted": 1 })));
+        assert_eq!(
+            deleted(&app, "memory", fact, None).await,
+            (StatusCode::NOT_FOUND, json!({ "error": format!("no memory row with id {fact}") }))
+        );
+
+        let live = seed_memory(&app, "a", "semantic_fact", "a live fact").await;
+        let secret = seed_memory(&app, "a", "semantic_fact", "the key is AKIAQ7ZXQ7ZXQ7ZXQ7ZX").await;
+        let twin = seed_memory(&app, "a", "semantic_fact", "a twin").await;
+        let saved_again = seed_memory(&app, "a", "semantic_fact", "a twin").await;
+        let old_topic = seed_memory(&app, "a", "semantic_fact", "the old engine").await;
+        let new_topic = seed_memory(&app, "a", "semantic_fact", "the new engine").await;
+        let hidden = seed_memory(&app, "b", "semantic_fact", "their deleted fact").await;
+        run_sql(
+            &app,
+            format!(
+                "UPDATE memory SET deleted_at = 2 WHERE id IN ({secret}, {twin}, {old_topic}, {hidden});
+                 UPDATE memory SET content_hash = 'same' WHERE id IN ({twin}, {saved_again});
+                 UPDATE memory SET topic_key = 'storage/engine' WHERE id IN ({old_topic}, {new_topic});"
+            ),
+        )
+        .await;
+        let conflict = |message: String| (StatusCode::CONFLICT, json!({ "error": message }));
+        let cases = [
+            (("bogus", fact, None), unknown_kind.clone()),
+            (("memory", 999_999, None), not_deleted(999_999)),
+            (("memory", live, None), not_deleted(live)),
+            (("memory", hidden, Some("a")), not_deleted(hidden)),
+            (
+                ("memory", secret, None),
+                conflict(format!(
+                    "memory #{secret} holds a secret (aws_access_key), so it stays deleted: restored, it would reach searches \
+                     and other agents. `clawg purge {secret} --yes` removes it for good"
+                )),
+            ),
+            (
+                ("memory", twin, None),
+                conflict(format!(
+                    "memory #{twin} was saved again as #{saved_again}, which is live; #{twin} stays deleted so the text is not stored twice"
+                )),
+            ),
+            (
+                ("memory", old_topic, None),
+                conflict(format!(
+                    "memory #{old_topic} was saved under topic storage/engine, which #{new_topic} holds now; \
+                     #{old_topic} stays deleted so the topic has one current memory"
+                )),
+            ),
+        ];
+        for ((kind, id, agent), expected) in cases {
+            assert_eq!(restored(&app, kind, id, agent).await, expected, "{kind} {id} {agent:?}");
+        }
+        assert_eq!(
+            restored(&app, "memory", fact, Some("a")).await,
+            (StatusCode::OK, json!({ "restored": 1, "id": fact, "status": "active", "superseded_by": null }))
+        );
+        assert_eq!(restored(&app, "memory", fact, None).await, not_deleted(fact));
+
+        let (waiting, _dir) = daemon_without_embedder().await;
+        assert_eq!(restored(&waiting, "bogus", fact, None).await, unknown_kind, "the kind is checked before the embedder");
+        assert_eq!(
+            restored(&waiting, "memory", fact, None).await,
+            (StatusCode::SERVICE_UNAVAILABLE, json!({ "error": "embedder_not_ready" }))
+        );
+        waiting.runtime.embedder_status.send_replace(EmbedderStatus::Failed { error: "disk full".into(), retryable: false });
+        assert_eq!(
+            restored(&waiting, "memory", fact, None).await,
+            (StatusCode::SERVICE_UNAVAILABLE, json!({ "error": "embedder_failed", "detail": "disk full", "retryable": false }))
+        );
+
+        app.runtime.close().await.expect("the store closes");
+        assert_eq!(
+            deleted(&app, "memory", live, None).await,
+            (StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": "memory backend channel error: connection closed during delete_memory_core" }))
+        );
+        assert_eq!(
+            restored(&app, "memory", fact, None).await,
+            (StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": "memory backend channel error: connection closed during restore_memory_core" }))
+        );
+    }
+
+    /// The status and the whole body `resolve_dispute` answers with, for every
+    /// refusal in the order it checks them and for both outcomes.
+    #[tokio::test]
+    async fn each_resolved_dispute_keeps_its_status_and_body() {
+        use serde_json::{json, Value};
+
+        async fn resolved(app: &Arc<AppCtx>, body: Value) -> (StatusCode, Value) {
+            let body: ResolveRequest = serde_json::from_value(body).expect("a resolve");
+            answer_of(resolve_dispute(State(app.clone()), Json(body)).await).await
+        }
+        let side = |id: i64, status: &str, by: Option<i64>| json!({ "id": id, "status": status, "superseded_by": by });
+
+        let (app, dir) = daemon_for_jobs().await;
+        let keep = seed_memory(&app, "a", "semantic_fact", "the engine is sqlite").await;
+        let other = seed_memory(&app, "a", "semantic_fact", "the engine is postgres").await;
+        let apart = seed_memory(&app, "a", "semantic_fact", "an unrelated fact").await;
+        let preference = seed_memory(&app, "a", "user_preference", "tabs over spaces").await;
+        let replaced = seed_memory(&app, "a", "semantic_fact", "a replaced fact").await;
+        let replacement = seed_memory(&app, "a", "semantic_fact", "its replacement").await;
+        let theirs = seed_memory(&app, "b", "semantic_fact", "their fact").await;
+        run_sql(
+            &app,
+            format!(
+                "INSERT INTO memory_conflict (new_id, old_id, distance, state, created_at) VALUES
+                   ({other}, {keep}, 0.2, 'pending', 3), ({preference}, {keep}, 0.2, 'pending', 3),
+                   ({theirs}, {keep}, 0.2, 'pending', 3), ({replaced}, {keep}, 0.2, 'pending', 3);
+                 UPDATE memory SET status = 'superseded', superseded_by = {replacement} WHERE id = {replaced};"
+            ),
+        )
+        .await;
+        std::fs::write(dir.path().join("sharing.json"), r#"{"version":1,"hides":{"a":["b"]}}"#).expect("write the policy");
+
+        let cases = [
+            (json!({ "keep": keep, "other": keep }), (StatusCode::BAD_REQUEST, json!({ "error": "a memory cannot be resolved against itself" }))),
+            (json!({ "keep": 999_999, "other": 999_999 }), (StatusCode::BAD_REQUEST, json!({ "error": "a memory cannot be resolved against itself" }))),
+            (json!({ "keep": 999_998, "other": 999_999 }), (StatusCode::NOT_FOUND, json!({ "error": "no memory row with id 999998" }))),
+            (json!({ "keep": keep, "other": 999_999 }), (StatusCode::NOT_FOUND, json!({ "error": "no memory row with id 999999" }))),
+            (
+                json!({ "keep": keep, "other": theirs, "agent_id": "a" }),
+                (StatusCode::NOT_FOUND, json!({ "error": format!("no memory row with id {theirs}") })),
+            ),
+            (
+                json!({ "keep": keep, "other": apart }),
+                (StatusCode::CONFLICT, json!({ "error": format!("memories {keep} and {apart} are not in dispute with each other") })),
+            ),
+            (
+                json!({ "keep": keep, "other": replaced }),
+                (
+                    StatusCode::CONFLICT,
+                    json!({ "error": format!("memory {replaced} was replaced by memory {replacement}; resolve that pair instead") }),
+                ),
+            ),
+            (
+                json!({ "keep": keep, "other": preference }),
+                (
+                    StatusCode::CONFLICT,
+                    json!({
+                        "error": format!(
+                            "memory {preference} is a preference or a decision, so {keep} supersedes it only on the user's word: \
+                             judge the pair `conflicts` and ask the user, then call again with `user_answered` and their \
+                             answer in `reason`"
+                        ),
+                    }),
+                ),
+            ),
+        ];
+        for (body, expected) in cases {
+            assert_eq!(resolved(&app, body.clone()).await, expected, "{body}");
+        }
+
+        assert_eq!(
+            resolved(&app, json!({ "keep": keep, "other": preference, "keep_both": true })).await,
+            (StatusCode::OK, json!({ "keep": side(keep, "active", None), "other": side(preference, "active", None), "pair": "judged" }))
+        );
+        assert_eq!(
+            resolved(&app, json!({ "keep": keep, "other": other, "agent_id": "a" })).await,
+            (StatusCode::OK, json!({ "keep": side(keep, "active", None), "other": side(other, "superseded", Some(keep)), "pair": "judged" }))
+        );
+        assert_eq!(
+            resolved(&app, json!({ "keep": other, "other": keep })).await,
+            (StatusCode::OK, json!({ "keep": side(other, "active", None), "other": side(keep, "superseded", Some(other)), "pair": "judged" })),
+            "a resolution is undone by the other verdict"
+        );
+
+        app.runtime.close().await.expect("the store closes");
+        assert_eq!(
+            resolved(&app, json!({ "keep": keep, "other": other })).await,
+            (StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": "memory backend channel error: connection closed during judge_pair" }))
+        );
+    }
+
+    /// The status and the whole body `answer_suggestion` answers with, for
+    /// every refusal in the order it checks them and for both answers.
+    #[tokio::test]
+    async fn each_answered_suggestion_keeps_its_status_and_body() {
+        use serde_json::{json, Value};
+
+        async fn answered(app: &Arc<AppCtx>, body: Value) -> (StatusCode, Value) {
+            let body: AnswerRequest = serde_json::from_value(body).expect("an answer");
+            answer_of(answer_suggestion(State(app.clone()), Json(body)).await).await
+        }
+        let bad = |message: &str| (StatusCode::BAD_REQUEST, json!({ "error": message }));
+        let users_call = bad("answering a suggestion is the user's call: send user_answered with the user's answer in reason");
+        let ask = |a: &str, b: &str, answer: &str| {
+            json!({ "project_id": a, "other_id": b, "answer": answer, "user_answered": true, "reason": "the user said so" })
+        };
+
+        let (app, _dir) = daemon_for_jobs().await;
+        run_sql(
+            &app,
+            "INSERT INTO project (id, name, born, reviewed, created_at) VALUES
+               ('app-1a2b', 'app', 'user', 1, 1), ('copia-85a9', 'copia', 'user', 1, 2),
+               ('web-0001', 'web', 'user', 1, 3), ('notas-0002', 'notas', 'user', 1, 4),
+               ('docs-0003', 'docs', 'user', 1, 5);
+             INSERT INTO project (id, name, born, reviewed, created_at, merged_into, merged_at) VALUES ('old-0004', 'old', 'user', 1, 1, 'app-1a2b', 2);
+             INSERT INTO project (id, name, born, reviewed, created_at, deleted_at) VALUES ('gone-7a8b', 'gone', 'user', 1, 1, 5);
+             INSERT INTO project_suggestion (project_id, other_id, reason, created_at) VALUES
+               ('copia-85a9', 'app-1a2b', 'root_commit', 2), ('web-0001', 'docs-0003', 'folder_name', 3);"
+                .to_string(),
+        )
+        .await;
+
+        let cases = [
+            (
+                json!({ "project_id": "app-1a2b", "other_id": "copia-85a9", "answer": "later" }),
+                bad("answer must be one of: merge, apart (got \"later\")"),
+            ),
+            (
+                json!({ "project_id": "app-1a2b", "other_id": "copia-85a9", "answer": "Merge", "user_answered": true, "reason": "yes" }),
+                bad("answer must be one of: merge, apart (got \"Merge\")"),
+            ),
+            (json!({ "project_id": "app-1a2b", "other_id": "copia-85a9", "answer": "merge" }), users_call.clone()),
+            (
+                json!({ "project_id": "app-1a2b", "other_id": "copia-85a9", "answer": "merge", "reason": "the user said so" }),
+                users_call.clone(),
+            ),
+            (json!({ "project_id": "app-1a2b", "other_id": "copia-85a9", "answer": "apart", "user_answered": true }), users_call.clone()),
+            (
+                json!({ "project_id": "app-1a2b", "other_id": "copia-85a9", "answer": "apart", "user_answered": true, "reason": " \n" }),
+                users_call.clone(),
+            ),
+            (json!({ "project_id": "nobody-0000", "other_id": "nobody-0001", "answer": "merge" }), users_call),
+            (ask("nobody-0000", "app-1a2b", "merge"), (StatusCode::NOT_FOUND, json!({ "error": "no project has the id nobody-0000" }))),
+            (ask("app-1a2b", "nobody-0000", "apart"), (StatusCode::NOT_FOUND, json!({ "error": "no project has the id nobody-0000" }))),
+            (ask("app-1a2b", "app-1a2b", "merge"), bad("project app-1a2b cannot be kept apart from itself")),
+            (
+                ask("old-0004", "copia-85a9", "merge"),
+                (StatusCode::CONFLICT, json!({ "error": "project_merged", "detail": "project old-0004 was merged into app-1a2b" })),
+            ),
+            (
+                ask("app-1a2b", "gone-7a8b", "apart"),
+                (StatusCode::CONFLICT, json!({ "error": "project_deleted", "detail": "project gone-7a8b is deleted" })),
+            ),
+            (
+                ask("web-0001", "notas-0002", "apart"),
+                (StatusCode::NOT_FOUND, json!({ "error": "no_suggestion", "detail": "no suggestion is pending between web-0001 and notas-0002" })),
+            ),
+        ];
+        for (body, expected) in cases {
+            assert_eq!(answered(&app, body.clone()).await, expected, "{body}");
+        }
+
+        assert_eq!(
+            answered(&app, ask("docs-0003", "web-0001", "apart")).await,
+            (StatusCode::OK, json!({ "project_id": "docs-0003", "other_id": "web-0001", "answer": "apart" }))
+        );
+        assert_eq!(
+            answered(&app, ask("web-0001", "docs-0003", "merge")).await,
+            (StatusCode::NOT_FOUND, json!({ "error": "no_suggestion", "detail": "no suggestion is pending between web-0001 and docs-0003" })),
+            "an answered suggestion is not answered again"
+        );
+
+        let (status, mut body) = answered(&app, ask("app-1a2b", "copia-85a9", "merge")).await;
+        let Some(Value::Object(mut merge)) = body.as_object_mut().expect("an object").remove("merge") else {
+            panic!("the merge is an object: {body}");
+        };
+        assert_eq!((status, body), (StatusCode::OK, json!({ "project_id": "app-1a2b", "other_id": "copia-85a9", "answer": "merge" })));
+        let merge_id = merge.remove("merge_id").expect("its number");
+        let snapshot = merge.remove("snapshot").expect("its snapshot");
+        assert!(merge_id.is_i64(), "{merge_id}");
+        assert!(snapshot.as_str().is_some_and(|s| s.contains("pre-merge")), "{snapshot}");
+        assert_eq!(
+            Value::Object(merge),
+            json!({
+                "dry_run": false,
+                "source": "copia-85a9",
+                "target": "app-1a2b",
+                "move_id": null,
+                "memories": 0,
+                "superseded": [],
+                "split": [],
+                "protected": 0,
+                "reviews": 0,
+                "folders": [],
+                "remotes": [],
+                "tombstones": [],
+                "suggestions": 1,
+                "workspaces": { "copied": [], "kept_beside": [], "failed": [] },
+                "trajectories": 0,
+                "skills": 0,
+            })
+        );
+        assert_eq!(
+            answered(&app, ask("app-1a2b", "copia-85a9", "merge")).await,
+            (StatusCode::CONFLICT, json!({ "error": "project_merged", "detail": "project copia-85a9 was merged into app-1a2b" }))
+        );
+
+        app.runtime.close().await.expect("the store closes");
+        assert_eq!(
+            answered(&app, ask("web-0001", "notas-0002", "merge")).await,
+            (StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": "memory backend channel error: ConnectionClosed" }))
+        );
+        assert_eq!(
+            answered(&app, json!({ "project_id": "web-0001", "other_id": "notas-0002", "answer": "merge" })).await,
+            bad("answering a suggestion is the user's call: send user_answered with the user's answer in reason"),
+            "the answer is checked before the store is read"
+        );
+    }
+
+    /// The status and the whole body `resolve_projects` answers with, for
+    /// every refusal in the order it checks them and for each resolution.
+    #[tokio::test]
+    async fn each_resolved_project_keeps_its_status_and_body() {
+        use serde_json::{json, Value};
+
+        async fn resolved(app: &Arc<AppCtx>, body: Value) -> (StatusCode, Value) {
+            let body: ProjectResolveRequest = serde_json::from_value(body).expect("a resolve");
+            answer_of(resolve_projects(State(app.clone()), Json(body)).await).await
+        }
+        let bad = |message: &str| (StatusCode::BAD_REQUEST, json!({ "error": message }));
+        let new_project = bad("new_project goes with create: it creates a project apart from the similar ones");
+        let none = |refused: &str, candidates: Value| {
+            json!({ "project_id": null, "name": null, "created": false, "deleted": false, "folders": [], "refused": refused, "candidates": candidates })
+        };
+        let candidate = |id: &str, name: &str| json!({ "id": id, "name": name, "deleted": false });
+
+        let (app, _dir) = daemon_for_jobs().await;
+        run_sql(
+            &app,
+            "INSERT INTO project (id, name, born, reviewed, created_at) VALUES
+               ('twin-0001', 'twin', 'user', 1, 1), ('twin-0002', 'twin', 'user', 1, 2), ('mi-app-0003', 'Mi App', 'user', 1, 3);
+             INSERT INTO project (id, name, born, reviewed, created_at, merged_into, merged_at) VALUES ('old-0004', 'old', 'user', 1, 1, 'mi-app-0003', 2);
+             INSERT INTO project (id, name, born, reviewed, created_at, deleted_at) VALUES ('gone-7a8b', 'gone', 'user', 1, 1, 5);"
+                .to_string(),
+        )
+        .await;
+
+        let cases = [
+            (json!({ "project": "ideas", "new_project": true }), new_project.clone()),
+            (json!({ "project": "", "new_project": true }), new_project.clone()),
+            (json!({ "project": "  " }), bad("a project name must not be empty")),
+            (json!({ "project": "x".repeat(81), "create": true }), bad("a project name has at most 80 characters")),
+            (json!({ "project": "a\u{7}b" }), bad("a project name must not hold control characters")),
+            (json!({ "project": "Twin", "create": true }), (StatusCode::OK, none("ambiguous", json!([candidate("twin-0001", "twin"), candidate("twin-0002", "twin")])))),
+            (json!({ "project": "mi_app" }), (StatusCode::OK, none("similar", json!([candidate("mi-app-0003", "Mi App")])))),
+            (json!({ "project": "mi_app", "create": true }), (StatusCode::OK, none("similar", json!([candidate("mi-app-0003", "Mi App")])))),
+            (json!({ "project": "nothing" }), (StatusCode::OK, none("unknown", json!([])))),
+        ];
+        for (body, expected) in cases {
+            assert_eq!(resolved(&app, body.clone()).await, expected, "{body}");
+        }
+
+        let found = |id: &str, name: &str, created: bool, deleted: bool| {
+            json!({ "project_id": id, "name": name, "created": created, "deleted": deleted, "folders": [], "refused": null, "candidates": [] })
+        };
+        assert_eq!(resolved(&app, json!({ "project": "old-0004" })).await, (StatusCode::OK, found("mi-app-0003", "Mi App", false, false)));
+        assert_eq!(resolved(&app, json!({ "project": " mi app " })).await, (StatusCode::OK, found("mi-app-0003", "Mi App", false, false)));
+        assert_eq!(resolved(&app, json!({ "project": "gone-7a8b" })).await, (StatusCode::OK, found("gone-7a8b", "gone", false, true)));
+        let (status, body) = resolved(&app, json!({ "project": "ideas", "create": true })).await;
+        let ideas = body["project_id"].as_str().expect("an id").to_string();
+        assert!(ideas.starts_with("ideas-"), "{ideas}");
+        assert_eq!((status, body), (StatusCode::OK, found(&ideas, "ideas", true, false)));
+        assert_eq!(resolved(&app, json!({ "project": "IDEAS" })).await, (StatusCode::OK, found(&ideas, "ideas", false, false)));
+        let (status, body) = resolved(&app, json!({ "project": "Mi-App!", "create": true, "new_project": true })).await;
+        let apart = body["project_id"].as_str().expect("an id").to_string();
+        assert!(apart.starts_with("mi-app-") && apart != "mi-app-0003", "{apart}");
+        assert_eq!((status, body), (StatusCode::OK, found(&apart, "Mi-App!", true, false)));
+
+        app.runtime.close().await.expect("the store closes");
+        assert_eq!(resolved(&app, json!({ "project": "ideas", "new_project": true })).await, new_project, "checked before the store is read");
+        assert_eq!(
+            resolved(&app, json!({ "project": "ideas" })).await,
+            (StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": "memory backend channel error: ConnectionClosed" }))
+        );
     }
 }
