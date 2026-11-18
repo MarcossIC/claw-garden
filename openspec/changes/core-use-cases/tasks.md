@@ -189,7 +189,7 @@ Los requisitos son R12 a R15 de [`spec.md`](spec.md#parte-3-las-otras-escrituras
 
 ## 13. Caracterización de las otras escrituras (R15)
 
-- [ ] `each_memory_update_keeps_its_status_and_body`, `each_memory_delete_and_restore_keeps_its_status_and_body`, `each_resolved_dispute_keeps_its_status_and_body`, `each_answered_suggestion_keeps_its_status_and_body` y `each_resolved_project_keeps_its_status_and_body` (`mod tests` de `crates/clawg-cli/src/daemon/api.rs`): el estado y el cuerpo entero de cada rechazo y de cada respuesta aceptada, con los literales que da `develop`. Pasan antes de seguir.
+- [x] `each_memory_update_keeps_its_status_and_body`, `each_memory_delete_and_restore_keeps_its_status_and_body`, `each_resolved_dispute_keeps_its_status_and_body`, `each_answered_suggestion_keeps_its_status_and_body` y `each_resolved_project_keeps_its_status_and_body` (`mod tests` de `crates/clawg-cli/src/daemon/api.rs`): el estado y el cuerpo entero de cada rechazo y de cada respuesta aceptada, con los literales que da `develop`. Pasan antes de seguir.
 - Commit: `test(daemon): pin the status and body of every update, delete, restore, dispute, answer and project resolve`
 - Tests al cerrar:
 
@@ -199,9 +199,9 @@ Los requisitos son R12 a R15 de [`spec.md`](spec.md#parte-3-las-otras-escrituras
 
 ## 14. Responder una sugerencia, en el núcleo (R12, R13)
 
-- [ ] **Tests en rojo** en `crates/clawg-core/src/memory/projects/registry.rs`: `an_answer_is_merge_or_apart`, `an_answer_is_the_users_word`, `each_answer_refusal_keeps_its_text`, `an_answer_needs_a_pending_suggestion`, `an_answer_checks_both_projects`, `apart_keeps_the_two_from_being_suggested_again`, `merge_merges_the_other_into_the_project`, `a_refused_merge_refuses_the_answer` y `a_store_that_fails_refuses_the_answer`.
-- [ ] `SuggestionAnswer` (del daemon), `UserAnswer`, `AnswerError`, `Answered` y `answer_suggestion_core` ([D16](design.md#d16-dónde-vive-cada-parte-de-la-tercera), [D17](design.md#d17-responder-una-sugerencia-en-dos-pasos)).
-- [ ] `answer_suggestion` llama a `UserAnswer::new` y a `answer_suggestion_core`, y traduce con `answer_refused`; ya no nombra `suggestion_between`, `keep_apart` ni `merge_core`.
+- [x] **Tests en rojo** en `crates/clawg-core/src/memory/projects/registry.rs`: `an_answer_is_merge_or_apart`, `an_answer_is_the_users_word`, `each_answer_refusal_keeps_its_text`, `an_answer_needs_a_pending_suggestion`, `an_answer_checks_both_projects`, `apart_keeps_the_two_from_being_suggested_again`, `merge_merges_the_other_into_the_project`, `a_refused_merge_refuses_the_answer` y `a_store_that_fails_refuses_the_answer`.
+- [x] `SuggestionAnswer` (del daemon), `UserAnswer`, `AnswerError`, `Answered` y `answer_suggestion_core` ([D16](design.md#d16-dónde-vive-cada-parte-de-la-tercera), [D17](design.md#d17-responder-una-sugerencia-en-dos-pasos)).
+- [x] `answer_suggestion` llama a `UserAnswer::new` y a `answer_suggestion_core`, y traduce con `answer_refused`; ya no nombra `suggestion_between`, `keep_apart` ni `merge_core`.
 - Commit: `refactor(core): answer a project suggestion in the core`
 - Tests al cerrar:
 
@@ -215,9 +215,9 @@ Los requisitos son R12 a R15 de [`spec.md`](spec.md#parte-3-las-otras-escrituras
 
 ## 15. `new_project` con `create`, en el núcleo (R14)
 
-- [ ] **Test en rojo** en `registry.rs`: `new_project_without_create_is_refused_before_anything_is_read`.
-- [ ] `ResolveError::NewProjectWithoutCreate`, que `resolve_project` devuelve antes de leer el store ([D18](design.md#d18-new_project-sin-create-en-resolve_project)).
-- [ ] `resolve_projects` deja de comprobarlo y traduce la variante a `400`, sin comodín.
+- [x] **Test en rojo** en `registry.rs`: `new_project_without_create_is_refused_before_anything_is_read`.
+- [x] `ResolveError::NewProjectWithoutCreate`, que `resolve_project` devuelve antes de leer el store ([D18](design.md#d18-new_project-sin-create-en-resolve_project)).
+- [x] `resolve_projects` deja de comprobarlo y traduce la variante a `400`, sin comodín.
 - Commit: `refactor(core): refuse new_project without create in resolve_project`
 - Tests al cerrar:
 
@@ -231,7 +231,7 @@ Los requisitos son R12 a R15 de [`spec.md`](spec.md#parte-3-las-otras-escrituras
 
 ## 16. Un restore rechazado, por su variante (R15)
 
-- [ ] `restore_memory` responde el `404` con el `Display` de `RestoreError::NotFound` y nombra `RestoreError::Store` en lugar del comodín ([D15](design.md#d15-lo-que-deciden-las-otras-escrituras)).
+- [x] `restore_memory` responde el `404` con el `Display` de `RestoreError::NotFound` y nombra `RestoreError::Store` en lugar del comodín ([D15](design.md#d15-lo-que-deciden-las-otras-escrituras)).
 - Commit: `refactor(daemon): answer a refused restore by its variant`
 - Tests al cerrar:
 
@@ -241,7 +241,7 @@ Los requisitos son R12 a R15 de [`spec.md`](spec.md#parte-3-las-otras-escrituras
 
 ## 17. Verificación de la parte 3
 
-- [ ] Sobre el último commit de código, en Linux:
+- [x] Sobre el último commit de código, en Linux:
 
   ```bash
   cargo test --workspace
@@ -255,8 +255,8 @@ Los requisitos son R12 a R15 de [`spec.md`](spec.md#parte-3-las-otras-escrituras
   cargo clippy -p clawg-cli -- -D warnings
   ```
 
-- [ ] Las comprobaciones de [D19](design.md#d19-cómo-se-comprueba-la-tercera-parte).
-- [ ] `verify.md`, con la parte 3 y su «Pendiente».
+- [x] Las comprobaciones de [D19](design.md#d19-cómo-se-comprueba-la-tercera-parte).
+- [x] `verify.md`, con la parte 3 y su «Pendiente».
 - Commit: `docs(openspec): record core-use-cases part 3 applied`
 
 ## Partes siguientes
