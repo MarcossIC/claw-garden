@@ -47,7 +47,7 @@ Se publica lo anterior y se instalan los hooks de Claude Code en un repositorio 
 
 [repeated-errors](changes/repeated-errors/proposal.md) (131) va en la nube salvo su verificación: no toca `memory.db` ni el daemon, y sus tareas 1 a 7 se prueban en Linux con el embedder falso. La puerta de latencia y la entrada real de los hooks quedan en local, en Windows; la campaña, después de 129. Quien ya instaló corre `clawg setup` otra vez para tener los dos hooks nuevos.
 
-[contract-diet](changes/contract-diet/exploration.md) (133) ya hizo su primera parte: el ruido del generador de esquemas (`$schema`, `"default": null`, `"null"` en el tipo, los `format` numéricos) salió del contrato sin cambiar ninguna palabra que el agente lee, 1.856 caracteres menos en las 13 herramientas. El bloque `lean` sí cambia lo que lee, así que espera a publicar y se decide con un brazo de agent-eval contra `full`, con las reglas de protocol-block. Sacar las secciones del resumen espera a memory-links (134).
+[contract-diet](changes/contract-diet/exploration.md) (133) ya hizo su primera parte: el ruido del generador de esquemas (`$schema`, `"default": null`, `"null"` en el tipo, los `format` numéricos) salió del contrato sin cambiar ninguna palabra que el agente lee, 1.856 caracteres menos en las 13 herramientas. El bloque `lean` sí cambia lo que lee: la variante, `--protocol lean` y el brazo `a3-lean` están aplicados, el valor por defecto sigue en `full`, y la campaña paga de `a3-lean` contra `a3` corre después de publicar, con las seis condiciones de D6 de protocol-block y T(`lean`) ≤ 0,9 × T(`a3`) ([verify](changes/contract-diet/verify.md#pendiente-la-campaña)). Sacar las secciones del resumen espera a memory-links (134).
 
 ## Corte (una noche local, con el piloto aprobado)
 
