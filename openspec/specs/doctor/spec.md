@@ -328,7 +328,7 @@ Sobre una base recién migrada desde V31 con filas viejas, las invariantes de `i
 
 Sin reglas, MUST NOT haber hallazgo `tool_rules`.
 
-Cuando el `settings.json` del usuario, o el `.claude/settings.local.json` de la carpeta actual, tiene el hook de `session-start` de este perfil y le faltan el de `PostToolUse` o el de `PostToolUseFailure` (matcher `Bash`), MUST sumar un hallazgo `tool_hooks` de severidad `info`, `reason_code` `not_installed`, con `clawg setup claude-code` (o con `--local`, para el archivo de la carpeta) como `safe_next_step`. Sin el hook de `session-start`, no hay hallazgo, porque ese perfil no corre clawg.
+Cuando el `settings.json` del usuario, o el `.claude/settings.local.json` de la carpeta actual, tiene el hook de `session-start` de este perfil y le faltan el de `PostToolUse` o el de `PostToolUseFailure` en un grupo con matcher `Bash` (uno bajo otro matcher no corre después de una llamada a Bash, así que cuenta como faltante), MUST sumar un hallazgo `tool_hooks` de severidad `info`, `reason_code` `not_installed`, con `clawg setup claude-code` (o con `--local`, para el archivo de la carpeta) como `safe_next_step`. Sin el hook de `session-start`, no hay hallazgo, porque ese perfil no corre clawg.
 
 Ninguno de los dos hallazgos cambia el código de salida, y `doctor` MUST NOT escribir el libro.
 

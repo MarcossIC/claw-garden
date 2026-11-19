@@ -469,23 +469,28 @@ fn is_clawg_hook(hook: &Value, event_arg: &str, profile: Profile) -> bool {
 /// The events of the hooks after a shell call that `text`, a `settings.json`,
 /// lacks for `profile`, when it has the hook of `session-start` for it: an
 /// install from before them. A file without that hook, or that is not
-/// settings, lacks nothing: it is not an install of clawg to complete.
+/// settings, lacks nothing: it is not an install of clawg to complete. A tool
+/// hook counts only in a group whose matcher is `Bash`: under another matcher
+/// the client never runs it after a shell call.
 pub(crate) fn missing_tool_hooks(text: &str, profile: Profile) -> Vec<&'static str> {
     let Ok(Value::Object(settings)) = serde_json::from_str::<Value>(text) else { return Vec::new() };
-    let has = |event: &str, arg: &str| {
-        settings
-            .get("hooks")
-            .and_then(|hooks| hooks.get(event))
-            .and_then(Value::as_array)
-            .is_some_and(|groups| hooks_of(groups).any(|hook| is_clawg_hook(hook, arg, profile)))
+    let has = |event: &str, arg: &str, matcher: Option<&str>| {
+        settings.get("hooks").and_then(|hooks| hooks.get(event)).and_then(Value::as_array).is_some_and(|groups| {
+            groups
+                .iter()
+                .filter(|group| matcher.is_none_or(|m| group.get("matcher").and_then(Value::as_str) == Some(m)))
+                .filter_map(|group| group.get("hooks").and_then(Value::as_array))
+                .flatten()
+                .any(|hook| is_clawg_hook(hook, arg, profile))
+        })
     };
-    if !has("SessionStart", "session-start") {
+    if !has("SessionStart", "session-start", None) {
         return Vec::new();
     }
     HOOK_EVENTS
         .iter()
         .filter(|(_, _, matcher)| *matcher == Some(SHELL_TOOL_MATCHER))
-        .filter(|(event, arg, _)| !has(event, arg))
+        .filter(|(event, arg, matcher)| !has(event, arg, *matcher))
         .map(|(event, _, _)| *event)
         .collect()
 }
