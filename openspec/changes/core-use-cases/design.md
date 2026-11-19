@@ -279,7 +279,7 @@ Los archivos de dominio son **módulos hijos** de `api`, en `crates/clawg-cli/sr
 
 ## D21. Los tests
 
-Cada test se muda al `#[cfg(test)] mod tests` del archivo cuyo código prueba, con su nombre intacto. El arnés que comparten (`daemon_on`, `daemon_for_jobs`, `daemon_embedding_with`, `daemon_without_embedder`, `status_and_body`, `answer_of`, `seed_memory`, `run_sql`, `count`, `reader_query`) va a `crates/clawg-cli/src/daemon/api/test_support.rs`, declarado en `api.rs` como `#[cfg(test)] mod test_support;`, con sus items `pub(super)`. Los tests de lo que se queda en la raíz (`serve_ephemeral`, `constant_time_eq`) se quedan en `api.rs`. Los ayudantes de un solo dominio (los de los trabajos de importación, `chunk`, `query`) van con sus tests.
+Cada test se muda al `#[cfg(test)] mod tests` del archivo cuyo código prueba, con su nombre intacto. El arnés que comparten (`daemon_on`, `daemon_for_jobs`, `daemon_embedding_with`, `daemon_without_embedder`, `status_and_body`, `answer_of`, `seed_memory`, `run_sql`, `count`, `reader_query`) va a `crates/clawg-cli/src/daemon/api/test_support.rs`, declarado en `api.rs` como `#[cfg(test)] mod test_support;`, con sus items `pub(super)`. Los tests de lo que se queda en la raíz (`serve_ephemeral`, `constant_time_eq`) se quedan en `api.rs`. Los ayudantes de un solo dominio (los de los trabajos de importación, `chunk`, `query`) van con sus tests. `test_support.rs` empieza con `#![cfg(test)]`: `tests/conventions.rs` mide el código de producción de un archivo hasta su `mod tests`, y este archivo es todo de tests (siembra filas con `rusqlite`). La convención reconoce esa línea y el archivo no cuenta como producción; es el único cambio de `tests/` de esta parte.
 
 ## D22. Las citas
 

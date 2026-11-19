@@ -270,7 +270,8 @@ El requisito es R16 de [`spec.md`](spec.md#parte-4-partir-apirs) y las decisione
 
 ## 19. Las rutas de sessions
 
-- [ ] Las rutas de sessions y sus tests pasan a `sessions.rs`, con el arnés de los tests en `test_support.rs` ([D20](design.md#d20-dónde-van-los-archivos-de-api), [D21](design.md#d21-los-tests)).
+- [x] Las rutas de sessions y sus tests pasan a `sessions.rs`, con el arnés de los tests en `test_support.rs` ([D20](design.md#d20-dónde-van-los-archivos-de-api), [D21](design.md#d21-los-tests)).
+- [x] `tests/conventions.rs` lee como test un archivo que empieza con `#![cfg(test)]` (`a_file_that_is_all_test_code_has_no_production_lines`): `test_support.rs` es todo de tests y nombra `rusqlite` para sembrar filas, y la convención sólo conocía el `mod tests` de un archivo con código.
 - Commit: `refactor(daemon): move the sessions routes out of api.rs`
 - Tests al cerrar:
 
@@ -284,7 +285,7 @@ El requisito es R16 de [`spec.md`](spec.md#parte-4-partir-apirs) y las decisione
 
 ## 20. Las rutas de outbox
 
-- [ ] Las rutas de outbox y sus tests pasan a `outbox.rs` ([D20](design.md#d20-dónde-van-los-archivos-de-api), [D21](design.md#d21-los-tests)).
+- [x] Las rutas de outbox y sus tests pasan a `outbox.rs` ([D20](design.md#d20-dónde-van-los-archivos-de-api), [D21](design.md#d21-los-tests)).
 - Commit: `refactor(daemon): move the outbox routes out of api.rs`
 - Tests al cerrar:
 
@@ -298,7 +299,7 @@ El requisito es R16 de [`spec.md`](spec.md#parte-4-partir-apirs) y las decisione
 
 ## 21. Las rutas de disputes
 
-- [ ] Las rutas de disputes y sus tests pasan a `disputes.rs` ([D20](design.md#d20-dónde-van-los-archivos-de-api), [D21](design.md#d21-los-tests)).
+- [x] Las rutas de disputes y sus tests pasan a `disputes.rs` ([D20](design.md#d20-dónde-van-los-archivos-de-api), [D21](design.md#d21-los-tests)).
 - Commit: `refactor(daemon): move the disputes routes out of api.rs`
 - Tests al cerrar:
 
@@ -312,7 +313,7 @@ El requisito es R16 de [`spec.md`](spec.md#parte-4-partir-apirs) y las decisione
 
 ## 22. Las rutas de portability
 
-- [ ] Las rutas de portability y sus tests pasan a `portability.rs`, con los trabajos de importación y sus tests ([D20](design.md#d20-dónde-van-los-archivos-de-api), [D21](design.md#d21-los-tests)).
+- [x] Las rutas de portability y sus tests pasan a `portability.rs`, con los trabajos de importación y sus tests ([D20](design.md#d20-dónde-van-los-archivos-de-api), [D21](design.md#d21-los-tests)).
 - Commit: `refactor(daemon): move the portability routes out of api.rs`
 - Tests al cerrar:
 
@@ -326,7 +327,7 @@ El requisito es R16 de [`spec.md`](spec.md#parte-4-partir-apirs) y las decisione
 
 ## 23. Las rutas de projects
 
-- [ ] Las rutas de projects y sus tests pasan a `projects.rs` ([D20](design.md#d20-dónde-van-los-archivos-de-api), [D21](design.md#d21-los-tests)).
+- [x] Las rutas de projects y sus tests pasan a `projects.rs` ([D20](design.md#d20-dónde-van-los-archivos-de-api), [D21](design.md#d21-los-tests)).
 - Commit: `refactor(daemon): move the projects routes out of api.rs`
 - Tests al cerrar:
 
@@ -340,7 +341,7 @@ El requisito es R16 de [`spec.md`](spec.md#parte-4-partir-apirs) y las decisione
 
 ## 24. Las rutas de docs
 
-- [ ] Las rutas de docs y sus tests pasan a `docs.rs` ([D20](design.md#d20-dónde-van-los-archivos-de-api), [D21](design.md#d21-los-tests)).
+- [x] Las rutas de docs y sus tests pasan a `docs.rs` ([D20](design.md#d20-dónde-van-los-archivos-de-api), [D21](design.md#d21-los-tests)).
 - Commit: `refactor(daemon): move the docs routes out of api.rs`
 - Tests al cerrar:
 
@@ -354,7 +355,7 @@ El requisito es R16 de [`spec.md`](spec.md#parte-4-partir-apirs) y las decisione
 
 ## 25. Las rutas de memories
 
-- [ ] Las rutas de memories y sus tests pasan a `memories.rs`, y `api.rs` queda con la raíz ([D20](design.md#d20-dónde-van-los-archivos-de-api), [D21](design.md#d21-los-tests)).
+- [x] Las rutas de memories y sus tests pasan a `memories.rs`, y `api.rs` queda con la raíz ([D20](design.md#d20-dónde-van-los-archivos-de-api), [D21](design.md#d21-los-tests)).
 - Commit: `refactor(daemon): move the memories routes out of api.rs`
 - Tests al cerrar:
 
@@ -368,12 +369,12 @@ El requisito es R16 de [`spec.md`](spec.md#parte-4-partir-apirs) y las decisione
 
 ## 26. Las citas
 
-- [ ] Los documentos vivos citan cada item por el archivo donde vive, sin número de línea ([D22](design.md#d22-las-citas)).
+- [x] Los documentos vivos citan cada item por el archivo donde vive, sin número de línea ([D22](design.md#d22-las-citas)).
 - Commit: `docs: cite the daemon routes by the file they moved to`
 
 ## 27. Verificación de la parte 4
 
-- [ ] Sobre el último commit de código, en Windows:
+- [x] Sobre el último commit de código, en Windows:
 
   ```bash
   cargo test --workspace --target-dir target-test
@@ -387,8 +388,8 @@ El requisito es R16 de [`spec.md`](spec.md#parte-4-partir-apirs) y las decisione
   cargo clippy -p clawg-cli --target-dir target-test -- -D warnings
   ```
 
-- [ ] Las comprobaciones de [D23](design.md#d23-cómo-se-comprueba-la-cuarta-parte).
-- [ ] `verify.md`, con la parte 4.
+- [x] Las comprobaciones de [D23](design.md#d23-cómo-se-comprueba-la-cuarta-parte).
+- [x] `verify.md`, con la parte 4.
 - Commit: `docs(openspec): record core-use-cases part 4 applied`
 
 ## Partes siguientes

@@ -204,3 +204,60 @@ Contadas de la línea de la firma a la llave que cierra, y las de producción de
 - **El modelo real.** No hace falta: de las seis rutas sólo el restore embebe, con el `FakeEmbedder`, y su código no cambió salvo el texto del `404`, que es el mismo.
 - **`rag-eval`.** No corre: el cambio no toca la recuperación.
 - **Al archivar:** consolidar R12 a R14 en `specs/project` con ids nuevos (R15 es de conservación). PL37 y PL32 siguen siendo ciertas como conducta (el `400` sin la palabra de la persona, el `404 no_suggestion`, `new_project` con `create`); las reglas viven ahora en `UserAnswer::new`, `answer_suggestion_core` y `resolve_project`, y `resolve_project` rechaza `new_project` sin `create` en lugar de ignorarlo.
+
+## Parte 4. Partir `api.rs`
+
+### Qué se corrió
+
+Sobre el último commit de código (`refactor(daemon): move the memories routes out of api.rs`), en **Windows**, con un único directorio de build (`target-test`, limpiado con `cargo clean --workspace --target-dir target-test` antes del primer build):
+
+| Comando | Resultado |
+|---|---|
+| `cargo test --workspace --target-dir target-test` | pasa, sin ningún fallo; incluye los doctests |
+| `cargo clippy --workspace --all-targets --target-dir target-test -- -D warnings` | sin hallazgos |
+| `cargo clippy -p clawg-cli --target-dir target-test -- -D warnings` | sin hallazgos |
+
+Es la primera corrida de la suite y de los dos clippy en Windows de este cambio: cubre el «Pendiente» de Windows de las partes 1 a 3 en lo que a la suite y a clippy se refiere. El CI de Windows del PR sigue siendo la comprobación de lo que no se corre aquí (el binario de release, los jobs de empaquetado).
+
+Cada commit de código pasó antes `cargo test -p clawg-cli --lib --target-dir target-test daemon::api` (57 tests, los mismos en cada paso) y `cargo check -p clawg-cli --all-targets --target-dir target-test` sin avisos. El último, además, `cargo check --workspace --all-targets` y `--test conventions`.
+
+### Los tests en rojo
+
+No hay: es un movimiento y no agrega ninguna regla ([R16](spec.md#r16-partir-apirs-no-cambia-nada)). La prueba de que nada cambia son los tests que ya existían.
+
+### Las comprobaciones de D23
+
+1. **Los nombres de los tests.** `cargo test -p clawg-cli --lib -- --list`, ordenado, antes de empezar y al terminar: 1.106 tests en cada lista, y son los mismos salvo el camino del módulo de los que se mudaron (`daemon::api::tests::x` pasa a `daemon::api::<dominio>::tests::x`). `diff` de las dos listas, con el segmento del dominio quitado, no muestra nada.
+2. **Los cuerpos no cambian.** Cada `fn` de `api.rs` (208, tests y ayudantes incluidos) se comparó con la del archivo donde queda, línea a línea sin la sangría: son iguales salvo tres, que cambian el camino de `super::process::` a `crate::daemon::process::` porque ahora están un módulo más abajo (`register_session`, `import_memories` y `accept_job`). Ninguna aserción ni nombre de test se editó.
+3. **Los tests de respuestas y los contratos.** `git diff` de `crates/clawg-cli/tests/api.rs` y de `crates/clawg-cli/src/mcp/` no muestra nada, y el de `agent_contract.json` y `agent_contract.es.json` tampoco. Los dos tests de contrato pasan sin `CLAWG_BLESS`. El único archivo de `tests/` que cambia es `conventions.rs` (ver abajo).
+4. **Los caminos públicos.** `cargo check --workspace --all-targets` compila `clawg-eval`, `tests/api.rs`, `client.rs`, `mcp/` y `stop.rs` sin tocarlos: `router`, `router_on`, `serve_ephemeral`, `AppCtx`, `SAVE_CONFIRM_TIMEOUT` y `MAX_CONTENT_BYTES` quedan en `api.rs`, y `DocsSearchBody` y `REFRESH_GRACE` se reexportan de `api/docs.rs` con un `pub use` explícito.
+
+### Los archivos
+
+Líneas, y tests (`#[test]` y `#[tokio::test]`) que viven en cada uno:
+
+| Archivo | Líneas | Tests |
+|---|---:|---:|
+| `api.rs` | 589 | 3 |
+| `api/memories.rs` | 2.059 | 27 |
+| `api/portability.rs` | 902 | 15 |
+| `api/projects.rs` | 978 | 5 |
+| `api/docs.rs` | 323 | 6 |
+| `api/disputes.rs` | 213 | 1 |
+| `api/sessions.rs` | 118 | 0 |
+| `api/outbox.rs` | 65 | 0 |
+| `api/test_support.rs` | 104 | 0 (el arnés) |
+
+`api.rs` tenía 5.159 líneas, 3.290 de código y 1.870 de tests. Quedan en la raíz `AppCtx`, la forma del error, el router, las ayudas compartidas (`reader`, `named_reader`, `reach`, `ready_embedder`, `embed_failure`, `live_project`, `ReaderQuery`) y `health`, `shutdown`, `metrics` y `stats`.
+
+### Lo que se resolvió distinto de lo escrito
+
+- **`tests/conventions.rs`.** `no_production_code_outside_core_reaches_the_connection` cuenta como producción todo lo que está antes del `mod tests` de un archivo, y `test_support.rs` es todo de tests (`seed_memory` nombra `rusqlite`). El archivo empieza con `#![cfg(test)]` y la convención lo reconoce (`a_file_that_is_all_test_code_has_no_production_lines`, que se escribió antes y falló). Es el único cambio de `tests/` ([D21](design.md#d21-los-tests)).
+- **El orden de los commits.** El cambio de `conventions.rs` entró en el commit de `sessions`, que es donde nace `test_support.rs`, para que ningún commit de la serie rompa esa convención.
+- **Los tipos privados en una firma.** Un tipo privado que aparece en la firma de un handler `pub(super)` pasó a `pub(super)` con él, como dice D20 (los de `projects.rs`, `portability.rs` y `memories.rs`); ningún item `pub` cambió de visibilidad.
+- **Las citas.** Además de las de `crates/clawg-cli/src/daemon/api.rs`, se reescribieron las del nombre corto `api.rs` y los números de línea sueltos (`api.rs:1234`, `:1234`) de `docs/reference/` y `openspec/specs/`: las de `check_content`, `check_operation_id` y `replaced_list`, que ya eran del núcleo desde la parte 1, apuntan a `crates/clawg-core/src/memory/ingest/save.rs`. Los documentos de `docs/completed-impl/` y los cambios archivados son historia y no se tocaron.
+
+### Pendiente de la parte 4
+
+- **Al archivar:** nada de la parte 4 va a `specs/`: R16 es de conservación y no deja una regla nueva.
+- **El CI del PR.** Corre `test (windows-latest)` y `test (ubuntu-latest)`; la parte no agrega código `cfg(windows)`.
