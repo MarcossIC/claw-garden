@@ -231,6 +231,6 @@ Sin `derived_from`, `admit` MUST NOT leer `sharing.json` ni consultar las fuente
 #### Escenario
 - GIVEN una fila viva de `a`, una borrada, una de `b` que `sharing.json` le oculta a `a`, y una reemplazada por otra
 - WHEN `a` admite una conclusión de cada una
-- THEN las tres primeras dan `MissingSources` con los ids que faltan, la reemplazada da `ReplacedSources` con su reemplazo, y la viva sola se admite
+- THEN la borrada y la oculta dan `MissingSources` con sus ids, la reemplazada da `ReplacedSources` con su reemplazo, y la viva sola se admite
 
 **Tests:** `a_conclusion_from_missing_or_hidden_sources_is_refused`, `a_conclusion_from_a_replaced_source_is_refused` y `a_store_that_fails_refuses_the_save_with_its_error` (`crates/clawg-core/src/runtime.rs`, mod tests, sin HTTP); `missing_sources_are_the_ones_that_were_not_found` y `replaced_sources_name_what_replaced_them` (`crates/clawg-core/src/memory/ingest/save.rs`, mod tests).

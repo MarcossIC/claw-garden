@@ -177,7 +177,7 @@ Una respuesta `201` de `POST /v1/memories` MUST incluir `redacted`, cada tipo un
 {"status": "saved", "memories": [{"kind": "memory", "id": 57, "outcome": "inserted"}], "redacted": ["github_token"]}
 ```
 
-`DaemonClient` MUST leerlo en `SaveOutcome::Saved.redacted` (`crates/clawg-cli/src/client.rs:581`), vacío si un daemon anterior no lo manda. `save_memory` MUST agregar al texto de éxito `; masked <tipos> before storing it` (`save_outcome_text`, `crates/clawg-cli/src/mcp/server.rs:688`). Las respuestas `202` no lo llevan, aunque el daemon ya haya enmascarado: su cuerpo es `status`, `reason` y `operation_id` (`SaveBody::queued`, `api/memories.rs`).
+`DaemonClient` MUST leerlo en `SaveOutcome::Saved.redacted` (`crates/clawg-cli/src/client.rs:581`), vacío si un daemon anterior no lo manda. `save_memory` MUST agregar al texto de éxito `; masked <tipos> before storing it` (`save_outcome_text`, `crates/clawg-cli/src/mcp/server.rs:688`). Las respuestas `202` no lo llevan, aunque el daemon ya haya enmascarado: su cuerpo es `status`, `reason` y `operation_id` (`SaveBody::queued`, `api/memories.rs`), con `topic_key` cuando el save trae una; una `partially_saved` lleva además `memories`, los pedazos que ya guardó, y `detail`, por qué se detuvo, y una `retrying`, `detail` y los pedazos guardados, si hay alguno.
 
 #### Escenario
 - GIVEN un daemon con el embedder listo
