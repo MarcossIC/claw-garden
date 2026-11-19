@@ -18,8 +18,9 @@ use clawg_core::memory::subfolder::{declare_subfolder, SubfolderError};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
+use super::docs::spawn_doc_refresh;
 use super::sessions::sessions_follow;
-use super::{ApiError, ApiResult, AppCtx, embed_failure, ready_embedder, spawn_doc_refresh};
+use super::{ApiError, ApiResult, AppCtx, embed_failure, ready_embedder};
 
 #[derive(Debug, Deserialize)]
 pub struct RegisterRequest {

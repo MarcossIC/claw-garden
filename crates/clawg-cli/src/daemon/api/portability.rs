@@ -23,7 +23,8 @@ use std::time::Instant;
 
 use crate::daemon::imports::{Busy, Cancel, End, JobView, Meta};
 
-use super::{ApiError, ApiResult, AppCtx, embed_failure, micros, ready_embedder};
+use super::docs::micros;
+use super::{ApiError, ApiResult, AppCtx, embed_failure, ready_embedder};
 
 #[derive(Debug, Serialize)]
 pub struct BackupBody {
