@@ -64,7 +64,7 @@ Por cada línea del texto, sin `\r` final:
 
 Después se aplican la forma de nombre válido y `redact` (`crates/clawg-core/src/memory/domain/redact.rs:235`, que pasa a `pub`). Primero se busca la subcadena `not found` en el texto entero, así que una salida sin ella no se parte en líneas.
 
-**Descartado:** la dependencia `regex` en `clawg-cli`. Compilar el patrón cuesta en cada proceso de hook, y las tres formas se cubren con `ends_with` y `strip_prefix`.
+**Descartado:** la dependencia `regex` en `clawg-cli`. Las tres formas se cubren con `ends_with` y `strip_prefix`, y no hace falta un motor de patrones para eso. `redact` sí compila sus `PATTERNS` en cada proceso con firma, porque es un `Lazy`. Medido con un release, ese costo es chico al lado del de arrancar el proceso: la tanda con firma suma entre 0 y unos 7 ms de p95 sobre la sin firma, y las dos quedan dentro de la puerta ([verify.md](verify.md#la-puerta-medida-otra-vez-con-lo-que-agrega-el-hook)).
 
 ## D5. `observe` no interpreta el shell
 

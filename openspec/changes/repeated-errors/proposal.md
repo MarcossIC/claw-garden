@@ -50,9 +50,9 @@ B, A y D, en ese orden. C queda afuera.
    - A lo sumo lee los dos archivos del libro (≤ 64 KiB cada uno) y agrega una línea.
    - Se corta a los 300 ms (`POST_TOOL_DEADLINE`), por debajo de los 5 s con los que se configura.
    - No deja línea en `hook-runs.jsonl`.
-   - Puerta en la verificación, en Windows y con el binario publicado: p95 ≤ 60 ms de reloj en 200 corridas desde Git Bash con una entrada sin firma. Hoy `clawg --version` tarda 38 a 43 ms ahí, y el proceso vacío 28 ms. Si no pasa, no se publica con `PostToolUse` instalado.
+   - Puerta en la verificación, en Windows y con un release: en 200 corridas desde Git Bash con una entrada sin firma, alternadas con las de `/usr/bin/true`, el p95 del hook menos el p95 de `true` es ≤ 60 ms. Se mide lo que agrega el hook y no el total, porque el arranque de un proceso vacío en la misma máquina dio p95 de 28, 56 y 122 ms en días distintos, y un tope absoluto juzgaba el día de la máquina. Se mide con la máquina en su uso de todos los días, no tranquila, que es como corre el hook. Si no pasa, no se publica con `PostToolUse` instalado.
 7. **El texto del arranque entra en el tope del cliente.** El bloque de reglas, de a lo sumo 700 bytes (el peor caso medido son 671), se descuenta del presupuesto que el hook le pide al daemon (`SESSION_BUDGET`, `hook.rs:65`). Así el total sigue debajo de los 10.000 caracteres (`hook.rs:655-667`).
-8. **Sin dependencias nuevas.** La firma se reconoce a mano, línea por línea (`: command not found` y las formas de `sh` y `zsh`). Un `regex` en `clawg-cli` costaría su compilación en cada proceso de hook. La búsqueda en el PATH reusa `doctor::analyze` (`crates/clawg-cli/src/doctor/mod.rs:61`).
+8. **Sin dependencias nuevas.** La firma se reconoce a mano, línea por línea (`: command not found` y las formas de `sh` y `zsh`). Un `regex` en `clawg-cli` no hace falta para tres formas fijas. La búsqueda en el PATH reusa `doctor::analyze` (`crates/clawg-cli/src/doctor/mod.rs:61`).
 
 ## Qué cambia para quien ya instaló
 
@@ -84,7 +84,7 @@ B, A y D, en ese orden. C queda afuera.
 - **La forma real de `tool_response` de Bash** no está en este repositorio: los tipos del cliente la dejan sin tipo. Por eso el hook busca la firma en todos los textos de `tool_response`, sin suponer campos. La verificación registra una entrada real de cada evento y la suma como fixture.
 - **El PATH del hook no es el del Bash del agente.** En Windows, Git Bash suma `/usr/bin`. El PATH sólo se usa para descartar una regla, nunca para crearla, así que el error posible es callar una regla, no inventarla.
 - **Un `CLAUDE.md` que pide lo contrario.** La regla no le dice al agente que desobedezca. Dice el hecho, ofrece las herramientas del cliente y pide avisarle a la persona. D le muestra la causa a la persona.
-- **El arranque de un proceso en Windows con el antivirus escaneando un binario de 43 MB** puede pasar los 60 ms en frío. Lo muestra la puerta de latencia.
+- **El arranque de un proceso en Windows con el antivirus escaneando un binario de 43 MB** puede sumar mucho en frío, pero lo paga igual cualquier proceso de clawg. La puerta de latencia mide lo que el hook agrega encima.
 - **Dos hooks que escriben a la vez** (llamadas en paralelo, sesiones en paralelo). Cada línea se agrega con una sola escritura en modo append y el renombrado no relee nada, como en `hook-runs.jsonl`. Perder una línea cuesta, como mucho, una sesión más de aprendizaje.
 
 ## Datos guardados

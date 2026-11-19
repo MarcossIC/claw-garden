@@ -9,6 +9,6 @@ artifacts:
   design: done  # D1 a D9
   tasks: done  # siete commits del producto, la verificación local y uno del arnés
   apply: done  # tareas 1 a 7 y la 9, el brazo a3-notools; la 8 es la verificación local
-  verify: partial  # RE1 a RE8 sin CRITICAL, con tres WARNING antes de archivar; RE9 y la tarea 8, pendientes (verify.md)
+  verify: partial  # RE1 a RE8 sin CRITICAL; W1, W2 y W3 cerrados; la puerta de latencia pasa (lo que agrega el hook sobre true); quedan la suite, clippy y CI sobre el commit que se archive (verify.md)
   archive: pending
-updated: 2026-11-14
+updated: 2026-11-19

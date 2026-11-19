@@ -102,7 +102,7 @@ Ninguno.
 | W2, el nombre del test | `60f1e295` | `only_a_program_that_never_worked_and_is_missing_is_a_rule` |
 | S4 y S5, visibilidad y comentarios | `5e6d7052` | `pub(crate)` en lo que sólo usa `clawg-cli`; `RULES_BLOCK_MAX` en el módulo de tests; los comentarios de `INPUT_LIMIT` y de `respond_reading` |
 
-Quedan abiertos W3 (el p95 de la tanda con firma, que juzga la puerta de latencia) y S2, S3, S6, S7 y S8. Con W1 arreglado, una respuesta con `stderr` vacío y la firma en `stdout`, sin `2>&1`, cuenta como llamada sin firma: un shell no escribe ahí su `command not found`, así que es lo buscado.
+W3 se cerró con la puerta de latencia, aceptando el costo (ver [la puerta, medida otra vez](#la-puerta-medida-otra-vez-con-lo-que-agrega-el-hook)). S7 se probó y no se commitea. Quedan abiertos S2, S3, S6 y S8. Con W1 arreglado, una respuesta con `stderr` vacío y la firma en `stdout`, sin `2>&1`, cuenta como llamada sin firma: un shell no escribe ahí su `command not found`, así que es lo buscado.
 
 ## La campaña
 
@@ -183,6 +183,23 @@ Se probó con TDD: `Command::runs_on_one_thread` en `cli.rs`, con el test `only_
 
 `/usr/bin/true` en la misma medición dio p50 108 y p95 126. El p50 baja 1 ms en las tres tandas, y el p95 se mueve para los dos lados. S7 no da una ganancia que se pueda medir, así que no se commitea.
 
-### Lo que queda por decidir
+## La puerta, medida otra vez, con lo que agrega el hook
 
-La puerta, tal como está escrita, no pasa con esta medición, así que el cambio no se archiva. Con lo que dice la tarea 8, `PostToolUse` no se publica instalado mientras no pase.
+Con el tope absoluto, la puerta juzgaba el día de la máquina: el mismo `true` vacío dio p95 de 28, 56 y 122 a 131 ms en días distintos. La [decisión 6](proposal.md) pasa a pedir que el p95 sin firma menos el p95 de `/usr/bin/true`, medidos alternados, sea ≤ 60 ms. Se mide con la máquina en su uso de todos los días, que es como corre el hook, no esperando un rato tranquilo.
+
+Medida sobre `d2416b56` (`clawg 0.89.0`) el 2026-11-19, con el mismo release con la feature `testing`, un home temporal por entrada (el de la tanda sin firma con los dos `fail` de `eza` de la medición anterior) y el editor y el agente abiertos. Dos mediciones seguidas de 200 rondas, cada ronda con `true`, `--version` y las dos entradas, en ese orden.
+
+| Tanda | 1.ª p50 | 1.ª p95 | 2.ª p50 | 2.ª p95 |
+|---|---|---|---|---|
+| `/usr/bin/true` | 108 | 128 | 125 | 161 |
+| `clawg --version` | 120 | 134 | 138 | 165 |
+| `hook post-tool-use`, sin firma | 130 | 148 | 144 | 172 |
+| `hook post-tool-use-failure`, con firma | 131 | 155 | 151 | 180 |
+
+**Pasa.** Sin firma, el hook agrega 20 y 11 ms de p95 sobre `true`, y 14 y 7 sobre `--version`. Con firma agrega 27 y 19 sobre `true`. Los números coinciden con los de la medición anterior (34 ms sin firma sobre `true`, 14 sobre `--version`), así que lo que agrega el hook es estable entre días aunque el piso no lo sea. La tanda con firma imprime la línea del mismo turno (`latency-probe-xyz` is not installed…), así que mide el camino que escribe y responde.
+
+**No queda una optimización barata.** Lo que el hook hace en el camino sin firma ya no abre nada salvo el libro: no habla con el daemon, no compila regex y no busca en el PATH. S7, la palanca que quedaba, se midió y no mueve el p95. La mayor parte del total es arrancar un proceso de unos 57 MB en Windows, y eso lo paga igual `clawg --version`, que sale en el parseo de los argumentos antes de crear el runtime.
+
+**W3** queda cerrado aceptando el costo: compilar los `PATTERNS` de `redact` en un proceso con firma suma unos 7 ms de p95 sobre la tanda sin firma en las dos mediciones, por debajo de la puerta. D4 y la decisión 8 lo dicen.
+
+Con la puerta pasada, `PostToolUse` puede publicarse instalado. De la tarea 8 quedan la suite y los dos clippy sobre el commit que se archive, y el CI de Linux y Windows.
