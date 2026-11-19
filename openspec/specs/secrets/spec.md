@@ -171,20 +171,20 @@ El worker MUST seguir aplicando `redact` al contenido de cada evento, de cualqui
 
 ### R3. El save dice qué se enmascaró
 
-Una respuesta `201` de `POST /v1/memories` MUST incluir `redacted`, cada tipo una vez y en el orden en que se enmascaró, cuando no está vacía, y MUST omitirlo cuando lo está (`SaveBody.redacted`, `crates/clawg-cli/src/daemon/api.rs:576`; `save_response`, `api.rs:1183`). La lista une lo que el daemon enmascaró al aceptar el save con lo que el reporte del worker agrega (`masked_kinds`, `api.rs:1252`; sólo un evento sin fila puede sumar algo en el worker):
+Una respuesta `201` de `POST /v1/memories` MUST incluir `redacted`, cada tipo una vez y en el orden en que se enmascaró, cuando no está vacía, y MUST omitirlo cuando lo está (`SaveBody.redacted`, `crates/clawg-cli/src/daemon/api/memories.rs`; `save_response`, `api/memories.rs`). La lista une lo que el daemon enmascaró al aceptar el save con lo que el reporte del worker agrega (`masked_kinds`, `api/memories.rs`; sólo un evento sin fila puede sumar algo en el worker):
 
 ```json
 {"status": "saved", "memories": [{"kind": "memory", "id": 57, "outcome": "inserted"}], "redacted": ["github_token"]}
 ```
 
-`DaemonClient` MUST leerlo en `SaveOutcome::Saved.redacted` (`crates/clawg-cli/src/client.rs:581`), vacío si un daemon anterior no lo manda. `save_memory` MUST agregar al texto de éxito `; masked <tipos> before storing it` (`save_outcome_text`, `crates/clawg-cli/src/mcp/server.rs:688`). Las respuestas `202` no lo llevan, aunque el daemon ya haya enmascarado: su cuerpo es `status`, `reason` y `operation_id` (`SaveBody::queued`, `api.rs:600`).
+`DaemonClient` MUST leerlo en `SaveOutcome::Saved.redacted` (`crates/clawg-cli/src/client.rs:581`), vacío si un daemon anterior no lo manda. `save_memory` MUST agregar al texto de éxito `; masked <tipos> before storing it` (`save_outcome_text`, `crates/clawg-cli/src/mcp/server.rs:688`). Las respuestas `202` no lo llevan, aunque el daemon ya haya enmascarado: su cuerpo es `status`, `reason` y `operation_id` (`SaveBody::queued`, `api/memories.rs`), con `topic_key` cuando el save trae una; una `partially_saved` lleva además `memories`, los pedazos que ya guardó, y `detail`, por qué se detuvo, y una `retrying`, `detail` y los pedazos guardados, si hay alguno.
 
 #### Escenario
 - GIVEN un daemon con el embedder listo
 - WHEN se guarda un texto con una key de Slack
 - THEN la respuesta es `201` con `redacted: ["slack_token"]`, y el texto de `save_memory` nombra `slack_token`
 
-**Tests:** `a_save_reports_the_secrets_it_masked` (`crates/clawg-cli/tests/api.rs`), `a_confirmed_save_lists_the_kinds_it_masked` (`api.rs`, mod tests) `a_masked_save_tells_the_agent_what_was_masked` (`server.rs`, mod tests) y `a_confirmed_save_names_its_operation_and_what_was_masked_before_it_was_recorded` (`api.rs`, mod tests).
+**Tests:** `a_save_reports_the_secrets_it_masked` (`crates/clawg-cli/tests/api.rs`), `a_confirmed_save_lists_the_kinds_it_masked` (`api/memories.rs`, mod tests) `a_masked_save_tells_the_agent_what_was_masked` (`server.rs`, mod tests) y `a_confirmed_save_names_its_operation_and_what_was_masked_before_it_was_recorded` (`api/memories.rs`, mod tests).
 
 ## Lo ya guardado
 

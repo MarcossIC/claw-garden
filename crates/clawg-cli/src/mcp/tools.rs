@@ -21,7 +21,8 @@ use clawg_core::memory::prompt_builder::{display_author, shared_note};
 use clawg_core::memory::provenance::mark;
 use clawg_core::memory::registry::{ListedSuggestion, Refusal, Resolution as ProjectResolution};
 use clawg_core::memory::sharing::{Reach, SharingError, SharingPolicy};
-use clawg_core::memory::ProjectIdentity;
+use clawg_core::memory::store_insert::MemoryType;
+use clawg_core::memory::{MemoryStatus, ProjectIdentity, StoredType};
 use clawg_core::paths::Profile;
 use clawg_core::preferences::Lang;
 
@@ -188,13 +189,13 @@ fn revised_from(row_project: &Option<Option<String>>, save_projects: &[String]) 
 /// revise the row under it, since a key of another project would promise a
 /// revision the reader cannot make. A preference without a project is revised
 /// only by a save with `all_projects`, and says so.
-fn shown_key(key: Option<&str>, memory_type: Option<&str>, row_project: &Option<Option<String>>, save_projects: &[String]) -> String {
+fn shown_key(key: Option<&str>, memory_type: Option<&StoredType>, row_project: &Option<Option<String>>, save_projects: &[String]) -> String {
     let Some(key) = key else {
         return String::new();
     };
     if revised_from(row_project, save_projects) {
         format!(" topic={key}")
-    } else if matches!(row_project, Some(None)) && memory_type == Some("user_preference") {
+    } else if matches!(row_project, Some(None)) && memory_type.is_some_and(|t| *t == MemoryType::UserPreference) {
         format!(" topic={key} all_projects")
     } else {
         String::new()
@@ -268,8 +269,8 @@ fn format_hits(lang: Lang, hits: &[Hit], reader: &str, save_projects: &[String])
 /// One line per side of a resolved dispute, the kept row first.
 pub fn format_resolution(lang: Lang, r: &Resolution) -> String {
     let line = |row: &ResolvedRow| match (row.superseded_by, lang) {
-        (Some(by), Lang::En) if row.status == "superseded" => format!("#{} superseded by #{by}", row.id),
-        (Some(by), Lang::Es) if row.status == "superseded" => format!("#{} reemplazada por #{by}", row.id),
+        (Some(by), Lang::En) if row.status == MemoryStatus::Superseded => format!("#{} superseded by #{by}", row.id),
+        (Some(by), Lang::Es) if row.status == MemoryStatus::Superseded => format!("#{} reemplazada por #{by}", row.id),
         _ => format!("#{} {}", row.id, row.status),
     };
     let rows = format!("{}\n{}", line(&r.keep), line(&r.other));
@@ -297,7 +298,7 @@ pub fn format_open_pairs(lang: Lang, open: &OpenPairs) -> String {
 /// when a save in one of `save_projects` would revise the row, as on a search
 /// hit.
 pub fn format_save(lang: Lang, save: &SavedText, save_projects: &[String]) -> String {
-    let topic = shown_key(save.topic_key.as_deref(), save.memory_type.as_deref(), &save.project_id, save_projects);
+    let topic = shown_key(save.topic_key.as_deref(), save.memory_type.as_ref(), &save.project_id, save_projects);
     if save.pieces <= 1 {
         return format!("#{}{topic}\n{}", save.id, save.text);
     }
@@ -413,19 +414,19 @@ pub fn format_restore(lang: Lang, r: &Restored) -> String {
     let key = r.topic_key.as_deref().map(|k| format!(" topic={k}")).unwrap_or_default();
     let id = r.id;
     let mut out = match (r.superseded_by, lang) {
-        (Some(by), Lang::En) if r.status == "superseded" && r.superseded_by_deleted => format!(
+        (Some(by), Lang::En) if r.status == MemoryStatus::Superseded && r.superseded_by_deleted => format!(
             "restored #{id}{key}; it is still superseded by #{by}, which is deleted too, so searches leave it out \
              until restore_memory brings #{by} back or the content is saved again"
         ),
-        (Some(by), Lang::Es) if r.status == "superseded" && r.superseded_by_deleted => format!(
+        (Some(by), Lang::Es) if r.status == MemoryStatus::Superseded && r.superseded_by_deleted => format!(
             "se restauró #{id}{key}; sigue reemplazada por #{by}, que también está borrada, así que las búsquedas la \
              dejan afuera hasta que restore_memory traiga #{by} de vuelta o el contenido se guarde de nuevo"
         ),
-        (Some(by), Lang::En) if r.status == "superseded" => format!(
+        (Some(by), Lang::En) if r.status == MemoryStatus::Superseded => format!(
             "restored #{id}{key}; it is still superseded by #{by}, so searches leave it out until \
              resolve_conflict keeps it"
         ),
-        (Some(by), Lang::Es) if r.status == "superseded" => format!(
+        (Some(by), Lang::Es) if r.status == MemoryStatus::Superseded => format!(
             "se restauró #{id}{key}; sigue reemplazada por #{by}, así que las búsquedas la dejan afuera hasta que \
              resolve_conflict la mantenga"
         ),
@@ -511,7 +512,7 @@ pub fn format_rows(lang: Lang, rows: &[MemoryRow], reader: &str) -> String {
                 r.kind,
                 // A daemon before V32 sends no type for a row of its other two
                 // kinds; a dash keeps every later field in the same column.
-                r.memory_type.as_deref().unwrap_or("-"),
+                r.memory_type.as_ref().map_or("-", StoredType::as_str),
                 r.tier,
                 r.importance,
                 r.access_count,
@@ -529,7 +530,7 @@ pub fn format_rows(lang: Lang, rows: &[MemoryRow], reader: &str) -> String {
 /// so a listing shows the versions of a topic and which one replaced which.
 fn revision(r: &MemoryRow) -> String {
     let mut out = String::new();
-    if let (Some(by), "superseded") = (r.superseded_by, r.status.as_str()) {
+    if let (Some(by), Some(MemoryStatus::Superseded)) = (r.superseded_by, r.status.known()) {
         out.push_str(&format!(" by=#{by}"));
     }
     if let Some(key) = &r.topic_key {
@@ -612,7 +613,7 @@ fn synthesis_line_with(r: &MemoryRow, extra: &str) -> String {
     format!(
         "#{} {}{origin}{}{extra} {}",
         r.id,
-        r.memory_type.as_deref().unwrap_or("-"),
+        r.memory_type.as_ref().map_or("-", StoredType::as_str),
         sources(r),
         truncate_content(&r.summary, CONTENT_PREVIEW_LIMIT)
     )
@@ -1235,6 +1236,7 @@ pub fn format_status(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clawg_core::memory::StoredStatus;
     use clawg_core::memory::outbox::{OutboxProblem, OutboxState, OutboxSummary};
     use clawg_core::memory::dispute::OpenPair;
     use crate::client::{RelatedMemory, ReplacedMemory};
@@ -1254,7 +1256,7 @@ mod tests {
             id,
             kind: kind.into(),
             content: content.into(),
-            memory_type: memory_type.into(),
+            memory_type: StoredType::read(memory_type),
             tier,
             score,
             agent_id: None,
@@ -1577,11 +1579,11 @@ mod tests {
         MemoryRow {
             id,
             kind: kind.into(),
-            memory_type: memory_type.map(str::to_owned),
+            memory_type: memory_type.map(StoredType::read),
             summary: summary.into(),
             tier: 2,
             importance: 5.0,
-            status: "active".into(),
+            status: StoredStatus::read("active"),
             access_count: 3,
             ..Default::default()
         }
@@ -1591,7 +1593,7 @@ mod tests {
     fn rows_show_their_key_and_who_replaced_them() {
         let current = MemoryRow { topic_key: Some("storage/engine".into()), ..row(9, "memory", Some("architectural_decision"), "postgres") };
         let old = MemoryRow {
-            status: "superseded".into(),
+            status: StoredStatus::read("superseded"),
             superseded_by: Some(9),
             topic_key: Some("storage/engine".into()),
             ..row(4, "memory", Some("architectural_decision"), "sqlite")
@@ -1798,14 +1800,14 @@ mod tests {
             text: "tabs".into(),
             topic_key: Some("style/indent".into()),
             project_id: Some(Some("other".into())),
-            memory_type: Some("user_preference".into()),
+            memory_type: Some(StoredType::read("user_preference")),
         };
         assert_eq!(format_save(Lang::En, &save, &["here".into()]), "#68\ntabs");
         assert_eq!(format_save(Lang::En, &save, &["other".into()]), "#68 topic=style/indent\ntabs");
         let every_project = SavedText { project_id: Some(None), ..save.clone() };
         assert_eq!(format_save(Lang::En, &every_project, &["here".into()]), "#68 topic=style/indent all_projects\ntabs");
         assert_eq!(format_save(Lang::En, &every_project, &[]), "#68 topic=style/indent all_projects\ntabs");
-        let a_fact = SavedText { memory_type: Some("semantic_fact".into()), ..every_project.clone() };
+        let a_fact = SavedText { memory_type: Some(StoredType::read("semantic_fact")), ..every_project.clone() };
         assert_eq!(format_save(Lang::En, &a_fact, &["here".into()]), "#68\ntabs");
         let no_type_sent = SavedText { memory_type: None, ..every_project };
         assert_eq!(format_save(Lang::En, &no_type_sent, &["here".into()]), "#68\ntabs", "a daemon that does not send the type");
@@ -1871,7 +1873,7 @@ mod tests {
             kind: "memory".into(),
             id: 12,
             importance: 8.0,
-            memory_type: Some("user_preference".into()),
+            memory_type: Some(StoredType::read("user_preference")),
             tier: 1,
             project_id: None,
             pulled_in: Vec::new(),
@@ -1895,7 +1897,7 @@ mod tests {
             kind: "memory".into(),
             id: 12,
             importance: 5.0,
-            memory_type: Some("semantic_fact".into()),
+            memory_type: Some(StoredType::read("semantic_fact")),
             tier: 3,
             project_id: Some("repo-1a2b".into()),
             pulled_in: vec![13, 14],
@@ -1913,7 +1915,7 @@ mod tests {
     }
 
     fn restored(id: i64, status: &str, superseded_by: Option<i64>) -> Restored {
-        Restored { id, status: status.into(), superseded_by, ..Restored::default() }
+        Restored { id, status: StoredStatus::read(status), superseded_by, ..Restored::default() }
     }
 
     #[test]
@@ -2224,7 +2226,7 @@ mod tests {
 
     #[test]
     fn format_resolution_names_both_rows_and_what_replaced_one() {
-        let row = |id, status: &str, superseded_by| ResolvedRow { id, status: status.into(), superseded_by };
+        let row = |id, status: &str, superseded_by| ResolvedRow { id, status: StoredStatus::read(status), superseded_by };
         let out = format_resolution(Lang::En, &Resolution { keep: row(9, "active", None), other: row(4, "superseded", Some(9)), pair: None });
         assert_eq!(out, "#9 active\n#4 superseded by #9");
     }
@@ -2474,7 +2476,7 @@ mod tests {
             kind: "memory".into(),
             id: 12,
             importance: 8.0,
-            memory_type: Some("user_preference".into()),
+            memory_type: Some(StoredType::read("user_preference")),
             tier: 1,
             project_id: None,
             pulled_in: vec![13],

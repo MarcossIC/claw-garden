@@ -15,6 +15,7 @@ Fuente de verdad del comportamiento actual de la identidad de proyecto. Cubre c�
 - [bridge-project-identity](../../changes/archive/2026-11-07-bridge-project-identity/proposal.md), archivado el 2026-11-07, que salió en 0.78.0 (R3 deja de dar al puente sólo el proyecto de su directorio, R6 pide `index_docs` para una carpeta abierta, y PL34 busca sin alcance cuando no hay ninguna; las carpetas abiertas y el save que nombra su proyecto están en [`specs/mcp`](../mcp/spec.md), BI1 a BI10).
 - [retire-legacy-kinds](../../changes/archive/2026-11-07-retire-legacy-kinds/proposal.md), archivado el 2026-11-07, que sale en 0.79.0 (RL2, «Los diarios de proyectos nombran las filas migradas», al final de esta spec: las uniones, los borrados y el registro dejan de tocar las tablas que V32 retira). Los requisitos de ese cambio se numeran R1 a R10 allí y RL1 a RL10 acá, para no chocar con los ids de cada spec.
 - [store-boundary](../../changes/archive/2026-11-12-store-boundary/proposal.md), archivado el 2026-11-12, que sale en 0.84.0 (SB3, «Las carpetas de un proyecto se cuentan en el núcleo», después de PL39: `locate_project` deja de leer `project_path` y cuenta con `registry::own_folder_count`). Los R1 a R10 de ese cambio son SB1 a SB10; los demás están en [`specs/storage`](../storage/spec.md), «El límite del almacenamiento», y SB8 también en [`specs/portability`](../portability/spec.md) y [`specs/sharing`](../sharing/spec.md).
+- [core-use-cases](../../changes/archive/2026-11-19-core-use-cases/proposal.md), archivado el 2026-11-19, que sale en 0.89.0 (PL66 a PL71, antes R8 a R10 y R12 a R14 de esa spec: las reglas de un registro, de ubicar una carpeta, de borrar con un código y de responder una sugerencia o resolver un `new_project` bajan del handler a `clawg-core`). SB3 cambia: `locate_folder` decide con `own_folder_count`, que es privada de `registry.rs`. Sus R11 y R15, de conservación, no se consolidan.
 
 ## Definiciones
 
@@ -118,11 +119,11 @@ El puente MCP (las raíces del cliente, su cwd y `project_path`) y `clawg memori
 
 ## R4. Registro de proyecto y re-key
 
-`POST /v1/projects`, con token, recibe `{ "root_path": "...", "legacy_ids": ["..."], "index_docs": <bool>, "assigned": <bool>, "path": "..." }` (`path`, el camino crudo, es opcional y sólo cuenta con `assigned`: PL44) y responde `{ "project_id": "...", "root_id": "...", "rekeyed": <n> }` (`register`, `crates/clawg-cli/src/daemon/api.rs`; `register_project`, `crates/clawg-core/src/memory/projects/project.rs`).
+`POST /v1/projects`, con token, recibe `{ "root_path": "...", "legacy_ids": ["..."], "index_docs": <bool>, "assigned": <bool>, "path": "..." }` (`path`, el camino crudo, es opcional y sólo cuenta con `assigned`: PL44) y responde `{ "project_id": "...", "root_id": "...", "rekeyed": <n> }` (`register`, `crates/clawg-cli/src/daemon/api/projects.rs`; `register_project`, `crates/clawg-core/src/memory/projects/project.rs`).
 
 - El daemon MUST decidir los ids él mismo, de `root_path` y de las huellas que lee de su checkout (PL3); no los recibe. Con `assigned` los asigna (R15, R16); sin él (un cliente anterior) el id de raíz y de proyecto es `derive_project_id(root_path)`, sin clave (R18).
-- `index_docs` dice si el daemon puede leer los archivos de la raíz ([`specs/project-docs`](../project-docs/spec.md), «Qué raíces se leen»). Si falta MUST tomarse como `false` (`RegisterRequest::index_docs`, `api.rs:1920`): un puente de una versión anterior registra sin indexar, y lo arregla `clawg projects add` o un puente actual en esa raíz cuando es un proyecto.
-- Con `index_docs: true` y una `root_path` que no es un directorio, MUST responder 400 antes de tocar `project_path` (`register`, `api.rs`). Sin `index_docs`, la misma ruta se sigue registrando como siempre.
+- `index_docs` dice si el daemon puede leer los archivos de la raíz ([`specs/project-docs`](../project-docs/spec.md), «Qué raíces se leen»). Si falta MUST tomarse como `false` (`RegisterRequest::index_docs`, `api/projects.rs`): un puente de una versión anterior registra sin indexar, y lo arregla `clawg projects add` o un puente actual en esa raíz cuando es un proyecto.
+- Con `index_docs: true` y una `root_path` que no es un directorio, MUST responder 400 antes de tocar `project_path` (`check_root`, PL66, que llama `register_root` en `crates/clawg-cli/src/daemon/api/projects.rs`). Sin `index_docs`, la misma ruta se sigue registrando como siempre.
 - MUST guardar en `project_path` la carpeta de la raíz (su id de raíz, `root_path`, `index_docs`, su proyecto y sus huellas, PL4) cuando ninguna carpeta del camino le sirve, y crear en `project` su proyecto cuando no existe.
 - Si la fila existe con la misma raíz y el registro pide indexar, MUST pasar `index_docs` de 0 a 1. MUST NOT bajarlo de 1 a 0: un save en otra sesión no le quita a una raíz aceptada su índice (`project.rs:98-100`). El resultado (`RegisterOutcome::index_docs`) lleva el valor que quedó guardado.
 - Sin `assigned`, si `derive_project_id(root_path)` ya está registrado con **otra** `root_path`, o la raíz está guardada con otro id, MUST responder 409 sin mover ninguna fila y sin tocar la marca de la otra raíz. El cuerpo es `{ "error": "project_root_collision", "detail": "<raíz> gets the project id <id>, which already belongs to <otra raíz>" }`. Con `assigned` MUST NOT responder 409 por un choque.
@@ -258,13 +259,13 @@ Cada fila que un movimiento cambia, por cualquier puerta, MUST dejar en `memory_
 
 `POST /v1/memories/move` MUST tomar `dry_run` y una selección (al menos uno de `ids`, `from_project`/`from_none`, `agent`, `memory_type`, `source`, `session_id` o `q`; sin `include_deleted`, filas no borradas; `q` con `include_deleted` es un 400) con un destino (`to_project` o `to_none`), o `undo`. Es del usuario: sin lector y sin `user_answered`; cuenta en `protected` las preferencias y decisiones vivas que movió. Con algo que mover y sin `dry_run`, MUST tomar antes el snapshot `pre-move`. Un ensayo MUST responder lo mismo que el movimiento, salvo `move_id` y `snapshot`, sin escribir nada. `clawg projects move` manda ese pedido al daemon que corre, sin arrancar uno, e imprime el reporte; su análisis de argumentos es puro (`MoveOpts::request`).
 
-**Test:** `a_dry_run_reports_what_a_move_does_and_writes_nothing`, `a_selection_needs_a_filter_and_text_only_over_live_rows` y `the_filters_narrow_the_selection` (`relocate.rs`); `a_move_asks_for_one_target_or_an_undo` (`api.rs`); `the_batch_moves_reports_and_snapshots` y `a_batch_without_a_selection_or_a_target_is_400` (`tests/api.rs`); `move_takes_a_selection_and_one_target_or_an_undo` (`cli.rs`); `a_move_report_names_what_moved_what_stayed_and_the_way_back` y `projects_move_moves_a_memory_and_undoes_it` (`projects.rs`); `projects_move_moves_and_undoes_a_seeded_store` (`tests/binary.rs`).
+**Test:** `a_dry_run_reports_what_a_move_does_and_writes_nothing`, `a_selection_needs_a_filter_and_text_only_over_live_rows` y `the_filters_narrow_the_selection` (`relocate.rs`); `a_move_asks_for_one_target_or_an_undo` (`api/memories.rs`); `the_batch_moves_reports_and_snapshots` y `a_batch_without_a_selection_or_a_target_is_400` (`tests/api.rs`); `move_takes_a_selection_and_one_target_or_an_undo` (`cli.rs`); `a_move_report_names_what_moved_what_stayed_and_the_way_back` y `projects_move_moves_a_memory_and_undoes_it` (`projects.rs`); `projects_move_moves_and_undoes_a_seeded_store` (`tests/binary.rs`).
 
 ## R13. Listar lo que no tiene proyecto
 
 `GET /v1/memories?no_project=true` MUST listar sólo las filas sin proyecto; con `project` es un 400. `clawg memories list` y `search` toman `--no-project`.
 
-**Test:** `a_listing_of_rows_without_a_project` (`admin.rs`), `no_project_and_project_together_are_refused` (`api.rs`), `the_listing_reaches_the_rows_without_a_project` (`tests/api.rs`), `list_and_search_take_no_project` (`cli.rs`).
+**Test:** `a_listing_of_rows_without_a_project` (`admin.rs`), `no_project_and_project_together_are_refused` (`api/memories.rs`), `the_listing_reaches_the_rows_without_a_project` (`tests/api.rs`), `list_and_search_take_no_project` (`cli.rs`).
 
 ## HI3. Elegir filas por su proyecto de origen
 
@@ -620,7 +621,7 @@ Desde V32 no existen `episodic_trajectory` ni `procedural_skill` (RL1 de [`specs
 
 ## PL23. Borrar un proyecto vacío (etapa 1)
 
-`POST /v1/projects/delete` con `{"project_id": X}`, detrás del token (`delete_core`, `project_delete.rs`; `delete_projects`, `crates/clawg-cli/src/daemon/api.rs`). Se rechaza sin escribir, y en este orden:
+`POST /v1/projects/delete` con `{"project_id": X}`, detrás del token (`delete_core`, `project_delete.rs`; `delete_projects`, `crates/clawg-cli/src/daemon/api/projects.rs`). Se rechaza sin escribir, y en este orden:
 
 - 404 si X no está en `project`;
 - 409 `project_merged` si X es una lápida, con `detail` que nombra el proyecto vivo;
@@ -642,7 +643,7 @@ Si X está vacío, MUST hacer lo siguiente en una transacción, sin snapshot:
 3. dejar a X con `deleted_at`;
 4. escribir la fila de `project_delete` con `with_memories` falso.
 
-El borrado MUST NOT cambiar las carpetas (salvo `index_docs`), los remotos, las sugerencias, las lápidas que llevan a X, `synthesis_review` ni los `workspace.md`. El cuerpo con `confirm` sin `with_memories`, o con `dry_run`, es 400 (PL24).
+El borrado MUST NOT cambiar las carpetas (salvo `index_docs`), los remotos, las sugerencias, las lápidas que llevan a X, `synthesis_review` ni los `workspace.md`. El cuerpo con `confirm` sin `with_memories`, o con `dry_run`, es 400 (PL24; el del `confirm` lo decide el núcleo, PL68).
 
 #### Escenario: un proyecto que ya se vació
 - GIVEN un proyecto A cuyas memorias se movieron a B con `projects move`, con una memoria borrada y una carpeta con índice de docs
@@ -717,6 +718,17 @@ Como las filas se marcan juntas, MUST NOT revivir ninguna fila del proyecto (`RE
 - THEN no se escribe nada, y la respuesta trae el informe con la memoria nueva y otro código
 
 **Tests:** `deleting_with_memories_marks_every_row_and_revives_none`, `a_delete_keeps_outside_rows_replaced_and_releases_their_disputes`, `a_stale_code_is_refused_with_the_new_report` y `a_delete_with_memories_waits_for_the_saves_of_its_project` (`project_delete.rs`); `deleting_through_the_daemon_takes_two_steps` (`tests/api.rs`).
+
+## PL68. Un código de confirmación va con las filas
+
+`delete_core` (`crates/clawg-core/src/memory/projects/project_delete.rs`) con `with_memories` en `false` y un `confirm` MUST rechazar con `DeleteError::ConfirmWithoutRows` antes de leer el store. Su texto es `confirm goes with with_memories: it is the code of the report of a delete with its rows`, y el daemon lo traduce a `400`: es el `400` de PL23 y PL24 para el cuerpo con `confirm` sin `with_memories`, que ya no decide el handler sino el núcleo. Es el primer brazo del `match` de `(with_memories, confirm)`, así que un `confirm` sin `with_memories` se rechaza antes del `404` de un proyecto que no existe, y el código ya no se ignora para borrar el proyecto como vacío.
+
+#### Escenario
+- GIVEN un proyecto que no existe
+- WHEN se borra sin `with_memories` y con un `confirm`
+- THEN el rechazo es `ConfirmWithoutRows`, no `UnknownProject`
+
+**Tests:** `a_confirm_without_the_rows_is_refused_before_anything_is_read` (`project_delete.rs`, mod tests); `each_refused_project_delete_keeps_its_status_and_body` (`crates/clawg-cli/src/daemon/api/projects.rs`, mod tests).
 
 ## PL26. El `--undo` de un borrado
 
@@ -841,7 +853,7 @@ La tabla de PL19 suma `POST /projects/delete`, con el proyecto en `body.project_
 4. Si no hay ninguno y no se pidió `create`, `refused: "unknown"`.
 5. Si no hay ninguno y se pidió `create`, MUST crear el proyecto (PL33) y responderlo con `created: true`.
 
-Con `new_project: true` y `create`, el paso 3 MUST NOT impedir la creación: se crea aunque haya parecidos. El paso 2 sigue: un nombre que ya tiene un proyecto vivo responde ese proyecto, nunca uno nuevo con el mismo nombre.
+`new_project: true` sin `create` MUST responder 400 sin leer el registro (PL71). Con `new_project: true` y `create`, el paso 3 MUST NOT impedir la creación: se crea aunque haya parecidos. El paso 2 sigue: un nombre que ya tiene un proyecto vivo responde ese proyecto, nunca uno nuevo con el mismo nombre.
 
 La respuesta resuelta trae `project_id`, `name`, `created`, `deleted` y sus carpetas (`root_id`, `index_docs`), las más viejas primero. Cada candidato trae `id`, `name`, `deleted` y, si está borrado, `delete_id`. Nada se escribe fuera del paso 5.
 
@@ -872,6 +884,17 @@ Un proyecto que crea PL32 MUST tener:
 La transacción que lo crea MUST volver a mirar el paso 2 de PL32: si mientras tanto un proyecto vivo tomó ese nombre, responde ese.
 
 **Tests:** `a_new_project_gets_a_slug_and_four_hex_digits` (pura) y `a_project_is_created_once_by_name` (`registry.rs`).
+
+## PL71. `new_project` va con `create`
+
+`resolve_project` (`crates/clawg-core/src/memory/projects/registry.rs`) con `new_project` y sin `create` MUST rechazar con `ResolveError::NewProjectWithoutCreate` antes de leer el store. Su texto es `new_project goes with create: it creates a project apart from the similar ones`, y `POST /v1/projects/resolve` lo traduce a `400` (el `400` que decía el handler, ahora del núcleo). `new_project` sólo cambia lo que `create` hace con los parecidos (PL32), así que sin `create` no tiene nada que cambiar, y no se responde la referencia como si no lo llevara.
+
+#### Escenario
+- GIVEN un store cerrado
+- WHEN se resuelve `"ideas"` con `new_project` y sin `create`
+- THEN el rechazo es `NewProjectWithoutCreate`, no `Store`
+
+**Tests:** `new_project_without_create_is_refused_before_anything_is_read` (`registry.rs`, mod tests); `each_resolved_project_keeps_its_status_and_body` (`crates/clawg-cli/src/daemon/api/projects.rs`, mod tests).
 
 ## PL34. El argumento `project` de las herramientas
 
@@ -914,8 +937,8 @@ Cuando no hay carpetas abiertas ([`specs/mcp`](../mcp/spec.md), BI3) y la llamad
 
 `POST /v1/projects/suggestions/answer`, detrás del token, con `{"project_id": P, "other_id": O, "answer": "merge"|"apart", "user_answered": true, "reason": "..."}`. MUST:
 
-- responder 400 sin escribir cuando `user_answered` no es `true` o `reason` está vacío, como un veredicto que pide la respuesta de la persona;
-- responder 404 cuando P u O no existen, y 404 `no_suggestion` cuando no hay una sugerencia pendiente entre los dos, leída por `canonical`;
+- responder 400 sin escribir cuando `user_answered` no es `true` o `reason` está vacío, como un veredicto que pide la respuesta de la persona (`UserAnswer::new`, PL69);
+- responder 404 cuando P u O no existen, y 404 `no_suggestion` cuando no hay una sugerencia pendiente entre los dos, leída por `canonical` (`answer_suggestion_core`, PL70);
 - tratar a P y a O como lo que administra proyectos: 409 `project_merged` para una lápida y 409 `project_deleted` para un borrado (PL15, PL27);
 - con `apart`, hacer lo de `keep_apart` (PL16);
 - con `merge`, unir O en P como `POST /v1/projects/merge` (PL13), con su snapshot, su diario y su número, y responder su informe. `--undo` la deshace como a cualquier unión.
@@ -928,6 +951,51 @@ La herramienta `answer_suggestion` (`project` opcional, por defecto el del puent
 - THEN la sugerencia queda `apart`, deja de mostrarse en `recall_context` y `session-start`, y registrar la copia otra vez no la vuelve a crear
 
 **Tests:** `answering_a_suggestion_needs_the_users_answer`, `answering_apart_keeps_the_pair_from_coming_back`, `answering_merge_merges_and_is_undone` y `answering_without_a_pending_suggestion_is_404` (`tests/api.rs`); `answer_suggestion_says_what_it_did` (`server.rs`).
+
+Las reglas de la ruta las decide el núcleo, y el handler (`answer_suggestion`, `crates/clawg-cli/src/daemon/api/projects.rs`) sólo las traduce: la palabra de la persona y la respuesta conocida, en PL69; la sugerencia pendiente, `apart` y `merge`, en PL70. Las respuestas, con su estado y su cuerpo entero, las fija `each_answered_suggestion_keeps_its_status_and_body` (`crates/clawg-cli/src/daemon/api/projects.rs`, mod tests).
+
+## PL69. Una sugerencia la responde la persona
+
+`UserAnswer::new(answer, user_answered, reason)` (`crates/clawg-core/src/memory/projects/registry.rs`) MUST ser una función pura que devuelve la respuesta o el primer rechazo, en este orden:
+
+| # | Regla | Rechazo | Texto |
+|---|---|---|---|
+| 1 | `answer` que no es `merge` ni `apart` | `AnswerError::UnknownAnswer(answer)` | `answer must be one of: merge, apart (got "<answer>")` |
+| 2 | sin `user_answered`, o sin `reason`, o con un `reason` sin nada más que espacios | `AnswerError::NeedsUser` | `answering a suggestion is the user's call: send user_answered with the user's answer in reason` |
+
+`UserAnswer` MUST tener sus campos privados: sólo sale de `new`, así que ningún llamador del núcleo responde una sugerencia sin la palabra de la persona. `SuggestionAnswer` (`merge`, `apart`) es del núcleo y se serializa así en `AnsweredBody`. El daemon traduce los dos rechazos a `400`.
+
+#### Escenario: el orden
+- GIVEN una respuesta `"later"` sin `user_answered`
+- WHEN se comprueba
+- THEN el rechazo es `UnknownAnswer("later")`
+
+#### Escenario: la palabra de la persona
+- GIVEN una respuesta `"merge"` con `user_answered` y un `reason` de espacios
+- WHEN se comprueba
+- THEN el rechazo es `NeedsUser`; con `"the user said they are one"` pasa y es `SuggestionAnswer::Merge`
+
+**Tests** (`registry.rs`, mod tests, sin HTTP): `an_answer_is_merge_or_apart`, `an_answer_is_the_users_word` y `each_answer_refusal_keeps_its_text`.
+
+## PL70. Sólo se responde una sugerencia pendiente
+
+`answer_suggestion_core(store, workspaces, backups, project_id, other_id, answer)` (`registry.rs`), con `answer` un `UserAnswer`, MUST:
+
+1. comprobar los dos proyectos y leer la sugerencia pendiente entre ellos como `suggestion_between`; su rechazo MUST ser `AnswerError::Pair(KeepApartError)`, con el error tal cual;
+2. sin sugerencia pendiente, rechazar con `AnswerError::NoSuggestion { project_id, other_id }` (`no suggestion is pending between <project_id> and <other_id>`) sin escribir nada;
+3. con `apart`, responder como `keep_apart` (PL16; su rechazo, `Pair`) y devolver `Answered::Apart`;
+4. con `merge`, unir `other_id` en `project_id` como `merge_core` sin prueba en seco (PL13) y devolver `Answered::Merged(informe)`. Una unión rechazada MUST ser `AnswerError::Merge(MergeError)`, con el error tal cual.
+
+La sugerencia MUST buscarse otra vez en la transacción que escribe la respuesta (la de `keep_apart`, o cada pase de la unión, `merge_checked`): si otra respuesta la contestó entre el paso 1 y la escritura, MUST rechazarse con `NoSuggestion` sin escribir nada, así de dos respuestas a una sugerencia sólo queda la primera. Una unión pedida con `POST /v1/projects/merge` no mira sugerencias.
+
+El daemon MUST traducir `NoSuggestion` a `404 no_suggestion` con el texto en `detail`, `Pair(e)` como `kept_apart_error` en `POST /v1/projects/keep-apart` y `Merge(e)` como `merge_error` en `POST /v1/projects/merge`. `Answered::Apart` y `Answered::Merged` dan el `AnsweredBody` de siempre: `answer` en `apart` sin `merge`, o en `merge` con el informe de la unión y `trajectories` y `skills` en 0. Las sesiones siguen la unión en el daemon (`sessions_follow`).
+
+#### Escenario
+- GIVEN los proyectos `app` y `copia` con una sugerencia pendiente, y `web` y `notas` sin ninguna
+- WHEN se responde `apart` entre `web` y `notas`, y `merge` entre `app` y `copia`
+- THEN la primera da `NoSuggestion` y no escribe nada, y la segunda da `Merged` con `copia` unida en `app`
+
+**Tests** (`registry.rs`, mod tests, sin HTTP): `an_answer_needs_a_pending_suggestion`, `an_answer_checks_both_projects`, `apart_keeps_the_two_from_being_suggested_again`, `merge_merges_the_other_into_the_project`, `a_refused_merge_refuses_the_answer`, `a_store_that_fails_refuses_the_answer`, `of_two_answers_to_one_suggestion_one_is_written` y `keeping_apart_only_what_is_pending_writes_nothing_without_a_suggestion`; `a_check_that_stops_holding_before_the_write_refuses_the_merge` (`merge.rs`, mod tests).
 
 ## PL38. Una carpeta con el nombre de un proyecto cuyas carpetas ya no están
 
@@ -946,7 +1014,7 @@ Un proyecto con una carpeta presente, uno sin carpetas, una lápida y un borrado
 ## PL39. `clawg projects create` y `clawg projects locate`
 
 - `clawg projects create <NOMBRE> [--new] [--profile P]` MUST resolver NOMBRE con `create` y `born = 'user'` (PL32), con `new_project` si se pasa `--new`. Imprime el proyecto creado, o el que ya tenía ese nombre, o los candidatos y que `--new` crea uno aparte (sale con 1).
-- `clawg projects locate <PROYECTO> <CAMINO> [--profile P]` MUST hacer que la raíz de CAMINO lleve a PROYECTO (un id o un nombre, que no sigue la lápida). El daemon registra la raíz como un puente (`POST /v1/projects/locate`, con `{"project", "root_path"}`; CAMINO tiene que ser un directorio). Si su proyecto ya es PROYECTO, no hace nada. Si no, ese proyecto MUST tener esa carpeta sola, o la respuesta es 409 `folder_shared`, que nombra el proyecto y la unión que haría falta; y con una sola carpeta MUST unirlo en PROYECTO como `POST /v1/projects/merge` (PL13), con su `--undo`, que es la forma de volver atrás. No tiene prueba en seco: la raíz se registra antes de saber a qué proyecto lleva.
+- `clawg projects locate <PROYECTO> <CAMINO> [--profile P]` MUST hacer que la raíz de CAMINO lleve a PROYECTO (un id o un nombre, que no sigue la lápida). El daemon registra la raíz como un puente (`POST /v1/projects/locate`, con `{"project", "root_path"}`; CAMINO tiene que ser un directorio, `check_folder`, PL67). Si su proyecto ya es PROYECTO, no hace nada. Si no, ese proyecto MUST tener esa carpeta sola, o la respuesta es 409 `folder_shared`, que nombra el proyecto y la unión que haría falta; y con una sola carpeta MUST unirlo en PROYECTO como `POST /v1/projects/merge` (PL13), con su `--undo`, que es la forma de volver atrás. No tiene prueba en seco: la raíz se registra antes de saber a qué proyecto lleva, aunque un PROYECTO que es una lápida o está borrado se rechaza antes de registrarla.
 
 Los dos MUST hablar con el daemon que corre, sin arrancar uno, e imprimir en el idioma de la preferencia, con una sentencia por `match` sobre `Lang`.
 
@@ -954,12 +1022,12 @@ Los dos MUST hablar con el daemon que corre, sin arrancar uno, e imprimir en el 
 
 ## SB3. Las carpetas de un proyecto se cuentan en el núcleo
 
-`registry::own_folder_count(store, project)` (`crates/clawg-core/src/memory/projects/registry.rs:816`) MUST devolver cuántas carpetas de `project_path` llevan a `project`: las que tienen su `project_id`, y una de antes de V27 cuyo `id` es el del proyecto. Su error MUST ser `StorageError` ([`specs/storage`](../storage/spec.md), SB5).
+`own_folder_count(store, project)` (`crates/clawg-core/src/memory/projects/registry.rs`, privada de ese archivo: sólo la llama `locate_folder`, PL67) MUST devolver cuántas carpetas de `project_path` llevan a `project`: las que tienen su `project_id`, y una de antes de V27 cuyo `id` es el del proyecto. Su error MUST ser `StorageError` ([`specs/storage`](../storage/spec.md), SB5).
 
-`locate_project` (`POST /v1/projects/locate`, `crates/clawg-cli/src/daemon/api.rs:3097`) MUST decidir con ese número, sin leer la base por su cuenta (SB1 de `specs/storage`):
+`locate_folder` (PL67) MUST decidir con ese número, y `locate_project` (`POST /v1/projects/locate`, `crates/clawg-cli/src/daemon/api/projects.rs`) MUST NOT leer la base por su cuenta (SB1 de `specs/storage`) ni nombrar `own_folder_count`:
 
-- con más de una carpeta, el 409 `folder_shared` MUST llevar el `detail` `<CAMINO> leads to project <P>, which has <N> folders; `clawg projects merge <P> --into <PROYECTO>` merges them all`;
-- el 500 de una consulta que falla MUST salir de `ApiError::internal`, con el texto del `StorageError`.
+- con más de una carpeta, el 409 `folder_shared` MUST llevar el `detail` `<CAMINO> leads to project <P>, which has <N> folders; `clawg projects merge <P> --into <PROYECTO>` merges them all` (el texto de `LocateError::FolderShared`);
+- el 500 de una consulta que falla MUST salir de `ApiError::internal`, con el texto del `StorageError` (`located_refused`, `LocateError::Store`).
 
 #### Escenario
 - GIVEN el proyecto A con dos carpetas, el proyecto B cuya única carpeta es de antes de V27 (con el `id` de B y sin `project_id`), y el proyecto C sin carpetas
@@ -967,6 +1035,27 @@ Los dos MUST hablar con el daemon que corre, sin arrancar uno, e imprimir en el 
 - THEN A tiene 2, B 1 y C 0
 
 **Tests:** `own_folder_count_counts_the_folders_that_lead_to_a_project` (`crates/clawg-core/src/memory/projects/registry.rs`); `a_folder_shared_by_its_project_is_not_located` (`crates/clawg-cli/tests/api.rs`), que comprueba el `detail` entero.
+
+## PL67. Ubicar una carpeta se decide en el núcleo
+
+`check_folder(folder, is_dir)` (`crates/clawg-core/src/memory/projects/registry.rs`) MUST rechazar con `LocateError::NotADirectory(folder)` (`<root_path> is not a directory: name a directory of the project`) una carpeta que `is_dir` no da por directorio. El daemon MUST llamarla antes que cualquier otra cosa de `POST /v1/projects/locate`, y su `400` es el de PL39.
+
+`locate_folder(store, workspaces, backups, folder, own, target)` (`registry.rs`), con `own` el proyecto que el registro le dio a la carpeta y `target` el nombrado, MUST:
+
+1. con `own` igual a `target`, devolver `Located::Already` sin leer el store;
+2. si `own` tiene más de una carpeta (`own_folder_count`, SB3), rechazar con `LocateError::FolderShared { folder, own, folders, target }`, cuyo texto es el `detail` de SB3;
+3. si no, unir `own` en `target` como `merge_core` sin prueba en seco (PL13), y devolver `Located::Merged(informe)`. Una unión rechazada MUST ser `LocateError::Merge(MergeError)`, con el error de la unión tal cual. Las carpetas de `own` MUST contarse otra vez en cada pase de la unión (`merge_checked`), el que la escribe incluido: si otra carpeta llegó a `own` desde el paso 2, MUST rechazarse con `FolderShared` sin escribir nada. Una unión pedida con `POST /v1/projects/merge` se lleva todas las carpetas.
+
+Antes de registrar la carpeta, `POST /v1/projects/locate` MUST rechazar un proyecto nombrado que es una lápida o está borrado (`check_located_target`, `registry.rs`), con el `409 project_merged` o `project_deleted` de `merge_error`, sin escribir nada; con `subfolder` también. La unión o la declaración lo vuelven a comprobar al escribir.
+
+Un error de la cuenta MUST ser `LocateError::Store(StorageError)`, con el texto del `StorageError`. El daemon traduce `FolderShared` a `409 folder_shared`, `Merge(e)` como `merge_error` en `POST /v1/projects/merge`, `Store` a `500`, y da el `LocatedBody` de siempre: `already` en `true` sin `merge`, o en `false` con el informe de la unión. Las sesiones siguen la unión en el daemon (`sessions_follow`).
+
+#### Escenario
+- GIVEN el proyecto `a` con una carpeta, el `b` con dos y el nombrado `ideas`
+- WHEN se ubica la carpeta de `b`, la de `a` y otra vez la de `a`
+- THEN la de `b` da `FolderShared` con 2 carpetas y no une nada, la de `a` da `Merged` con `a` unido en `ideas`, y la segunda vez su proyecto ya es `ideas` y da `Already`
+
+**Tests** (`registry.rs`, mod tests, sin HTTP): `a_folder_that_is_not_a_directory_is_not_located`, `a_folder_already_in_the_named_project_is_left_as_it_is`, `a_folder_shared_by_its_project_is_not_merged`, `the_only_folder_of_a_project_merges_it_into_the_named_one`, `a_refused_merge_refuses_the_locate` y `a_store_that_fails_refuses_the_locate`; las respuestas, con su estado y su cuerpo entero, las fija `each_located_folder_keeps_its_status_and_body` (`crates/clawg-cli/src/daemon/api/projects.rs`, mod tests).
 
 ## PL40. Ninguna ruta nueva se olvida de la lápida
 
@@ -1041,6 +1130,29 @@ El subcamino MUST salir de una función pura de la cima y el camino (`subpath_of
 - THEN la respuesta es la de `/work/a` sin `path`, y el log lo dice
 
 **Tests:** la pura `the_subpath_is_measured_from_the_top_of_the_checkout` (`identity.rs`); `a_path_in_a_worktree_has_its_subpath_from_the_worktree` y `a_path_that_does_not_lead_to_its_root_has_no_subpath` (`crates/clawg-core/tests/project_root.rs`, con repositorios reales: necesitan `git` en el PATH); `a_registration_without_a_path_or_with_one_elsewhere_answers_as_before` (`crates/clawg-cli/tests/api.rs`).
+
+## PL66. La raíz de un registro se comprueba en el núcleo
+
+`check_root(root_path, index_docs, is_dir)` (`crates/clawg-core/src/memory/projects/project.rs`) MUST devolver la raíz que nombra `root_path` o el primer rechazo, en este orden:
+
+| # | Regla | Rechazo | Texto |
+|---|---|---|---|
+| 1 | `root_path` sin nada más que espacios | `RegisterError::EmptyRoot` | `root_path must not be empty` |
+| 2 | con `index_docs`, una raíz que `is_dir` no da por directorio | `RegisterError::NotADirectory(raíz)` | `<root_path> is not a directory, so it has no files to index` |
+
+`is_dir` es lo único que lee el disco, y sin `index_docs` MUST NOT llamarse. El daemon MUST llamar a `check_root` antes de leer el checkout de la raíz y antes de `register_project`, así que un id viejo con formato inválido (`RegisterError::InvalidLegacyId`, R4) se rechaza después de las dos reglas. El daemon traduce `EmptyRoot`, `NotADirectory` e `InvalidLegacyId` a `400`; `register_refused` (`crates/clawg-cli/src/daemon/api/projects.rs`) no decide ninguna de las dos reglas.
+
+#### Escenario: el orden
+- GIVEN un registro con `root_path` `"  "` e `index_docs`
+- WHEN se comprueba
+- THEN el rechazo es `EmptyRoot`, y `is_dir` no se llamó
+
+#### Escenario: sólo la raíz que se indexa
+- GIVEN una raíz que no es un directorio
+- WHEN se comprueba sin `index_docs`
+- THEN pasa, y `is_dir` no se llamó; con `index_docs` el rechazo es `NotADirectory`
+
+**Tests** (`project.rs`, mod tests, sin HTTP): `an_empty_root_is_not_registered`, `only_a_root_to_index_must_be_a_directory` y `each_root_refusal_keeps_its_text`; las respuestas, con su estado y su cuerpo entero, las fija `each_refused_registration_keeps_its_status_and_body` (`crates/clawg-cli/src/daemon/api/projects.rs`, mod tests).
 
 ## PL45. La declaración más profunda decide
 

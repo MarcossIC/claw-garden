@@ -103,7 +103,7 @@ pub(crate) use retrieval::search;
 #[cfg(test)]
 pub(crate) use embedding::model_download;
 
-pub use domain::record::{MemoryRecord, MemoryRow};
+pub use domain::record::{MemoryRecord, MemoryRow, MemoryStatus, StoredStatus, StoredType};
 pub use projects::identity::{derive_project_id, ProjectIdentity};
 /// Re-exported at the `memory` root because structured retrieval is now an
 /// entry point in its own right: the `clawg serve` daemon and the `clawg mcp`

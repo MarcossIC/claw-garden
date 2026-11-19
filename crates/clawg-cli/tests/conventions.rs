@@ -111,6 +111,129 @@ fn no_production_code_names_the_retired_tables() {
     assert!(found.is_empty(), "these lines name a table V32 dropped:\n{}", found.join("\n"));
 }
 
+/// The quoted names the first line of `text` compares `status` or
+/// `memory_type` with, as `(column, name)`: after `=`, `<>` or `!=`, and each
+/// quoted item of an `IN` list. The column is named on that line and its
+/// operand may run on into the lines after it, as a list split over several
+/// lines does; the `\` or `"` that ends a line of a Rust string is no part of
+/// an item. A column whose name only ends in one of them (`from_status`) is
+/// another column; an operand that is not a quoted literal names nothing.
+fn compared_names(text: &str) -> Vec<(&'static str, String)> {
+    let continues = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let line = &text[..text.find('\n').unwrap_or(text.len())];
+    let mut found = Vec::new();
+    for column in ["status", "memory_type"] {
+        for (at, _) in line.match_indices(column) {
+            if line[..at].chars().next_back().is_some_and(continues) {
+                continue;
+            }
+            let rest = &text[at + column.len()..];
+            if rest.starts_with(continues) {
+                continue;
+            }
+            let rest = rest.trim_start();
+            let after_not = rest.strip_prefix("NOT ").map_or(rest, str::trim_start);
+            if let Some(list) = after_not.strip_prefix("IN").map(str::trim_start).and_then(|r| r.strip_prefix('(')) {
+                let list = &list[..list.find(')').unwrap_or(list.len())];
+                for item in list.split(',').map(|i| i.trim_matches(|c: char| c.is_whitespace() || c == '\\' || c == '"')) {
+                    if let Some(name) = item.strip_prefix('\'').and_then(|i| i.strip_suffix('\'')) {
+                        found.push((column, name.to_string()));
+                    }
+                }
+                continue;
+            }
+            let Some(operand) = ["<>", "!=", "="].iter().find_map(|op| rest.strip_prefix(op)) else {
+                continue;
+            };
+            if let Some(quoted) = operand.trim_start().strip_prefix('\'') {
+                if let Some(end) = quoted.find('\'') {
+                    found.push((column, quoted[..end].to_string()));
+                }
+            }
+        }
+    }
+    found
+}
+
+#[test]
+fn compared_names_reads_the_literals_a_line_compares() {
+    let cases: [(&str, &[(&str, &str)]); 11] = [
+        ("WHERE m.status IN ('active', 'disputed')", &[("status", "active"), ("status", "disputed")]),
+        ("AND status <> 'superseded' AND", &[("status", "superseded")]),
+        ("SET status = 'superseded', superseded_by = ?2", &[("status", "superseded")]),
+        ("WHERE memory_type = 'session_summary' AND status NOT IN ('superseded')", &[("status", "superseded"), ("memory_type", "session_summary")]),
+        ("(move_id, row_id, from_status) SELECT status, superseded_by", &[]),
+        ("AND status = ? AND memory_type IN (SELECT value FROM json_each(?))", &[]),
+        ("judgment_status = 'x', memory_types = 'y'", &[]),
+        ("    status: String,", &[]),
+        ("WHERE status IN ('active',\n                 'disputed')", &[("status", "active"), ("status", "disputed")]),
+        ("AND memory_type NOT IN ('session_summary', \\\n       'code_block')", &[("memory_type", "session_summary"), ("memory_type", "code_block")]),
+        ("AND x = 1\nAND status = 'active'", &[]),
+    ];
+    for (line, want) in cases {
+        let want: Vec<(&str, String)> = want.iter().map(|(c, n)| (*c, n.to_string())).collect();
+        assert_eq!(compared_names(line), want, "{line}");
+    }
+}
+
+/// The SQL keeps its status and type names as literals, which the partial
+/// indexes of the migrations need to match a query. Each one is a name the
+/// code knows, so a misspelt literal fails here instead of matching no row.
+#[test]
+fn every_status_and_type_the_sql_compares_is_one_the_code_knows() {
+    use clawg_core::memory::store_insert::MemoryType;
+    use clawg_core::memory::MemoryStatus;
+
+    let crates = Path::new(env!("CARGO_MANIFEST_DIR")).parent().expect("the crates directory");
+    let mut files = Vec::new();
+    for krate in fs::read_dir(crates).expect("read crates/").flatten() {
+        rust_files(&krate.path().join("src"), &mut files);
+    }
+    assert!(!files.is_empty(), "no sources found under {}", crates.display());
+    let mut compared = Vec::new();
+    for file in &files {
+        let shown = file.strip_prefix(crates).unwrap_or(file).to_string_lossy().replace('\\', "/");
+        let source = fs::read_to_string(file).unwrap_or_else(|e| panic!("read {}: {e}", file.display()));
+        let end = production_end(&source.lines().collect::<Vec<_>>());
+        for (n, text) in lines_onward(&source).take(end) {
+            compared.extend(compared_names(text).into_iter().map(|(column, name)| (format!("{shown}:{n}"), column, name)));
+        }
+    }
+    let migrations = crates.join("clawg-core/migrations");
+    for entry in fs::read_dir(&migrations).expect("read the migrations").flatten() {
+        let path = entry.path();
+        let source = fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let shown = path.strip_prefix(crates).unwrap_or(&path).to_string_lossy().replace('\\', "/");
+        for (n, text) in lines_onward(&source) {
+            compared.extend(compared_names(text).into_iter().map(|(column, name)| (format!("{shown}:{n}"), column, name)));
+        }
+    }
+
+    let mut unknown = Vec::new();
+    for (at, column, name) in &compared {
+        let known = match *column {
+            "status" => MemoryStatus::from_name(name).is_some(),
+            _ => name.parse::<MemoryType>().is_ok(),
+        };
+        if !known {
+            unknown.push(format!("{at}: {column} {name:?}"));
+        }
+    }
+    assert!(!compared.is_empty(), "no SQL compares a status or a type: the scan reads nothing");
+    assert!(unknown.is_empty(), "these lines compare a name the code does not know:\n{}", unknown.join("\n"));
+}
+
+/// Each line of `source`, from 1, with the text from its start to the end of
+/// `source`, so a reader of the line can follow what it starts onto the next.
+fn lines_onward(source: &str) -> impl Iterator<Item = (usize, &str)> {
+    let mut at = 0;
+    source.split_inclusive('\n').enumerate().map(move |(n, line)| {
+        let text = &source[at..];
+        at += line.len();
+        (n + 1, text)
+    })
+}
+
 /// A failed call on the store's connection is worded in one place,
 /// `memory/store/error.rs`, so no other code of the core matches on the connection's
 /// error.
@@ -144,6 +267,13 @@ fn production_lines_naming(source: &str, names: impl Fn(&str) -> bool) -> Vec<us
 
 /// How many of `lines` are production code.
 fn production_end(lines: &[&str]) -> usize {
+    let all_test = lines
+        .iter()
+        .take_while(|line| line.trim_end().starts_with("//!") || line.trim_end().starts_with("#!["))
+        .any(|line| line.trim_end() == "#![cfg(test)]");
+    if all_test {
+        return 0;
+    }
     lines
         .windows(2)
         .position(|pair| pair[0] == "#[cfg(test)]" && pair[1].starts_with("mod ") && pair[1].trim_end().ends_with('{'))
@@ -194,6 +324,13 @@ fn a_test_module_in_another_file_does_not_end_the_production_code() {
     let source = "#[cfg(test)]\nmod helpers;\n\nuse rusqlite::Connection;\n\n#[cfg(test)]\nmod tests {\n    use rusqlite::params;\n}\n";
     assert_eq!(production_lines_naming(source, reaches_the_connection), [4]);
     assert_eq!(production_lines_naming(&source.replace('\n', "\r\n"), reaches_the_connection), [4]);
+}
+
+#[test]
+fn a_file_that_is_all_test_code_has_no_production_lines() {
+    let source = "//! Helpers.\n#![cfg(test)]\n\nuse rusqlite::Connection;\n";
+    assert!(production_lines_naming(source, reaches_the_connection).is_empty());
+    assert_eq!(production_lines_naming("//! Helpers.\n\nuse rusqlite::Connection;\n", reaches_the_connection), [3]);
 }
 
 /// Whether `source` names the module `module` of `clawg_core::memory`: in a

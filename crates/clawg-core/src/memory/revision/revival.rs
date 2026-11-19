@@ -6,6 +6,7 @@
 //! deleted row supersedes it again. A row a `supersedes` verdict replaced
 //! stays replaced: undoing a judged decision is not a delete's to do.
 
+use crate::memory::domain::record::StoredStatus;
 use rusqlite::{Connection, OptionalExtension};
 
 use crate::memory::domain::clock::TimestampMs;
@@ -125,7 +126,7 @@ const KEY_HELD_SQL: &str = "SELECT EXISTS (SELECT 1 FROM memory d JOIN memory t 
 pub(crate) fn revive_after_delete(c: &Connection, deleted: i64, now: TimestampMs) -> rusqlite::Result<Revived> {
     let Some(status) = c
         .query_row("SELECT status FROM memory WHERE id = ?1 AND deleted_at IS NOT NULL", [deleted], |r| {
-            r.get::<_, String>(0)
+            r.get::<_, StoredStatus>(0)
         })
         .optional()?
     else {
@@ -146,7 +147,7 @@ pub(crate) fn revive_after_delete(c: &Connection, deleted: i64, now: TimestampMs
         }
         None => false,
     };
-    let plan = plan_revival(matches!(status.as_str(), "active" | "disputed"), key_held, &replaced);
+    let plan = plan_revival(status.is_live(), key_held, &replaced);
 
     let mut revived = Vec::new();
     for &id in &plan.revive {

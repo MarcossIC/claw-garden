@@ -8,6 +8,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use clawg_core::memory::sharing;
+use clawg_core::memory::MemoryStatus;
 use clawg_core::paths::{Profile, ProfileError};
 use clawg_core::preferences::Lang;
 
@@ -22,9 +23,9 @@ pub struct Cli {
     pub command: Command,
 }
 
-/// Reads a `--protocol` value: `full`, `short` or `off`.
+/// Reads a `--protocol` value: `full`, `short`, `lean` or `off`.
 fn parse_protocol(raw: &str) -> Result<Variant, String> {
-    Variant::parse(raw).ok_or_else(|| format!("`{raw}` is not a protocol variant; use full, short or off"))
+    Variant::parse(raw).ok_or_else(|| format!("`{raw}` is not a protocol variant; use full, short, lean or off"))
 }
 
 /// Trims an `--agent` value, refusing one with nothing left: a blank id
@@ -310,8 +311,8 @@ pub enum Command {
         path: Option<PathBuf>,
         /// Claude Code only: how much of the memory protocol the block in the
         /// user's `CLAUDE.md` holds, `full` (what setup writes unless told
-        /// otherwise), `short` or `off`. Without it, setup keeps the variant
-        /// chosen before.
+        /// otherwise), `short`, `lean` or `off`. Without it, setup keeps the
+        /// variant chosen before.
         #[arg(long, value_name = "VARIANT", value_parser = parse_protocol, conflicts_with_all = ["remove", "local", "path"])]
         protocol: Option<Variant>,
         #[command(flatten)]
@@ -1017,13 +1018,12 @@ pub enum StatusArg {
     Superseded,
 }
 
-impl StatusArg {
-    /// The spelling the daemon's API takes.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            StatusArg::Active => "active",
-            StatusArg::Disputed => "disputed",
-            StatusArg::Superseded => "superseded",
+impl From<StatusArg> for MemoryStatus {
+    fn from(s: StatusArg) -> Self {
+        match s {
+            StatusArg::Active => MemoryStatus::Active,
+            StatusArg::Disputed => MemoryStatus::Disputed,
+            StatusArg::Superseded => MemoryStatus::Superseded,
         }
     }
 }
@@ -1597,9 +1597,12 @@ mod tests {
         assert_eq!(protocol(&["--protocol", "full"]), Some(Variant::Full));
         assert_eq!(protocol(&["--protocol", "short", "--dry-run"]), Some(Variant::Short));
         assert_eq!(protocol(&["--protocol=off"]), Some(Variant::Off));
+        assert_eq!(protocol(&["--protocol", "lean"]), Some(Variant::Lean));
         for bad in [&["--protocol", "tiny"][..], &["--protocol", "Full"], &["--protocol"]] {
             assert!(Cli::try_parse_from([&["clawg", "setup", "claude-code"], bad].concat()).is_err(), "{bad:?}");
         }
+        let said = Cli::try_parse_from(["clawg", "setup", "claude-code", "--protocol", "tiny"]).unwrap_err().to_string();
+        assert!(said.contains("use full, short, lean or off"), "every variant is named: {said}");
         for with in ["--remove", "--local"] {
             let both = Cli::try_parse_from(["clawg", "setup", "claude-code", "--protocol", "short", with]);
             assert!(both.is_err(), "{with} writes no block, so there is none to choose");

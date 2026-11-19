@@ -80,6 +80,11 @@ pub struct RegisterOutcome {
 
 #[derive(Debug, thiserror::Error)]
 pub enum RegisterError {
+    #[error("root_path must not be empty")]
+    EmptyRoot,
+    /// A root whose files the caller asks to index, which has none to read.
+    #[error("{} is not a directory, so it has no files to index", .0.display())]
+    NotADirectory(PathBuf),
     #[error("{0:?} is not a project id")]
     InvalidLegacyId(String),
     /// A caller that derives its own id, for a root whose id belongs to
@@ -91,6 +96,20 @@ pub enum RegisterError {
     NoFreeId(PathBuf),
     #[error(transparent)]
     Store(#[from] MemoryError),
+}
+
+/// The root `root_path` names, checked before anything reads it: an empty
+/// one names nothing, and one whose files are to be indexed must be a
+/// directory. `is_dir` reads the disk, and only for a root to index.
+pub fn check_root(root_path: &str, index_docs: bool, is_dir: impl FnOnce(&Path) -> bool) -> Result<&Path, RegisterError> {
+    if root_path.trim().is_empty() {
+        return Err(RegisterError::EmptyRoot);
+    }
+    let root = Path::new(root_path);
+    if index_docs && !is_dir(root) {
+        return Err(RegisterError::NotADirectory(root.to_path_buf()));
+    }
+    Ok(root)
 }
 
 /// Whether `s` has the shape [`derive_project_id`] produces:
@@ -1011,6 +1030,41 @@ mod tests {
         for bad in ["repo", "-1a2b", "repo-1A2B", "repo-1a2", "repo-1a2bc", "repo-zzzz", "", "repo 1a2b"] {
             assert!(!is_project_id(bad), "{bad}");
         }
+    }
+
+    fn never_read(root: &Path) -> bool {
+        panic!("{} was read", root.display())
+    }
+
+    #[test]
+    fn an_empty_root_is_not_registered() {
+        for root in ["", "  ", "\t\n"] {
+            for index_docs in [false, true] {
+                let refused = check_root(root, index_docs, never_read).expect_err("an empty root is refused");
+                assert!(matches!(refused, RegisterError::EmptyRoot), "{root:?}: {refused:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn only_a_root_to_index_must_be_a_directory() {
+        assert_eq!(check_root("/no/such/dir", false, never_read).expect("a root to label"), Path::new("/no/such/dir"));
+        assert_eq!(check_root("/work/repo", true, |_| true).expect("a directory"), Path::new("/work/repo"));
+        let mut asked = Vec::new();
+        let refused = check_root("/no/such/dir", true, |root| {
+            asked.push(root.to_path_buf());
+            false
+        })
+        .expect_err("no files to index");
+        assert!(matches!(refused, RegisterError::NotADirectory(ref root) if root == Path::new("/no/such/dir")), "{refused:?}");
+        assert_eq!(asked, [PathBuf::from("/no/such/dir")]);
+    }
+
+    #[test]
+    fn each_root_refusal_keeps_its_text() {
+        let text = |root: &str| check_root(root, true, |_| false).expect_err("refused").to_string();
+        assert_eq!(text(" "), "root_path must not be empty");
+        assert_eq!(text("/work/notes.txt"), "/work/notes.txt is not a directory, so it has no files to index");
     }
 
     struct Fixture {

@@ -241,7 +241,7 @@ pub fn select(text: &str, since_ms: i64, seed: u64) -> Result<Selection, WarnedE
         .iter()
         .filter_map(|&i| {
             let head = world.groups[i].head;
-            if !is_claim_type(&head.memory_type) || head.topic_key.is_some() || warned.contains(&i) {
+            if !is_claim_type(head.memory_type.as_str()) || head.topic_key.is_some() || warned.contains(&i) {
                 return None;
             }
             let predecessors = world.predecessors(i);
@@ -265,7 +265,7 @@ pub fn select(text: &str, since_ms: i64, seed: u64) -> Result<Selection, WarnedE
         .map(|g| WSave {
             agent: g.head.agent_id.clone(),
             project: g.head.project_id.clone(),
-            memory_type: g.head.memory_type.clone(),
+            memory_type: g.head.memory_type.to_string(),
             importance: g.head.importance,
             topic_key: g.head.topic_key.clone(),
             text: g.text.clone(),
@@ -319,7 +319,7 @@ fn gone_at(parsed: &Parsed, rows: &HashMap<i64, &MemoryLine>) -> HashMap<i64, i6
     }
     let mut gone = HashMap::new();
     for (_, row) in &parsed.memories {
-        let replaced = (row.status == "superseded").then(|| {
+        let replaced = (row.status.as_str() == "superseded").then(|| {
             let by = row.superseded_by;
             let made = by.and_then(|id| rows.get(&id)).map(|r| r.created_at);
             match row.supersede_cause.as_deref() {
@@ -377,7 +377,7 @@ impl World<'_> {
     fn actions(&self, later: usize, old: &MemoryLine) -> Actions {
         let group = &self.groups[later];
         let key = group.head.topic_key.as_ref();
-        let hid = old.status == "superseded"
+        let hid = old.status.as_str() == "superseded"
             && old.supersede_cause.as_deref() == Some("verdict")
             && old.superseded_by.is_some_and(|by| group.rows.iter().any(|r| r.id == by));
         let reused = key.is_some_and(|key| {

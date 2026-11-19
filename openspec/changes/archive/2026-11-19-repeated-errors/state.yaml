@@ -1,7 +1,7 @@
 change: repeated-errors
 objective: "1, 5"
-depends_on: [agent-eval-sessions]  # sólo la tarea 9 y la campaña; el producto (tareas 1 a 8) no depende de nada
-phase: apply
+depends_on: [agent-eval-sessions]  # archivado; sólo la tarea 9 y la campaña; el producto (tareas 1 a 8) no depende de nada
+phase: archive
 artifacts:
   exploration: done  # la evidencia es docs/completed-impl/hipotesis/A2/informe.md
   proposal: done  # B, A y D; C, los rechazos de clawg y Cursor quedan afuera
@@ -9,6 +9,6 @@ artifacts:
   design: done  # D1 a D9
   tasks: done  # siete commits del producto, la verificación local y uno del arnés
   apply: done  # tareas 1 a 7 y la 9, el brazo a3-notools; la 8 es la verificación local
-  verify: partial  # RE1 a RE8 sin CRITICAL, con tres WARNING antes de archivar; RE9 y la tarea 8, pendientes (verify.md)
-  archive: pending
-updated: 2026-11-14
+  verify: done  # RE1 a RE9 sin CRITICAL; W1 a W3 y S1 cerrados; la puerta de latencia pasa con lo que agrega el hook sobre true; la campaña cumple A; la suite y los dos clippy pasan en Windows; el CI corre en el PR a main
+  archive: done  # 2026-11-19, sale en 0.90.0
+updated: 2026-11-19

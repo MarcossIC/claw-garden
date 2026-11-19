@@ -19,7 +19,7 @@ Fuente de verdad de qué peticiones llegan a la API HTTP del daemon antes de mir
 - **Modo privado:** en Unix, un directorio sin ningún bit de grupo ni de otros (`modo & 0o077 == 0`).
 - **Socket del perfil:** `<data>/clawg.sock` (`socket_file`, `crates/clawg-core/src/paths.rs`), un socket AF_UNIX con ruta, nunca abstracto, en Unix y en Windows.
 - **Sistema sin AF_UNIX:** uno cuyo sistema operativo no puede crear un socket AF_UNIX (en Windows, `socket` da 10047).
-- **Guardia:** `admit_loopback` (`crates/clawg-cli/src/daemon/api.rs:1231`), la capa que `router` (`api.rs:1149`) aplica a todas sus rutas, `/health` y `/v1` incluidas, por fuera de `require_bearer` (`api.rs:1254`).
+- **Guardia:** `admit_loopback` (`crates/clawg-cli/src/daemon/api.rs`), la capa que `router` (`api.rs`) aplica a todas sus rutas, `/health` y `/v1` incluidas, por fuera de `require_bearer` (`api.rs`).
 
 ## Límite
 

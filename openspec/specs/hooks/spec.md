@@ -13,6 +13,7 @@ Fuente de verdad del comportamiento actual de `clawg hook <evento>`: el subcoman
 - [hook-run-log](../../changes/archive/2026-11-04-hook-run-log/proposal.md), archivado el 2026-11-04, sale en 0.76.0 (HR1 a HR5 y HR8): `clawg hook session-start` deja una línea por corrida en `<data>/hook-runs.jsonl`. La espera acotada de esa escritura (HR4) y la de los archivos que el hook lee salen en 0.77.0.
 - [session-usage](../../changes/archive/2026-11-11-session-usage/proposal.md), archivado el 2026-11-11, sale en 0.81.0: SU9 de esa spec entra como SU9 (`clawg hook session-end`), y cambian R2, R3, R6, HR1 y HR4 (el tercer evento, y el evento, el cliente y el `source` que el registro de la sesión manda). Qué cuenta el daemon de eso está en [`specs/metrics`](../metrics/spec.md) (SU2, SU3 y SU6).
 - [protocol-block](../../changes/archive/2026-11-17-protocol-block/proposal.md), archivado el 2026-11-17, que sale en 0.88.0: el aviso de `session-start` cuando el bloque del protocolo difiere (PB4) y el tope de 2.000 bytes de lo que el hook suma (R4 y R7). La clasificación del bloque está en [`specs/doctor`](../doctor/spec.md) (PB2).
+- [repeated-errors](../../changes/archive/2026-11-19-repeated-errors/proposal.md), archivado el 2026-11-19, que sale en 0.90.0: los eventos `post-tool-use` y `post-tool-use-failure` de Bash, que anotan en `tool-failures.jsonl` los programas que el shell dice que no existen y avisan en el mismo turno (RE1 a RE6, al final de esta spec). Cambian R2 y R3 aquí; el registro de corridas no cambia.
 
 ## Definiciones
 
@@ -28,7 +29,7 @@ Fuente de verdad del comportamiento actual de `clawg hook <evento>`: el subcoman
 
 ## R2. `clawg hook <evento>`
 
-`clawg hook session-start|user-prompt-submit|session-end --agent A [--profile P]` MUST leer el JSON del host por stdin, tolerando campos desconocidos y ausentes (`HookInput`, `hook.rs:70`; todos sus campos son opcionales, `session_id` y `reason` entre ellos), y MUST NOT arrancar un daemon. `--agent` MUST ser obligatorio y se recorta; sólo hay tres eventos (`HookEvent`, `crates/clawg-cli/src/cli.rs:951`), y `session-end` no lee ninguna carpeta ni imprime nada (SU9). En los otros dos, el proyecto MUST salir de `cwd` (o del directorio actual sin él) como lo resuelve el puente (`ProjectIdentity::resolve` en `project_of`, `hook.rs:451`). Un perfil que el build rechaza MUST rechazarse como en los otros subcomandos (`profile.resolve()` en `crates/clawg-cli/src/main.rs:129`).
+`clawg hook session-start|user-prompt-submit|session-end|post-tool-use|post-tool-use-failure --agent A [--profile P]` MUST leer el JSON del host por stdin, tolerando campos desconocidos y ausentes (`HookInput`, `hook.rs:70`; todos sus campos son opcionales, `session_id` y `reason` entre ellos), y MUST NOT arrancar un daemon. `--agent` MUST ser obligatorio y se recorta; hay cinco eventos (`HookEvent`, `crates/clawg-cli/src/cli.rs:963`), y `session-end` no lee ninguna carpeta ni imprime nada (SU9). Los dos de herramientas no hablan con el daemon ni leen el proyecto: son RE1. En `session-start` y `user-prompt-submit`, el proyecto MUST salir de `cwd` (o del directorio actual sin él) como lo resuelve el puente (`ProjectIdentity::resolve` en `project_of`, `hook.rs:451`). Un perfil que el build rechaza MUST rechazarse como en los otros subcomandos (`profile.resolve()` en `crates/clawg-cli/src/main.rs:129`).
 
 El `--agent` del hook MUST ser el del puente: las memorias que pide y el último save que mira son las de ese agente, y con otro nombre el hook leería a un agente distinto del que guarda ([`specs/visibility`](../visibility/spec.md), R1).
 
@@ -38,7 +39,7 @@ Esta spec no instala el hook: lo instala `clawg setup claude-code`, en forma exe
 
 ## R3. Un hook nunca rompe la sesión
 
-Sin daemon, con un daemon que responde un error o no responde a tiempo, o con una entrada que no es JSON, el hook MUST NOT escribir nada en stdout, salvo la línea del idioma de `session-start` cuando hay preferencia (R7), y MUST salir con 0 (`respond_reading` y `answer`, `hook.rs:326-384` y `:463-525`; `Command::Hook`, `main.rs:128-136`). El tope es de 3 s en total, de leer stdin a la respuesta (`HOOK_DEADLINE`, `hook.rs:32`; el de `session-end` es de 1 s, SU9), por debajo de los 5 s con los que se configura un hook, para que el host nunca lo cancele; `session-start` responde 50 ms antes de ese tope, para dejar su línea en el registro (HR4). Un error de uso de `clawg hook`, o un perfil rechazado, MUST salir con 1 y el motivo en stderr; `clawg hook` MUST NOT salir con 2, el código de clap para un uso inválido, que el host leería como «bloquear» y borraría el mensaje del usuario (`is_hook_invocation`, `cli.rs:977`; el camino de `Cli::parse_args` en `main.rs:50-61`, que hace lo mismo con `clawg` sin argumentos, [`specs/setup`](../setup/spec.md) R8).
+Sin daemon, con un daemon que responde un error o no responde a tiempo, o con una entrada que no es JSON, el hook MUST NOT escribir nada en stdout, salvo lo que `session-start` imprime sin daemon (la línea del idioma cuando hay preferencia, R7; el bloque de las reglas aprendidas cuando el libro da alguna regla, RE6; el aviso del bloque del protocolo que difiere, PB4) y, en los eventos de herramienta, el aviso del mismo turno (RE3), y MUST salir con 0. Sin preferencia, sin reglas y sin ese aviso, stdout queda vacío (`respond_reading` y `answer`, `hook.rs:326-384` y `:463-525`; `Command::Hook`, `main.rs:128-136`). El tope es de 3 s en total, de leer stdin a la respuesta (`HOOK_DEADLINE`, `hook.rs:32`; el de `session-end` es de 1 s, SU9, y el de los eventos de herramienta, de 300 ms, RE1), por debajo de los 5 s con los que se configura un hook, para que el host nunca lo cancele; `session-start` responde 50 ms antes de ese tope, para dejar su línea en el registro (HR4). Un error de uso de `clawg hook`, o un perfil rechazado, MUST salir con 1 y el motivo en stderr; `clawg hook` MUST NOT salir con 2, el código de clap para un uso inválido, que el host leería como «bloquear» y borraría el mensaje del usuario (`is_hook_invocation`, `cli.rs:977`; el camino de `Cli::parse_args` en `main.rs:50-61`, que hace lo mismo con `clawg` sin argumentos, [`specs/setup`](../setup/spec.md) R8).
 
 El hook MUST NOT arrancar un daemon (usa `DaemonClient::from_data_dir`, no `probe_running(.., true)`, que puede esperar hasta 60 s): el puente MCP es quien arranca el daemon con la sesión, así que el primer `SessionStart` del día puede llegar antes y quedar sin contexto. Es la decisión de no autoarrancar (D6 del diseño archivado), y ese es todo su costo.
 
@@ -299,3 +300,139 @@ Una línea MUST quedar chica por grande que sea la entrada, así que cada campo 
 `clawg hook session-end --agent A [--client C] [--profile P]` MUST leer `session_id` y `reason` de su entrada (`HookInput`, `hook.rs:70`) y mandar el cierre al daemon (`POST /v1/sessions/end` por `DaemonClient::end_session`, `crates/clawg-cli/src/client.rs:1289`; `end_session`, `hook.rs:434`). MUST NOT imprimir nada, MUST NOT registrar el proyecto ni leer su carpeta, MUST NOT dejar una línea en el registro (HR1) y MUST terminar dentro de `SESSION_END_DEADLINE` (1 s, `hook.rs:36`; `deadline_of`, `hook.rs:39`). Sin daemon, sin `session_id` o con una entrada que no es JSON, no hace nada y sale con 0 (R3). Un hook instalado para Claude Code que corre Cursor no hace nada, como los otros (CU8). Qué hace el daemon con el cierre está en [`specs/metrics`](../metrics/spec.md), SU3 y SU6; el hook lo instala `clawg setup` ([`specs/setup`](../setup/spec.md), R3 y CU3).
 
 **Tests:** `a_session_end_closes_the_session_and_prints_nothing`, `a_session_end_without_a_daemon_or_an_id_does_nothing`, `a_hook_names_its_event_and_its_source` (`hook.rs`), `hook_takes_the_session_end_event` (`cli.rs`), `a_session_end_closes_the_session_and_what_follows_opens_another` (`tests/binary.rs`).
+
+## Los eventos de herramienta: definiciones
+
+Lo que dicen RE1 a RE6 sobre los eventos después de una llamada a una herramienta. Un programa es «ausente» cuando el shell de esta máquina lo dice, no cuando clawg lo supone.
+
+- **Firma de programa ausente:** una línea de un texto de la salida que termina en `: command not found` (las formas de `bash` y `sh`, con o sin `line N: ` delante del nombre, como `/usr/bin/bash: line 1: eza: command not found`), o que tiene la forma `sh: N: X: not found` (`dash`) o `zsh: command not found: X`. `X` es el programa (`missing_programs`, `crates/clawg-cli/src/tool_failures.rs`).
+- **Nombre de programa válido:** de 1 a 32 caracteres de `[A-Za-z0-9._+-]`, que empieza por letra o número, y en el que `redact` no encuentra ningún secreto (`is_program_name`).
+- **Palabra de comando:** la primera palabra de cada segmento de `tool_input.command`. Un segmento empieza después de `|`, `||`, `&&`, `;`, `&`, un salto de línea, `(` o `$(`, siempre que ese separador esté fuera de comillas `'…'` o `"…"`. Se saltan las asignaciones `NOMBRE=valor` y los prefijos `sudo`, `time`, `env`, `command`, `exec` y `xargs`. Un `&` pegado a `>` o a `<`, o seguido de `>` (`2>&1`, `&>`), no empieza un segmento. El comando no se interpreta más allá de esto (`command_words`).
+- **Libro:** `<data>/tool-failures.jsonl`, un objeto JSON por línea. Al llegar a 64 KiB (`hook_log::ROLL_AT`) pasa a `tool-failures.1.jsonl`, que reemplaza al anterior.
+- **Línea del libro:** `{"at_ms": N, "event": "fail"|"ok", "tool": T, "program": P, "session": S}`. `tool` es el `tool_name` de la entrada (`Bash`); `session` es el `session_id`, cortado a 64 caracteres.
+- **Ventana:** los 30 días anteriores al momento en que se lee el libro (`WINDOW_MS`).
+- **Regla:** un par (`tool`, `program`) que, en la ventana, tiene líneas `fail` de dos o más sesiones distintas, ninguna línea `ok`, y cuyo programa no está en el PATH del proceso del hook.
+
+## RE1. Los eventos `post-tool-use` y `post-tool-use-failure`
+
+`clawg hook post-tool-use|post-tool-use-failure --agent A [--profile P]` MUST leer de stdin la entrada de `PostToolUse` o de `PostToolUseFailure` de Claude Code: `tool_name`, `tool_input`, `tool_response` (cualquier valor JSON) o `error` (texto), y `session_id`. Los campos desconocidos y los ausentes se toleran. Con los dos eventos, el hook:
+
+- MUST NOT conectarse a un daemon ni arrancarlo.
+- MUST NOT abrir ni crear `memory.db`.
+- MUST NOT dejar una línea en `hook-runs.jsonl`.
+- MUST salir con 0 y terminar en `POST_TOOL_DEADLINE` (300 ms, `hook.rs`) como mucho.
+- Lee la preferencia de idioma sólo cuando va a imprimir algo.
+- Una entrada que no es JSON, que pasa de 1 MiB o que no trae `tool_name` MUST no imprimir nada ni anotar nada.
+- Con `--client cursor`, o con una entrada que trae `cursor_version`, MUST no imprimir nada ni anotar nada.
+- Sólo `tool_name` = `Bash` se mira. Cualquier otra herramienta MUST no imprimir nada ni anotar nada.
+
+#### Escenario: sin daemon, igual responde
+- GIVEN un home de prueba sin daemon y una entrada de `PostToolUseFailure` de `Bash` cuyo `error` es `Exit code 127\n/usr/bin/bash: line 1: eza: command not found` y cuyo comando es `eza -la src`
+- WHEN corre `clawg hook post-tool-use-failure --agent claude-code --profile dev`
+- THEN sale con 0, imprime un sobre con `hookEventName` `PostToolUseFailure`, y en el directorio de datos no hay `memory.db` ni línea nueva en `hook-runs.jsonl`
+
+**Tests:** `hook_takes_the_post_tool_events` (`cli.rs`); `the_hook_input_reads_the_tool_fields` (`hook.rs`); `a_post_tool_hook_answers_without_a_daemon_and_leaves_the_store_alone` (`crates/clawg-cli/tests/binary.rs`); `cursor_and_other_tools_get_nothing_after_a_tool` (`hook.rs`).
+
+## RE2. La firma de un programa ausente
+
+La decisión de qué observa una llamada (`observe`, `crates/clawg-cli/src/tool_failures.rs`) MUST ser una función pura de `tool_name`, el comando, los textos de la salida y el evento. Los textos de la salida son:
+
+- en `post-tool-use-failure`, el `error`;
+- en `post-tool-use`, lo que da `response_texts`: si `tool_response` trae un `stderr` con texto, sólo ese, porque ahí el shell escribe su `command not found`; `stdout` son las palabras de los programas, y un programa que lee un log puede imprimir una firma sin que falte ninguno. Cuentan todos los textos de `tool_response`, a cualquier profundidad, cuando el comando manda un flujo al otro (`2>&1` o `|&`) y cuando `stderr` está vacío: después de una llamada que terminó bien, el cliente deja las palabras del shell en `stdout` y `stderr` vacío.
+
+Esa función:
+
+- MUST dar un fallo por cada programa distinto que aparece en una firma, es una palabra de comando del comando y tiene un nombre válido.
+- MUST NOT dar un fallo por un programa que no es una palabra de comando, como la dependencia de un script que el comando lanzó.
+- MUST NOT dar nada por un `Exit code 127` sin firma, ni por las formas `is not recognized` de cmd o PowerShell.
+- Da un éxito de un programa P sólo en `post-tool-use`, si P es una palabra de comando, la salida no trae ninguna firma ni `is not recognized`, y el comando no tiene `2>`, `&>`, `||` ni `|&`.
+- MUST NOT dar nada cuando `tool_input.run_in_background` es `true`: la respuesta de un comando en segundo plano llega antes de que el programa corra (`after_tool`, `hook.rs`).
+
+#### Escenario: un pipe que esconde el código
+- GIVEN un `PostToolUse` de `Bash` con el comando `eza -la | head` y un `tool_response` cuyo `stderr` es `/usr/bin/bash: line 1: eza: command not found`
+- WHEN se clasifica la llamada
+- THEN da un fallo de `eza` y ningún éxito de `head`
+
+#### Escenario: un script que llama a otro programa
+- GIVEN el comando `npm test` y una salida con `sh: 1: eslint: not found`
+- WHEN se clasifica la llamada
+- THEN no da ningún fallo
+
+**Tests:** `a_missing_program_is_read_from_each_shell_form`, `a_failure_needs_the_program_in_command_position`, `a_pipe_with_exit_zero_still_shows_the_failure`, `a_redirected_or_chained_command_is_no_success`, `a_secret_or_an_odd_name_is_never_a_program`, `exit_127_alone_and_other_shells_say_nothing`, `a_separator_inside_quotes_starts_no_command`, `the_signature_is_read_only_where_the_shell_reports_it`, `a_pipe_that_exits_zero_with_the_shell_words_in_stdout_is_a_failure` (`tool_failures.rs`); `a_signature_a_program_printed_is_no_missing_program` y `a_command_in_the_background_is_no_success` (`hook.rs`).
+
+## RE3. El aviso en el mismo turno
+
+Cuando la llamada da un fallo de P y el libro no tiene una línea `ok` de P en la ventana, el hook MUST imprimir el sobre del evento con `additionalContext`. El texto es una línea en el idioma preferido (inglés sin preferencia), que arma `same_turn_line`, y que:
+
+- nombra P entre comillas invertidas;
+- dice que no existe en el Bash de esta máquina;
+- pide no volver a llamarlo en la sesión;
+- ofrece Glob, Grep, Read o Edit, u otro programa instalado.
+
+Con varios programas, una línea los nombra a todos. Con una línea `ok` de P en la ventana, MUST NOT imprimir nada por P, porque el fallo es probablemente transitorio. Sin ningún fallo, MUST NOT imprimir nada. La preferencia de idioma se lee sólo cuando hay una línea que decir (`remember`, `hook.rs`).
+
+#### Escenario: el primer fallo de `eza`
+- GIVEN la preferencia `es` y un libro vacío
+- WHEN llega un `PostToolUseFailure` con la firma de `eza`
+- THEN `additionalContext` es la línea en español que nombra `` `eza` ``
+
+#### Escenario: un `rg` que suele andar
+- GIVEN un libro con una línea `ok` de `rg` de ayer
+- WHEN llega un `PostToolUse` con la firma de `rg`
+- THEN no se imprime nada
+
+**Tests:** `the_same_turn_line_names_the_program_in_the_users_language`, `a_program_that_worked_recently_gets_no_line`, `a_call_without_a_signature_prints_nothing` (`hook.rs`).
+
+## RE4. El libro
+
+- Cada fallo MUST agregar una línea `fail` al libro.
+- Un éxito de P MUST agregar una línea `ok` sólo si la línea más nueva de P en el libro es `fail` (`to_write`). Así el libro crece con los fallos y no con las llamadas que andan.
+- Cada línea MUST armarse entera y agregarse con una sola escritura en modo append (`append`, sobre `hook_log::append_rolled`).
+- Con el libro en 64 KiB o más, antes de agregar MUST renombrarlo a `tool-failures.1.jsonl`, reemplazando al anterior, sin leer ni reescribir nada. Si el renombrado falla, la línea se agrega igual al archivo actual, y la próxima llamada vuelve a intentarlo.
+- MUST NOT crear el directorio de datos.
+- Cualquier falla MUST tragarse sin cambiar la salida ni el código de salida.
+- Una línea MUST NOT tener el comando, la salida, una ruta, `cwd`, `transcript_path` ni ningún otro valor de la entrada fuera de los de su definición.
+- Al leer, una línea dañada MUST costar sólo esa línea, y un archivo que no se puede leer cuenta como vacío (`parse_lines`, `read`).
+
+Límites conocidos: si dos procesos ven el libro en 64 KiB a la vez, el segundo puede renombrar sobre el archivo rotado y perder sus líneas; y si el renombrado falla siempre, el archivo crece sin tope y cada llamada lo lee entero. Son S2 y S3 del [verify](../../changes/archive/2026-11-19-repeated-errors/verify.md#pendiente-después-de-publicar), abiertas.
+
+#### Escenario: lo que queda de un fallo
+- GIVEN un `PostToolUseFailure` con el comando `cd /home/u/secreto && eza --token=abc` y la firma de `eza`
+- WHEN se anota
+- THEN la línea nueva tiene sólo `at_ms`, `event` `fail`, `tool` `Bash`, `program` `eza` y `session`, y el libro no contiene `secreto` ni `abc`
+
+**Tests:** `a_line_keeps_only_the_program_the_tool_and_the_session`, `only_the_first_success_after_a_failure_is_written`, `the_ledger_rolls_at_64_kib_without_rewriting`, `no_data_directory_no_ledger`, `a_damaged_line_costs_only_itself` (`tool_failures.rs`).
+
+## RE5. Cuándo un fallo es una regla
+
+Las reglas MUST salir de una función pura de las líneas de los dos archivos del libro, el momento actual y una función `on_path(program) -> bool` (`rules`). MUST dar las reglas de la definición, cada una con su cantidad de sesiones y la hora de su último fallo, de la más reciente a la más vieja y como mucho 5. `on_path` se consulta sólo sobre los candidatos, antes de tomar las cinco. Dos fallos de una misma `session` MUST contar como una sola sesión. En el hook, `on_path` busca el programa en las carpetas del `PATH` del proceso, y en Windows también con las extensiones de `PATHEXT`, como `doctor::analyze` busca `clawg`.
+
+#### Escenario: lo que cuenta como regla
+- GIVEN fallos de `eza` en dos sesiones; fallos de `rg` en tres sesiones, cada uno seguido de un `ok`; fallos de `gh` en dos sesiones con `gh` presente en el PATH; y fallos de `fd` en dos sesiones de hace 31 días
+- WHEN se calculan las reglas
+- THEN la única regla es `eza`, con 2 sesiones
+
+**Tests:** `two_sessions_make_a_rule_and_one_does_not`, `a_success_in_the_window_cancels_the_rule`, `a_program_on_the_path_is_no_rule`, `failures_older_than_thirty_days_are_forgotten`, `at_most_five_rules_newest_first`, `only_a_program_that_never_worked_and_is_missing_is_a_rule` (`tool_failures.rs`).
+
+## RE6. Las reglas al iniciar la sesión
+
+Con `--client claude-code`, `session-start` MUST leer el libro y calcular las reglas en un hilo propio, dentro de la misma espera que la preferencia de idioma y el aviso de PB4 (`LANGUAGE_WAIT`, `respond_reading`, `hook.rs`). Con alguna regla:
+
+- MUST imprimir un bloque después de la línea del idioma (R7) y antes del aviso de PB4 y del contexto, que se presenta como evidencia. Es el orden de `opening_lines`: idioma, reglas, aviso.
+- El bloque abre con `clawg:`, nombra cada programa con sus sesiones y su último fallo, ofrece las herramientas del cliente y dice que, si una instrucción pide esos programas, se le avise a la persona (`rules_block`).
+- El bloque MUST imprimirse aunque no haya daemon, o aunque el daemon falle o no responda a tiempo, como la línea del idioma.
+- El contexto MUST pedirse con `SESSION_BUDGET` menos los bytes del bloque (`context_budget`), así lo que el hook agrega sin el bloque sigue debajo de 2.000 bytes y el total debajo de 10.000. El bloque pesa como mucho 700 bytes (`RULES_BLOCK_MAX`, el tope que fija un test de `tool_failures.rs`).
+
+Sin reglas, la salida MUST ser byte a byte la de antes. `--client cursor` y `user-prompt-submit` MUST NOT leer el libro.
+
+#### Escenario: dos sesiones y la tercera
+- GIVEN un home de prueba sin daemon y con la preferencia `es`
+- WHEN `clawg hook post-tool-use-failure` recibe la firma de `eza` en la sesión `s1` y después en `s2`, y luego corre `clawg hook session-start` para `s3`
+- THEN la salida trae la línea del idioma y, debajo, el bloque que nombra `` `eza` `` con 2 sesiones
+
+#### Escenario: una sola sesión no alcanza
+- GIVEN dos fallos de `eza`, los dos en la sesión `s1`
+- WHEN corre `session-start`
+- THEN la salida es sólo la línea del idioma
+
+**Tests:** `session_start_names_the_learned_rules_before_the_evidence`, `the_rules_come_out_of_the_context_budget`, `without_rules_session_start_says_what_it_said`, `what_the_hook_adds_stays_small` (con cinco reglas de nombre máximo), `the_rules_reach_the_session_with_or_without_a_daemon` (`hook.rs`); `the_rules_block_of_five_long_names_stays_small` (`tool_failures.rs`); `two_sessions_teach_the_third`, `two_sessions_with_the_shell_words_in_stdout_teach_the_third` y `one_session_teaches_nothing` (`crates/clawg-cli/tests/binary.rs`).

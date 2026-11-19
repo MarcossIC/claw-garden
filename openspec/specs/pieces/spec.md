@@ -130,7 +130,7 @@ Los parsers del eval (`crates/clawg-eval/src/bin/rag-eval/agent_view/parse.rs`) 
 
 ## R6. El save entero
 
-`GET /v1/memories/{kind}/{id}/save` (`crates/clawg-cli/src/daemon/api.rs:1036`, handler `get_save`, `api.rs:1662`) con la query `agent` MUST devolver el save de la fila (`read_save_core`, `crates/clawg-core/src/memory/retrieval/pieces.rs:101`):
+`GET /v1/memories/{kind}/{id}/save` (`crates/clawg-cli/src/daemon/api.rs`, handler `get_save`, `api/memories.rs`) con la query `agent` MUST devolver el save de la fila (`read_save_core`, `crates/clawg-core/src/memory/retrieval/pieces.rs:101`):
 
 - `id`, `kind`, `piece` (la posición de la fila pedida), `pieces` (el total) e `ids`: el id de cada posición, o `null` si esa fila está borrada o fuera del alcance del lector (`agent`);
 - `missing`: las posiciones sin fila visible;

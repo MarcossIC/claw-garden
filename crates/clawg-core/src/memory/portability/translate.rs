@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 use crate::memory::embedding::chunker::ChatChunker;
 use crate::memory::store::dedup::content_hash;
 use crate::memory::domain::redact::redact;
-use crate::memory::domain::record::MemoryType;
+use crate::memory::domain::record::{MemoryStatus, MemoryType};
 use crate::memory::store::tier::compute_tier;
 use crate::memory::revision::topic::{validate_topic_key, MAX_TOPIC_KEY_LEN};
 
@@ -600,7 +600,7 @@ fn lines(drafts: &[Draft<'_>], options: &TranslateOptions, mut report: ForeignRe
                     agent_id: Some(options.agent.clone()),
                     project_id: d.project_id.clone(),
                     content: piece.clone(),
-                    memory_type: d.memory_type.as_str().to_owned(),
+                    memory_type: d.memory_type.into(),
                     source: "import".to_owned(),
                     created_at: d.written,
                     created_by_type: if d.note.kind == NoteKind::Prompt { "user" } else { "agent" }.to_owned(),
@@ -612,8 +612,8 @@ fn lines(drafts: &[Draft<'_>], options: &TranslateOptions, mut report: ForeignRe
                     last_accessed_at: d.last_accessed,
                     access_count: d.accesses,
                     importance,
-                    tier: compute_tier(START_TIER, importance, d.accesses, d.memory_type.as_str()),
-                    status: if by.is_some() { "superseded" } else { "active" }.to_owned(),
+                    tier: compute_tier(START_TIER, importance, d.accesses, Some(d.memory_type)),
+                    status: if by.is_some() { MemoryStatus::Superseded } else { MemoryStatus::Active }.into(),
                     superseded_by: by.map(|n| firsts[n]),
                     supersede_cause: by.map(|_| "revision".to_owned()),
                     dispute_count: 0,
@@ -742,9 +742,9 @@ fn relate(relations: &[ForeignRelation], now_ms: i64, t: &mut Translated) {
     let mut conflicts = Vec::new();
     // A memory line's number is its id, and its index is one less.
     let memories = &mut t.parsed.memories;
-    let live = |m: &MemoryLine| m.deleted_at.is_none() && matches!(m.status.as_str(), "active" | "disputed");
+    let live = |m: &MemoryLine| m.deleted_at.is_none() && m.status.is_live();
     for ((new_id, old_id), (r, source, target)) in newest {
-        let protected = MemoryType::is_protected_name(&memories[(target.start - 1) as usize].1.memory_type);
+        let protected = memories[(target.start - 1) as usize].1.memory_type.known().is_some_and(MemoryType::is_protected);
         let (state, verdict) = match pair_for(&r.verb, &r.judgment, r.by_user, protected) {
             PairFor::LeftOut(reason) => {
                 count(&reason);
@@ -754,7 +754,7 @@ fn relate(relations: &[ForeignRelation], now_ms: i64, t: &mut Translated) {
             PairFor::Escalated => {
                 let newer = &mut memories[(new_id - 1) as usize].1;
                 if live(newer) {
-                    newer.status = "disputed".to_owned();
+                    newer.status = MemoryStatus::Disputed.into();
                     newer.disputed_against.push(old_id);
                 }
                 ("escalated", None)
@@ -764,7 +764,7 @@ fn relate(relations: &[ForeignRelation], now_ms: i64, t: &mut Translated) {
                     for id in target {
                         let replaced = &mut memories[(id - 1) as usize].1;
                         if live(replaced) {
-                            replaced.status = "superseded".to_owned();
+                            replaced.status = MemoryStatus::Superseded.into();
                             replaced.superseded_by = Some(source.start);
                             replaced.supersede_cause = Some("verdict".to_owned());
                         }
@@ -900,7 +900,7 @@ pub(crate) mod tests {
         notes.push(ForeignNote { source_type: None, ..note("claude-code:p/untyped.md", "Untyped", "no type") });
         let export = ForeignExport { source: "claude-code", version: String::new(), ..export(notes) };
         let t = translate(&export, &options(&[]), &ChatChunker::with_fallback(), NOW);
-        let ty = |name: &str| row(&t, &format!("claude-code:p/{name}.md")).memory_type.clone();
+        let ty = |name: &str| row(&t, &format!("claude-code:p/{name}.md")).memory_type.to_string();
         assert_eq!(ty("user"), "user_preference");
         assert_eq!(ty("feedback"), "user_preference");
         assert_eq!(ty("project"), "semantic_fact");
@@ -925,7 +925,7 @@ pub(crate) mod tests {
             ..note("engram:session:s1", "", "Wired the importer")
         });
         let t = run(notes, &[]);
-        let ty = |origin: &str| row(&t, origin).memory_type.clone();
+        let ty = |origin: &str| row(&t, origin).memory_type.to_string();
         assert_eq!(ty("engram:decision"), "architectural_decision");
         assert_eq!(ty("engram:architecture"), "architectural_decision");
         assert_eq!(ty("engram:preference"), "user_preference");
@@ -1200,7 +1200,7 @@ pub(crate) mod tests {
         let keys: HashSet<String> = unprojected.iter().map(|o| key_of(o)).collect();
         assert_eq!(keys.len(), unprojected.len(), "no two projects of the source share a key: {keys:?}");
         for (_, m) in &t.parsed.memories {
-            assert_eq!(m.status, "active");
+            assert_eq!(m.status.as_str(), "active");
             assert!(validate_topic_key(m.topic_key.as_deref().unwrap()).is_ok());
         }
         assert!(t.report.qualified_keys.contains(&KeyChange { from: key.into(), to: "a/sdd/x/proposal".into() }));
@@ -1231,7 +1231,7 @@ pub(crate) mod tests {
 
         let placed = |origin: &str| {
             let m = row(&t, origin);
-            (m.project_id.clone().unwrap(), m.topic_key.clone().unwrap(), m.status.clone())
+            (m.project_id.clone().unwrap(), m.topic_key.clone().unwrap(), m.status.to_string())
         };
         assert_eq!(placed("engram:a"), ("app-1a2b".into(), "a/sdd/x".into(), "active".into()));
         assert_eq!(placed("engram:b"), ("app-1a2b".into(), "b/sdd/x".into(), "active".into()));

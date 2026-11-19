@@ -109,7 +109,7 @@ pub fn read_export(text: &str) -> Result<Export, StoreError> {
         ..ExportCounts::default()
     };
     for (_, row) in &parsed.memories {
-        if row.status == "superseded" {
+        if row.status.as_str() == "superseded" {
             match row.supersede_cause.as_deref() {
                 Some("revision") => counts.superseded_by_revision += 1,
                 Some("verdict") => counts.superseded_by_verdict += 1,
@@ -122,7 +122,7 @@ pub fn read_export(text: &str) -> Result<Export, StoreError> {
         if head.topic_key.is_some() {
             counts.keyed_saves += 1;
         }
-        if is_claim_type(&head.memory_type) && first_key_at.is_some_and(|at| head.created_at >= at) {
+        if is_claim_type(head.memory_type.as_str()) && first_key_at.is_some_and(|at| head.created_at >= at) {
             counts.claim_saves_since_first_key += 1;
         }
         let Some(agent) = head.agent_id.clone() else {
@@ -132,12 +132,12 @@ pub fn read_export(text: &str) -> Result<Export, StoreError> {
         flow.push(Save {
             agent,
             project: head.project_id.clone(),
-            memory_type: head.memory_type.clone(),
+            memory_type: head.memory_type.to_string(),
             importance: head.importance,
             topic_key: head.topic_key.clone(),
             text,
             gone: head.deleted_at.is_some()
-                || (head.status == "superseded" && head.supersede_cause.as_deref() == Some("verdict")),
+                || (head.status.as_str() == "superseded" && head.supersede_cause.as_deref() == Some("verdict")),
         });
     }
     Ok(Export { format: header.format, version: header.version, flow, counts })

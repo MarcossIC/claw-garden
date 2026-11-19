@@ -14,7 +14,7 @@ Las reglas de qué es un guardado válido viven en el handler HTTP. Para probar 
    - con el embedder `failed` no se acepta el save (`:1467-1475`);
    - el proyecto se sigue hasta el vivo (`live_project`, `:1477`).
 2. **El tipo se valida y se tira.** `raw.parse::<MemoryType>()` (`:1427-1429`) descarta el resultado; la métrica de la sesión vuelve a parsear y tira el error (`:1482`), y al evento viaja el `String` original (`:1495`).
-3. **Las reglas de formato son funciones de `api.rs`:** `check_content` (`:703`), `check_operation_id` (`:722`), `distinct_sources` (`:331`), `missing_sources` (`:345`) y `replaced_list` (`:350`), con sus tests en el `mod tests` del daemon. El tope de contenido es del producto ([`specs/ingest`](../../specs/ingest/spec.md)), no de HTTP.
+3. **Las reglas de formato son funciones de `api.rs`:** `check_content` (`:703`), `check_operation_id` (`:722`), `distinct_sources` (`:331`), `missing_sources` (`:345`) y `replaced_list` (`:350`), con sus tests en el `mod tests` del daemon. El tope de contenido es del producto ([`specs/ingest`](../../../specs/ingest/spec.md)), no de HTTP.
 
 ## Enfoque
 
@@ -40,14 +40,14 @@ Este PR aplica la primera parte coherente, el guardado completo (`POST /v1/memor
 3. **`save_memory`** queda en leer el cuerpo, pedir la sesión al registro del daemon, llamar a `accept` y traducir cada `SaveRejected` a un estado.
 4. Los tests puros del daemon que cubren esas reglas se mudan a core con su nombre y sus literales.
 
-Las partes siguientes, cada una en su PR, están en [`tasks.md`](tasks.md#partes-siguientes).
+La segunda parte, en su PR, baja las escrituras de proyectos ([R8 a R11](spec.md#parte-2-las-escrituras-de-proyectos)): las dos reglas de la raíz de un registro (`check_root`), la decisión de ubicar una carpeta con `folder_shared` (`locate_folder`, que se queda con `own_folder_count`) y, de la revisión de las demás rutas de proyectos ([D13](design.md#d13-lo-que-deciden-las-demás-rutas-de-proyectos)), el código de confirmación que va con las filas de un borrado. La tercera, en su PR, baja las reglas de las otras escrituras ([R12 a R15](spec.md#parte-3-las-otras-escrituras)): de la revisión de `PATCH`, el borrado, el restore, las disputas y dos rutas de proyectos ([D15](design.md#d15-lo-que-deciden-las-otras-escrituras)), la respuesta a una sugerencia (`merge` o `apart`, la palabra de la persona, la sugerencia pendiente) y `new_project` sin `create`. La parte 4 está en [`tasks.md`](tasks.md#partes-siguientes).
 
 ## Fuera de alcance
 
 - Cambiar códigos de estado, cuerpos de respuesta o mensajes de error. Ninguna respuesta existente cambia, ni con campos agregados.
 - El contrato MCP (`agent_contract.json`, `agent_contract.es.json`) y los textos del puente.
 - `PATCH /v1/memories/...`, que también parsea `memory_type`, y las demás rutas que escriben: van en las partes siguientes.
-- `context`, `register_root` y `locate_project` ([D7](design.md#d7-qué-handlers-entran)).
+- `context` ([D7](design.md#d7-qué-handlers-entran)); `register_root` y `locate_project` van en la segunda parte.
 - `eval_api` ([D6](design.md#d6-eval_api-no-cambia)).
 - Partir `api.rs` en archivos.
 

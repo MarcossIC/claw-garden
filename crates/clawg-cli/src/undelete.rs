@@ -3,6 +3,7 @@
 //! Restoring embeds the row again, so it goes through the running daemon and
 //! its loaded model; without a daemon nothing is opened.
 
+use clawg_core::memory::MemoryStatus;
 use clawg_core::preferences::Lang;
 
 use crate::client::{ClientError, DaemonClient, Restored};
@@ -17,18 +18,18 @@ pub fn report(lang: Lang, r: &Restored) -> String {
     };
     let id = r.id;
     let mut out = match (r.superseded_by, lang) {
-        (Some(by), Lang::En) if r.status == "superseded" && r.superseded_by_deleted => format!(
+        (Some(by), Lang::En) if r.status == MemoryStatus::Superseded && r.superseded_by_deleted => format!(
             "restored memory #{id}{key}; it is still superseded by #{by}, which is deleted too: \
              `clawg undelete {by}` brings it back"
         ),
-        (Some(by), Lang::Es) if r.status == "superseded" && r.superseded_by_deleted => format!(
+        (Some(by), Lang::Es) if r.status == MemoryStatus::Superseded && r.superseded_by_deleted => format!(
             "se restauró la memoria #{id}{key}; sigue reemplazada por #{by}, que también está borrada: \
              `clawg undelete {by}` la trae de vuelta"
         ),
-        (Some(by), Lang::En) if r.status == "superseded" => {
+        (Some(by), Lang::En) if r.status == MemoryStatus::Superseded => {
             format!("restored memory #{id}{key}; it is still superseded by #{by}, so searches leave it out")
         }
-        (Some(by), Lang::Es) if r.status == "superseded" => {
+        (Some(by), Lang::Es) if r.status == MemoryStatus::Superseded => {
             format!("se restauró la memoria #{id}{key}; sigue reemplazada por #{by}, así que las búsquedas la dejan afuera")
         }
         (_, Lang::En) => format!("restored memory #{id}{key}"),
@@ -64,14 +65,15 @@ pub async fn run(lang: Lang, client: &DaemonClient, id: i64) -> Result<String, C
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clawg_core::memory::StoredStatus;
     use crate::client::tests::{publish, save_and_wait, start_daemon};
     use crate::client::{ListArgs, RelatedMemory, ReplacedMemory};
 
     #[test]
     fn report_names_the_row_and_a_replacement() {
-        let active = Restored { id: 4, status: "active".into(), ..Restored::default() };
+        let active = Restored { id: 4, status: StoredStatus::read("active"), ..Restored::default() };
         assert_eq!(report(Lang::En, &active), "restored memory #4");
-        let replaced = Restored { id: 4, status: "superseded".into(), superseded_by: Some(9), ..Restored::default() };
+        let replaced = Restored { id: 4, status: StoredStatus::read("superseded"), superseded_by: Some(9), ..Restored::default() };
         assert_eq!(report(Lang::En, &replaced), "restored memory #4; it is still superseded by #9, so searches leave it out");
         let gone = Restored { superseded_by_deleted: true, ..replaced };
         assert_eq!(
@@ -96,7 +98,7 @@ mod tests {
     fn the_undelete_report_speaks_spanish() {
         let replaced = Restored {
             id: 4,
-            status: "superseded".into(),
+            status: StoredStatus::read("superseded"),
             superseded_by: Some(9),
             topic_key: Some("storage/engine".into()),
             ..Restored::default()
@@ -107,7 +109,7 @@ mod tests {
         );
         let full = Restored {
             id: 4,
-            status: "active".into(),
+            status: StoredStatus::read("active"),
             replaced: vec![ReplacedMemory { id: 2, excerpt: "Storage engine is SQLite".into() }],
             related: vec![RelatedMemory { id: 7, escalated: true, excerpt: "storage engine is postgres".into() }],
             ..Restored::default()

@@ -152,7 +152,7 @@ El puente no se queda con el daemon que encontró al abrir. Cuando una llamada f
 
 Al encontrar un daemon releyendo, el puente deja en el log su dirección, la versión del daemon y la propia (`startup.rs:109-115`; si `/health` falla en ese momento, sólo la dirección) y MUST NOT cambiar por eso lo que contesta la herramienta. `version_warning` (`crates/clawg-cli/src/memories.rs:332`) no se usa en el puente: aconseja `clawg stop`, y después de una actualización lo viejo es el puente, no el daemon.
 
-Repetir MUST NOT llegar dos veces al handler del daemon: un 401 lo corta `require_bearer` antes del handler (`crates/clawg-cli/src/daemon/api.rs:1118-1136`), y una conexión rechazada no llegó. Por eso la única llamada del cliente con timeout es `/health` (`crates/clawg-cli/src/client.rs:971`, `HEALTH_TIMEOUT` en `client.rs:50`), y en una herramienta que escribe `NotRunning` sólo significa una conexión que no se abrió. `map_transport` (`client.rs:793`) mapea a `NotRunning` lo que es `is_connect` o `is_timeout`.
+Repetir MUST NOT llegar dos veces al handler del daemon: un 401 lo corta `require_bearer` antes del handler (`crates/clawg-cli/src/daemon/api.rs`), y una conexión rechazada no llegó. Por eso la única llamada del cliente con timeout es `/health` (`crates/clawg-cli/src/client.rs:971`, `HEALTH_TIMEOUT` en `client.rs:50`), y en una herramienta que escribe `NotRunning` sólo significa una conexión que no se abrió. `map_transport` (`client.rs:793`) mapea a `NotRunning` lo que es `is_connect` o `is_timeout`.
 
 #### Escenario: el daemon se reinició
 - GIVEN un puente contra el daemon A, con su puerto y su token
@@ -212,7 +212,7 @@ El texto de `ClientError::Unauthorized` de la CLI (`crates/clawg-cli/src/client.
 
 **Test:** `a_project_registration_the_old_daemon_refused_is_sent_to_the_new_one` (`mcp/server.rs`).
 
-**`memory_status`.** `memory_status_impl` (`crates/clawg-cli/src/mcp/server.rs:1264`) pasa por `call` como las demás herramientas. Su `/health` no lleva token (`DaemonClient::health`, `client.rs:971`; ruta abierta en `crates/clawg-cli/src/daemon/api.rs:1055`), así que después de un reinicio muestra el daemon nuevo.
+**`memory_status`.** `memory_status_impl` (`crates/clawg-cli/src/mcp/server.rs:1264`) pasa por `call` como las demás herramientas. Su `/health` no lleva token (`DaemonClient::health`, `client.rs:971`; ruta abierta en `crates/clawg-cli/src/daemon/api.rs`), así que después de un reinicio muestra el daemon nuevo.
 
 #### Escenario: `memory_status` después de un reinicio
 - GIVEN un puente contra el daemon A que se detuvo, y el daemon B arrancado
@@ -233,7 +233,7 @@ El texto de `ClientError::Unauthorized` de la CLI (`crates/clawg-cli/src/client.
 
 ## El modelo en memoria en `/health`
 
-`GET /health` MUST incluir `embedder_resident` (`HealthBody`, `crates/clawg-cli/src/daemon/api.rs:551`, que lo lee de `Embedder::resident` en `api.rs:1165`): `true` con el modelo en memoria, `false` cuando el daemon lo soltó por ocio, o lo descartó porque su hilo de inferencia murió, y la próxima llamada que necesite un vector espera que vuelva a cargar, y `null` antes de la primera carga. `embedder` sigue en `ready` con el modelo suelto ([`specs/storage`](../storage/spec.md), «Ciclo de vida del embedder»). El cliente MUST leer un `/health` sin el campo, el de un daemon anterior, como `None` (`client.rs:139`, `#[serde(default)]`). `memory_status` lo muestra porque imprime el `Health` entero.
+`GET /health` MUST incluir `embedder_resident` (`HealthBody`, `crates/clawg-cli/src/daemon/api.rs`, que lo lee de `Embedder::resident` en `api.rs`): `true` con el modelo en memoria, `false` cuando el daemon lo soltó por ocio, o lo descartó porque su hilo de inferencia murió, y la próxima llamada que necesite un vector espera que vuelva a cargar, y `null` antes de la primera carga. `embedder` sigue en `ready` con el modelo suelto ([`specs/storage`](../storage/spec.md), «Ciclo de vida del embedder»). El cliente MUST leer un `/health` sin el campo, el de un daemon anterior, como `None` (`client.rs:139`, `#[serde(default)]`). `memory_status` lo muestra porque imprime el `Health` entero.
 
 #### Escenario: el modelo suelto
 - GIVEN un daemon con el modelo cargado una vez y soltado por ocio
@@ -244,7 +244,7 @@ El texto de `ClientError::Unauthorized` de la CLI (`crates/clawg-cli/src/client.
 
 ## El presupuesto de `recall_context`
 
-`POST /v1/context` MUST aceptar `budget` opcional, en bytes del prompt (`ContextRequest`, `crates/clawg-cli/src/daemon/api.rs:415-432`, donde `query` también es opcional y una en blanco vale como ausente: [`specs/retrieval`](../retrieval/spec.md), «El contexto sin consulta»; `check_budget`, `api.rs:343`, que el handler llama antes de armar nada, `api.rs:1501`):
+`POST /v1/context` MUST aceptar `budget` opcional, en bytes del prompt (`ContextRequest`, `crates/clawg-cli/src/daemon/api/memories.rs`, donde `query` también es opcional y una en blanco vale como ausente: [`specs/retrieval`](../retrieval/spec.md), «El contexto sin consulta»; `check_budget`, `api/memories.rs`, que el handler llama antes de armar nada, `api/memories.rs`):
 
 - ausente, MUST usar 8.000 (`DEFAULT_BUDGET`);
 - mayor que 24.000, MUST usar 24.000 (`MAX_BUDGET`);
@@ -267,7 +267,7 @@ El texto de `ClientError::Unauthorized` de la CLI (`crates/clawg-cli/src/client.
 
 ## `recall_context` dice si buscó memorias
 
-`POST /v1/context` MUST responder `retrieval` con `state` (`ContextBody` y `RetrievalState`, `api.rs:704-776`), leído del mismo estado del embedder que usa `POST /v1/search` (`RetrievalState::of`, `api.rs:763`):
+`POST /v1/context` MUST responder `retrieval` con `state` (`ContextBody` y `RetrievalState`, `api/memories.rs`), leído del mismo estado del embedder que usa `POST /v1/search` (`RetrievalState::of`, `api/memories.rs`):
 
 - `searched`, con `hits` y `withheld`: se buscó; `hits` son los que usó el prompt antes del presupuesto y `withheld` las filas de score 0 que dejó afuera ([`specs/retrieval`](../retrieval/spec.md), «`recall_context` deja afuera los ceros»);
 - `recent`, con `hits`: el contexto se pidió sin `query`, o con una en blanco, y no se buscó nada; `hits` son los saves de RECENT ([`specs/retrieval`](../retrieval/spec.md), «El contexto sin consulta»). Lo pide el hook de inicio de sesión, pero también lo recibe `recall_context` cuando el modelo manda una `query` en blanco, porque el puente la reenvía tal cual (`recall_context_impl`, `server.rs:976`);
@@ -590,9 +590,9 @@ Los pares escalados que cuenta `memory_status` MUST ser los del proyecto abierto
 
 ## BI9. Los documentos de las carpetas abiertas
 
-Una carpeta abierta MUST registrarse con `index_docs` si `auto_indexable` la acepta (tiene `.git` o un manifiesto y no es el directorio personal), como el directorio del puente (`indexable_folders`, `server.rs`; `indexes_docs`, `tools.rs`; [`specs/project`](../project/spec.md), R6). Un camino que nombra el modelo y no es una carpeta abierta MUST seguir registrándose sin `index_docs`. El 403 de `search_project` (`not_accepted`, `crates/clawg-cli/src/daemon/api.rs`), `clawg projects add` en `docs/reference/commands.md` y `docs/reference/daemon.md` MUST decir que se lee sola una carpeta que el cliente MCP tiene abierta o en la que arrancó un puente ([`specs/project-docs`](../project-docs/spec.md), «Búsqueda»).
+Una carpeta abierta MUST registrarse con `index_docs` si `auto_indexable` la acepta (tiene `.git` o un manifiesto y no es el directorio personal), como el directorio del puente (`indexable_folders`, `server.rs`; `indexes_docs`, `tools.rs`; [`specs/project`](../project/spec.md), R6). Un camino que nombra el modelo y no es una carpeta abierta MUST seguir registrándose sin `index_docs`. El 403 de `search_project` (`not_accepted`, `crates/clawg-cli/src/daemon/api/docs.rs`), `clawg projects add` en `docs/reference/commands.md` y `docs/reference/daemon.md` MUST decir que se lee sola una carpeta que el cliente MCP tiene abierta o en la que arrancó un puente ([`specs/project-docs`](../project-docs/spec.md), «Búsqueda»).
 
-**Tests:** `a_root_the_client_declares_is_indexed_like_the_directory` (`server.rs`), `the_refusal_names_what_is_read_without_the_user_adding_it` (`api.rs`), `only_an_open_folder_is_indexed` (`tools.rs`); `a_save_elsewhere_registers_the_root_without_reading_it` y `a_bridge_in_a_folder_that_is_not_a_project_indexes_nothing`.
+**Tests:** `a_root_the_client_declares_is_indexed_like_the_directory` (`server.rs`), `the_refusal_names_what_is_read_without_the_user_adding_it` (`api/docs.rs`), `only_an_open_folder_is_indexed` (`tools.rs`); `a_save_elsewhere_registers_the_root_without_reading_it` y `a_bridge_in_a_folder_that_is_not_a_project_indexes_nothing`.
 
 ## BI10. Lo que ve el modelo
 
@@ -695,7 +695,7 @@ Con el idioma de la sesión `es`, la prosa de cada respuesta del puente MUST est
 
 El segmento `{kind}` de `/v1/memories/{kind}/{id}`, `/save` y `/restore`, y el filtro `kind` de `GET /v1/memories`, MUST aceptar `memory`. Un kind retirado MUST dar un 400 con la explicación, que nombra `search_memory`; cualquier otro valor, un 400 que dice que `memory` es el único. Las respuestas MUST seguir llevando `kind` (`memory` en una fila, también las de `POST /v1/synthesis`; `Memory` en un hit), `GET /v1/stats` MUST seguir llevando `totals.episodic` y `totals.procedural` en 0, y la unión de una respuesta `merge` a una sugerencia, `trajectories` y `skills` en 0, porque un bridge de la versión anterior los exige. Las filas MUST NOT llevar `success_count`, `trigger` ni `source_trajectory_ids`.
 
-**Test:** `a_retired_kind_is_refused_with_where_its_rows_went` y `the_answers_keep_what_a_bridge_of_the_previous_version_requires` (`crates/clawg-cli/tests/api.rs`); `parse_kind_takes_memory_alone` y `a_retired_kind_says_where_its_rows_went` (`crates/clawg-cli/src/daemon/api.rs`).
+**Test:** `a_retired_kind_is_refused_with_where_its_rows_went` y `the_answers_keep_what_a_bridge_of_the_previous_version_requires` (`crates/clawg-cli/tests/api.rs`); `parse_kind_takes_memory_alone` y `a_retired_kind_says_where_its_rows_went` (`crates/clawg-cli/src/daemon/api/memories.rs`).
 
 ## RL6. La CLI
 

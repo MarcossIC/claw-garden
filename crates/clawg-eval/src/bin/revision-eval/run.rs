@@ -335,7 +335,7 @@ async fn run_arm<'a>(input: &ChainsInput<'a>, arm: Arm, dir: &Path) -> Result<Ar
 
 /// Per chain, the versions with a row of their own the router lists live.
 fn live_versions(run: &ArmRun<'_>) -> Vec<usize> {
-    let live = |id: &i64| run.listed.get(id).is_some_and(|row| is_live(&row.status));
+    let live = |id: &i64| run.listed.get(id).is_some_and(|row| is_live(row.status.as_str()));
     run.own.iter().map(|versions| versions.iter().flatten().filter(|rows| rows.iter().any(live)).count()).collect()
 }
 
@@ -909,19 +909,19 @@ mod tests {
         let rows = |chain: usize, version: usize| run.saved[chain][version].as_ref().expect("saved").rows.clone();
         let (v1, v2) = (rows(1, 0), rows(1, 1));
         let old = &run.listed[&v1[0].0];
-        assert_eq!(old.status, "superseded");
+        assert_eq!(old.status.as_str(), "superseded");
         assert_eq!(old.superseded_by, Some(v2[0].0));
-        assert_eq!(run.listed[&v2[0].0].status, "active");
+        assert_eq!(run.listed[&v2[0].0].status.as_str(), "active");
         assert_eq!(run.listed[&v2[0].0].topic_key.as_deref(), Some("style/indent"));
 
         let ids = |version: usize| rows(0, version).into_iter().map(|(id, _)| id).collect::<Vec<_>>();
         let own = own_rows(&[Some(ids(0)), Some(ids(1)), Some(ids(2))]);
         assert!(ids(2).iter().any(|id| ids(0).contains(id)), "the long versions must share a piece to mean anything");
         for id in own[0].iter().chain(&own[1]).flatten() {
-            assert_eq!(run.listed[id].status, "superseded", "#{id} is an older version's own row");
+            assert_eq!(run.listed[id].status.as_str(), "superseded", "#{id} is an older version's own row");
         }
         for id in ids(2) {
-            assert_eq!(run.listed[&id].status, "active", "#{id} is held by the last version");
+            assert_eq!(run.listed[&id].status.as_str(), "active", "#{id} is held by the last version");
         }
     }
 

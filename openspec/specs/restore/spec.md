@@ -101,15 +101,15 @@ Devuelve el id, el `status` y el `superseded_by` con que quedó la fila (`Restor
 
 ## R4. HTTP
 
-`POST /v1/memories/{kind}/{id}/restore` (ruta en `crates/clawg-cli/src/daemon/api.rs:1037`, `restore_memory`, `api.rs:1750`) MUST aceptar `agent` en la query, como `DELETE`, y MUST responder:
+`POST /v1/memories/{kind}/{id}/restore` (ruta en `crates/clawg-cli/src/daemon/api.rs`, `restore_memory`, `api/memories.rs`) MUST aceptar `agent` en la query, como `DELETE`, y MUST responder:
 
 - 200 con `restored = 1`, `id`, `status` y `superseded_by`;
 - 400 si `kind` no es `memory` o no es un kind; el kind se mira antes que el embedder, así que un pedido que no puede salir bien lo dice aunque el modelo siga cargando;
 - 404 por "no existe" (R1);
-- 409 por gemela viva, con su id en el mensaje, por titular de la clave, con la clave y su id, y por secreto, con los tipos y `clawg purge` (`api.rs:1765`);
-- 503 cuando no hay un embedder con que calcular el vector. Con el modelo todavía sin cargar, `ready_embedder` (`api.rs:1414`) responde `embedder_not_ready` (cargando) o `embedder_failed` con la causa y si se reintenta (la carga falló), como la búsqueda. Con el modelo ya cargado una vez, aunque el daemon lo haya soltado por inactivo, el embedder es el `IdleEmbedder` ([`specs/storage`](../storage/spec.md), «Las herramientas funcionan con el modelo suelto»): el restore espera la recarga y responde 200, y sólo si esa recarga falla (o vuelve un modelo de otra identidad) responde `embedder_not_ready` (`embed_failure`, `api.rs:1406`; `crates/clawg-core/src/memory/embedding/idle_embedder.rs:128-135`) y la siguiente llamada vuelve a intentar. Cualquier otro error del embedder es un 500.
+- 409 por gemela viva, con su id en el mensaje, por titular de la clave, con la clave y su id, y por secreto, con los tipos y `clawg purge` (`api/memories.rs`);
+- 503 cuando no hay un embedder con que calcular el vector. Con el modelo todavía sin cargar, `ready_embedder` (`api.rs`) responde `embedder_not_ready` (cargando) o `embedder_failed` con la causa y si se reintenta (la carga falló), como la búsqueda. Con el modelo ya cargado una vez, aunque el daemon lo haya soltado por inactivo, el embedder es el `IdleEmbedder` ([`specs/storage`](../storage/spec.md), «Las herramientas funcionan con el modelo suelto»): el restore espera la recarga y responde 200, y sólo si esa recarga falla (o vuelve un modelo de otra identidad) responde `embedder_not_ready` (`embed_failure`, `api.rs`; `crates/clawg-core/src/memory/embedding/idle_embedder.rs:128-135`) y la siguiente llamada vuelve a intentar. Cualquier otro error del embedder es un 500.
 
-`GET /v1/memories` MUST aceptar `deleted=true`: lista sólo borradas, de la más recién borrada a la más vieja (`ORDER BY deleted_at DESC, id DESC`, `listing.rs:180`), con los mismos filtros y con `deleted_at` en cada ítem. Sin `deleted`, el listado MUST NOT cambiar. `deleted=true` con `q` MUST ser 400 (`api.rs:228-233`): una borrada no tiene entrada en el índice de texto.
+`GET /v1/memories` MUST aceptar `deleted=true`: lista sólo borradas, de la más recién borrada a la más vieja (`ORDER BY deleted_at DESC, id DESC`, `listing.rs:180`), con los mismos filtros y con `deleted_at` en cada ítem. Sin `deleted`, el listado MUST NOT cambiar. `deleted=true` con `q` MUST ser 400 (`api/memories.rs`): una borrada no tiene entrada en el índice de texto.
 
 #### Escenario
 - GIVEN una memoria guardada y borrada por HTTP
@@ -120,7 +120,7 @@ Devuelve el id, el `status` y el `superseded_by` con que quedó la fila (`Restor
 - WHEN se manda `POST .../restore?agent=<otro>` sin esa exclusión
 - THEN responde 200 y una búsqueda la encuentra
 
-**Test:** `restore_brings_a_deleted_memory_back_for_any_agent_that_reaches_it`, `restore_answers_each_refusal_with_its_status` (404, 409 por gemela, 400 por kind y 503 `embedder_not_ready` sin modelo cargado), `restore_refuses_a_row_whose_topic_is_live_again` (409 por clave) y `listing_deleted_rows_shows_only_them_newest_deletion_first` en `crates/clawg-cli/tests/api.rs`; `deleted_listing_refuses_a_text_query` junto a `list_params_from_query` en `crates/clawg-cli/src/daemon/api.rs`. Ningún test cubre el 409 por secreto por HTTP, el 503 `embedder_failed` ni un restore con el modelo suelto: lo último lo respalda lo que prueban `a_search_with_the_model_unloaded_loads_it_and_answers` y `a_search_whose_model_cannot_load_again_answers_not_ready` para la búsqueda, que usa el mismo embedder.
+**Test:** `restore_brings_a_deleted_memory_back_for_any_agent_that_reaches_it`, `restore_answers_each_refusal_with_its_status` (404, 409 por gemela, 400 por kind y 503 `embedder_not_ready` sin modelo cargado), `restore_refuses_a_row_whose_topic_is_live_again` (409 por clave) y `listing_deleted_rows_shows_only_them_newest_deletion_first` en `crates/clawg-cli/tests/api.rs`; `deleted_listing_refuses_a_text_query` junto a `list_params_from_query` en `crates/clawg-cli/src/daemon/api/memories.rs`. Ningún test cubre el 409 por secreto por HTTP, el 503 `embedder_failed` ni un restore con el modelo suelto: lo último lo respalda lo que prueban `a_search_with_the_model_unloaded_loads_it_and_answers` y `a_search_whose_model_cannot_load_again_answers_not_ready` para la búsqueda, que usa el mismo embedder.
 
 ## R5. Herramienta MCP `restore_memory`
 
@@ -163,7 +163,7 @@ Borrar una fila viva (`delete_memory_core`, `crates/clawg-core/src/memory/upkeep
 
 Revivir MUST dejar la fila `active` (o `disputed` si sus disputas siguen), sin `superseded_by` ni causa, con `revived_from` igual al id borrado (`REVIVE_SQL`, `crates/clawg-core/src/memory/revision/dispute.rs:344`), de vuelta en el KNN y en el índice de texto, y MUST llevar a su estado de reposo a la fila y a las retadoras que la disputaban antes (`settle_row` y `settle_challengers`, `dispute.rs:222` y `dispute.rs:215`). El borrado de una pieza viva de un save largo cuya primera pieza ya está borrada aplica la regla también a esa primera pieza (`revive_after_delete_of_piece`, `revival.rs:174`). Un borrado que no afectó ninguna fila MUST NOT revivir nada, y las filas de otro proyecto MUST NOT revivir; la que reemplazó una revisión de otro agente en el proyecto sí. `clawg purge` de una fila viva la marca borrada y aplica la misma regla antes de sacarla, en la misma transacción ([`specs/secrets`](../secrets/spec.md), R5).
 
-La respuesta de `DELETE /v1/memories/{kind}/{id}` (`DeletedBody`, `crates/clawg-cli/src/daemon/api.rs:813`) MUST sumar `revived` (id y primera línea) y `hidden` (ids), omitidos cuando están vacíos, y `delete_memory` MUST nombrarlos (`format_delete`, `crates/clawg-cli/src/mcp/tools.rs:389`).
+La respuesta de `DELETE /v1/memories/{kind}/{id}` (`DeletedBody`, `crates/clawg-cli/src/daemon/api/memories.rs`) MUST sumar `revived` (id y primera línea) y `hidden` (ids), omitidos cuando están vacíos, y `delete_memory` MUST nombrarlos (`format_delete`, `crates/clawg-cli/src/mcp/tools.rs:389`).
 
 #### Escenario: la versión nueva se borra
 - GIVEN v1 reemplazada por v2 con la clave `storage/engine`
@@ -223,7 +223,7 @@ La pasada de mantenimiento (`run_maintenance_once_at`, `crates/clawg-core/src/me
 
 ### Restaurar en HTTP y en la CLI
 
-`POST /v1/memories/{kind}/{id}/restore` suma a su respuesta `topic_key` (si la fila tiene clave), `replaced`, `superseded_by_deleted` y `related`, omitidos cuando están vacíos o son falsos (`RestoredBody`, `crates/clawg-cli/src/daemon/api.rs:835`). `DaemonClient::restore` los lee con `#[serde(default)]` (`crates/clawg-cli/src/client.rs:1235`), así que un daemon anterior no los manda. `clawg undelete` imprime la clave, lo que volvió a reemplazar y cada par nuevo, una línea por candidata, sin juzgarlos (`report`, `crates/clawg-cli/src/undelete.rs:9`).
+`POST /v1/memories/{kind}/{id}/restore` suma a su respuesta `topic_key` (si la fila tiene clave), `replaced`, `superseded_by_deleted` y `related`, omitidos cuando están vacíos o son falsos (`RestoredBody`, `crates/clawg-cli/src/daemon/api/memories.rs`). `DaemonClient::restore` los lee con `#[serde(default)]` (`crates/clawg-cli/src/client.rs:1235`), así que un daemon anterior no los manda. `clawg undelete` imprime la clave, lo que volvió a reemplazar y cada par nuevo, una línea por candidata, sin juzgarlos (`report`, `crates/clawg-cli/src/undelete.rs:9`).
 
 **Test:** `a_restore_answers_its_key_and_its_new_pairs` en `crates/clawg-cli/tests/api.rs`; `report_names_the_row_and_a_replacement` en `crates/clawg-cli/src/undelete.rs`; `format_restore_names_key_replacements_and_pairs` en `crates/clawg-cli/src/mcp/tools.rs`.
 

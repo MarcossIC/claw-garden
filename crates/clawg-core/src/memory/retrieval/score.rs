@@ -3,6 +3,7 @@
 //! an importance multiplier, and a live-status gate into one ranking value.
 
 use crate::memory::domain::clock::TimestampMs;
+use crate::memory::domain::record::{MemoryType, StoredStatus, StoredType};
 
 // ---------------------------------------------------------------------------
 // Config
@@ -14,9 +15,9 @@ use crate::memory::domain::clock::TimestampMs;
 pub(crate) struct RawHit {
     pub id: i64,
     pub content: String,
-    pub memory_type: String,
+    pub memory_type: StoredType,
     pub tier: i64,
-    pub status: String,
+    pub status: StoredStatus,
     pub distance: f64,
     pub created_at: TimestampMs,
     pub last_accessed_at: TimestampMs,
@@ -210,15 +211,15 @@ fn rescale_cosine(cosine: f64, floor: f64) -> f64 {
 }
 
 /// Resolves the decay rate of a row by its `memory_type`.
-pub(crate) fn lambda_for(cfg: &ScoringConfig, memory_type: &str) -> f64 {
-    match memory_type {
-        "user_preference" => cfg.decay.user_preference,
-        "architectural_decision" => cfg.decay.architectural_decision,
-        "session_summary" => cfg.decay.session_summary,
-        "semantic_fact" => cfg.decay.semantic_fact,
-        "chat_message" => cfg.decay.chat_message,
-        "tool_error" => cfg.decay.tool_error,
-        _ => cfg.decay.fallback,
+pub(crate) fn lambda_for(cfg: &ScoringConfig, memory_type: &StoredType) -> f64 {
+    match memory_type.known() {
+        Some(MemoryType::UserPreference) => cfg.decay.user_preference,
+        Some(MemoryType::ArchitecturalDecision) => cfg.decay.architectural_decision,
+        Some(MemoryType::SessionSummary) => cfg.decay.session_summary,
+        Some(MemoryType::SemanticFact) => cfg.decay.semantic_fact,
+        Some(MemoryType::ChatMessage) => cfg.decay.chat_message,
+        Some(MemoryType::ToolError) => cfg.decay.tool_error,
+        Some(MemoryType::CodeBlock) | None => cfg.decay.fallback,
     }
 }
 
@@ -280,10 +281,7 @@ pub(crate) fn score(cfg: &ScoringConfig, hit: &RawHit, now: TimestampMs) -> f64 
     // similarity, so it also flags same-topic rows holding a different fact;
     // demoting them buried correct answers. The possible conflict stays
     // recorded on the row and visible in the CONFLICTS block of the context.
-    let status = match hit.status.as_str() {
-        "active" | "disputed" => 1.0,
-        _ => 0.0,
-    };
+    let status = if hit.status.is_live() { 1.0 } else { 0.0 };
 
     relevance * tier_floor.max(decay) * importance * status
 }
@@ -305,9 +303,9 @@ mod tests {
         RawHit {
             id: 1,
             content: String::new(),
-            memory_type: memory_type.to_string(),
+            memory_type: StoredType::read(memory_type),
             tier,
-            status: status.to_string(),
+            status: StoredStatus::read(status),
             distance,
             created_at: TimestampMs::from_unix_millis(0),
             last_accessed_at,
@@ -519,6 +517,13 @@ mod tests {
         let cfg = ScoringConfig::DEFAULT;
         let v = score(&cfg, &neutral_hit_at_importance(5.0, "superseded"), epoch());
         assert_eq!(v, 0.0);
+    }
+
+    #[test]
+    fn a_status_the_code_does_not_know_never_ranks() {
+        let cfg = ScoringConfig::DEFAULT;
+        assert_eq!(score(&cfg, &neutral_hit_at_importance(5.0, "archived"), epoch()), 0.0);
+        assert!(score(&cfg, &neutral_hit_at_importance(5.0, "active"), epoch()) > 0.0);
     }
 
     #[test]
@@ -761,9 +766,11 @@ mod tests {
     #[test]
     fn lambda_for_memory_dispatches_on_memory_type() {
         let cfg = ScoringConfig::DEFAULT;
-        assert_eq!(lambda_for(&cfg, "user_preference"), cfg.decay.user_preference);
-        assert_eq!(lambda_for(&cfg, "tool_error"), cfg.decay.tool_error);
-        assert_eq!(lambda_for(&cfg, "unrecognized"), cfg.decay.fallback);
+        let rate = |name: &str| lambda_for(&cfg, &StoredType::read(name));
+        assert_eq!(rate("user_preference"), cfg.decay.user_preference);
+        assert_eq!(rate("tool_error"), cfg.decay.tool_error);
+        assert_eq!(rate("code_block"), cfg.decay.fallback);
+        assert_eq!(rate("unrecognized"), cfg.decay.fallback);
     }
 
     // ── lexical bonus ──

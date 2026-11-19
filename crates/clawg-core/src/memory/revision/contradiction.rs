@@ -215,7 +215,7 @@ pub(crate) async fn detect_contradiction(
                 && h.distance < CONTRADICTION_THRESHOLD as f64
         })
         .filter_map(|h| {
-            let old_type = MemoryType::from_db_str(&h.memory_type).filter(|t| t.is_claim_bearing())?;
+            let old_type = h.memory_type.known().filter(|t| t.is_claim_bearing())?;
             let escalated = needs_user(candidate_type, old_type, Some(h.distance), shares_identifier(text, &h.content));
             let same_scope = h.project_id.as_deref() == project_id;
             Some(Candidate { id: h.id, distance: h.distance, escalated, excerpt: excerpt(&h.content), same_scope })

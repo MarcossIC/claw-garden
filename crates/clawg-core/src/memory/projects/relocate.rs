@@ -23,7 +23,7 @@ use crate::memory::domain::clock::TimestampMs;
 use crate::memory::projects::merge::canonical_in;
 use crate::memory::projects::project_delete::{deleted_in, deleted_message};
 use crate::memory::retrieval::search::{reader_predicate, viewer_match_expression};
-use crate::memory::domain::record::MemoryType;
+use crate::memory::domain::record::{MemoryType, StoredType};
 use crate::memory::{store::error::MemoryError, store::db::MemoryStore};
 
 /// Why a unit stays where it is. Nothing of it is written.
@@ -62,7 +62,7 @@ pub struct MovedRow {
     /// The type of a live preference or decision, which only the user's word
     /// takes out of its project through an agent's door.
     #[serde(skip)]
-    pub(crate) protected: Option<String>,
+    pub(crate) protected: Option<MemoryType>,
 }
 
 /// What a move does, or would do on a dry run.
@@ -160,7 +160,7 @@ pub(crate) struct UnitRow {
     pub scope: String,
     /// Not deleted, and `active` or `disputed`.
     pub live: bool,
-    pub memory_type: String,
+    pub memory_type: StoredType,
     pub content_hash: Option<String>,
     pub topic_key: Option<String>,
     /// Within the reach of the caller.
@@ -240,7 +240,7 @@ pub(crate) fn decide(units: &[Unit]) -> MoveReport {
             }
         }
         for r in &unit.rows {
-            let protected = (r.live && MemoryType::is_protected_name(&r.memory_type)).then(|| r.memory_type.clone());
+            let protected = r.memory_type.known().filter(|t| r.live && t.is_protected());
             report.protected += usize::from(protected.is_some());
             report.moved.push(MovedRow {
                 id: r.id,
@@ -497,7 +497,7 @@ pub struct MoveFilter {
     pub ids: Vec<i64>,
     pub from: Option<ProjectFilter>,
     pub agent_id: Option<String>,
-    pub memory_type: Option<String>,
+    pub memory_type: Option<StoredType>,
     pub source: Option<String>,
     pub session_id: Option<String>,
     /// Free text over `memory.content`, as the viewer searches it.
@@ -544,15 +544,15 @@ impl MoveFilter {
             None => {}
         }
         for (column, value) in [
-            ("agent_id", &self.agent_id),
-            ("memory_type", &self.memory_type),
-            ("source", &self.source),
-            ("source_session_id", &self.session_id),
-            ("origin_project", &self.origin_project),
+            ("agent_id", self.agent_id.as_deref()),
+            ("memory_type", self.memory_type.as_ref().map(StoredType::as_str)),
+            ("source", self.source.as_deref()),
+            ("source_session_id", self.session_id.as_deref()),
+            ("origin_project", self.origin_project.as_deref()),
         ] {
             if let Some(v) = value {
                 sql.push_str(&format!(" AND {column} = ?"));
-                params.push(Value::Text(v.clone()));
+                params.push(Value::Text(v.to_owned()));
             }
         }
         if let Some(text) = &self.query {
@@ -757,7 +757,7 @@ pub(crate) fn decide_merge(units: &[Unit], origins: &[String], target: &str, spa
         let mut moved_any = false;
         for r in unit.rows.iter().filter(|r| joined(r)) {
             moved_any = true;
-            let protected = (r.live && MemoryType::is_protected_name(&r.memory_type)).then(|| r.memory_type.clone());
+            let protected = r.memory_type.known().filter(|t| r.live && t.is_protected());
             report.protected += usize::from(protected.is_some());
             report.moved.push(MovedRow {
                 id: r.id,
@@ -994,7 +994,7 @@ mod tests {
             agent_id: Some("agent-a".into()),
             scope: "agent".into(),
             live: true,
-            memory_type: "semantic_fact".into(),
+            memory_type: StoredType::read("semantic_fact"),
             content_hash: Some(format!("h{id}")),
             topic_key: None,
             admitted: true,
@@ -1087,7 +1087,7 @@ mod tests {
     #[test]
     fn decide_lets_a_deleted_row_through_and_counts_live_protected_rows() {
         let deleted = UnitRow { live: false, content_hash: Some("taken".into()), ..row(1, None) };
-        let decision = UnitRow { memory_type: "architectural_decision".into(), ..row(2, None) };
+        let decision = UnitRow { memory_type: StoredType::read("architectural_decision"), ..row(2, None) };
         let old_decision = UnitRow { live: false, ..decision.clone() };
         let twin_of_deleted = UnitRow { content_hash: Some("taken".into()), ..row(9, None) };
         let report = decide(&[
@@ -1097,7 +1097,7 @@ mod tests {
 
         assert_eq!(moved_ids(&report), vec![9, 1, 2, 3]);
         assert_eq!(report.protected, 1);
-        assert_eq!(report.moved[2].protected.as_deref(), Some("architectural_decision"));
+        assert_eq!(report.moved[2].protected, Some(MemoryType::ArchitecturalDecision));
     }
 
     #[test]
@@ -1142,7 +1142,7 @@ mod tests {
             is_error: None,
             source: MemorySource::Explicit,
             timestamp_ms: 1,
-            memory_type: Some("semantic_fact".into()),
+            memory_type: Some(StoredType::read("semantic_fact")),
             importance: None,
             derived_from: Vec::new(),
             topic_key: None,
@@ -1485,7 +1485,7 @@ mod tests {
 
         assert!(moved_ids(&report).contains(&gone));
         let restored = restore_memory_core(&store, &FakeEmbedder::default(), gone, None).await.unwrap();
-        assert_eq!(restored.status, "active");
+        assert_eq!(restored.status.as_str(), "active");
         assert_eq!(place(&store, gone).await.0.as_deref(), Some(B));
     }
 
@@ -1530,7 +1530,7 @@ mod tests {
         let store = store().await;
         let id = save_one(
             &store,
-            MemoryEvent { memory_type: Some("session_summary".into()), ..fact("Goal: wire the cache", None) },
+            MemoryEvent { memory_type: Some(StoredType::read("session_summary")), ..fact("Goal: wire the cache", None) },
         )
         .await;
         let workspaces = crate::test_dir::test_dir();
@@ -1732,7 +1732,7 @@ mod tests {
         let filter = MoveFilter {
             from: Some(ProjectFilter::None),
             agent_id: Some("agent-a".into()),
-            memory_type: Some("semantic_fact".into()),
+            memory_type: Some(StoredType::read("semantic_fact")),
             source: Some("explicit".into()),
             session_id: Some("s-1".into()),
             ..MoveFilter::default()

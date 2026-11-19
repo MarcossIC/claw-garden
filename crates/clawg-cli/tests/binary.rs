@@ -2635,7 +2635,7 @@ async fn doctor_marks_an_old_block_stale_without_a_preference() {
 
     // What `setup` writes is what `doctor` holds the block to, whichever variant was chosen.
     let empty = sandbox.home.join("empty-path");
-    for choice in [&[][..], &["--protocol", "short"], &["--protocol", "off"], &["--protocol", "full"]] {
+    for choice in [&[][..], &["--protocol", "short"], &["--protocol", "lean"], &["--protocol", "off"], &["--protocol", "full"]] {
         std::fs::write(&md, old).expect("write");
         let out = sandbox
             .command(&[&["setup", "claude-code", "--profile", "dev"], choice].concat())

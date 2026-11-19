@@ -2937,9 +2937,12 @@ mod tests {
             && span.split('_').all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_lowercase()))
     }
 
-    /// The protocol without a preference and with each language.
+    /// The full protocol and the lean one, without a preference and with each language.
     fn every_protocol() -> Vec<String> {
-        [None, Some(Lang::En), Some(Lang::Es)].into_iter().map(|l| protocol::text(l).into_owned()).collect()
+        [None, Some(Lang::En), Some(Lang::Es)]
+            .into_iter()
+            .flat_map(|l| [protocol::text(l).into_owned(), protocol::lean(l)])
+            .collect()
     }
 
     #[test]
@@ -3056,38 +3059,45 @@ mod tests {
 
     #[test]
     fn the_protocol_says_where_a_key_is_shown() {
-        let save = PROTOCOL.split("\n## How to write a save").nth(1).expect("a section on writing a save");
-        let save = save.split("\n## ").next().unwrap_or(save).split_whitespace().collect::<Vec<_>>().join(" ");
-        assert!(save.contains("only where saving under it replaces"), "{save}");
-        assert!(save.contains("another project"), "{save}");
-        assert!(save.contains("`topic=K all_projects`: save its new version with `all_projects` and that key"), "{save}");
+        for protocol in [PROTOCOL.to_string(), protocol::lean(None)] {
+            let save = protocol.split("\n## How to write a save").nth(1).expect("a section on writing a save");
+            let save = save.split("\n## ").next().unwrap_or(save).split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(save.contains("only where saving under it replaces"), "{save}");
+            assert!(save.contains("another project"), "{save}");
+            assert!(save.contains("`topic=K all_projects`: save its new version with `all_projects` and that key"), "{save}");
+        }
     }
 
     #[test]
     fn the_protocol_describes_the_session_summary() {
-        let summary = PROTOCOL.split("\n## Session summary").nth(1).expect("a session summary section");
-        for section in
-            ["Goal:", "Instructions:", "Discoveries:", "Accomplished:", "Next steps:", "Relevant files:", "Validation:"]
-        {
-            assert!(summary.contains(section), "{section} missing");
+        for protocol in [PROTOCOL.to_string(), protocol::lean(None)] {
+            let summary = protocol.split("\n## Session summary").nth(1).expect("a session summary section");
+            for section in
+                ["Goal:", "Instructions:", "Discoveries:", "Accomplished:", "Next steps:", "Relevant files:", "Validation:"]
+            {
+                assert!(summary.contains(section), "{section} missing");
+            }
+            assert!(protocol.contains("\n## After a compaction"), "{protocol}");
         }
-        assert!(PROTOCOL.contains("\n## After a compaction"), "{PROTOCOL}");
     }
 
     #[test]
     fn the_spanish_protocol_describes_the_session_summary() {
-        let summary = PROTOCOL_ES.split("\n## Resumen de sesión").nth(1).expect("a session summary section");
-        let summary = summary.split("\n## ").next().unwrap_or(summary);
-        for section in [
-            "Objetivo:",
-            "Instrucciones:",
-            "Descubrimientos:",
-            "Logrado:",
-            "Próximos pasos:",
-            "Archivos relevantes:",
-            "Validación:",
-        ] {
-            assert!(summary.contains(section), "{section} missing");
+        for protocol in [PROTOCOL_ES.to_string(), protocol::lean(Some(Lang::Es))] {
+            let summary = protocol.split("\n## Resumen de sesión").nth(1).expect("a session summary section");
+            let summary = summary.split("\n## ").next().unwrap_or(summary);
+            for section in [
+                "Objetivo:",
+                "Instrucciones:",
+                "Descubrimientos:",
+                "Logrado:",
+                "Próximos pasos:",
+                "Archivos relevantes:",
+                "Validación:",
+            ] {
+                assert!(summary.contains(section), "{section} missing");
+            }
+            assert!(protocol.contains("\n## Después de una compactación"), "{protocol}");
         }
     }
 
@@ -4947,7 +4957,7 @@ mod tests {
                 .await
                 .expect("list");
             rows.sort_by_key(|r| r.id);
-            rows.into_iter().map(|r| r.status).collect::<Vec<_>>()
+            rows.into_iter().map(|r| r.status.to_string()).collect::<Vec<_>>()
         };
 
         hide(&d, "agent-b", "agent-a");

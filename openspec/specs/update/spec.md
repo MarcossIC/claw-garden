@@ -110,7 +110,7 @@ Sobre una fila que no existe, borrada o fuera del alcance del lector, MUST devol
 
 ## R4. HTTP
 
-`PATCH /v1/memories/{kind}/{id}` (`update_memory`, `crates/clawg-cli/src/daemon/api.rs:1676`) MUST aceptar el cuerpo `{importance?, memory_type?, user_answered?}` (`UpdateRequest`, `api.rs:502`; `user_answered` es booleano y falta como `false`) y la query `agent` de siempre.
+`PATCH /v1/memories/{kind}/{id}` (`update_memory`, `crates/clawg-cli/src/daemon/api/memories.rs`) MUST aceptar el cuerpo `{importance?, memory_type?, user_answered?}` (`UpdateRequest`, `api/memories.rs`; `user_answered` es booleano y falta como `false`) y la query `agent` de siempre.
 
 - Un cambio inválido (R1) MUST responder 400 con el mensaje de la validación.
 - El descenso de una fila protegida sin la declaración (R1) MUST responder 409 con el mensaje de `UpdateError::NeedsUser`, y la fila MUST NOT cambiar.
@@ -172,4 +172,4 @@ Filas sembradas con SQL directo como las dejaba la versión anterior (una de `me
 
 `PATCH /v1/memories/memory/{id}` MUST aceptar `project_id` (un destino) o `no_project: true`, no los dos (400), solos o con `importance` y `memory_type`. El movimiento es el de [`specs/project`](../project/spec.md) R8 a R11, con el lector de `?agent=`, y MUST ir en la misma transacción que el resto del cambio: un rechazo de cualquiera no escribe nada. Una unidad rechazada es un 409 que nombra el motivo y las filas, un destino no registrado un 404, y una unidad con una fila protegida viva MUST pedir la declaración (`UpdateError::MoveNeedsUser`, 409). Un movimiento solo MUST NOT tocar `update_count` ni `last_modified_at`. La respuesta MUST sumar `project_id` (`null` sin proyecto) y, cuando movió, `move_id` y `pulled_in`. Funciona sin embedder.
 
-**Test:** `a_patch_needs_a_change_and_moves_only_memory_rows`, `a_move_alone_changes_the_project_and_nothing_it_says`, `a_move_and_a_change_of_importance_are_one_write`, `an_unregistered_project_is_not_a_place_to_move_to`, `a_protected_row_leaves_its_project_only_on_the_users_word` y `a_move_takes_the_rest_of_the_save_along` (`admin.rs`); `an_update_names_one_destination_at_most` (`api.rs`); `patch_moves_a_whole_save`, `patch_with_a_clash_is_409_and_changes_nothing`, `patch_with_both_destinations_is_400` y `patch_moves_while_the_embedder_loads` (`tests/api.rs`).
+**Test:** `a_patch_needs_a_change_and_moves_only_memory_rows`, `a_move_alone_changes_the_project_and_nothing_it_says`, `a_move_and_a_change_of_importance_are_one_write`, `an_unregistered_project_is_not_a_place_to_move_to`, `a_protected_row_leaves_its_project_only_on_the_users_word` y `a_move_takes_the_rest_of_the_save_along` (`admin.rs`); `an_update_names_one_destination_at_most` (`api/memories.rs`); `patch_moves_a_whole_save`, `patch_with_a_clash_is_409_and_changes_nothing`, `patch_with_both_destinations_is_400` y `patch_moves_while_the_embedder_loads` (`tests/api.rs`).

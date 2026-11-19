@@ -13,7 +13,7 @@
 3. **El análisis de arquitectura ya se hizo a mano en este repositorio, tres veces:**
    - [memory-module-layout](../archive/2026-11-13-memory-module-layout/exploration.md): 32 de 51 módulos en un solo ciclo, y dependencias invertidas;
    - [store-boundary](../archive/2026-11-12-store-boundary/exploration.md): 44 de 51 módulos `pub`, que le esconden código muerto al compilador;
-   - [core-use-cases](../core-use-cases/exploration.md): `daemon/api.rs` con más de 3.000 líneas y handlers que deciden reglas de dominio.
+   - [core-use-cases](../archive/2026-11-19-core-use-cases/exploration.md): `daemon/api.rs` con más de 3.000 líneas y handlers que deciden reglas de dominio.
 
    Son el tipo de hallazgo que un mapa podría dar sin rearmarlo cada vez.
 4. **Parte de ese análisis ya se fija como test, no como dibujo.** `crates/clawg-cli/tests/conventions.rs` falla ante ciertas faltas, y memory-module-layout propone fijar con un test la dirección permitida de las dependencias.

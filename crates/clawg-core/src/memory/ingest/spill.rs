@@ -108,6 +108,7 @@ pub(crate) fn parse_lines(text: &str) -> (Vec<MemoryEvent>, Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::domain::record::StoredType;
     use crate::memory::domain::events::MemorySource;
     use crate::models::chat::Role;
 
@@ -120,7 +121,7 @@ mod tests {
             is_error: None,
             source: MemorySource::Explicit,
             timestamp_ms: 42,
-            memory_type: Some("decision".into()),
+            memory_type: Some(StoredType::read("decision")),
             importance: Some(8.0),
             derived_from: vec![3, 1],
             topic_key: None,
@@ -147,7 +148,7 @@ mod tests {
         assert!(rejected.is_empty());
         assert_eq!(events.len(), 1);
         assert_eq!(json(&events[0]), json(&original));
-        assert_eq!(events[0].memory_type.as_deref(), Some("decision"));
+        assert_eq!(events[0].memory_type.as_ref().map(|t| t.as_str()), Some("decision"));
         assert_eq!(events[0].importance, Some(8.0));
         assert_eq!(events[0].derived_from, vec![3, 1]);
     }

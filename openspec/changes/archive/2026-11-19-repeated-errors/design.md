@@ -2,7 +2,7 @@
 
 Las decisiones de fondo están en la [propuesta](proposal.md#decisiones) y no se reabren. Acá van las de implementación, con lo que se descartó. Las citas son `ruta:línea` de `develop` en `8a2f3723`.
 
-Después de esa cita [protocol-block](../archive/2026-11-17-protocol-block/proposal.md) cambió `hook.rs`, `setup.rs` y el doctor, así que las líneas de esos tres archivos se corrieron y vale el nombre de la función. Lo que cambió y toca a este diseño:
+Después de esa cita [protocol-block](../2026-11-17-protocol-block/proposal.md) cambió `hook.rs`, `setup.rs` y el doctor, así que las líneas de esos tres archivos se corrieron y vale el nombre de la función. Lo que cambió y toca a este diseño:
 
 - `session-start` ya trae una línea más de la palabra de clawg, el aviso del bloque del protocolo viejo (`block_notice`), que va después de la línea del idioma. Las reglas de este cambio van entre las dos: idioma, reglas, aviso del bloque, contexto.
 - `respond_reading` ya lee el idioma y el bloque del `CLAUDE.md` a la vez, con la misma espera. Las reglas se leen en el mismo `join`, con una lectura inyectada como las otras dos.
@@ -64,7 +64,7 @@ Por cada línea del texto, sin `\r` final:
 
 Después se aplican la forma de nombre válido y `redact` (`crates/clawg-core/src/memory/domain/redact.rs:235`, que pasa a `pub`). Primero se busca la subcadena `not found` en el texto entero, así que una salida sin ella no se parte en líneas.
 
-**Descartado:** la dependencia `regex` en `clawg-cli`. Compilar el patrón cuesta en cada proceso de hook, y las tres formas se cubren con `ends_with` y `strip_prefix`.
+**Descartado:** la dependencia `regex` en `clawg-cli`. Las tres formas se cubren con `ends_with` y `strip_prefix`, y no hace falta un motor de patrones para eso. `redact` sí compila sus `PATTERNS` en cada proceso con firma, porque es un `Lazy`. Medido con un release, ese costo es chico al lado del de arrancar el proceso: la tanda con firma suma entre 0 y unos 7 ms de p95 sobre la sin firma, y las dos quedan dentro de la puerta ([verify.md](verify.md#la-puerta-medida-otra-vez-con-lo-que-agrega-el-hook)).
 
 ## D5. `observe` no interpreta el shell
 
@@ -124,7 +124,7 @@ Que falten los hooks se mira con una función pura sobre el texto del `settings.
 
 `a3-notools` es `a3` con las claves `PostToolUse` y `PostToolUseFailure` sacadas del `settings.json` que da `setup::plan` (`crates/clawg-eval/src/bin/agent-eval/arm.rs:243-249`). Es el `a3` de antes de este cambio, sin mantener una copia de los hooks viejos.
 
-La tarea (`shelf-eza-missing`), el shell acotado y `tool_failed_count` son de [129](../archive/2026-11-17-agent-eval-sessions/proposal.md#lugar-para-131-y-132). Si su diseño deja que el check reciba el texto de la firma, se le pasa `eza: command not found`, que es la forma que reconoce RE2. Este cambio no le pide más.
+La tarea (`shelf-eza-missing`), el shell acotado y `tool_failed_count` son de [129](../2026-11-17-agent-eval-sessions/proposal.md#lugar-para-131-y-132). Si su diseño deja que el check reciba el texto de la firma, se le pasa `eza: command not found`, que es la forma que reconoce RE2. Este cambio no le pide más.
 
 **Descartado:** comparar `a3` contra el resultado de `a3` de la campaña de 129. Esa campaña corre con otra versión del binario y con 3 corridas, y la regla de decisión pide 5 con todo lo demás igual. Su `a0` sí se reusa: no corre clawg.
 

@@ -2,7 +2,7 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| 1 y 5 (clawg aprende de lo que pasa en la sesión sin que el agente decida guardar) | M: siete commits del producto (el último de docs), una verificación local y uno del arnés | — para el producto; [agent-eval-sessions](../archive/2026-11-17-agent-eval-sessions/proposal.md) (129) para la campaña paga | tareas escritas |
+| 1 y 5 (clawg aprende de lo que pasa en la sesión sin que el agente decida guardar) | M: siete commits del producto (el último de docs), una verificación local y uno del arnés | — para el producto; [agent-eval-sessions](../2026-11-17-agent-eval-sessions/proposal.md) (129) para la campaña paga | tareas escritas |
 
 ## Problema
 
@@ -17,7 +17,7 @@ B, A y D, en ese orden. C queda afuera.
 1. **B, el aviso en el mismo turno.** `clawg hook post-tool-use` y `clawg hook post-tool-use-failure`, instalados con matcher `Bash`. Cuando la salida de la llamada trae la firma de un programa ausente que el comando llamó, el hook devuelve una línea por `additionalContext`, en el idioma preferido: el programa no existe en el Bash de esta máquina, no lo llames otra vez en esta sesión, usa Glob, Grep, Read o Edit u otro programa instalado.
 2. **A, el libro y la regla al arrancar.** Los mismos hooks anotan en `<data>/tool-failures.jsonl` cada fallo con firma, y el primer éxito verificado después de un fallo. Sólo anotan el programa, la herramienta, la sesión y la hora. `session-start` arma con el libro las reglas que valen y las imprime como la palabra de clawg, junto a la línea del idioma y antes de la evidencia. Una regla vale si en los últimos 30 días el programa falló en dos sesiones distintas o más, no anduvo ninguna vez y no está en el PATH del hook.
 3. **D, el diagnóstico.** `clawg doctor` lista las reglas aprendidas y nombra el `CLAUDE.md` que pide cada programa ausente. También avisa cuando el hook de arranque está instalado sin los dos hooks nuevos, con `clawg setup claude-code` como paso.
-4. **La medición en agent-eval.** Un brazo `a3-notools`, que es `a3` sin los dos hooks nuevos: es el `a3` que mide 129 antes de este cambio, porque los brazos toman los hooks de `setup::plan`. La tarea `shelf-eza-missing`, el shell acotado y el check `tool_failed_count` son de [agent-eval-sessions](../archive/2026-11-17-agent-eval-sessions/proposal.md) (129), que la propone como línea base de este cambio. Se construye cuando 129 esté aplicado.
+4. **La medición en agent-eval.** Un brazo `a3-notools`, que es `a3` sin los dos hooks nuevos: es el `a3` que mide 129 antes de este cambio, porque los brazos toman los hooks de `setup::plan`. La tarea `shelf-eza-missing`, el shell acotado y el check `tool_failed_count` son de [agent-eval-sessions](../2026-11-17-agent-eval-sessions/proposal.md) (129), que la propone como línea base de este cambio. Se construye cuando 129 esté aplicado.
 
 ## Fuera de alcance
 
@@ -32,7 +32,7 @@ B, A y D, en ese orden. C queda afuera.
 
 1. **El libro es un archivo del directorio de datos, no una tabla ni memorias.**
    - Una fila `tool_error` por fallo pasaría por la ingesta y despertaría el modelo de embeddings en cada fallo. Competiría en la búsqueda con todo lo demás, necesitaría el daemon vivo en cada llamada y llegaría al agente como evidencia, que es lo que hoy no funciona.
-   - Una tabla nueva pediría esquema, migración, una ruta en `api.rs` (que core-use-cases va a partir) y el daemon en cada llamada.
+   - Una tabla nueva pediría esquema, migración, una ruta en `crates/clawg-cli/src/daemon/api/` (que core-use-cases partió en un archivo por dominio) y el daemon en cada llamada.
    - El archivo sigue el precedente de `hook-runs.jsonl` (`crates/clawg-cli/src/hook_log.rs:132-141`): una línea por escritura, se renombra a los 64 KiB, nunca crea el directorio de datos y falla en silencio.
    - Es un dato derivado. Borrarlo cuesta sólo volver a aprender, en dos sesiones. No entra en snapshots ni en el export, como el registro de hooks.
    - El alcance es la máquina, por perfil, porque el archivo es del directorio de datos. Es el alcance que A2 mide como el más rendidor (+256 evitables frente al alcance por proyecto).
@@ -50,13 +50,13 @@ B, A y D, en ese orden. C queda afuera.
    - A lo sumo lee los dos archivos del libro (≤ 64 KiB cada uno) y agrega una línea.
    - Se corta a los 300 ms (`POST_TOOL_DEADLINE`), por debajo de los 5 s con los que se configura.
    - No deja línea en `hook-runs.jsonl`.
-   - Puerta en la verificación, en Windows y con el binario publicado: p95 ≤ 60 ms de reloj en 200 corridas desde Git Bash con una entrada sin firma. Hoy `clawg --version` tarda 38 a 43 ms ahí, y el proceso vacío 28 ms. Si no pasa, no se publica con `PostToolUse` instalado.
+   - Puerta en la verificación, en Windows y con un release: en 200 corridas desde Git Bash con una entrada sin firma, alternadas con las de `/usr/bin/true`, el p95 del hook menos el p95 de `true` es ≤ 60 ms. Se mide lo que agrega el hook y no el total, porque el arranque de un proceso vacío en la misma máquina dio p95 de 28, 56 y 122 ms en días distintos, y un tope absoluto juzgaba el día de la máquina. Se mide con la máquina en su uso de todos los días, no tranquila, que es como corre el hook. Si no pasa, no se publica con `PostToolUse` instalado.
 7. **El texto del arranque entra en el tope del cliente.** El bloque de reglas, de a lo sumo 700 bytes (el peor caso medido son 671), se descuenta del presupuesto que el hook le pide al daemon (`SESSION_BUDGET`, `hook.rs:65`). Así el total sigue debajo de los 10.000 caracteres (`hook.rs:655-667`).
-8. **Sin dependencias nuevas.** La firma se reconoce a mano, línea por línea (`: command not found` y las formas de `sh` y `zsh`). Un `regex` en `clawg-cli` costaría su compilación en cada proceso de hook. La búsqueda en el PATH reusa `doctor::analyze` (`crates/clawg-cli/src/doctor/mod.rs:61`).
+8. **Sin dependencias nuevas.** La firma se reconoce a mano, línea por línea (`: command not found` y las formas de `sh` y `zsh`). Un `regex` en `clawg-cli` no hace falta para tres formas fijas. La búsqueda en el PATH reusa `doctor::analyze` (`crates/clawg-cli/src/doctor/mod.rs:61`).
 
 ## Qué cambia para quien ya instaló
 
-`clawg setup claude-code`, con y sin `--local`, instala dos eventos más: `PostToolUse` y `PostToolUseFailure`, los dos con matcher `Bash` y la misma forma exec de los demás. Correrlo otra vez sobre una instalación anterior agrega sólo esos dos y deja los demás byte a byte (R3 de [`specs/setup`](../../specs/setup/spec.md)). `--remove` los saca. `clawg update` no corre `setup`, así que quien ya instaló tiene que correrlo otra vez, y `clawg doctor` lo avisa mientras falten. El servidor MCP, sus herramientas y el bloque del protocolo no cambian, así que `crates/clawg-cli/src/mcp/agent_contract.json` y su versión en español quedan iguales y no se bendicen.
+`clawg setup claude-code`, con y sin `--local`, instala dos eventos más: `PostToolUse` y `PostToolUseFailure`, los dos con matcher `Bash` y la misma forma exec de los demás. Correrlo otra vez sobre una instalación anterior agrega sólo esos dos y deja los demás byte a byte (R3 de [`specs/setup`](../../../specs/setup/spec.md)). `--remove` los saca. `clawg update` no corre `setup`, así que quien ya instaló tiene que correrlo otra vez, y `clawg doctor` lo avisa mientras falten. El servidor MCP, sus herramientas y el bloque del protocolo no cambian, así que `crates/clawg-cli/src/mcp/agent_contract.json` y su versión en español quedan iguales y no se bendicen.
 
 ## Cómo se mide el éxito
 
@@ -84,7 +84,7 @@ B, A y D, en ese orden. C queda afuera.
 - **La forma real de `tool_response` de Bash** no está en este repositorio: los tipos del cliente la dejan sin tipo. Por eso el hook busca la firma en todos los textos de `tool_response`, sin suponer campos. La verificación registra una entrada real de cada evento y la suma como fixture.
 - **El PATH del hook no es el del Bash del agente.** En Windows, Git Bash suma `/usr/bin`. El PATH sólo se usa para descartar una regla, nunca para crearla, así que el error posible es callar una regla, no inventarla.
 - **Un `CLAUDE.md` que pide lo contrario.** La regla no le dice al agente que desobedezca. Dice el hecho, ofrece las herramientas del cliente y pide avisarle a la persona. D le muestra la causa a la persona.
-- **El arranque de un proceso en Windows con el antivirus escaneando un binario de 43 MB** puede pasar los 60 ms en frío. Lo muestra la puerta de latencia.
+- **El arranque de un proceso en Windows con el antivirus escaneando un binario de 43 MB** puede sumar mucho en frío, pero lo paga igual cualquier proceso de clawg. La puerta de latencia mide lo que el hook agrega encima.
 - **Dos hooks que escriben a la vez** (llamadas en paralelo, sesiones en paralelo). Cada línea se agrega con una sola escritura en modo append y el renombrado no relee nada, como en `hook-runs.jsonl`. Perder una línea cuesta, como mucho, una sesión más de aprendizaje.
 
 ## Datos guardados

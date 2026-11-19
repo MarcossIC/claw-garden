@@ -7,7 +7,7 @@
 //! [`project_name`] does.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rusqlite::{Connection, OptionalExtension};
@@ -16,9 +16,10 @@ use serde::{Deserialize, Serialize};
 use crate::memory::store::error::{ClosedAs, failed_call};
 use crate::memory::domain::clock::TimestampMs;
 use crate::memory::projects::identity::Ground;
-use crate::memory::projects::merge::{canonical_in, MAX_MERGE_HOPS};
+use crate::memory::projects::merge::{canonical_in, merge_checked, Checked, MergeError, MergeReport, MAX_MERGE_HOPS};
 use crate::memory::projects::project::is_project_id;
 use crate::memory::projects::project_delete::{deleted_in, deleted_message};
+use crate::memory::retrieval::workspace::WorkspaceManager;
 use crate::memory::{store::error::MemoryError, store::db::MemoryStore, store::error::StorageError};
 
 /// The name a project has until someone gives it one: its id without the
@@ -586,6 +587,13 @@ pub enum KeepApartError {
 /// a registration from suggesting it later: a suggestion is made once per
 /// pair.
 pub async fn keep_apart(store: &MemoryStore, a: &str, b: &str) -> Result<KeptApart, KeepApartError> {
+    kept_apart(store, a, b, false).await
+}
+
+/// [`keep_apart`], which with `only_pending` writes nothing and answers 0
+/// when no suggestion is pending between the two: the check and the answer
+/// are one transaction.
+async fn kept_apart(store: &MemoryStore, a: &str, b: &str, only_pending: bool) -> Result<KeptApart, KeepApartError> {
     let (a, b) = (a.to_string(), b.to_string());
     store
         .conn
@@ -630,6 +638,9 @@ pub async fn keep_apart(store: &MemoryStore, a: &str, b: &str) -> Result<KeptApa
                 }
             }
             if answered == 0 {
+                if only_pending {
+                    return Ok(KeptApart { project_id: a, other_id: b, answered });
+                }
                 tx.execute(
                     "INSERT OR IGNORE INTO project_suggestion (project_id, other_id, reason, created_at, answer, answered_at) \
                      VALUES (?1, ?2, 'user', ?3, 'apart', ?3)",
@@ -643,6 +654,105 @@ pub async fn keep_apart(store: &MemoryStore, a: &str, b: &str) -> Result<KeptApa
         })
         .await
         .map_err(failed_call(ClosedAs::AsIs))
+}
+
+/// The answers a suggestion takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SuggestionAnswer {
+    Merge,
+    Apart,
+}
+
+/// Why a suggestion was not answered.
+#[derive(Debug, thiserror::Error)]
+pub enum AnswerError {
+    #[error("answer must be one of: merge, apart (got {0:?})")]
+    UnknownAnswer(String),
+    #[error("answering a suggestion is the user's call: send user_answered with the user's answer in reason")]
+    NeedsUser,
+    #[error("no suggestion is pending between {project_id} and {other_id}")]
+    NoSuggestion { project_id: String, other_id: String },
+    /// One of the two is not a live project, or they are the same one.
+    #[error(transparent)]
+    Pair(#[from] KeepApartError),
+    #[error(transparent)]
+    Merge(#[from] MergeError),
+}
+
+/// The person's answer to a suggestion, as an agent relays it: only
+/// [`UserAnswer::new`] makes one, so nothing answers a suggestion without
+/// the person's word.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UserAnswer {
+    answer: SuggestionAnswer,
+}
+
+impl UserAnswer {
+    /// Reads `answer`, then refuses it unless the caller declares the user
+    /// answered (`user_answered`) and relays their words in `reason`. Nothing
+    /// records the reason: it only shows the answer was asked for.
+    pub fn new(answer: &str, user_answered: bool, reason: Option<&str>) -> Result<Self, AnswerError> {
+        let answer = match answer {
+            "merge" => SuggestionAnswer::Merge,
+            "apart" => SuggestionAnswer::Apart,
+            other => return Err(AnswerError::UnknownAnswer(other.to_string())),
+        };
+        if !user_answered || reason.is_none_or(|r| r.trim().is_empty()) {
+            return Err(AnswerError::NeedsUser);
+        }
+        Ok(Self { answer })
+    }
+}
+
+/// What answering a suggestion did.
+#[derive(Debug)]
+#[expect(clippy::large_enum_variant, reason = "one per answer, matched as soon as it returns; none is stored")]
+pub enum Answered {
+    /// The two are kept from being suggested again.
+    Apart,
+    /// The other project was merged into the project.
+    Merged(MergeReport),
+}
+
+/// Answers the suggestion pending between `project_id` and `other_id`:
+/// `apart` as [`keep_apart`] does, `merge` by merging `other_id` into
+/// `project_id` as `projects merge` does. Only a suggestion nobody answered
+/// is answered, so an agent merges no projects nobody suggested; without one
+/// nothing is written. It is looked for again in the transaction that writes
+/// the answer, so of two answers to one suggestion only the first is written.
+pub async fn answer_suggestion_core(
+    store: &MemoryStore,
+    workspaces: &WorkspaceManager,
+    backups: &Path,
+    project_id: &str,
+    other_id: &str,
+    answer: UserAnswer,
+) -> Result<Answered, AnswerError> {
+    if suggestion_between(store, project_id, other_id).await?.is_none() {
+        return Err(AnswerError::NoSuggestion { project_id: project_id.to_string(), other_id: other_id.to_string() });
+    }
+    let no_suggestion = || AnswerError::NoSuggestion { project_id: project_id.to_string(), other_id: other_id.to_string() };
+    match answer.answer {
+        SuggestionAnswer::Apart => match kept_apart(store, project_id, other_id, true).await? {
+            KeptApart { answered: 0, .. } => Err(no_suggestion()),
+            _ => Ok(Answered::Apart),
+        },
+        SuggestionAnswer::Merge => {
+            let (project, other) = (project_id.to_string(), other_id.to_string());
+            let pending = move |c: &Connection| -> Result<(), Checked<AnswerError>> {
+                if pending_suggestions_in(c, &project)?.iter().any(|s| s.other_id == other) {
+                    return Ok(());
+                }
+                Err(Checked::Check(AnswerError::NoSuggestion { project_id: project.clone(), other_id: other.clone() }))
+            };
+            match merge_checked(store, workspaces, backups, other_id, project_id, false, pending).await {
+                Ok(merged) => Ok(Answered::Merged(merged)),
+                Err(Checked::Merge(e)) => Err(AnswerError::Merge(e)),
+                Err(Checked::Check(e)) => Err(e),
+            }
+        }
+    }
 }
 
 /// What tells two names apart for a person: the name in Unicode lower case,
@@ -765,6 +875,10 @@ pub struct Resolution {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ResolveError {
+    /// `new_project` overrides the similar projects that keep a name from
+    /// being created; without `create` there is nothing to override.
+    #[error("new_project goes with create: it creates a project apart from the similar ones")]
+    NewProjectWithoutCreate,
     #[error(transparent)]
     Name(#[from] NameError),
     #[error("every id a project named {0:?} may take is taken")]
@@ -813,9 +927,100 @@ fn folders_of_in(c: &Connection, project: &str) -> rusqlite::Result<Vec<Resolved
 
 /// How many folders lead to `project`: those recorded with its id, and one
 /// from before folders named their project, whose own id is the project's.
-pub async fn own_folder_count(store: &MemoryStore, project: &str) -> Result<usize, StorageError> {
+async fn own_folder_count(store: &MemoryStore, project: &str) -> Result<usize, StorageError> {
     let project = project.to_string();
     Ok(store.conn.call(move |c| own_folders_in(c, &project)).await?.len())
+}
+
+/// Why a folder was not located in a project.
+#[derive(Debug, thiserror::Error)]
+pub enum LocateError {
+    #[error("{} is not a directory: name a directory of the project", .0.display())]
+    NotADirectory(PathBuf),
+    /// The folder's project has other folders, which a merge would take
+    /// along, and nobody named them.
+    #[error(
+        "{} leads to project {own}, which has {folders} folders; `clawg projects merge {own} --into {target}` merges them all",
+        folder.display()
+    )]
+    FolderShared { folder: PathBuf, own: String, folders: usize, target: String },
+    #[error(transparent)]
+    Merge(#[from] MergeError),
+    #[error(transparent)]
+    Store(#[from] StorageError),
+}
+
+/// What locating a folder did.
+#[derive(Debug)]
+#[expect(clippy::large_enum_variant, reason = "one per locate, matched as soon as it returns; none is stored")]
+pub enum Located {
+    /// The folder led to the named project already: nothing was written.
+    Already,
+    /// The folder's own project was merged into the named one.
+    Merged(MergeReport),
+}
+
+/// Refuses a folder to locate that `is_dir` does not find to be a directory,
+/// before anything else is read.
+pub fn check_folder(folder: &Path, is_dir: impl FnOnce(&Path) -> bool) -> Result<(), LocateError> {
+    if is_dir(folder) { Ok(()) } else { Err(LocateError::NotADirectory(folder.to_path_buf())) }
+}
+
+/// Makes `folder`, whose registration gave it the project `own`, lead to
+/// `target`: when `own` is `target` nothing is read; when `own` has other
+/// folders it is refused, since a merge would take them along; else `own` is
+/// merged into `target` as `projects merge` does.
+pub async fn locate_folder(
+    store: &MemoryStore,
+    workspaces: &WorkspaceManager,
+    backups: &Path,
+    folder: &Path,
+    own: &str,
+    target: &str,
+) -> Result<Located, LocateError> {
+    if own == target {
+        return Ok(Located::Already);
+    }
+    let shared = |folders: usize| LocateError::FolderShared { folder: folder.to_path_buf(), own: own.to_string(), folders, target: target.to_string() };
+    let folders = own_folder_count(store, own).await?;
+    if folders > 1 {
+        return Err(shared(folders));
+    }
+    // Counted again where the merge is written: a folder that joined `own`
+    // since would go along with it.
+    let source = own.to_string();
+    let alone = move |c: &Connection| -> Result<(), Checked<usize>> {
+        match own_folders_in(c, &source)?.len() {
+            0 | 1 => Ok(()),
+            folders => Err(Checked::Check(folders)),
+        }
+    };
+    match merge_checked(store, workspaces, backups, own, target, false, alone).await {
+        Ok(merged) => Ok(Located::Merged(merged)),
+        Err(Checked::Merge(e)) => Err(LocateError::Merge(e)),
+        Err(Checked::Check(folders)) => Err(shared(folders)),
+    }
+}
+
+/// Refuses `target` as the project a folder is located in when it is a
+/// tombstone or deleted, as the merge or the declaration that follows would
+/// refuse it, so that a refused locate registers no folder.
+pub async fn check_located_target(store: &MemoryStore, target: &str) -> Result<(), MergeError> {
+    let target = target.to_string();
+    store
+        .conn
+        .call(move |c| {
+            let into = canonical_in(c, &target)?;
+            if into != target {
+                return Err(MergeError::Merged { id: target, into });
+            }
+            if let Some(deleted) = deleted_in(c, &target)? {
+                return Err(MergeError::Deleted { id: target, delete_id: deleted.delete_id });
+            }
+            Ok(())
+        })
+        .await
+        .map_err(failed_call(ClosedAs::AsIs))
 }
 
 fn own_folders_in(c: &Connection, project: &str) -> rusqlite::Result<Vec<ResolvedFolder>> {
@@ -839,8 +1044,12 @@ fn own_folders_dated_in(c: &Connection, project: &str) -> rusqlite::Result<Vec<(
 /// `options.create` a name nothing holds or resembles, or with
 /// `options.new_project` one that only resembles others, becomes a project
 /// without a folder, in the same transaction that looked. Nothing else is
-/// written.
+/// written. `new_project` without `create` is refused before anything is
+/// read.
 pub async fn resolve_project(store: &MemoryStore, reference: &str, options: ResolveOptions) -> Result<Resolution, ResolveError> {
+    if options.new_project && !options.create {
+        return Err(ResolveError::NewProjectWithoutCreate);
+    }
     let reference = reference.trim().to_string();
     store
         .conn
@@ -962,6 +1171,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::memory::domain::record::StoredType;
     use crate::memory::domain::events::{MemoryEvent, MemorySource};
     use crate::memory::projects::identity::{FakeGround, RootCommit};
     use crate::memory::projects::relocate::{move_memories_core, undo_move_core, MoveFilter};
@@ -1026,7 +1236,7 @@ mod tests {
             is_error: None,
             source: MemorySource::Explicit,
             timestamp_ms: 1,
-            memory_type: Some("semantic_fact".into()),
+            memory_type: Some(StoredType::read("semantic_fact")),
             importance: None,
             derived_from: Vec::new(),
             topic_key: None,
@@ -1758,5 +1968,365 @@ mod tests {
         assert_eq!(find_project(&store, "gone").await.unwrap(), Named::Unknown, "a deleted project's name is free");
         assert_eq!(find_project(&store, "gone-7a8b").await.unwrap(), Named::Project("gone-7a8b".into()), "its id is not");
         assert_eq!(find_project(&store, "nobody").await.unwrap(), Named::Unknown);
+    }
+
+    /// A store with the projects `a-0001`, with one folder and a memory,
+    /// `b-0002`, with two folders, `ideas` without any, and `gone-7a8b`,
+    /// deleted; the directory its workspaces and snapshots go in.
+    struct Locating {
+        store: MemoryStore,
+        ws: crate::memory::retrieval::workspace::WorkspaceManager,
+        backups: PathBuf,
+        _dir: crate::test_dir::TestDir,
+    }
+
+    impl Locating {
+        async fn new() -> Self {
+            let store = MemoryStore::new_for_test().await.unwrap();
+            let dir = crate::test_dir::test_dir();
+            let ws = crate::memory::retrieval::workspace::WorkspaceManager::new(dir.path().join("workspaces"));
+            let backups = dir.path().join("backups");
+            store
+                .conn
+                .call(|c| {
+                    c.execute_batch(
+                        "INSERT INTO project (id, name, born, reviewed, created_at) VALUES \
+                             ('a-0001', 'a', 'root', 1, 1), ('b-0002', 'b', 'root', 1, 1), ('ideas', 'ideas', 'user', 1, 1), \
+                             ('gone-7a8b', 'gone', 'user', 1, 1);
+                         INSERT INTO project_path (id, root_path, created_at, project_id) VALUES \
+                             ('a-0001', '/work/a', 1, 'a-0001'), ('b-0002', '/work/b', 1, 'b-0002'), ('b-0009', '/work/b-clone', 2, 'b-0002');
+                         INSERT INTO memory \
+                          (scope, agent_id, project_id, content, memory_type, source, created_at, created_by_type, created_by_ref, \
+                           last_modified_at, last_accessed_at, importance, tier, status) \
+                          VALUES ('agent', 'x', 'a-0001', 'the notes of the week', 'semantic_fact', 'explicit', 1, 'agent', 'x', \
+                           1, 1, 5.0, 3, 'active');",
+                    )
+                })
+                .await
+                .unwrap();
+            mark_deleted(&store, "gone-7a8b", 1).await;
+            Locating { store, ws, backups, _dir: dir }
+        }
+
+        async fn locate(&self, folder: &str, own: &str, target: &str) -> Result<Located, LocateError> {
+            locate_folder(&self.store, &self.ws, &self.backups, Path::new(folder), own, target).await
+        }
+
+        async fn merged_into(&self, id: &'static str) -> Option<String> {
+            self.store.conn.call(move |c| c.query_row("SELECT merged_into FROM project WHERE id = ?1", [id], |r| r.get(0))).await.unwrap()
+        }
+    }
+
+    #[test]
+    fn a_folder_that_is_not_a_directory_is_not_located() {
+        assert!(check_folder(Path::new("/work/notes"), |_| true).is_ok());
+        let mut asked = Vec::new();
+        let refused = check_folder(Path::new("/work/notes.txt"), |folder| {
+            asked.push(folder.to_path_buf());
+            false
+        })
+        .expect_err("a file is no folder of a project");
+        assert!(matches!(refused, LocateError::NotADirectory(ref f) if f == Path::new("/work/notes.txt")), "{refused:?}");
+        assert_eq!(refused.to_string(), "/work/notes.txt is not a directory: name a directory of the project");
+        assert_eq!(asked, [PathBuf::from("/work/notes.txt")]);
+    }
+
+    #[tokio::test]
+    async fn a_folder_already_in_the_named_project_is_left_as_it_is() {
+        let f = Locating::new().await;
+        f.store.conn.clone().close().await.unwrap();
+
+        let located = f.locate("/work/b", "b-0002", "b-0002").await;
+
+        assert!(matches!(located, Ok(Located::Already)), "the store is not read: {located:?}");
+    }
+
+    #[tokio::test]
+    async fn a_folder_shared_by_its_project_is_not_merged() {
+        let f = Locating::new().await;
+
+        let refused = f.locate("/work/b", "b-0002", "ideas").await.expect_err("two folders lead to b");
+
+        assert!(
+            matches!(&refused, LocateError::FolderShared { folder, own, folders: 2, target }
+                if folder == Path::new("/work/b") && own == "b-0002" && target == "ideas"),
+            "{refused:?}"
+        );
+        assert_eq!(
+            refused.to_string(),
+            "/work/b leads to project b-0002, which has 2 folders; `clawg projects merge b-0002 --into ideas` merges them all"
+        );
+        assert_eq!(f.merged_into("b-0002").await, None, "nothing is merged");
+    }
+
+    #[tokio::test]
+    async fn the_only_folder_of_a_project_merges_it_into_the_named_one() {
+        let f = Locating::new().await;
+
+        let located = f.locate("/work/a", "a-0001", "ideas").await.expect("located");
+
+        let Located::Merged(report) = located else { panic!("a merge: {located:?}") };
+        assert_eq!((report.source.as_str(), report.target.as_str(), report.dry_run, report.memories), ("a-0001", "ideas", false, 1));
+        assert!(report.merge_id.is_some(), "{report:?}");
+        assert_eq!(f.merged_into("a-0001").await.as_deref(), Some("ideas"));
+    }
+
+    #[tokio::test]
+    async fn a_refused_merge_refuses_the_locate() {
+        let f = Locating::new().await;
+
+        let refused = f.locate("/work/a", "a-0001", "gone-7a8b").await.expect_err("a deleted project takes no merge");
+
+        assert!(matches!(&refused, LocateError::Merge(MergeError::Deleted { id, .. }) if id == "gone-7a8b"), "{refused:?}");
+        assert_eq!(refused.to_string(), "project gone-7a8b is deleted, in delete 1: undo it with `clawg projects delete --undo 1`");
+        assert_eq!(f.merged_into("a-0001").await, None);
+    }
+
+    #[tokio::test]
+    async fn a_store_that_fails_refuses_the_locate() {
+        let f = Locating::new().await;
+        f.store.conn.clone().close().await.unwrap();
+
+        let refused = f.locate("/work/a", "a-0001", "ideas").await.expect_err("the count fails");
+
+        assert!(matches!(refused, LocateError::Store(_)), "{refused:?}");
+    }
+
+    /// A store with the projects `app-1a2b` and `copia-85a9`, with a
+    /// suggestion pending between them, `web-0001` and `notas-0002`, with
+    /// none, `old-0004`, merged into `app-1a2b`, and `gone-7a8b`, deleted;
+    /// the directory its workspaces and snapshots go in.
+    struct Answering {
+        store: MemoryStore,
+        ws: crate::memory::retrieval::workspace::WorkspaceManager,
+        backups: PathBuf,
+        _dir: crate::test_dir::TestDir,
+    }
+
+    impl Answering {
+        async fn new() -> Self {
+            let store = MemoryStore::new_for_test().await.unwrap();
+            let dir = crate::test_dir::test_dir();
+            let ws = crate::memory::retrieval::workspace::WorkspaceManager::new(dir.path().join("workspaces"));
+            let backups = dir.path().join("backups");
+            store
+                .conn
+                .call(|c| {
+                    c.execute_batch(
+                        "INSERT INTO project (id, name, born, reviewed, created_at) VALUES \
+                             ('app-1a2b', 'app', 'user', 1, 1), ('copia-85a9', 'copia', 'user', 1, 2), \
+                             ('web-0001', 'web', 'user', 1, 3), ('notas-0002', 'notas', 'user', 1, 4), \
+                             ('gone-7a8b', 'gone', 'user', 1, 1);
+                         INSERT INTO project (id, name, born, reviewed, created_at, merged_into, merged_at) VALUES \
+                             ('old-0004', 'old', 'user', 1, 1, 'app-1a2b', 2);
+                         INSERT INTO project_suggestion (project_id, other_id, reason, created_at) VALUES \
+                             ('copia-85a9', 'app-1a2b', 'root_commit', 2);",
+                    )
+                })
+                .await
+                .unwrap();
+            mark_deleted(&store, "gone-7a8b", 1).await;
+            Answering { store, ws, backups, _dir: dir }
+        }
+
+        async fn answer(&self, project: &str, other: &str, answer: &str) -> Result<Answered, AnswerError> {
+            let answer = UserAnswer::new(answer, true, Some("the user said so")).expect("the user's answer");
+            answer_suggestion_core(&self.store, &self.ws, &self.backups, project, other, answer).await
+        }
+
+        async fn merged_into(&self, id: &'static str) -> Option<String> {
+            self.store.conn.call(move |c| c.query_row("SELECT merged_into FROM project WHERE id = ?1", [id], |r| r.get(0))).await.unwrap()
+        }
+
+        async fn answers(&self) -> Vec<(String, String, Option<String>)> {
+            self.store
+                .conn
+                .call(|c| {
+                    let mut stmt = c.prepare("SELECT project_id, other_id, answer FROM project_suggestion ORDER BY rowid")?;
+                    let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+                    rows.collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .await
+                .unwrap()
+        }
+    }
+
+    #[test]
+    fn an_answer_is_merge_or_apart() {
+        let answer = |raw: &str| UserAnswer::new(raw, true, Some("the user said so")).map(|a| a.answer);
+        assert_eq!(answer("merge").expect("merge"), SuggestionAnswer::Merge);
+        assert_eq!(answer("apart").expect("apart"), SuggestionAnswer::Apart);
+        for raw in ["later", "Merge", " apart", ""] {
+            assert!(matches!(answer(raw), Err(AnswerError::UnknownAnswer(ref got)) if got == raw), "{raw:?}");
+        }
+        let refused = UserAnswer::new("later", false, None).map(|a| a.answer);
+        assert!(matches!(refused, Err(AnswerError::UnknownAnswer(_))), "the answer is read first: {refused:?}");
+    }
+
+    #[test]
+    fn an_answer_is_the_users_word() {
+        for (user_answered, reason) in [(false, Some("the user said so")), (true, None), (true, Some("")), (true, Some(" \n"))] {
+            let refused = UserAnswer::new("merge", user_answered, reason).map(|a| a.answer);
+            assert!(matches!(refused, Err(AnswerError::NeedsUser)), "{user_answered} {reason:?}: {refused:?}");
+        }
+        let answer = UserAnswer::new("apart", true, Some("the user said they are two")).expect("the user's word");
+        assert_eq!(answer.answer, SuggestionAnswer::Apart);
+    }
+
+    #[test]
+    fn each_answer_refusal_keeps_its_text() {
+        let cases = [
+            (AnswerError::UnknownAnswer("later".into()), "answer must be one of: merge, apart (got \"later\")"),
+            (
+                AnswerError::NeedsUser,
+                "answering a suggestion is the user's call: send user_answered with the user's answer in reason",
+            ),
+            (
+                AnswerError::NoSuggestion { project_id: "web-0001".into(), other_id: "notas-0002".into() },
+                "no suggestion is pending between web-0001 and notas-0002",
+            ),
+            (AnswerError::Pair(KeepApartError::NotFound("nobody-0000".into())), "no project has the id nobody-0000"),
+            (AnswerError::Merge(MergeError::SameProject("app-1a2b".into())), &MergeError::SameProject("app-1a2b".into()).to_string()),
+        ];
+        for (refused, text) in cases {
+            assert_eq!(refused.to_string(), text, "{refused:?}");
+        }
+        assert_eq!(serde_json::to_value([SuggestionAnswer::Merge, SuggestionAnswer::Apart]).unwrap(), serde_json::json!(["merge", "apart"]));
+    }
+
+    #[tokio::test]
+    async fn an_answer_needs_a_pending_suggestion() {
+        let f = Answering::new().await;
+        let before = f.answers().await;
+
+        for answer in ["apart", "merge"] {
+            let refused = f.answer("web-0001", "notas-0002", answer).await.expect_err("nobody suggested them");
+            assert!(
+                matches!(&refused, AnswerError::NoSuggestion { project_id, other_id } if project_id == "web-0001" && other_id == "notas-0002"),
+                "{answer}: {refused:?}"
+            );
+        }
+
+        assert_eq!(f.answers().await, before, "nothing is written");
+        assert_eq!((f.merged_into("web-0001").await, f.merged_into("notas-0002").await), (None, None));
+    }
+
+    /// Two answers sent at once both find the suggestion pending, and only
+    /// the first one written stands: each looks for it again where it writes.
+    #[tokio::test]
+    async fn of_two_answers_to_one_suggestion_one_is_written() {
+        let f = Answering::new().await;
+
+        let (apart, merge) = tokio::join!(f.answer("app-1a2b", "copia-85a9", "apart"), f.answer("app-1a2b", "copia-85a9", "merge"));
+
+        let merged = f.merged_into("copia-85a9").await;
+        match (&apart, &merge) {
+            (Ok(Answered::Apart), Err(AnswerError::NoSuggestion { .. })) => assert_eq!(merged, None),
+            (Err(AnswerError::Pair(KeepApartError::Merged { .. })), Ok(Answered::Merged(_))) => {
+                assert_eq!(merged.as_deref(), Some("app-1a2b"))
+            }
+            other => panic!("both answers were written, or neither: {other:?}"),
+        }
+    }
+
+    /// Asked only to answer what is pending, a pair nobody suggested is left
+    /// as it was, not recorded apart.
+    #[tokio::test]
+    async fn keeping_apart_only_what_is_pending_writes_nothing_without_a_suggestion() {
+        let f = Answering::new().await;
+        let before = f.answers().await;
+
+        let kept = kept_apart(&f.store, "web-0001", "notas-0002", true).await.expect("both are live");
+
+        assert_eq!(kept.answered, 0);
+        assert_eq!(f.answers().await, before);
+    }
+
+    #[tokio::test]
+    async fn an_answer_checks_both_projects() {
+        let f = Answering::new().await;
+
+        let refused = f.answer("nobody-0000", "app-1a2b", "merge").await.expect_err("unknown");
+        assert!(matches!(&refused, AnswerError::Pair(KeepApartError::NotFound(id)) if id == "nobody-0000"), "{refused:?}");
+        let refused = f.answer("app-1a2b", "app-1a2b", "merge").await.expect_err("the same");
+        assert!(matches!(&refused, AnswerError::Pair(KeepApartError::Same(id)) if id == "app-1a2b"), "{refused:?}");
+        let refused = f.answer("old-0004", "copia-85a9", "merge").await.expect_err("a tombstone");
+        assert!(matches!(&refused, AnswerError::Pair(KeepApartError::Merged { id, into }) if id == "old-0004" && into == "app-1a2b"), "{refused:?}");
+        let refused = f.answer("app-1a2b", "gone-7a8b", "apart").await.expect_err("deleted");
+        assert!(matches!(&refused, AnswerError::Pair(KeepApartError::Deleted { id, delete_id: Some(1) }) if id == "gone-7a8b"), "{refused:?}");
+        assert_eq!(f.merged_into("copia-85a9").await, None);
+    }
+
+    #[tokio::test]
+    async fn apart_keeps_the_two_from_being_suggested_again() {
+        let f = Answering::new().await;
+
+        let answered = f.answer("app-1a2b", "copia-85a9", "apart").await.expect("answered");
+
+        assert!(matches!(answered, Answered::Apart), "{answered:?}");
+        assert_eq!(f.answers().await, [("copia-85a9".into(), "app-1a2b".into(), Some("apart".into()))]);
+        assert!(suggestion_between(&f.store, "app-1a2b", "copia-85a9").await.unwrap().is_none());
+        assert_eq!(f.merged_into("copia-85a9").await, None);
+    }
+
+    #[tokio::test]
+    async fn merge_merges_the_other_into_the_project() {
+        let f = Answering::new().await;
+
+        let answered = f.answer("app-1a2b", "copia-85a9", "merge").await.expect("answered");
+
+        let Answered::Merged(report) = answered else { panic!("a merge: {answered:?}") };
+        assert_eq!(
+            (report.source.as_str(), report.target.as_str(), report.dry_run, report.suggestions),
+            ("copia-85a9", "app-1a2b", false, 1)
+        );
+        assert!(report.merge_id.is_some(), "{report:?}");
+        assert_eq!(f.merged_into("copia-85a9").await.as_deref(), Some("app-1a2b"));
+    }
+
+    #[tokio::test]
+    async fn a_refused_merge_refuses_the_answer() {
+        let f = Answering::new().await;
+        f.store
+            .conn
+            .call(|c| {
+                c.execute_batch(
+                    r#"INSERT INTO ingest_outbox (operation_id, agent_id, content, event, created_at, updated_at)
+                       VALUES ('op-copia', 'agent-a', 'a save', '{"agent_id":"agent-a","project_id":"copia-85a9","content":""}', 1, 1);"#,
+                )
+            })
+            .await
+            .unwrap();
+
+        let refused = f.answer("app-1a2b", "copia-85a9", "merge").await.expect_err("a save of copia is pending");
+
+        assert!(matches!(refused, AnswerError::Merge(MergeError::SavesPending(1))), "{refused:?}");
+        assert_eq!(f.merged_into("copia-85a9").await, None);
+        assert!(suggestion_between(&f.store, "app-1a2b", "copia-85a9").await.unwrap().is_some(), "still pending");
+    }
+
+    #[tokio::test]
+    async fn a_store_that_fails_refuses_the_answer() {
+        let f = Answering::new().await;
+        f.store.conn.clone().close().await.unwrap();
+
+        let refused = f.answer("app-1a2b", "copia-85a9", "merge").await.expect_err("the store is closed");
+
+        assert!(matches!(refused, AnswerError::Pair(KeepApartError::Store(_))), "{refused:?}");
+    }
+
+    #[tokio::test]
+    async fn new_project_without_create_is_refused_before_anything_is_read() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        store.conn.clone().close().await.unwrap();
+
+        let options = ResolveOptions { create: false, new_project: true, born: Born::User };
+        let refused = resolve_project(&store, "ideas", options).await.expect_err("new_project goes with create");
+
+        assert!(matches!(refused, ResolveError::NewProjectWithoutCreate), "{refused:?}");
+        assert_eq!(refused.to_string(), "new_project goes with create: it creates a project apart from the similar ones");
+        let options = ResolveOptions { create: false, new_project: false, born: Born::User };
+        let failed = resolve_project(&store, "ideas", options).await.expect_err("the store is closed");
+        assert!(matches!(failed, ResolveError::Store(_)), "{failed:?}");
     }
 }

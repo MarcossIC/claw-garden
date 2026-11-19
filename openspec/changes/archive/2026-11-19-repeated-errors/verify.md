@@ -1,6 +1,6 @@
 # repeated-errors — Verificación
 
-Veredicto: **cumple RE1 a RE8, sin hallazgos CRITICAL**. RE9 queda pendiente, porque es la tarea 9 y espera a [agent-eval-sessions](../archive/2026-11-17-agent-eval-sessions/proposal.md). Hay tres WARNING para resolver antes de archivar: un falso positivo que contradice D5, el nombre de un test y el regex que compila `redact` en el camino con firma. Fuera de esta verificación quedan la tarea 8 (la verificación local en Windows), la puerta de latencia, la entrada real de los dos eventos y la campaña.
+Veredicto: **cumple RE1 a RE9, sin hallazgos CRITICAL**. Esta lectura, hecha antes de aplicar, dio tres WARNING (W1 a W3) y una sugerencia (S1); los cuatro se cerraron después, como dice [Arreglos después de la verificación](#arreglos-después-de-la-verificación). La puerta de latencia pasa con lo que agrega el hook, y la campaña pasa la condición A. La suite y los dos clippy pasan en Windows sobre el commit que se archiva. Quedan abiertas las sugerencias S2, S3, S6 y S8, y el CI de Linux y Windows, en [Pendiente después de publicar](#pendiente-después-de-publicar).
 
 ## Qué se revisó
 
@@ -28,7 +28,7 @@ El cambio no toca el ranking, así que no se corre `rag-eval`.
 | RE6 las reglas al iniciar | `respond_reading` lee el libro en el mismo `join` que el idioma y el bloque, con `wait` (`hook.rs:473-487`), sólo para el `SessionStart` de Claude Code; `rules_block` (`tool_failures.rs:308`) abre con `clawg:`; `opening_lines` (`hook.rs:168`): idioma, reglas, aviso del bloque; `context_budget` (`hook.rs:175`) descuenta los bytes del bloque; el texto de respaldo sin daemon lleva el bloque (`hook.rs:506-509`) | `session_start_names_the_learned_rules_before_the_evidence`, `the_rules_reach_the_session_with_or_without_a_daemon`, `the_rules_come_out_of_the_context_budget`, `without_rules_session_start_says_what_it_said` (también: Cursor y `user-prompt-submit` no leen el libro), `what_the_hook_adds_stays_small` (cinco nombres de 32 caracteres, cien sesiones, 30 días), `the_rules_block_of_five_long_names_stays_small` (≤ `RULES_BLOCK_MAX`), `two_sessions_teach_the_third` y `one_session_teaches_nothing` (binario, sin daemon) | Cumple |
 | RE7 `setup` | `HOOK_EVENTS` con el matcher de cada evento (`setup.rs:56`); `install_hooks` (`:552`) lo usa; `remove_hooks` (`:615`) y `--local` recorren la misma tabla | `a_run_over_an_install_without_the_tool_hooks_adds_only_them` (byte a byte, y el reporte), `the_tool_hooks_match_bash_only` (y el conflicto con otro hook de clawg), `remove_takes_the_tool_hooks_too` (el hook ajeno queda), `an_empty_state_plans_the_server_the_hooks_and_the_block`, la segunda corrida `unchanged` (idempotente), y los de `setup/local.rs` con cinco eventos | Cumple |
 | RE8 `doctor` | `checks::tool_rules` (`checks.rs:1107`) con `names_word` (`:1159`), palabra entera y mayúsculas exactas; `checks::tool_hooks` (`:1182`) sobre `setup::missing_tool_hooks` (`setup.rs:473`); `doctor::run` (`doctor/mod.rs:219-223`) lee los `CLAUDE.md` sólo si hay reglas (`instruction_files`, `:282`) y los dos `settings` (`settings_files`, `:303`) | `the_learned_rules_are_listed_with_the_files_that_ask_for_them`, `no_rules_no_finding`, `a_session_start_hook_without_the_tool_hooks_is_reported`; `doctor_names_what_the_ledger_learned_and_the_hooks_that_are_missing` (binario: exit 0, `named_in`, el paso, el libro igual byte a byte) y `doctor_has_nothing_to_say_without_rules_or_an_install` | Cumple |
-| RE9 `a3-notools` | — | — | Pendiente (tarea 9) |
+| RE9 `a3-notools` | `Arm::A3NoTools` (`crates/clawg-eval/src/bin/agent-eval/arm.rs`) | `a3_notools_is_a3_without_the_tool_hooks`, `a3_notools_reads_and_prints_by_its_name` | Cumple (la campaña usó el brazo, en «La campaña») |
 
 La spec de RE6 cambió durante el apply (`efb4eb17`): «lo que el hook agrega sigue debajo de 1500 bytes» pasó a «sin el bloque sigue debajo de 2000», con el bloque de a lo sumo 700. Se acepta. El tope de 2000 ya venía de protocol-block, el bloque ocupa lugar del contexto en vez de sumarse encima (`context_budget`), y el límite que importa, 10.000 caracteres del cliente, lo comprueba `what_the_hook_adds_stays_small` con el peor caso. D6 deja escrito el motivo.
 
@@ -83,15 +83,15 @@ Ninguno.
 - **S7. El runtime del hook.** `clawg hook` arma un runtime multi-hilo, con un worker por núcleo (`main.rs:69`). Ya pasaba antes, pero ahora corre en cada Bash. Si la puerta de latencia no pasa, la palanca más barata es un `current_thread` para `clawg hook`, antes de sacar la lectura del libro del camino feliz.
 - **S8. Tests contra el corte real.** `the_same_turn_line_names_the_program_in_the_users_language` y los del binario esperan una línea dentro de los 300 ms. La documentación de `LANGUAGE_WAIT` registra lecturas de hasta 785 ms en Windows con todos los núcleos ocupados (el 99 % por debajo de 17 ms). Puede fallar alguna vez en una máquina cargada. Los unitarios pueden pasar un plazo más largo a `respond`.
 
-## Pendiente
+## Lo que quedaba pendiente al verificar
 
-- **Tarea 9 (RE9)**: `Arm::A3NoTools` y sus dos tests en `arm.rs`, cuando agent-eval-sessions esté aplicado. Hasta entonces, `a3` ya corre con los hooks nuevos (toma los de `setup::plan`), pero el arnés niega `Bash`, así que no se disparan.
+- **Tarea 9 (RE9)**: aplicada, con `Arm::A3NoTools` y sus dos tests en `arm.rs`, y usada en [la campaña](#la-campaña).
 - **Tarea 8, la verificación local en Windows**:
-  - la suite y los dos clippy sobre el commit que se archive, y el CI de Linux y Windows;
-  - la entrada real de `PostToolUse` y de `PostToolUseFailure` de Bash, registrada con autorización para `~/.clawg-dev` y sumada como fixture. Hay que confirmar que la firma está en algún texto de `tool_response` (`stderr` o no), que el cliente corre `PostToolUseFailure` con matcher `Bash`, y que lee `additionalContext` en los dos eventos;
-  - la puerta de latencia de la decisión 6: p95 ≤ 60 ms en 200 corridas sin firma, desde Git Bash y con el binario publicado. La tanda con firma también se anota, y W3 pide juzgarla;
-  - el `verify.md` de esa verificación, o una sección más en este.
-- **Después del cambio**: la campaña paga (`shelf-eza-missing` y la tarea N, brazos `a3-notools` y `a3`), y correr otra vez `clawg setup claude-code` en cada cliente ya configurado. `doctor` lo avisa con `tool_hooks` mientras falte.
+  - la suite y los dos clippy (el del workspace y el de `-p clawg-cli` sin `--all-targets`) pasan en Windows sobre `620cfbbe`, el último commit con código antes del archivado, después de `cargo clean --workspace`; el CI de Linux y Windows corre en el PR a `main`;
+  - la forma real de la entrada de `PostToolUse` y de `PostToolUseFailure` de Bash salió de los transcripts de la campaña ([la campaña](#la-campaña)), y los tests de `response_texts` la usan;
+  - la puerta de latencia pasa con lo que agrega el hook ([la puerta, medida otra vez](#la-puerta-medida-otra-vez-con-lo-que-agrega-el-hook));
+  - este `verify.md`.
+- **Después del cambio**: la campaña paga corrió. Correr otra vez `clawg setup claude-code` queda en [Pendiente después de publicar](#pendiente-después-de-publicar).
 
 ## Arreglos después de la verificación
 
@@ -102,7 +102,7 @@ Ninguno.
 | W2, el nombre del test | `60f1e295` | `only_a_program_that_never_worked_and_is_missing_is_a_rule` |
 | S4 y S5, visibilidad y comentarios | `5e6d7052` | `pub(crate)` en lo que sólo usa `clawg-cli`; `RULES_BLOCK_MAX` en el módulo de tests; los comentarios de `INPUT_LIMIT` y de `respond_reading` |
 
-Quedan abiertos W3 (el p95 de la tanda con firma, que juzga la puerta de latencia) y S2, S3, S6, S7 y S8. Con W1 arreglado, una respuesta con `stderr` vacío y la firma en `stdout`, sin `2>&1`, cuenta como llamada sin firma: un shell no escribe ahí su `command not found`, así que es lo buscado.
+W3 se cerró con la puerta de latencia, aceptando el costo (ver [la puerta, medida otra vez](#la-puerta-medida-otra-vez-con-lo-que-agrega-el-hook)). S7 se probó y no se commitea. Quedan abiertos S2, S3, S6 y S8. Con W1 arreglado, un `stderr` con texto es el único lugar donde se busca la firma. Con un `stderr` vacío, en cambio, se busca en todos los textos, también `stdout`, porque ahí deja el cliente las palabras del shell después de una llamada que terminó bien (el arreglo de [la campaña](#la-campaña)). Eso deja un falso positivo abierto: si el comando imprime una firma vieja que nombra a uno de sus propios programas, como `rg "command not found" build.log` con un log que trae `rg: command not found`, sale un fallo de ese programa. Si el libro no tiene un `ok` de ese programa en la ventana, también sale el aviso del mismo turno, aunque el programa esté instalado. Para que llegue a regla hacen falta dos sesiones, ningún éxito en 30 días y que el programa no esté en el PATH del hook.
 
 ## La campaña
 
@@ -151,3 +151,61 @@ Con el `clawg.exe` arreglado (`9a76a8ec`), 5 corridas de `shelf-eza-missing` baj
 Lo que no decide:
 - En la repetición 5 la regla no llegó por otra vía que la de la primera medición. La sesión 1 falló en Bash y quedó anotada, pero la sesión 2 probó `eza` sólo en la herramienta PowerShell, que el cliente frena pidiendo una aprobación. El libro vio un solo fallo antes de la sesión 3, y la sesión 3 llamó a `eza` en Bash.
 - Ninguna sesión 1 ni 2 de esta medición usó una tubería (`eza -1 -f src`, `eza -1 src`): todas salieron con 127 y el cliente corrió `PostToolUseFailure`. El caso que arregló `response_texts`, la tubería que sale con 0, no se volvió a dar en la campaña; lo cubren los tres tests de arriba.
+
+## La puerta de latencia, con un release
+
+Medida sobre `ffc3206d` (`clawg 0.88.0`) con un release que lleva la feature `testing` de clawg-core: `cargo build --release -p clawg-cli --features clawg-core/testing --target-dir target-test`. La feature hace falta porque un release sin ella ignora `CLAWG_TEST_HOME` (`home_dir`, `crates/clawg-core/src/paths.rs`) y la tanda con firma escribiría en el libro de un perfil real. En el camino del hook, lo único que cambia es cómo se busca el home. El home es temporal y tiene el `tool-failures.jsonl` de una corrida de la campaña: dos `fail` de `eza`, de sesiones distintas, 236 bytes. Las entradas y el método de cronometraje son los de la tarea 8: 200 corridas por tanda, desde Git Bash, con `date +%s%N` y el stdin por un pipe. p50 y p95 son los elementos 100 y 190.
+
+**No pasa: la tanda sin firma da un p95 de 156 a 159 ms, contra los 60 que pide la puerta.** Con estos números la puerta no juzga el hook, porque el piso de la máquina ya la pasa solo. En el mismo día, `/usr/bin/true` dio un p95 de 122 a 131 ms. Un sondeo de 60 corridas de `true` por minuto, durante 45 minutos, nunca bajó de 95 ms. El 2026-11-17 había dado 56 ms, y el 2026-11-13, 28 ms por corrida.
+
+| Tanda | p50 | p95 |
+|---|---|---|
+| `/usr/bin/true` | 103 | 122 |
+| `clawg --version` | 124 | 142 |
+| `hook post-tool-use`, sin firma | 137 | 156 |
+| `hook post-tool-use-failure`, con firma | 141 | 163 |
+
+Es la primera de dos tandas seguidas. La segunda dio, en el mismo orden, 112/131, 134/158, 138/159 y 148/168.
+
+Lo que el hook agrega, que es lo que se puede comparar entre días: sobre `--version`, unos 14 ms de p95 sin firma y 21 con firma. Sobre `true`, 34 y 41. Con el build debug de la medición anterior, la tanda sin firma agregaba 33 ms sobre `--version` y 41 sobre `true`.
+
+**W3.** La tanda con firma cuesta lo mismo que la tanda sin firma, dentro del ruido. En la medición alternada de abajo, el p95 es 156 en las dos con el binario de `ffc3206d`. Compilar los `PATTERNS` de `redact` no se ve en el proceso. Con esto, W3 se puede cerrar aceptando el costo. Al cerrarlo, la justificación de D4 («costaría su compilación en cada proceso de hook») tiene que decir que ese costo existe pero no se distingue del ruido de arrancar el proceso.
+
+### S7: un runtime `current_thread` para `clawg hook`
+
+Se probó con TDD: `Command::runs_on_one_thread` en `cli.rs`, con el test `only_the_hook_runs_on_one_thread`, y `main.rs` armando `new_current_thread` para `hook`. Pasaron los tests de `cli.rs` y `tests/binary.rs`. Se midió el binario de antes contra el de después, alternados en cada ronda: 200 rondas, y en cada una `true`, `--version` y las dos entradas de cada binario, cada binario con su propio home. Así la carga de la máquina pesa igual sobre todas las series.
+
+| Tanda | Antes p50 | Antes p95 | Después p50 | Después p95 |
+|---|---|---|---|---|
+| `clawg --version` | 125 | 145 | 124 | 143 |
+| sin firma | 141 | 156 | 140 | 158 |
+| con firma | 136 | 156 | 135 | 149 |
+
+`/usr/bin/true` en la misma medición dio p50 108 y p95 126. El p50 baja 1 ms en las tres tandas, y el p95 se mueve para los dos lados. S7 no da una ganancia que se pueda medir, así que no se commitea.
+
+## La puerta, medida otra vez, con lo que agrega el hook
+
+Con el tope absoluto, la puerta juzgaba el día de la máquina: el mismo `true` vacío dio p95 de 28, 56 y 122 a 131 ms en días distintos. La [decisión 6](proposal.md) pasa a pedir que el p95 sin firma menos el p95 de `/usr/bin/true`, medidos alternados, sea ≤ 60 ms. Se mide con la máquina en su uso de todos los días, que es como corre el hook, no esperando un rato tranquilo.
+
+Medida sobre `d2416b56` (`clawg 0.89.0`) el 2026-11-19, con el mismo release con la feature `testing`, un home temporal por entrada (el de la tanda sin firma con los dos `fail` de `eza` de la medición anterior) y el editor y el agente abiertos. Dos mediciones seguidas de 200 rondas, cada ronda con `true`, `--version` y las dos entradas, en ese orden.
+
+| Tanda | 1.ª p50 | 1.ª p95 | 2.ª p50 | 2.ª p95 |
+|---|---|---|---|---|
+| `/usr/bin/true` | 108 | 128 | 125 | 161 |
+| `clawg --version` | 120 | 134 | 138 | 165 |
+| `hook post-tool-use`, sin firma | 130 | 148 | 144 | 172 |
+| `hook post-tool-use-failure`, con firma | 131 | 155 | 151 | 180 |
+
+**Pasa.** Sin firma, el hook agrega 20 y 11 ms de p95 sobre `true`, y 14 y 7 sobre `--version`. Con firma agrega 27 y 19 sobre `true`. Los números coinciden con los de la medición anterior (34 ms sin firma sobre `true`, 14 sobre `--version`), así que lo que agrega el hook es estable entre días aunque el piso no lo sea. La tanda con firma imprime la línea del mismo turno (`latency-probe-xyz` is not installed…), así que mide el camino que escribe y responde.
+
+**No queda una optimización barata.** Lo que el hook hace en el camino sin firma ya no abre nada salvo el libro: no habla con el daemon, no compila regex y no busca en el PATH. S7, la palanca que quedaba, se midió y no mueve el p95. La mayor parte del total es arrancar un proceso de unos 57 MB en Windows, y eso lo paga igual `clawg --version`, que sale en el parseo de los argumentos antes de crear el runtime.
+
+**W3** queda cerrado aceptando el costo: compilar los `PATTERNS` de `redact` en un proceso con firma suma unos 7 ms de p95 sobre la tanda sin firma en las dos mediciones, por debajo de la puerta. D4 y la decisión 8 lo dicen.
+
+Con la puerta pasada, `PostToolUse` puede publicarse instalado.
+
+## Pendiente después de publicar
+
+- Correr otra vez `clawg setup claude-code` en cada cliente ya configurado, y `clawg setup claude-code --local` en cada carpeta donde se instaló con `--local` o `--path`. Hasta entonces el hook de `PostToolUse` y el de `PostToolUseFailure` no están, y `clawg doctor` lo avisa con el hallazgo `tool_hooks` (RE8).
+- Quedan abiertas como sugerencias S2 (el rename puede perder el archivo rotado si dos procesos lo ven a la vez), S3 (`read` no tiene tope si el rename falla), S6 (las palabras reservadas del shell, como `do` o `then`, no se saltan) y S8 (los tests contra el plazo de 300 ms pueden fallar en una máquina cargada).
+- El CI de Linux y Windows corre en el PR a `main`.

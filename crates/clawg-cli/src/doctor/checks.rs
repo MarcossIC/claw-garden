@@ -2236,6 +2236,14 @@ mod tests {
         let half = tool_hooks(L, &[settings("s.json", false, half)], P);
         assert_eq!(half[0].evidence["missing"], json!(["PostToolUseFailure"]));
 
+        let elsewhere = settings_of(json!({
+            "SessionStart": [{ "hooks": [clawg_hook("session-start", "dev")] }],
+            "PostToolUse": [{ "matcher": "Edit", "hooks": [clawg_hook("post-tool-use", "dev")] }],
+            "PostToolUseFailure": [{ "hooks": [clawg_hook("post-tool-use-failure", "dev")] }, { "matcher": "Bash", "hooks": [clawg_hook("post-tool-use-failure", "dev")] }]
+        }));
+        let elsewhere = tool_hooks(L, &[settings("s.json", false, elsewhere)], P);
+        assert_eq!(elsewhere[0].evidence["missing"], json!(["PostToolUse"]), "a tool hook counts only under the Bash matcher");
+
         let complete = settings_of(json!({
             "SessionStart": [{ "hooks": [clawg_hook("session-start", "dev")] }],
             "PostToolUse": [{ "matcher": "Bash", "hooks": [clawg_hook("post-tool-use", "dev")] }],

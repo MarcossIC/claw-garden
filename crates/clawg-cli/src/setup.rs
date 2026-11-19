@@ -469,23 +469,24 @@ fn is_clawg_hook(hook: &Value, event_arg: &str, profile: Profile) -> bool {
 /// The events of the hooks after a shell call that `text`, a `settings.json`,
 /// lacks for `profile`, when it has the hook of `session-start` for it: an
 /// install from before them. A file without that hook, or that is not
-/// settings, lacks nothing: it is not an install of clawg to complete.
+/// settings, lacks nothing: it is not an install of clawg to complete. A tool
+/// hook counts as `hooks_run_for` says, as it does for `setup`.
 pub(crate) fn missing_tool_hooks(text: &str, profile: Profile) -> Vec<&'static str> {
     let Ok(Value::Object(settings)) = serde_json::from_str::<Value>(text) else { return Vec::new() };
-    let has = |event: &str, arg: &str| {
+    let has = |event: &str, arg: &str, matcher: Option<&str>| {
         settings
             .get("hooks")
             .and_then(|hooks| hooks.get(event))
             .and_then(Value::as_array)
-            .is_some_and(|groups| hooks_of(groups).any(|hook| is_clawg_hook(hook, arg, profile)))
+            .is_some_and(|groups| hooks_run_for(groups, matcher).any(|hook| is_clawg_hook(hook, arg, profile)))
     };
-    if !has("SessionStart", "session-start") {
+    if !has("SessionStart", "session-start", None) {
         return Vec::new();
     }
     HOOK_EVENTS
         .iter()
         .filter(|(_, _, matcher)| *matcher == Some(SHELL_TOOL_MATCHER))
-        .filter(|(event, arg, _)| !has(event, arg))
+        .filter(|(event, arg, matcher)| !has(event, arg, *matcher))
         .map(|(event, _, _)| *event)
         .collect()
 }
@@ -512,9 +513,39 @@ fn runs_as(hook: &Value, planned: &Value) -> bool {
     hook.get("command") == planned.get("command") && hook.get("args") == planned.get("args")
 }
 
-/// The hooks of an event's groups, in order.
-fn hooks_of(groups: &[Value]) -> impl Iterator<Item = &Value> {
-    groups.iter().filter_map(|g| g.get("hooks").and_then(Value::as_array)).flatten()
+/// The hooks of an event's groups that the client runs for what the planned
+/// `matcher` names, in order. Only the shell tool's matcher is checked: a tool
+/// hook in a group that does not run after a shell call is not installed. A
+/// `session-start` hook counts under any matcher, so an install that gave it
+/// its own does not get a second group that would run clawg twice.
+fn hooks_run_for<'a>(groups: &'a [Value], matcher: Option<&str>) -> impl Iterator<Item = &'a Value> {
+    let shell_only = matcher == Some(SHELL_TOOL_MATCHER);
+    groups
+        .iter()
+        .filter(move |group| !shell_only || runs_after_shell_call(group))
+        .filter_map(|group| group.get("hooks").and_then(Value::as_array))
+        .flatten()
+}
+
+/// Whether the client runs a tool event's group after a call to `Bash`: a
+/// group without a matcher, or with an empty one or `*`, runs after every
+/// tool, and `Edit|Bash` names it as one of its alternatives. A matcher of only
+/// letters, digits, `_`, `-`, spaces, `,` and `|` is, for the client, a list of
+/// exact names split by `|` or `,` with spaces around them, as in `Edit, Bash`;
+/// any other is a regular expression, read here only by its `|` alternatives,
+/// where a space is one more character to match.
+fn runs_after_shell_call(group: &Value) -> bool {
+    let Some(matcher) = group.get("matcher") else { return true };
+    let Some(m) = matcher.as_str() else { return false };
+    if m.is_empty() || m == "*" {
+        return true;
+    }
+    let is_list = m.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | ' ' | ',' | '|'));
+    if is_list {
+        m.split(['|', ',']).any(|name| name.trim() == SHELL_TOOL_MATCHER)
+    } else {
+        m.split('|').any(|alternative| alternative == SHELL_TOOL_MATCHER)
+    }
 }
 
 /// The `hooks` object of the settings, and the array of one event in it;
@@ -557,7 +588,7 @@ fn install_hooks(settings: &mut Map<String, Value>, exe: &str, profile: Profile,
         // for byte as it was.
         let (mut installed, mut legacy, mut other) = (false, false, None);
         if let Some(groups) = event_groups(settings, event, false, path, CLAUDE_LAYOUT)? {
-            for hook in hooks_of(groups).filter(|h| is_clawg_hook(h, arg, profile)) {
+            for hook in hooks_run_for(groups, matcher).filter(|h| is_clawg_hook(h, arg, profile)) {
                 if runs_as(hook, &planned) {
                     installed = true;
                 } else if is_legacy_hook(hook, arg, profile) {
@@ -571,7 +602,7 @@ fn install_hooks(settings: &mut Map<String, Value>, exe: &str, profile: Profile,
             step.conflicts.push((event, other));
         } else if legacy {
             let groups = event_groups(settings, event, false, path, CLAUDE_LAYOUT)?.expect("found above");
-            migrate_hooks(groups, &planned, installed, arg, profile);
+            migrate_hooks(groups, matcher, &planned, installed, arg, profile);
             step.migrated.push(event);
         } else if installed {
             step.unchanged.push(event);
@@ -591,10 +622,15 @@ fn install_hooks(settings: &mut Map<String, Value>, exe: &str, profile: Profile,
 
 /// Puts `planned` where the first hook as setup wrote it was, so its group
 /// keeps its place and its matcher, and drops the others: one more would run
-/// clawg twice. A group left without hooks by that goes too.
-fn migrate_hooks(groups: &mut Vec<Value>, planned: &Value, installed: bool, event_arg: &str, profile: Profile) {
+/// clawg twice. A group left without hooks by that goes too. Only the groups
+/// [`hooks_run_for`] reads for `matcher` are touched: the others stay as they were.
+fn migrate_hooks(groups: &mut Vec<Value>, matcher: Option<&str>, planned: &Value, installed: bool, event_arg: &str, profile: Profile) {
+    let shell_only = matcher == Some(SHELL_TOOL_MATCHER);
     let mut placed = installed;
     groups.retain_mut(|group| {
+        if shell_only && !runs_after_shell_call(group) {
+            return true;
+        }
         let Some(hooks) = group.get_mut("hooks").and_then(Value::as_array_mut) else { return true };
         let before = hooks.len();
         hooks.retain_mut(|hook| {
@@ -690,6 +726,7 @@ fn assemble(eol: &str, language: Option<Lang>, variant: Variant, stamp: Option<S
     let text = match variant {
         Variant::Full => protocol::text(language).replace("\r\n", "\n"),
         Variant::Short => protocol::short(language),
+        Variant::Lean => protocol::lean(language),
         Variant::Off => String::new(),
     };
     let body = text.trim_end();
@@ -1481,6 +1518,7 @@ mod tests {
         let chosen = Stamp { version: v("0.9.12"), choice: Some(Variant::Off) };
         assert_eq!(Stamp::parse("<!-- clawg 0.88.0 -->"), Some(plain));
         assert_eq!(Stamp::parse("<!-- clawg 0.9.12 protocol=off -->"), Some(chosen));
+        assert_eq!(Stamp::parse("<!-- clawg 0.88.0 protocol=lean -->"), Some(Stamp { choice: Some(Variant::Lean), ..plain }));
         assert_eq!(plain.line(), "<!-- clawg 0.88.0 -->");
         assert_eq!(chosen.line(), "<!-- clawg 0.9.12 protocol=off -->");
         for unreadable in [
@@ -1542,10 +1580,16 @@ mod tests {
             assert!(short.contains(protocol::short(language).trim_end()));
             assert!(short.len() < 2000 && short.len() < full.len() / 4, "{} bytes", short.len());
 
+            let lean = block("\n", language, Variant::Lean, stamp(Some(Variant::Lean)));
+            assert!(lean.starts_with(&format!("{BEGIN_MARKER}\n<!-- clawg 0.88.0 protocol=lean -->\n")), "{lean}");
+            assert!(lean.ends_with(&format!("\n{END_MARKER}")), "{lean}");
+            assert!(lean.contains(protocol::lean(language).trim_end()));
+            assert!(lean.len() < full.len() && lean.len() > short.len(), "{} bytes", lean.len());
+
             let off = block("\n", language, Variant::Off, stamp(Some(Variant::Off)));
             assert_eq!(off, format!("{BEGIN_MARKER}\n<!-- clawg 0.88.0 protocol=off -->\n{END_MARKER}"));
 
-            for (text, choice) in [(&full, None), (&short, Some(Variant::Short)), (&off, Some(Variant::Off))] {
+            for (text, choice) in [(&full, None), (&short, Some(Variant::Short)), (&lean, Some(Variant::Lean)), (&off, Some(Variant::Off))] {
                 assert_eq!(freshness(text, language, own), Freshness::Current, "{choice:?} is what its own stamp asks for");
                 assert_eq!(read_stamp(text), Some(stamp(choice)));
             }
@@ -1554,6 +1598,21 @@ mod tests {
         }
         let short = block("\n", None, Variant::Short, stamp(Some(Variant::Short)));
         assert_eq!(freshness(&short, Some(Lang::Es), own), Freshness::Stale, "the other language is other text");
+        let lean = block("\n", None, Variant::Lean, stamp(Some(Variant::Lean)));
+        assert_eq!(freshness(&lean, Some(Lang::Es), own), Freshness::Stale, "the other language is other text");
+    }
+
+    #[test]
+    fn a_stamp_with_an_unknown_variant_reads_as_stale() {
+        let own = v("0.88.0");
+        let unknown = "<!-- clawg 0.99.0 protocol=leaner -->";
+        assert_eq!(Stamp::parse(unknown), None, "a variant this binary does not know");
+        let lean = block("\n", None, Variant::Lean, Stamp { version: v("0.99.0"), choice: Some(Variant::Lean) });
+        let later = lean.replacen("<!-- clawg 0.99.0 protocol=lean -->", unknown, 1);
+        assert_eq!(read_stamp(&later), None, "its stamp reads as none");
+        assert_eq!(freshness(&later, None, own), Freshness::Stale, "stale, not newer: the version is never read");
+        let plan_ = plan(&asking_for(None, &later), Mode::Install).unwrap();
+        assert_eq!((plan_.block, plan_.variant), (BlockStep::Rewritten, Some(Variant::Full)), "setup writes the default over it");
     }
 
     fn asking_for(protocol: Option<Variant>, instructions: &str) -> State {
@@ -1565,7 +1624,7 @@ mod tests {
         let mine = |block: &str| format!("# Mine\n\nSome rules.\n\n{block}\n\nAfter.\n");
         let before_stamps = mine(&unstamped(None, Variant::Full));
 
-        for variant in [Variant::Short, Variant::Off, Variant::Full] {
+        for variant in [Variant::Short, Variant::Lean, Variant::Off, Variant::Full] {
             let chosen = plan(&asking_for(Some(variant), &before_stamps), Mode::Install).unwrap();
             assert_eq!((chosen.block, chosen.variant), (BlockStep::Rewritten, Some(variant)), "{variant:?}");
             let stamp = Stamp { version: v("0.88.0"), choice: Some(variant) };
@@ -1598,7 +1657,9 @@ mod tests {
 
     #[test]
     fn a_new_version_with_the_same_text_rewrites_nothing() {
-        for (choice, requested) in [(None, None), (Some(Variant::Short), None), (Some(Variant::Short), Some(Variant::Short)), (Some(Variant::Off), None)] {
+        for (choice, requested) in
+            [(None, None), (Some(Variant::Short), None), (Some(Variant::Short), Some(Variant::Short)), (Some(Variant::Lean), None), (Some(Variant::Off), None)]
+        {
             let variant = choice.unwrap_or(Variant::Full);
             let older = block("\n", None, variant, Stamp { version: v("0.87.0"), choice });
             let plan_ = plan(&asking_for(requested, &older), Mode::Install).unwrap();
@@ -1964,6 +2025,70 @@ mod tests {
         let (report, code) = report(&plan, &s, None);
         assert_eq!(code, 0, "{report}");
         assert!(report.contains("would add PostToolUse, PostToolUseFailure; SessionStart, UserPromptSubmit, SessionEnd already there"), "{report}");
+    }
+
+    #[test]
+    fn a_tool_hook_counts_only_under_a_matcher_that_runs_after_a_shell_call() {
+        let with = |tool_groups: Value| {
+            let settings = serde_json::json!({ "hooks": {
+                "SessionStart": [{ "matcher": "startup", "hooks": [hook("session-start")] }],
+                "UserPromptSubmit": [{ "hooks": [hook("user-prompt-submit")] }],
+                "SessionEnd": [{ "hooks": [hook("session-end")] }],
+                "PostToolUse": tool_groups.clone(),
+                "PostToolUseFailure": tool_groups
+            }})
+            .to_string();
+            let plan = plan(&state(None, Some(&settings), None), Mode::Install).unwrap();
+            let missing = missing_tool_hooks(&settings, Profile::Dev);
+            (plan, missing)
+        };
+
+        let (elsewhere, missing) = with(serde_json::json!([{ "matcher": "Edit", "hooks": [hook("post-tool-use"), hook("post-tool-use-failure")] }]));
+        assert_eq!(elsewhere.hooks.added, ["PostToolUse", "PostToolUseFailure"], "{:?}", elsewhere.hooks);
+        assert_eq!(elsewhere.hooks.unchanged, ["SessionStart", "UserPromptSubmit", "SessionEnd"], "a session-start hook counts under any matcher");
+        assert!(elsewhere.hooks.conflicts.is_empty(), "{:?}", elsewhere.hooks);
+        assert_eq!(missing, ["PostToolUse", "PostToolUseFailure"]);
+        let value: Value = serde_json::from_str(written(&elsewhere.settings)).unwrap();
+        assert_eq!(value["hooks"]["PostToolUse"][1], serde_json::json!({ "matcher": "Bash", "hooks": [hook("post-tool-use")] }));
+
+        // A space in a regular expression is one more character to match.
+        let (regex, missing) = with(serde_json::json!([{ "matcher": "Notebook.*| Bash", "hooks": [hook("post-tool-use"), hook("post-tool-use-failure")] }]));
+        assert_eq!(regex.hooks.added, ["PostToolUse", "PostToolUseFailure"], "{:?}", regex.hooks);
+        assert_eq!(missing, ["PostToolUse", "PostToolUseFailure"]);
+
+        for matcher in [Some("Edit|Bash"), Some("Edit| Bash"), Some("Edit , Bash"), Some("*"), Some(""), None] {
+            let mut group = serde_json::json!({ "hooks": [hook("post-tool-use"), hook("post-tool-use-failure")] });
+            if let Some(m) = matcher {
+                group["matcher"] = m.into();
+            }
+            let (there, missing) = with(serde_json::json!([group]));
+            assert!(there.hooks.added.is_empty(), "{matcher:?}: {:?}", there.hooks);
+            assert!(missing.is_empty(), "{matcher:?}: {missing:?}");
+        }
+    }
+
+    #[test]
+    fn an_old_tool_hook_is_migrated_only_under_a_matcher_that_runs_after_a_shell_call() {
+        let old = |arg: &str| shell_hook(&format!("/old/clawg hook {arg} --agent claude-code --profile dev"));
+        let settings = serde_json::json!({ "hooks": {
+            "SessionStart": [{ "hooks": [hook("session-start")] }],
+            "PostToolUse": [
+                { "matcher": "Edit", "hooks": [old("post-tool-use")] },
+                { "matcher": "Bash", "hooks": [old("post-tool-use")] }
+            ]
+        }})
+        .to_string();
+        let plan = plan(&state(None, Some(&settings), None), Mode::Install).unwrap();
+        assert_eq!(plan.hooks.migrated, ["PostToolUse"], "{:?}", plan.hooks);
+        let value: Value = serde_json::from_str(written(&plan.settings)).unwrap();
+        assert_eq!(
+            value["hooks"]["PostToolUse"],
+            serde_json::json!([
+                { "matcher": "Edit", "hooks": [old("post-tool-use")] },
+                { "matcher": "Bash", "hooks": [hook("post-tool-use")] }
+            ]),
+            "a group that never runs after a shell call is left as it was"
+        );
     }
 
     #[test]
