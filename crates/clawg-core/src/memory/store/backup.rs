@@ -1233,6 +1233,7 @@ mod tests {
             })
             .await
             .unwrap();
+        store.conn.clone().close().await.unwrap();
 
         assert!(matches!(result, Err(BackupError::Snapshot { .. })), "got {result:?}");
         assert_eq!(files_in(&backups), Vec::<String>::new());
