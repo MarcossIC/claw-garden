@@ -101,7 +101,7 @@ impl ImportControl {
     }
 
     /// Publishes `step` as the one running and starts its clock.
-    pub(super) fn begin(&self, step: Step) -> (Instant, Timing) {
+    pub fn begin(&self, step: Step) -> (Instant, Timing) {
         self.0.progress.send_modify(|p| {
             p.step = Some(step);
             p.step_started_at_ms = TimestampMs::now().as_millis_i64();

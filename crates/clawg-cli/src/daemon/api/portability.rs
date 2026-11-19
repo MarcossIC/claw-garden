@@ -389,7 +389,14 @@ async fn accept_job_for(
     }
     let Asked { source, options } = checked_fields(app, ImportFields { from, dry_run, agent, map_roots, project_map }).await?;
     let reservation = app.imports.reserve().map_err(job_refused)?;
-    let input = tokio::task::spawn_blocking(move || read_export(&path, source)).await.map_err(ApiError::internal)??;
+    let reading = control.clone();
+    let input = tokio::task::spawn_blocking(move || {
+        // Published where the file is read, as the job's first step.
+        reading.begin(Step::Read);
+        read_export(&path, source)
+    })
+    .await
+    .map_err(ApiError::internal)??;
     tokenizer_for(app, &input)?;
     let mut timings = ImportTimings::new(dry_run).with_memory(crate::daemon::process::private_bytes);
     timings.record(Timing { elapsed: started.elapsed(), ..Timing::new(Step::Read) });
@@ -930,16 +937,27 @@ mod tests {
         std::fs::write(&path, rows_file(3)).expect("an export file");
         let request: ImportJobRequest = serde_json::from_value(serde_json::json!({ "path": path })).expect("a request");
 
-        // Polled once and dropped: a zero timeout is not enough, since its
-        // deadline rounds up to the timer's next tick and a fast read can
-        // answer before it fires.
-        let mut asked = Box::pin(accept_job(app.clone(), request, ImportControl::default()));
-        let polled = std::future::Future::poll(asked.as_mut(), &mut std::task::Context::from_waker(std::task::Waker::noop()));
-        assert!(polled.is_pending(), "the request goes before it is answered");
-        drop(asked);
-        tokio::task::yield_now().await;
+        // The read says when it begins and waits there until the test lets it go.
+        let (entered, has_entered) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let gate = std::sync::Mutex::new(Some((entered, released)));
+        let control = ImportControl::default();
+        control.on_step(move |step| {
+            if step != Step::Read {
+                return;
+            }
+            if let Some((entered, released)) = gate.lock().unwrap().take() {
+                let _ = entered.send(());
+                let _ = released.recv();
+            }
+        });
+        let asked = tokio::spawn(accept_job(app.clone(), request, control));
+        tokio::time::timeout(Duration::from_secs(10), has_entered).await.expect("the read begins").expect("the gate is kept");
+        asked.abort();
+        assert!(asked.await.expect_err("the request goes before it is answered").is_cancelled());
 
         assert!(matches!(app.imports.reserve(), Err(Busy::Running(1))), "the read still holds the slot");
+        release.send(()).expect("the read waits at the gate");
         tokio::time::timeout(Duration::from_secs(10), app.imports.settled()).await.expect("the slot is given back once the read ends");
         assert!(app.imports.view(1).is_none(), "no job was started");
         assert_eq!(count(&app, "SELECT COUNT(*) FROM memory_import").await, 0);
