@@ -470,19 +470,15 @@ fn is_clawg_hook(hook: &Value, event_arg: &str, profile: Profile) -> bool {
 /// lacks for `profile`, when it has the hook of `session-start` for it: an
 /// install from before them. A file without that hook, or that is not
 /// settings, lacks nothing: it is not an install of clawg to complete. A tool
-/// hook counts only in a group whose matcher is `Bash`: under another matcher
-/// the client never runs it after a shell call.
+/// hook counts as `hooks_run_for` says, as it does for `setup`.
 pub(crate) fn missing_tool_hooks(text: &str, profile: Profile) -> Vec<&'static str> {
     let Ok(Value::Object(settings)) = serde_json::from_str::<Value>(text) else { return Vec::new() };
     let has = |event: &str, arg: &str, matcher: Option<&str>| {
-        settings.get("hooks").and_then(|hooks| hooks.get(event)).and_then(Value::as_array).is_some_and(|groups| {
-            groups
-                .iter()
-                .filter(|group| matcher.is_none_or(|m| group.get("matcher").and_then(Value::as_str) == Some(m)))
-                .filter_map(|group| group.get("hooks").and_then(Value::as_array))
-                .flatten()
-                .any(|hook| is_clawg_hook(hook, arg, profile))
-        })
+        settings
+            .get("hooks")
+            .and_then(|hooks| hooks.get(event))
+            .and_then(Value::as_array)
+            .is_some_and(|groups| hooks_run_for(groups, matcher).any(|hook| is_clawg_hook(hook, arg, profile)))
     };
     if !has("SessionStart", "session-start", None) {
         return Vec::new();
@@ -517,9 +513,31 @@ fn runs_as(hook: &Value, planned: &Value) -> bool {
     hook.get("command") == planned.get("command") && hook.get("args") == planned.get("args")
 }
 
-/// The hooks of an event's groups, in order.
-fn hooks_of(groups: &[Value]) -> impl Iterator<Item = &Value> {
-    groups.iter().filter_map(|g| g.get("hooks").and_then(Value::as_array)).flatten()
+/// The hooks of an event's groups that the client runs for what the planned
+/// `matcher` names, in order. Only the shell tool's matcher is checked: a tool
+/// hook in a group that does not run after a shell call is not installed. A
+/// `session-start` hook counts under any matcher, so an install that gave it
+/// its own does not get a second group that would run clawg twice.
+fn hooks_run_for<'a>(groups: &'a [Value], matcher: Option<&str>) -> impl Iterator<Item = &'a Value> {
+    let shell_only = matcher == Some(SHELL_TOOL_MATCHER);
+    groups
+        .iter()
+        .filter(move |group| !shell_only || runs_after_shell_call(group))
+        .filter_map(|group| group.get("hooks").and_then(Value::as_array))
+        .flatten()
+}
+
+/// Whether the client runs a tool event's group after a call to `Bash`: a
+/// group without a matcher, or with an empty one or `*`, runs after every
+/// tool, and `Edit|Bash` names it as one of its alternatives. The matcher is
+/// not read as a regular expression beyond that.
+fn runs_after_shell_call(group: &Value) -> bool {
+    match group.get("matcher") {
+        None => true,
+        Some(matcher) => matcher
+            .as_str()
+            .is_some_and(|m| m.is_empty() || m == "*" || m.split('|').any(|alternative| alternative == SHELL_TOOL_MATCHER)),
+    }
 }
 
 /// The `hooks` object of the settings, and the array of one event in it;
@@ -562,7 +580,7 @@ fn install_hooks(settings: &mut Map<String, Value>, exe: &str, profile: Profile,
         // for byte as it was.
         let (mut installed, mut legacy, mut other) = (false, false, None);
         if let Some(groups) = event_groups(settings, event, false, path, CLAUDE_LAYOUT)? {
-            for hook in hooks_of(groups).filter(|h| is_clawg_hook(h, arg, profile)) {
+            for hook in hooks_run_for(groups, matcher).filter(|h| is_clawg_hook(h, arg, profile)) {
                 if runs_as(hook, &planned) {
                     installed = true;
                 } else if is_legacy_hook(hook, arg, profile) {
@@ -1994,6 +2012,41 @@ mod tests {
         let (report, code) = report(&plan, &s, None);
         assert_eq!(code, 0, "{report}");
         assert!(report.contains("would add PostToolUse, PostToolUseFailure; SessionStart, UserPromptSubmit, SessionEnd already there"), "{report}");
+    }
+
+    #[test]
+    fn a_tool_hook_counts_only_under_a_matcher_that_runs_after_a_shell_call() {
+        let with = |tool_groups: Value| {
+            let settings = serde_json::json!({ "hooks": {
+                "SessionStart": [{ "matcher": "startup", "hooks": [hook("session-start")] }],
+                "UserPromptSubmit": [{ "hooks": [hook("user-prompt-submit")] }],
+                "SessionEnd": [{ "hooks": [hook("session-end")] }],
+                "PostToolUse": tool_groups.clone(),
+                "PostToolUseFailure": tool_groups
+            }})
+            .to_string();
+            let plan = plan(&state(None, Some(&settings), None), Mode::Install).unwrap();
+            let missing = missing_tool_hooks(&settings, Profile::Dev);
+            (plan, missing)
+        };
+
+        let (elsewhere, missing) = with(serde_json::json!([{ "matcher": "Edit", "hooks": [hook("post-tool-use"), hook("post-tool-use-failure")] }]));
+        assert_eq!(elsewhere.hooks.added, ["PostToolUse", "PostToolUseFailure"], "{:?}", elsewhere.hooks);
+        assert_eq!(elsewhere.hooks.unchanged, ["SessionStart", "UserPromptSubmit", "SessionEnd"], "a session-start hook counts under any matcher");
+        assert!(elsewhere.hooks.conflicts.is_empty(), "{:?}", elsewhere.hooks);
+        assert_eq!(missing, ["PostToolUse", "PostToolUseFailure"]);
+        let value: Value = serde_json::from_str(written(&elsewhere.settings)).unwrap();
+        assert_eq!(value["hooks"]["PostToolUse"][1], serde_json::json!({ "matcher": "Bash", "hooks": [hook("post-tool-use")] }));
+
+        for matcher in [Some("Edit|Bash"), Some("*"), Some(""), None] {
+            let mut group = serde_json::json!({ "hooks": [hook("post-tool-use"), hook("post-tool-use-failure")] });
+            if let Some(m) = matcher {
+                group["matcher"] = m.into();
+            }
+            let (there, missing) = with(serde_json::json!([group]));
+            assert!(there.hooks.added.is_empty(), "{matcher:?}: {:?}", there.hooks);
+            assert!(missing.is_empty(), "{matcher:?}: {missing:?}");
+        }
     }
 
     #[test]
