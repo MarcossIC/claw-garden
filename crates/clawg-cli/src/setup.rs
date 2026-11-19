@@ -529,14 +529,22 @@ fn hooks_run_for<'a>(groups: &'a [Value], matcher: Option<&str>) -> impl Iterato
 
 /// Whether the client runs a tool event's group after a call to `Bash`: a
 /// group without a matcher, or with an empty one or `*`, runs after every
-/// tool, and `Edit|Bash` names it as one of its alternatives. The matcher is
-/// not read as a regular expression beyond that.
+/// tool, and `Edit|Bash` names it as one of its alternatives. A matcher of only
+/// letters, digits, `_`, `-`, spaces, `,` and `|` is, for the client, a list of
+/// exact names split by `|` or `,` with spaces around them, as in `Edit, Bash`;
+/// any other is a regular expression, read here only by its `|` alternatives,
+/// where a space is one more character to match.
 fn runs_after_shell_call(group: &Value) -> bool {
-    match group.get("matcher") {
-        None => true,
-        Some(matcher) => matcher
-            .as_str()
-            .is_some_and(|m| m.is_empty() || m == "*" || m.split('|').any(|alternative| alternative == SHELL_TOOL_MATCHER)),
+    let Some(matcher) = group.get("matcher") else { return true };
+    let Some(m) = matcher.as_str() else { return false };
+    if m.is_empty() || m == "*" {
+        return true;
+    }
+    let is_list = m.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | ' ' | ',' | '|'));
+    if is_list {
+        m.split(['|', ',']).any(|name| name.trim() == SHELL_TOOL_MATCHER)
+    } else {
+        m.split('|').any(|alternative| alternative == SHELL_TOOL_MATCHER)
     }
 }
 
@@ -594,7 +602,7 @@ fn install_hooks(settings: &mut Map<String, Value>, exe: &str, profile: Profile,
             step.conflicts.push((event, other));
         } else if legacy {
             let groups = event_groups(settings, event, false, path, CLAUDE_LAYOUT)?.expect("found above");
-            migrate_hooks(groups, &planned, installed, arg, profile);
+            migrate_hooks(groups, matcher, &planned, installed, arg, profile);
             step.migrated.push(event);
         } else if installed {
             step.unchanged.push(event);
@@ -614,10 +622,15 @@ fn install_hooks(settings: &mut Map<String, Value>, exe: &str, profile: Profile,
 
 /// Puts `planned` where the first hook as setup wrote it was, so its group
 /// keeps its place and its matcher, and drops the others: one more would run
-/// clawg twice. A group left without hooks by that goes too.
-fn migrate_hooks(groups: &mut Vec<Value>, planned: &Value, installed: bool, event_arg: &str, profile: Profile) {
+/// clawg twice. A group left without hooks by that goes too. Only the groups
+/// [`hooks_run_for`] reads for `matcher` are touched: the others stay as they were.
+fn migrate_hooks(groups: &mut Vec<Value>, matcher: Option<&str>, planned: &Value, installed: bool, event_arg: &str, profile: Profile) {
+    let shell_only = matcher == Some(SHELL_TOOL_MATCHER);
     let mut placed = installed;
     groups.retain_mut(|group| {
+        if shell_only && !runs_after_shell_call(group) {
+            return true;
+        }
         let Some(hooks) = group.get_mut("hooks").and_then(Value::as_array_mut) else { return true };
         let before = hooks.len();
         hooks.retain_mut(|hook| {
@@ -2038,7 +2051,12 @@ mod tests {
         let value: Value = serde_json::from_str(written(&elsewhere.settings)).unwrap();
         assert_eq!(value["hooks"]["PostToolUse"][1], serde_json::json!({ "matcher": "Bash", "hooks": [hook("post-tool-use")] }));
 
-        for matcher in [Some("Edit|Bash"), Some("*"), Some(""), None] {
+        // A space in a regular expression is one more character to match.
+        let (regex, missing) = with(serde_json::json!([{ "matcher": "Notebook.*| Bash", "hooks": [hook("post-tool-use"), hook("post-tool-use-failure")] }]));
+        assert_eq!(regex.hooks.added, ["PostToolUse", "PostToolUseFailure"], "{:?}", regex.hooks);
+        assert_eq!(missing, ["PostToolUse", "PostToolUseFailure"]);
+
+        for matcher in [Some("Edit|Bash"), Some("Edit| Bash"), Some("Edit , Bash"), Some("*"), Some(""), None] {
             let mut group = serde_json::json!({ "hooks": [hook("post-tool-use"), hook("post-tool-use-failure")] });
             if let Some(m) = matcher {
                 group["matcher"] = m.into();
@@ -2047,6 +2065,30 @@ mod tests {
             assert!(there.hooks.added.is_empty(), "{matcher:?}: {:?}", there.hooks);
             assert!(missing.is_empty(), "{matcher:?}: {missing:?}");
         }
+    }
+
+    #[test]
+    fn an_old_tool_hook_is_migrated_only_under_a_matcher_that_runs_after_a_shell_call() {
+        let old = |arg: &str| shell_hook(&format!("/old/clawg hook {arg} --agent claude-code --profile dev"));
+        let settings = serde_json::json!({ "hooks": {
+            "SessionStart": [{ "hooks": [hook("session-start")] }],
+            "PostToolUse": [
+                { "matcher": "Edit", "hooks": [old("post-tool-use")] },
+                { "matcher": "Bash", "hooks": [old("post-tool-use")] }
+            ]
+        }})
+        .to_string();
+        let plan = plan(&state(None, Some(&settings), None), Mode::Install).unwrap();
+        assert_eq!(plan.hooks.migrated, ["PostToolUse"], "{:?}", plan.hooks);
+        let value: Value = serde_json::from_str(written(&plan.settings)).unwrap();
+        assert_eq!(
+            value["hooks"]["PostToolUse"],
+            serde_json::json!([
+                { "matcher": "Edit", "hooks": [old("post-tool-use")] },
+                { "matcher": "Bash", "hooks": [hook("post-tool-use")] }
+            ]),
+            "a group that never runs after a shell call is left as it was"
+        );
     }
 
     #[test]
