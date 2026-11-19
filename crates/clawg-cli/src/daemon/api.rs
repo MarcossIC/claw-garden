@@ -16,8 +16,9 @@
 //! *before* it can be expected to have found the token file — and it discloses
 //! nothing a port scan would not.
 
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+mod sessions;
+#[cfg(test)]
+mod test_support;
 
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
@@ -27,58 +28,68 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post};
 use axum::{Json, Router};
 use clawg_core::memory::admin::{
-    Deleted, delete_memory_core, get_memory_core, list_memories_core, memory_stats_core, query_has_tokens,
-    update_memory_core, ListParams, MemoryAdminRow, MemoryPatch, StatsParams,
-    UpdateError, UpdatedRow, restore_memory_core, RestoreError, RestoredRow,
+    delete_memory_core, Deleted, get_memory_core, list_memories_core, ListParams, memory_stats_core,
+    MemoryAdminRow, MemoryPatch, query_has_tokens, restore_memory_core, RestoredRow, RestoreError,
+    StatsParams, update_memory_core, UpdatedRow, UpdateError,
 };
 use clawg_core::memory::backup::Reason;
 use clawg_core::memory::bootstrap::EmbedderStatus;
 use clawg_core::memory::chunker::ChatChunker;
-use clawg_core::memory::dispute::{judge_pair, open_pairs, resolve_dispute_core, OpenPairs, Outcome, Resolution, ResolveError, Verdict};
-use clawg_core::memory::embedder::{EmbedError, EmbedRole, Embedder};
-use clawg_core::memory::portability::timing::seconds;
-use clawg_core::memory::project_docs::{self, DocHit, DocIndexError, RefreshGuard};
-use clawg_core::memory::worker::{
-    ChunkOutcome, IngestFailure, IngestReport, SavedChunk,
-};
 use clawg_core::memory::clock::TimestampMs;
-use clawg_core::memory::language::{count_saves_in, count_saves_in_projects};
-use clawg_core::memory::portability::timing::{Step, Timing};
-use clawg_core::memory::portability::{
-    self, ImportControl, ImportError, ImportInput, ImportOptions, ImportReport, ImportTimings, Imported, MapProject, MapTarget, UndoError,
-    UndoReport, MAX_IMPORT_BYTES,
+use clawg_core::memory::dispute::{
+    judge_pair, open_pairs, OpenPairs, Outcome, Resolution, resolve_dispute_core, ResolveError,
+    Verdict,
 };
+use clawg_core::memory::embedder::{Embedder, EmbedError, EmbedRole};
 use clawg_core::memory::identity::{Disk, Ground, ProjectIdentity};
+use clawg_core::memory::language::{count_saves_in, count_saves_in_projects};
+use clawg_core::memory::merge::{canonical, merge_core, MergeError, MergeReport, undo_merge_core};
+use clawg_core::memory::outbox::{OutboxActionError, OutboxState, OutboxSummary};
+use clawg_core::memory::portability::timing::{seconds, Step, Timing};
+use clawg_core::memory::portability::{
+    ImportControl, Imported, ImportError, ImportInput, ImportOptions, ImportReport, ImportTimings,
+    MapProject, MapTarget, MAX_IMPORT_BYTES, UndoError, UndoReport,
+};
 use clawg_core::memory::project::{check_root, register_project, RegisterError, RegisterOutcome, Registration};
-use clawg_core::memory::subfolder::{declare_subfolder, SubfolderError};
-use clawg_core::memory::merge::{canonical, merge_core, undo_merge_core, MergeError, MergeReport};
-use clawg_core::memory::project_delete::{delete_core, undo_delete_core, DeleteError, DeleteReport};
-use clawg_core::memory::registry::{
-    answer_suggestion_core, check_folder, find_project, keep_apart, list_deletes, list_projects, locate_folder, pending_suggestions,
-    rename_project, resolve_project, AnswerError, Answered, Born, KeepApartError, KeptApart, ListedDelete, ListedProject, ListedSuggestion,
-    LocateError, Located, Named, Project, RenameError,
-    Resolution as ProjectResolution, ResolveError as ProjectResolveError, ResolveOptions, SuggestionAnswer, UserAnswer,
-};
-use clawg_core::memory::relocate::{move_memories_core, undo_move_core, MoveError, MoveFilter, MoveReport, ProjectFilter};
+use clawg_core::memory::project_delete::{delete_core, DeleteError, DeleteReport, undo_delete_core};
+use clawg_core::memory::project_docs::{DocHit, DocIndexError, RefreshGuard};
 use clawg_core::memory::prompt_builder::{
-    build_memory_prompt, build_session_prompt, PromptBlock, QueryTexts, Retrieval, DEFAULT_BUDGET, MAX_BUDGET,
+    build_memory_prompt, build_session_prompt, DEFAULT_BUDGET, MAX_BUDGET, PromptBlock, QueryTexts,
+    Retrieval,
 };
-use clawg_core::memory::sharing::{self, Reach, Reader};
+use clawg_core::memory::redact::SecretKind;
+use clawg_core::memory::registry::{
+    answer_suggestion_core, Answered, AnswerError, Born, check_folder, find_project, keep_apart,
+    KeepApartError, KeptApart, list_deletes, list_projects, ListedDelete, ListedProject,
+    ListedSuggestion, locate_folder, Located, LocateError, Named, pending_suggestions, Project,
+    rename_project, RenameError, Resolution as ProjectResolution, resolve_project,
+    ResolveError as ProjectResolveError, ResolveOptions, SuggestionAnswer, UserAnswer,
+};
+use clawg_core::memory::relocate::{
+    move_memories_core, MoveError, MoveFilter, MoveReport, ProjectFilter, undo_move_core,
+};
+use clawg_core::memory::save::{check_operation_id, NewSave, SaveInput, SaveRejected};
+use clawg_core::memory::sharing::{Reach, Reader};
+use clawg_core::memory::store_insert::MemoryType;
+use clawg_core::memory::subfolder::{declare_subfolder, SubfolderError};
 use clawg_core::memory::synthesis::{
-    conclusions_to_review_count, synthesis_core, unreviewed_count, ConclusionReview, LostSource,
-    Synthesis, SynthesisParams,
+    ConclusionReview, conclusions_to_review_count, LostSource, Synthesis, synthesis_core,
+    SynthesisParams, unreviewed_count,
 };
-use clawg_core::memory::{read_save_core, search_all_memories, RankedHit, SaveText, SearchScope};
+use clawg_core::memory::worker::{ChunkOutcome, IngestFailure, IngestReport, SavedChunk};
+use clawg_core::memory::{
+    portability, project_docs, RankedHit, read_save_core, SaveText, search_all_memories,
+    SearchScope, sharing,
+};
+use clawg_core::metrics::sessions::{Activity, UNSPECIFIED};
 use clawg_core::metrics::{EventKind, Recorder, Unit};
 use clawg_core::paths::Profile;
 use clawg_core::preferences::Lang;
-use clawg_core::memory::outbox::{OutboxActionError, OutboxState, OutboxSummary};
-use clawg_core::memory::redact::SecretKind;
-use clawg_core::memory::save::{check_operation_id, NewSave, SaveInput, SaveRejected};
-use clawg_core::memory::store_insert::MemoryType;
-use clawg_core::metrics::sessions::{label, Activity, HookEvent, Who, CLIENTS, END_REASONS, OTHER, SOURCES, UNSPECIFIED};
-use clawg_core::runtime::{AcceptError, Accepted, MemoryRuntime};
+use clawg_core::runtime::{Accepted, AcceptError, MemoryRuntime};
 use serde::{Deserialize, Serialize};
+use sessions::{count_empty_search, count_tool_call, end_session, register_session, sessions_follow};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 
 use crate::relevance::shown_hits;
@@ -86,13 +97,14 @@ use crate::relevance::shown_hits;
 use super::guard::{admits, RefusalLog};
 use super::imports::{Busy, Cancel, End, ImportJobs, JobView, Meta};
 use super::lifecycle::now_ms;
-use super::metrics::{metrics_body, prometheus_text, time_request, HttpMeter, Transport};
-use super::sessions::{check_session_id, tool_label, SessionRegistry};
+use super::metrics::{HttpMeter, metrics_body, prometheus_text, time_request, Transport};
+use super::sessions::SessionRegistry;
 
 /// Largest `limit` any search will honour. A retrieval request is a vector
 /// scan plus a rerank; letting a caller ask for thousands turns one HTTP call
 /// into a stall for every other caller sharing this single-threaded store.
 pub const MAX_SEARCH_LIMIT: usize = 50;
+
 /// `limit` used when the caller does not say.
 pub const DEFAULT_SEARCH_LIMIT: usize = 10;
 
@@ -381,41 +393,6 @@ impl From<SaveRequest> for SaveInput {
             topic_key: body.topic_key,
         }
     }
-}
-
-#[derive(Debug, Deserialize)]
-pub struct SessionRequest {
-    pub agent_id: String,
-    #[serde(default)]
-    pub project_id: Option<String>,
-    pub session_id: String,
-    /// What the hook reports: `start` or `prompt`. Absent, as a hook from
-    /// before the log of sessions sends it, the session is only registered.
-    #[serde(default)]
-    pub event: Option<String>,
-    /// What started the session, with `start`.
-    #[serde(default)]
-    pub source: Option<String>,
-    /// The client whose hook this is.
-    #[serde(default)]
-    pub client: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct SessionEndRequest {
-    pub session_id: String,
-    #[serde(default)]
-    pub reason: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct ToolCallRequest {
-    pub agent_id: String,
-    #[serde(default)]
-    pub project_id: Option<String>,
-    pub tool: String,
-    #[serde(default)]
-    pub failed: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1678,73 +1655,6 @@ fn record_context(metrics: &Recorder, retrieval: &RetrievalState, prompt_bytes: 
     metrics.observe("context.prompt_bytes", Unit::Bytes, &[], prompt_bytes as u64);
     for block in cut {
         metrics.gauge("context.cut", &[("block", block.as_str())], 1.0);
-    }
-}
-
-/// Records the host session `agent_id` works in for `project_id`, as a hook
-/// reports it; the saves that follow are stamped with it. What the hook says
-/// happened is counted in the row of that session.
-async fn register_session(
-    State(app): State<Arc<AppCtx>>,
-    Json(body): Json<SessionRequest>,
-) -> ApiResult<StatusCode> {
-    check_session_id(&body.session_id).map_err(|e| ApiError::bad_request(e.to_string()))?;
-    let project_id = live_project(&app, body.project_id).await?;
-    app.sessions.register(&body.agent_id, project_id.as_deref(), &body.session_id);
-    let who = Who {
-        session_id: &body.session_id,
-        agent_id: &body.agent_id,
-        project_id: project_id.as_deref(),
-        client: body.client.as_deref().map_or(OTHER, |client| label(&CLIENTS, client)),
-        utc_offset_s: super::process::utc_offset_s(),
-    };
-    let event = match body.event.as_deref() {
-        Some("start") => HookEvent::Start(body.source.as_deref().map_or(UNSPECIFIED, |source| label(&SOURCES, source))),
-        Some("prompt") => HookEvent::Prompt,
-        _ => HookEvent::Seen,
-    };
-    app.runtime.metrics.sessions().hook(who, now_ms() as i64, event);
-    Ok(StatusCode::NO_CONTENT)
-}
-
-/// Closes the row of a session its client says ended, with the reason it
-/// gives. It names no project, so a hook can send it without registering one.
-async fn end_session(State(app): State<Arc<AppCtx>>, Json(body): Json<SessionEndRequest>) -> ApiResult<StatusCode> {
-    check_session_id(&body.session_id).map_err(|e| ApiError::bad_request(e.to_string()))?;
-    let reason = body.reason.as_deref().map_or(OTHER, |reason| label(&END_REASONS, reason));
-    app.runtime.metrics.sessions().end(&body.session_id, now_ms() as i64, reason);
-    Ok(StatusCode::NO_CONTENT)
-}
-
-/// Counts a call of one of the bridge's tools for the session its agent and
-/// project are in, as the bridge reports it once the tool has answered.
-async fn count_tool_call(State(app): State<Arc<AppCtx>>, Json(body): Json<ToolCallRequest>) -> ApiResult<StatusCode> {
-    let project_id = live_project(&app, body.project_id).await?;
-    if let Some(session) = app.sessions.current(&body.agent_id, project_id.as_deref()) {
-        let call = Activity::Call { tool: tool_label(&body.tool), failed: body.failed };
-        app.runtime.metrics.sessions().activity(&session, now_ms() as i64, call);
-    }
-    Ok(StatusCode::NO_CONTENT)
-}
-
-/// Counts a search that found nothing for the session of `agent_id` in the
-/// one project it read, or in none; a search over several is nobody's.
-fn count_empty_search(app: &AppCtx, agent_id: &str, projects: Option<&[String]>) {
-    let project = match projects {
-        None => None,
-        Some([project]) => Some(project.as_str()),
-        Some(_) => return,
-    };
-    if let Some(session) = app.sessions.current(agent_id, project) {
-        app.runtime.metrics.sessions().activity(&session, now_ms() as i64, Activity::EmptySearch);
-    }
-}
-
-/// The sessions of a merged project go to the one that stays. A dry run, or
-/// a merge that wrote nothing, moves none.
-fn sessions_follow(app: &AppCtx, merged: &MergeReport) {
-    if merged.merge_id.is_some() && !merged.dry_run {
-        app.runtime.metrics.sessions().merge_project(&merged.source, &merged.target);
     }
 }
 
@@ -3186,6 +3096,7 @@ async fn docs_in(store: &clawg_core::memory::MemoryStore, project_id: &str) -> A
 
 /// Largest `limit` a documentation search honours.
 pub const MAX_DOCS_LIMIT: usize = 20;
+
 /// `limit` of a documentation search when the caller does not say.
 pub const DEFAULT_DOCS_LIMIT: usize = 5;
 
@@ -3289,6 +3200,11 @@ async fn shutdown(State(app): State<Arc<AppCtx>>) -> (StatusCode, Json<QueuedBod
 mod tests {
     use super::*;
     use clawg_core::memory::embedder::GatedEmbedder;
+
+    use super::test_support::{
+        answer_of, count, daemon_embedding_with, daemon_for_jobs, daemon_without_embedder, reader_query,
+        run_sql, seed_memory, status_and_body,
+    };
 
     fn chunk(id: i64, outcome: ChunkOutcome) -> SavedChunk {
         SavedChunk { id, outcome }
@@ -3447,48 +3363,6 @@ mod tests {
     /// The rows an import writes in one batch.
     const WRITE_BATCH: usize = 256;
 
-    /// A daemon over an in-memory store and the directory it keeps its
-    /// snapshots in.
-    async fn daemon_for_jobs() -> (Arc<AppCtx>, tempfile::TempDir) {
-        daemon_embedding_with(None).await
-    }
-
-    /// The same daemon, embedding with `embedder` when there is one.
-    async fn daemon_embedding_with(embedder: Option<Arc<dyn Embedder>>) -> (Arc<AppCtx>, tempfile::TempDir) {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let (runtime, _rx) = MemoryRuntime::new_for_test(dir.path().to_path_buf()).await;
-        let runtime = match embedder {
-            Some(embedder) => {
-                let cell = Arc::new(once_cell::sync::OnceCell::<Arc<dyn Embedder>>::new());
-                cell.set(embedder).ok();
-                MemoryRuntime { embedder: cell, ..runtime }
-            }
-            None => runtime,
-        };
-        (daemon_on(runtime), dir)
-    }
-
-    /// The same daemon before its embedder loaded.
-    async fn daemon_without_embedder() -> (Arc<AppCtx>, tempfile::TempDir) {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let (runtime, _rx) = MemoryRuntime::new_for_test(dir.path().to_path_buf()).await;
-        (daemon_on(MemoryRuntime { embedder: Default::default(), ..runtime }), dir)
-    }
-
-    fn daemon_on(runtime: MemoryRuntime) -> Arc<AppCtx> {
-        let (shutdown, _) = tokio::sync::watch::channel(false);
-        Arc::new(AppCtx {
-            runtime,
-            token: "job-token".to_string(),
-            profile: Profile::Dev,
-            started_at: Instant::now(),
-            shutdown,
-            save_timeout: SAVE_CONFIRM_TIMEOUT,
-            sessions: Default::default(),
-            imports: Default::default(),
-        })
-    }
-
     /// A clawg export of `rows` rows.
     fn rows_file(rows: usize) -> String {
         let header = serde_json::json!({
@@ -3566,10 +3440,6 @@ mod tests {
             }
         });
         control
-    }
-
-    async fn count(app: &AppCtx, sql: &'static str) -> i64 {
-        app.runtime.store.conn_for_test().call(move |c| c.query_row(sql, [], |r| r.get(0))).await.expect("count")
     }
 
     /// How many notes have rows, and how many different numbers of rows a
@@ -4363,17 +4233,6 @@ mod tests {
         }
     }
 
-    /// The status and the JSON body of a handler's answer.
-    async fn status_and_body(response: Response) -> (StatusCode, serde_json::Value) {
-        let status = response.status();
-        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.expect("the body");
-        (status, serde_json::from_slice(&bytes).expect("a JSON body"))
-    }
-
-    async fn run_sql(app: &AppCtx, sql: String) {
-        app.runtime.store.conn_for_test().call(move |c| c.execute_batch(&sql)).await.expect("run the SQL");
-    }
-
     /// The status and the whole body `register` answers a refused
     /// registration with, for every rule and in the order it checks them.
     #[tokio::test]
@@ -4585,38 +4444,6 @@ mod tests {
         for (body, expected) in cases {
             assert_eq!(refused(&app, body.clone()).await, expected, "{body}");
         }
-    }
-
-    /// The status and the JSON body of a handler's answer, accepted or refused.
-    async fn answer_of<T: Serialize>(answer: ApiResult<Json<T>>) -> (StatusCode, serde_json::Value) {
-        status_and_body(match answer {
-            Ok(body) => body.into_response(),
-            Err(e) => e.into_response(),
-        })
-        .await
-    }
-
-    /// A live row of `memory` saved by `agent`.
-    async fn seed_memory(app: &AppCtx, agent: &str, memory_type: &str, content: &str) -> i64 {
-        let (agent, memory_type, content) = (agent.to_string(), memory_type.to_string(), content.to_string());
-        app.runtime
-            .store
-            .conn_for_test()
-            .call(move |c| {
-                c.execute(
-                    "INSERT INTO memory (scope, agent_id, content, memory_type, source, created_at, created_by_type, \
-                     created_by_ref, last_modified_at, last_accessed_at, importance, tier, status) \
-                     VALUES ('agent', ?1, ?2, ?3, 'explicit', 1, 'agent', ?1, 1, 1, 5.0, 3, 'active')",
-                    [&agent, &content, &memory_type],
-                )?;
-                Ok::<_, rusqlite::Error>(c.last_insert_rowid())
-            })
-            .await
-            .expect("seed a row")
-    }
-
-    fn reader_query(agent: Option<&str>) -> Query<ReaderQuery> {
-        Query(ReaderQuery { agent: agent.map(str::to_string) })
     }
 
     /// The status and the whole body `update_memory` answers with, for every

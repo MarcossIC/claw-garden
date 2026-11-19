@@ -144,6 +144,13 @@ fn production_lines_naming(source: &str, names: impl Fn(&str) -> bool) -> Vec<us
 
 /// How many of `lines` are production code.
 fn production_end(lines: &[&str]) -> usize {
+    let all_test = lines
+        .iter()
+        .take_while(|line| line.trim_end().starts_with("//!") || line.trim_end().starts_with("#!["))
+        .any(|line| line.trim_end() == "#![cfg(test)]");
+    if all_test {
+        return 0;
+    }
     lines
         .windows(2)
         .position(|pair| pair[0] == "#[cfg(test)]" && pair[1].starts_with("mod ") && pair[1].trim_end().ends_with('{'))
@@ -194,6 +201,13 @@ fn a_test_module_in_another_file_does_not_end_the_production_code() {
     let source = "#[cfg(test)]\nmod helpers;\n\nuse rusqlite::Connection;\n\n#[cfg(test)]\nmod tests {\n    use rusqlite::params;\n}\n";
     assert_eq!(production_lines_naming(source, reaches_the_connection), [4]);
     assert_eq!(production_lines_naming(&source.replace('\n', "\r\n"), reaches_the_connection), [4]);
+}
+
+#[test]
+fn a_file_that_is_all_test_code_has_no_production_lines() {
+    let source = "//! Helpers.\n#![cfg(test)]\n\nuse rusqlite::Connection;\n";
+    assert!(production_lines_naming(source, reaches_the_connection).is_empty());
+    assert_eq!(production_lines_naming("//! Helpers.\n\nuse rusqlite::Connection;\n", reaches_the_connection), [3]);
 }
 
 /// Whether `source` names the module `module` of `clawg_core::memory`: in a
