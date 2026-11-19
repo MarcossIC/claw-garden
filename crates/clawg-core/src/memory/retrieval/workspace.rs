@@ -2,6 +2,7 @@
 //! the AUTO section is regenerated from DB queries, the USER section is
 //! preserved byte-for-byte.
 
+use crate::memory::domain::record::MemoryType;
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
@@ -393,7 +394,7 @@ async fn fetch_auto_rows(
             let mut stmt = c.prepare(AUTO_PREFERENCES_SQL)?;
             let user_prefs: Vec<MemoryLine> = readable(
                 stmt.query_map(rusqlite::params![reach, proj], map_memory)?,
-                "user_preference",
+                MemoryType::UserPreference.as_str(),
             );
 
             // Query 2: architectural_decision rows, scoped to project when provided,
@@ -419,7 +420,7 @@ async fn fetch_auto_rows(
                 )?;
                 let rows: Vec<MemoryLine> = readable(
                     stmt2.query_map(rusqlite::params![agent, pid], map_memory)?,
-                    "architectural_decision",
+                    MemoryType::ArchitecturalDecision.as_str(),
                 );
                 rows
             } else {
@@ -435,7 +436,7 @@ async fn fetch_auto_rows(
                 )?;
                 let rows: Vec<MemoryLine> = readable(
                     stmt2.query_map(rusqlite::params![agent], map_memory)?,
-                    "architectural_decision",
+                    MemoryType::ArchitecturalDecision.as_str(),
                 );
                 rows
             };

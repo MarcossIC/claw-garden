@@ -4,6 +4,7 @@
 //! same project, whoever saved them, as far as its agent reaches them; the
 //! replaced rows stay, `superseded` by the new save, as its history.
 
+use crate::memory::domain::record::StoredType;
 use rusqlite::Connection;
 use serde::Serialize;
 
@@ -61,7 +62,7 @@ pub(crate) struct TopicScope {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct TopicRow {
     pub id: i64,
-    pub memory_type: String,
+    pub memory_type: StoredType,
     pub importance: f64,
 }
 

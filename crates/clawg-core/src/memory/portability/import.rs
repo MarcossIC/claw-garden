@@ -40,6 +40,7 @@ use serde::{Deserialize, Serialize};
 use crate::memory::store::backup::Reason;
 use crate::memory::embedding::chunker::{embedding_text, ChatChunker};
 use crate::memory::domain::clock::TimestampMs;
+use crate::memory::domain::record::{MemoryStatus, StoredStatus};
 use crate::memory::store::dedup::content_hash;
 use crate::memory::embedding::embedder::{longest_first, EmbedError, EmbedRole, Embedder};
 use crate::memory::projects::identity::{Ground, ReadAhead};
@@ -328,14 +329,14 @@ struct Row {
 
 impl Row {
     fn live(&self) -> bool {
-        self.src.deleted_at.is_none() && self.src.status != "superseded"
+        self.src.deleted_at.is_none() && self.src.status != MemoryStatus::Superseded
     }
 
     fn state(&self) -> &'static str {
-        match (self.src.deleted_at, self.src.status.as_str()) {
+        match (self.src.deleted_at, self.src.status.known()) {
             (Some(_), _) => "deleted",
-            (None, "superseded") => "superseded",
-            _ => "live",
+            (None, Some(MemoryStatus::Superseded)) => "superseded",
+            (None, Some(MemoryStatus::Active | MemoryStatus::Disputed) | None) => "live",
         }
     }
 }
@@ -918,7 +919,7 @@ struct NewRow<'a> {
     row: &'a Row,
     project: Option<&'a str>,
     key: Option<&'a str>,
-    status: &'a str,
+    status: StoredStatus,
     superseded_by: Option<i64>,
     cause: Option<&'a str>,
     vector: Option<&'a [u8]>,
@@ -1313,7 +1314,7 @@ struct Known {
     created_at: i64,
     key: Option<String>,
     deleted: bool,
-    status: String,
+    status: StoredStatus,
     /// `created_by_ref` of an imported row.
     origin: Option<String>,
     by_ref: String,
@@ -1336,7 +1337,7 @@ impl Known {
     }
 
     fn live(&self) -> bool {
-        !self.deleted && matches!(self.status.as_str(), "active" | "disputed")
+        !self.deleted && self.status.is_live()
     }
 
     fn origin_row(&self) -> OriginRow {
@@ -1434,7 +1435,7 @@ impl Seat for Planned {
             created_at: src.created_at,
             key: new.key.map(str::to_owned),
             deleted: src.deleted_at.is_some(),
-            status: new.status.to_owned(),
+            status: new.status.clone(),
             origin: (src.source == "import").then(|| src.created_by_ref.clone()),
             by_ref: src.created_by_ref.clone(),
         });
@@ -1443,7 +1444,7 @@ impl Seat for Planned {
 
     fn revise(&mut self, id: i64, _by: i64) -> Result<(), Infallible> {
         if let Some(row) = self.rows.get_mut(&id).filter(|r| r.live()) {
-            row.status = "superseded".to_owned();
+            row.status = MemoryStatus::Superseded.into();
         }
         Ok(())
     }
@@ -1851,8 +1852,8 @@ fn place<S: Seat>(
         return Ok(None);
     }
     let (status, superseded_by, cause) = match under.or(topic_holder) {
-        Some(by) => ("superseded", Some(by), Some("revision")),
-        None => (row.src.status.as_str(), None, row.src.supersede_cause.as_deref()),
+        Some(by) => (MemoryStatus::Superseded.into(), Some(by), Some("revision")),
+        None => (row.src.status.clone(), None, row.src.supersede_cause.as_deref()),
     };
     let id = seat.insert(&NewRow { row, project, key, status, superseded_by, cause, vector })?;
     ledger.import_agents.insert(id, row.src.agent_id.clone());
@@ -2576,7 +2577,7 @@ fn report(prepared: &Prepared, written: &Written, dry_run: bool) -> ImportReport
             Some(placement @ (Placement::Inserted(_) | Placement::TopicTaken { .. } | Placement::Older { .. })) => {
                 let (project, key) = target(row, prepared.found(row, ledger));
                 report.inserted += 1;
-                *report.by_type.entry(row.src.memory_type.clone()).or_default() += 1;
+                *report.by_type.entry(row.src.memory_type.to_string()).or_default() += 1;
                 let state = if matches!(placement, Placement::Inserted(_)) { row.state() } else { "superseded" };
                 *report.by_state.entry(state.to_string()).or_default() += 1;
                 *report.by_project.entry(project.unwrap_or_default().to_owned()).or_default() += 1;
@@ -2808,7 +2809,7 @@ pub(crate) mod tests {
         assert_eq!(count(&dst, "SELECT count(*) FROM memory_vectors").await, 15, "every imported row but the deleted has a vector");
 
         let fake = FakeEmbedder::default();
-        for m in after.memories.iter().filter(|m| m.deleted_at.is_none() && m.status != "superseded" && m.content != "A row that was here first") {
+        for m in after.memories.iter().filter(|m| m.deleted_at.is_none() && m.status.as_str() != "superseded" && m.content != "A row that was here first") {
             let context = after.pieces.iter().find(|p| p.memory == m.id).map(|p| p.context.clone()).unwrap_or_default();
             let vector = fake.embed_with_role(&embedding_text(&context, &m.content), EmbedRole::Passage).await.unwrap();
             let agent = m.agent_id.clone().unwrap_or_else(|| "claude-code".into());
@@ -4011,7 +4012,7 @@ pub(crate) mod tests {
         let imported = &after["Storage engine: SQLite with WAL"];
         assert_eq!((imported.status.as_str(), imported.superseded_by, imported.supersede_cause.as_deref()), ("superseded", Some(holder), Some("revision")));
         assert_eq!(after["Storage engine: Postgres"].superseded_by, Some(imported.id));
-        assert_eq!(after["Storage engine: DuckDB"].status, "active");
+        assert_eq!(after["Storage engine: DuckDB"].status.as_str(), "active");
     }
 
     #[tokio::test]

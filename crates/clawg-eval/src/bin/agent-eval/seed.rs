@@ -4,6 +4,7 @@
 
 use clawg_core::eval_api::earned_tier;
 use clawg_core::memory::portability::format::{Filter, Header, Line, MemoryLine, ProjectLine, FORMAT, VERSION};
+use clawg_core::memory::{MemoryStatus, StoredType};
 
 use crate::task::SeedMemory;
 
@@ -46,7 +47,7 @@ pub fn export(memories: &[SeedMemory], agent: &str, root: &str, name: &str, now_
             agent_id: Some(agent.into()),
             project_id: Some(PROJECT_ID.into()),
             content: memory.content.clone(),
-            memory_type: memory.memory_type.clone(),
+            memory_type: StoredType::read(&memory.memory_type),
             source: "explicit".into(),
             created_at,
             // How `save_memory` stores an explicit memory with `user_stated`.
@@ -60,7 +61,7 @@ pub fn export(memories: &[SeedMemory], agent: &str, root: &str, name: &str, now_
             access_count: memory.access_count,
             importance: memory.importance,
             tier: earned_tier(memory.importance, memory.access_count, &memory.memory_type),
-            status: "active".into(),
+            status: MemoryStatus::Active.into(),
             superseded_by: None,
             supersede_cause: None,
             dispute_count: 0,

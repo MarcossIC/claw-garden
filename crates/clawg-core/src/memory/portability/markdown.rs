@@ -43,7 +43,7 @@ pub fn render(export: &Export) -> String {
         };
         let _ = write!(out, "\n## {title}\n");
         for ty in MemoryType::ALL {
-            let of_type: Vec<&&MemoryLine> = rows.iter().filter(|m| m.memory_type == ty.as_str()).collect();
+            let of_type: Vec<&&MemoryLine> = rows.iter().filter(|m| m.memory_type == ty).collect();
             if of_type.is_empty() {
                 continue;
             }
@@ -57,7 +57,7 @@ pub fn render(export: &Export) -> String {
 }
 
 fn row(out: &mut String, export: &Export, m: &MemoryLine) {
-    let mut state = m.status.clone();
+    let mut state = m.status.to_string();
     if let Some(by) = m.superseded_by {
         let _ = write!(state, " by #{by}");
     }

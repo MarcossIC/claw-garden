@@ -7,6 +7,7 @@ use std::sync::Arc;
 use crate::memory::store::error::{ClosedAs, failed_call};
 use crate::memory::retrieval::pieces::read_save_core;
 use crate::memory::domain::provenance::{mark, preference_mark};
+use crate::memory::domain::record::StoredType;
 use crate::preferences::Lang;
 use crate::memory::{
     retrieval::access::AccessTracker,
@@ -1083,7 +1084,7 @@ async fn fetch_recent_saves(
             let mut stmt = c.prepare_cached(RECENT_SAVES_SQL)?;
             let rows = stmt.query_map(rusqlite::params![agent, project, since, printed, limit], |row| {
                 let piece: Option<i64> = row.get(9)?;
-                let memory_type: String = row.get(2)?;
+                let memory_type: StoredType = row.get(2)?;
                 let (source, by): (String, String) = (row.get(11)?, row.get(12)?);
                 Ok(RankedHit {
                     id: row.get(0)?,
@@ -1330,6 +1331,7 @@ async fn fetch_active_conflicts(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::domain::record::StoredStatus;
     use crate::memory::{domain::clock::TimestampMs, store::db::MemoryStore, embedding::embedder::{EmbedError, Embedder}};
 
     /// Records every `(role, text)` pair handed to `embed_with_role`.
@@ -1411,9 +1413,9 @@ mod tests {
         RankedHit {
             id,
             content: content.to_string(),
-            memory_type: memory_type.to_string(),
+            memory_type: StoredType::read(memory_type),
             tier: 2,
-            status: "active".to_string(),
+            status: StoredStatus::read("active"),
             score: 0.9,
             distance: 0.1,
             created_at: TimestampMs::from_unix_millis(1_700_000_000_000),
@@ -2131,9 +2133,9 @@ mod tests {
         let make_hit = |ts: i64| RankedHit {
             id: 0,
             content: String::new(),
-            memory_type: String::new(),
+            memory_type: StoredType::read(""),
             tier: 2,
-            status: "active".to_string(),
+            status: StoredStatus::read("active"),
             score: 0.5,
             distance: 0.5,
             created_at: TimestampMs::from_unix_millis(ts),
@@ -2156,9 +2158,9 @@ mod tests {
         let hit = RankedHit {
             id: 0,
             content: String::new(),
-            memory_type: String::new(),
+            memory_type: StoredType::read(""),
             tier: 2,
-            status: "active".to_string(),
+            status: StoredStatus::read("active"),
             score: 0.5,
             distance: 0.5,
             created_at: TimestampMs::from_unix_millis(0),
@@ -2180,9 +2182,9 @@ mod tests {
         let hit = RankedHit {
             id: 0,
             content: String::new(),
-            memory_type: String::new(),
+            memory_type: StoredType::read(""),
             tier: 2,
-            status: "active".to_string(),
+            status: StoredStatus::read("active"),
             score: 0.5,
             distance: 0.5,
             created_at: TimestampMs::from_unix_millis(-86_400_000),
@@ -2205,9 +2207,9 @@ mod tests {
         let hit = RankedHit {
             id: 0,
             content: String::new(),
-            memory_type: String::new(),
+            memory_type: StoredType::read(""),
             tier: 2,
-            status: "active".to_string(),
+            status: StoredStatus::read("active"),
             score: 0.5,
             distance: 0.5,
             created_at: TimestampMs::from_unix_millis(now_ms + 86_400_000),
@@ -2599,10 +2601,10 @@ mod tests {
     async fn recent_longterm_split_by_7day_window() {
         let now_ms: i64 = 1_700_000_000_000;
         let recent = vec![
-            RankedHit { id: 1, content: "r".to_string(), memory_type: "chat_message".to_string(), tier: 2, status: "active".to_string(), score: 0.9, distance: 0.1, created_at: TimestampMs::from_unix_millis(now_ms - 86_400_000), agent_id: None, piece: None, exact: false, topic_key: None, project_id: None, origin: None },
+            RankedHit { id: 1, content: "r".to_string(), memory_type: StoredType::read("chat_message"), tier: 2, status: StoredStatus::read("active"), score: 0.9, distance: 0.1, created_at: TimestampMs::from_unix_millis(now_ms - 86_400_000), agent_id: None, piece: None, exact: false, topic_key: None, project_id: None, origin: None },
         ];
         let old = vec![
-            RankedHit { id: 2, content: "o".to_string(), memory_type: "chat_message".to_string(), tier: 2, status: "active".to_string(), score: 0.8, distance: 0.2, created_at: TimestampMs::from_unix_millis(now_ms - 8 * 86_400_000), agent_id: None, piece: None, exact: false, topic_key: None, project_id: None, origin: None },
+            RankedHit { id: 2, content: "o".to_string(), memory_type: StoredType::read("chat_message"), tier: 2, status: StoredStatus::read("active"), score: 0.8, distance: 0.2, created_at: TimestampMs::from_unix_millis(now_ms - 8 * 86_400_000), agent_id: None, piece: None, exact: false, topic_key: None, project_id: None, origin: None },
         ];
         let (r, l) = bucket_by_recency(recent.into_iter().chain(old).collect(), TimestampMs::from_unix_millis(now_ms));
         assert_eq!(r.len(), 1);
@@ -2613,8 +2615,8 @@ mod tests {
     async fn all_old_hits_go_to_longterm_only() {
         let now_ms: i64 = 1_700_000_000_000;
         let hits = vec![
-            RankedHit { id: 1, content: "a".to_string(), memory_type: "chat_message".to_string(), tier: 2, status: "active".to_string(), score: 0.9, distance: 0.1, created_at: TimestampMs::from_unix_millis(now_ms - 30 * 86_400_000), agent_id: None, piece: None, exact: false, topic_key: None, project_id: None, origin: None },
-            RankedHit { id: 2, content: "b".to_string(), memory_type: "chat_message".to_string(), tier: 2, status: "active".to_string(), score: 0.8, distance: 0.2, created_at: TimestampMs::from_unix_millis(now_ms - 20 * 86_400_000), agent_id: None, piece: None, exact: false, topic_key: None, project_id: None, origin: None },
+            RankedHit { id: 1, content: "a".to_string(), memory_type: StoredType::read("chat_message"), tier: 2, status: StoredStatus::read("active"), score: 0.9, distance: 0.1, created_at: TimestampMs::from_unix_millis(now_ms - 30 * 86_400_000), agent_id: None, piece: None, exact: false, topic_key: None, project_id: None, origin: None },
+            RankedHit { id: 2, content: "b".to_string(), memory_type: StoredType::read("chat_message"), tier: 2, status: StoredStatus::read("active"), score: 0.8, distance: 0.2, created_at: TimestampMs::from_unix_millis(now_ms - 20 * 86_400_000), agent_id: None, piece: None, exact: false, topic_key: None, project_id: None, origin: None },
         ];
         let (r, l) = bucket_by_recency(hits, TimestampMs::from_unix_millis(now_ms));
         assert_eq!(r.len(), 0);
@@ -2625,8 +2627,8 @@ mod tests {
     async fn all_recent_hits_go_to_recent_only() {
         let now_ms: i64 = 1_700_000_000_000;
         let hits = vec![
-            RankedHit { id: 1, content: "a".to_string(), memory_type: "chat_message".to_string(), tier: 2, status: "active".to_string(), score: 0.9, distance: 0.1, created_at: TimestampMs::from_unix_millis(now_ms - 86_400_000), agent_id: None, piece: None, exact: false, topic_key: None, project_id: None, origin: None },
-            RankedHit { id: 2, content: "b".to_string(), memory_type: "chat_message".to_string(), tier: 2, status: "active".to_string(), score: 0.8, distance: 0.2, created_at: TimestampMs::from_unix_millis(now_ms - 2 * 86_400_000), agent_id: None, piece: None, exact: false, topic_key: None, project_id: None, origin: None },
+            RankedHit { id: 1, content: "a".to_string(), memory_type: StoredType::read("chat_message"), tier: 2, status: StoredStatus::read("active"), score: 0.9, distance: 0.1, created_at: TimestampMs::from_unix_millis(now_ms - 86_400_000), agent_id: None, piece: None, exact: false, topic_key: None, project_id: None, origin: None },
+            RankedHit { id: 2, content: "b".to_string(), memory_type: StoredType::read("chat_message"), tier: 2, status: StoredStatus::read("active"), score: 0.8, distance: 0.2, created_at: TimestampMs::from_unix_millis(now_ms - 2 * 86_400_000), agent_id: None, piece: None, exact: false, topic_key: None, project_id: None, origin: None },
         ];
         let (r, l) = bucket_by_recency(hits, TimestampMs::from_unix_millis(now_ms));
         assert_eq!(r.len(), 2);

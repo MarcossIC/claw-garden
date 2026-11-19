@@ -4957,7 +4957,7 @@ mod tests {
                 .await
                 .expect("list");
             rows.sort_by_key(|r| r.id);
-            rows.into_iter().map(|r| r.status).collect::<Vec<_>>()
+            rows.into_iter().map(|r| r.status.to_string()).collect::<Vec<_>>()
         };
 
         hide(&d, "agent-b", "agent-a");

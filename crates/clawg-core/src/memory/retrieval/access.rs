@@ -265,6 +265,7 @@ impl AccessTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::domain::record::{StoredStatus, StoredType};
 
     // ── Test helpers ─────────────────────────────────────────────────────────
 
@@ -394,9 +395,9 @@ mod tests {
         crate::memory::retrieval::search::RankedHit {
             id,
             content: String::new(),
-            memory_type: String::new(),
+            memory_type: StoredType::read(""),
             tier: 3,
-            status: "active".into(),
+            status: StoredStatus::read("active"),
             score,
             distance: 0.5,
             created_at: TimestampMs::from_unix_millis(0),

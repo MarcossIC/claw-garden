@@ -8,6 +8,7 @@
 //! rows takes that code back, and a code that is no longer the set's gets the
 //! new report instead of a delete.
 
+use crate::memory::domain::record::{MemoryType, StoredStatus, StoredType};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
@@ -228,11 +229,11 @@ pub struct DeleteReport {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SetRow {
     id: i64,
-    status: String,
+    status: StoredStatus,
     deleted_at: Option<i64>,
     update_count: i64,
     agent_id: Option<String>,
-    memory_type: Option<String>,
+    memory_type: Option<StoredType>,
 }
 
 impl SetRow {
@@ -463,12 +464,12 @@ fn report_of(c: &Connection, set: &Set, with_memories: bool) -> Result<DeleteRep
     };
     let mut by_author: BTreeMap<Option<String>, usize> = BTreeMap::new();
     for row in set.memories.iter().filter(|r| r.is_live()) {
-        let kind = row.memory_type.clone().unwrap_or_default();
-        if kind == "user_preference" || kind == "architectural_decision" {
+        if row.memory_type.as_ref().and_then(StoredType::known).is_some_and(MemoryType::is_protected) {
             report.protected.push(row.id);
         }
+        let kind = row.memory_type.as_ref().map(StoredType::to_string).unwrap_or_default();
         *report.by_type.entry(kind).or_default() += 1;
-        *report.by_status.entry(row.status.clone()).or_default() += 1;
+        *report.by_status.entry(row.status.to_string()).or_default() += 1;
         *by_author.entry(row.agent_id.clone()).or_default() += 1;
     }
     report.by_author = by_author.into_iter().map(|(agent_id, rows)| AuthorRows { agent_id, rows }).collect();
@@ -1108,7 +1109,7 @@ mod tests {
                 is_error: None,
                 source: MemorySource::Explicit,
                 timestamp_ms: at,
-                memory_type: Some("semantic_fact".into()),
+                memory_type: Some(StoredType::read("semantic_fact")),
                 importance: None,
                 derived_from: Vec::new(),
                 topic_key: None,
@@ -1439,7 +1440,7 @@ mod tests {
     fn the_code_of_a_set_does_not_depend_on_its_order() {
         let row = |id: i64, status: &str, deleted_at: Option<i64>| SetRow {
             id,
-            status: status.to_string(),
+            status: StoredStatus::read(status),
             deleted_at,
             update_count: id,
             agent_id: None,
@@ -1484,11 +1485,11 @@ mod tests {
             subfolders: Vec::new(),
             memories: vec![SetRow {
                 id: 1,
-                status: "active".into(),
+                status: StoredStatus::read("active"),
                 deleted_at: None,
                 update_count: 0,
                 agent_id: Some("agent-a".into()),
-                memory_type: Some("semantic_fact".into()),
+                memory_type: Some(StoredType::read("semantic_fact")),
             }],
         };
         assert_eq!(code_of(&set), "9461170e", "the code a report gave before declarations");

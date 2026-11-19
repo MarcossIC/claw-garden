@@ -22,7 +22,7 @@ use crate::memory::domain::provenance::mark;
 use crate::memory::domain::redact::redact;
 use crate::memory::retrieval::search::{memory_project_predicate, project_bind, reader_bind, reader_predicate};
 use crate::memory::domain::sharing::Reader;
-use crate::memory::domain::record::MemoryType;
+use crate::memory::domain::record::{MemoryStatus, MemoryType, StoredStatus, StoredType};
 use crate::memory::{store::error::MemoryError, store::db::MemoryStore};
 
 /// How a dispute between two rows is closed.
@@ -111,7 +111,7 @@ impl From<rusqlite::Error> for ResolveError {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResolvedRow {
     pub id: i64,
-    pub status: String,
+    pub status: StoredStatus,
     pub superseded_by: Option<i64>,
 }
 
@@ -129,19 +129,19 @@ pub struct Resolution {
 #[derive(Debug, Clone, PartialEq)]
 struct PairRow {
     id: i64,
-    status: String,
+    status: StoredStatus,
     superseded_by: Option<i64>,
     disputes: Vec<i64>,
-    memory_type: String,
+    memory_type: StoredType,
 }
 
 impl PairRow {
     fn replaced_by(&self) -> Option<i64> {
-        (self.status == "superseded").then_some(self.superseded_by).flatten()
+        (self.status == MemoryStatus::Superseded).then_some(self.superseded_by).flatten()
     }
 
     fn protected(&self) -> bool {
-        MemoryType::is_protected_name(&self.memory_type)
+        self.memory_type.known().is_some_and(MemoryType::is_protected)
     }
 }
 
@@ -580,7 +580,7 @@ mod tests {
     use crate::memory::retrieval::search::{search_all_memories, SearchScope};
 
     fn pair_row(id: i64, status: &str, superseded_by: Option<i64>, disputes: &[i64]) -> PairRow {
-        PairRow { id, status: status.into(), superseded_by, disputes: disputes.to_vec(), memory_type: "semantic_fact".into() }
+        PairRow { id, status: StoredStatus::read(status), superseded_by, disputes: disputes.to_vec(), memory_type: StoredType::read("semantic_fact") }
     }
 
     // ── check_pair ──────────────────────────────────────────────────────────
@@ -719,8 +719,8 @@ mod tests {
 
         let resolution = resolve_dispute_core(&store, new, old, Outcome::Supersede, None).await.unwrap();
 
-        assert_eq!(resolution.keep, ResolvedRow { id: new, status: "active".into(), superseded_by: None });
-        assert_eq!(resolution.other, ResolvedRow { id: old, status: "superseded".into(), superseded_by: Some(new) });
+        assert_eq!(resolution.keep, ResolvedRow { id: new, status: StoredStatus::read("active"), superseded_by: None });
+        assert_eq!(resolution.other, ResolvedRow { id: old, status: StoredStatus::read("superseded"), superseded_by: Some(new) });
         let kept = row(&store, new).await;
         assert_eq!(kept.disputes, None);
         assert_eq!(kept.last_disputed_at, Some(1000), "the record that a dispute happened stays");
@@ -756,8 +756,8 @@ mod tests {
 
         let resolution = resolve_dispute_core(&store, old, new, Outcome::Supersede, None).await.unwrap();
 
-        assert_eq!(resolution.keep, ResolvedRow { id: old, status: "active".into(), superseded_by: None });
-        assert_eq!(resolution.other, ResolvedRow { id: new, status: "superseded".into(), superseded_by: Some(old) });
+        assert_eq!(resolution.keep, ResolvedRow { id: old, status: StoredStatus::read("active"), superseded_by: None });
+        assert_eq!(resolution.other, ResolvedRow { id: new, status: StoredStatus::read("superseded"), superseded_by: Some(old) });
         assert_eq!(row(&store, new).await.disputes, None);
     }
 
@@ -770,11 +770,11 @@ mod tests {
 
         let resolution = resolve_dispute_core(&store, new, first, Outcome::Supersede, None).await.unwrap();
 
-        assert_eq!(resolution.keep.status, "disputed");
+        assert_eq!(resolution.keep.status.as_str(), "disputed");
         assert_eq!(row(&store, new).await.disputes, Some(format!("[{second}]")));
 
         let resolution = resolve_dispute_core(&store, new, second, Outcome::Supersede, None).await.unwrap();
-        assert_eq!(resolution.keep.status, "active");
+        assert_eq!(resolution.keep.status.as_str(), "active");
     }
 
     #[tokio::test]
@@ -817,8 +817,8 @@ mod tests {
 
         let resolution = resolve_dispute_core(&store, new, old, Outcome::KeepBoth, None).await.unwrap();
 
-        assert_eq!(resolution.keep, ResolvedRow { id: new, status: "active".into(), superseded_by: None });
-        assert_eq!(resolution.other, ResolvedRow { id: old, status: "active".into(), superseded_by: None });
+        assert_eq!(resolution.keep, ResolvedRow { id: new, status: StoredStatus::read("active"), superseded_by: None });
+        assert_eq!(resolution.other, ResolvedRow { id: old, status: StoredStatus::read("active"), superseded_by: None });
         assert_eq!(row(&store, new).await.disputes, None);
     }
 
@@ -830,12 +830,12 @@ mod tests {
         resolve_dispute_core(&store, new, old, Outcome::Supersede, None).await.unwrap();
 
         let resolution = resolve_dispute_core(&store, old, new, Outcome::Supersede, None).await.unwrap();
-        assert_eq!(resolution.keep, ResolvedRow { id: old, status: "active".into(), superseded_by: None });
-        assert_eq!(resolution.other, ResolvedRow { id: new, status: "superseded".into(), superseded_by: Some(old) });
+        assert_eq!(resolution.keep, ResolvedRow { id: old, status: StoredStatus::read("active"), superseded_by: None });
+        assert_eq!(resolution.other, ResolvedRow { id: new, status: StoredStatus::read("superseded"), superseded_by: Some(old) });
 
         let resolution = resolve_dispute_core(&store, new, old, Outcome::KeepBoth, None).await.unwrap();
-        assert_eq!(resolution.keep.status, "active");
-        assert_eq!(resolution.other.status, "active");
+        assert_eq!(resolution.keep.status.as_str(), "active");
+        assert_eq!(resolution.other.status.as_str(), "active");
         assert_eq!(resolution.keep.superseded_by, None);
     }
 
@@ -849,7 +849,7 @@ mod tests {
 
         let resolution = resolve_dispute_core(&store, new, first, Outcome::KeepBoth, None).await.unwrap();
 
-        assert_eq!(resolution.keep.status, "disputed", "the dispute with `second` was never closed");
+        assert_eq!(resolution.keep.status.as_str(), "disputed", "the dispute with `second` was never closed");
     }
 
     #[tokio::test]
@@ -897,7 +897,7 @@ mod tests {
 
         let other = Reader::new("agent-x", Reach::AllBut(Vec::new()));
         let resolution = resolve_dispute_core(&store, new, old, Outcome::Supersede, Some(&other)).await.unwrap();
-        assert_eq!(resolution.other.status, "superseded");
+        assert_eq!(resolution.other.status.as_str(), "superseded");
     }
 
     #[tokio::test]
@@ -1019,7 +1019,7 @@ mod tests {
 
         let resolution = judge_pair(&store, new, old, Verdict::Supersedes, None, false, None).await.unwrap();
 
-        assert_eq!(resolution.other, ResolvedRow { id: old, status: "superseded".into(), superseded_by: Some(new) });
+        assert_eq!(resolution.other, ResolvedRow { id: old, status: StoredStatus::read("superseded"), superseded_by: Some(new) });
         assert_eq!(resolution.pair.as_deref(), Some("judged"));
         assert_eq!(pair_of(&store, new, old).await, judged("supersedes", None));
 
@@ -1099,7 +1099,7 @@ mod tests {
 
         let again = judge_pair(&store, new, old, Verdict::Conflicts, None, false, None).await.unwrap();
         assert_eq!(row(&store, new).await.disputes, Some(format!("[{old}]")), "named once");
-        assert_eq!(again.keep.status, "disputed");
+        assert_eq!(again.keep.status.as_str(), "disputed");
     }
 
     async fn supersede_undeclared(store: &MemoryStore, keep: i64, other: i64) -> Result<Resolution, ResolveError> {
@@ -1172,8 +1172,8 @@ mod tests {
 
         let undone = supersede_undeclared(&store, old, new).await.unwrap();
 
-        assert_eq!(undone.keep, ResolvedRow { id: old, status: "active".into(), superseded_by: None });
-        assert_eq!(undone.other, ResolvedRow { id: new, status: "superseded".into(), superseded_by: Some(old) });
+        assert_eq!(undone.keep, ResolvedRow { id: old, status: StoredStatus::read("active"), superseded_by: None });
+        assert_eq!(undone.other, ResolvedRow { id: new, status: StoredStatus::read("superseded"), superseded_by: Some(old) });
 
         let fact = seed_typed(&store, "semantic_fact", "active", &[], 2).await;
         let decision = seed_typed(&store, "architectural_decision", "active", &[], 3).await;
@@ -1191,7 +1191,7 @@ mod tests {
         let reason = Some("the user now prefers tabs".to_string());
         let resolution = judge_pair(&store, new, old, Verdict::Supersedes, reason, true, None).await.unwrap();
 
-        assert_eq!(resolution.other, ResolvedRow { id: old, status: "superseded".into(), superseded_by: Some(new) });
+        assert_eq!(resolution.other, ResolvedRow { id: old, status: StoredStatus::read("superseded"), superseded_by: Some(new) });
         assert_eq!(pair_of(&store, new, old).await, judged("supersedes", Some("user answered: the user now prefers tabs")));
     }
 
@@ -1271,8 +1271,8 @@ mod tests {
 
         let resolution = judge_pair(&store, new[0], old[0], Verdict::Supersedes, None, false, None).await.unwrap();
 
-        assert_eq!(resolution.keep, ResolvedRow { id: new[2], status: "active".into(), superseded_by: None });
-        assert_eq!(resolution.other, ResolvedRow { id: old[1], status: "superseded".into(), superseded_by: Some(new[2]) });
+        assert_eq!(resolution.keep, ResolvedRow { id: new[2], status: StoredStatus::read("active"), superseded_by: None });
+        assert_eq!(resolution.other, ResolvedRow { id: old[1], status: StoredStatus::read("superseded"), superseded_by: Some(new[2]) });
         assert_eq!(row(&store, old[0]).await.status, "active", "only the row of the pair is replaced");
 
         let undone = judge_pair(&store, old[0], new[1], Verdict::Compatible, None, false, None).await.unwrap();

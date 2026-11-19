@@ -17,6 +17,7 @@
 //! the columns the decision read of its rows, so an edit that came in between
 //! keeps its row.
 
+use crate::memory::domain::record::{MemoryStatus, StoredStatus};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
@@ -157,7 +158,7 @@ pub(crate) struct Logged {
 pub(crate) struct Replaced {
     pub row: i64,
     pub by: i64,
-    pub status: String,
+    pub status: StoredStatus,
     pub superseded_by: Option<i64>,
     pub cause: Option<String>,
 }
@@ -276,7 +277,7 @@ pub(crate) struct Now {
     pub deleted_at: Option<i64>,
     pub cause: Option<String>,
     pub project: Option<String>,
-    pub status: String,
+    pub status: StoredStatus,
     pub superseded_by: Option<i64>,
     pub revived_from: Option<i64>,
     pub disputed_against: Option<String>,
@@ -458,7 +459,7 @@ pub(crate) fn decide(facts: &Facts) -> Plan {
 
     // What the import wrote in rows it did not insert, still as it left it,
     // names its rows only because of the import.
-    let replaced_now = |r: &&Replaced| facts.now.get(&r.row).is_some_and(|n| n.status == "superseded" && n.superseded_by == Some(r.by));
+    let replaced_now = |r: &&Replaced| facts.now.get(&r.row).is_some_and(|n| n.status == MemoryStatus::Superseded && n.superseded_by == Some(r.by));
     let mut own: HashSet<(i64, i64)> = facts.extras.iter().filter(|e| intact(facts, e)).flat_map(Extra::names).collect();
     own.extend(facts.replaced.iter().filter(replaced_now).map(|r| (r.row, r.by)));
     let added_pieces: HashSet<(i64, i64)> = facts
@@ -1391,7 +1392,7 @@ mod tests {
     }
 
     fn now(project: Option<&str>) -> Now {
-        Now { status: "active".into(), project: project.map(str::to_owned), ..Default::default() }
+        Now { status: StoredStatus::read("active"), project: project.map(str::to_owned), ..Default::default() }
     }
 
     #[test]
@@ -1418,11 +1419,11 @@ mod tests {
         // 300 was here, and the import filled its link to 11.
         facts.now.insert(300, Now { superseded_by: Some(11), ..now(None) });
         facts.extras.push(Extra::Fill { row: 300, column: Column::SupersededBy, value: "11".into() });
-        facts.replaced.push(Replaced { row: 400, by: 1, status: "active".into(), superseded_by: None, cause: None });
-        facts.replaced.push(Replaced { row: 401, by: 2, status: "active".into(), superseded_by: None, cause: None });
-        facts.replaced.push(Replaced { row: 402, by: 13, status: "active".into(), superseded_by: None, cause: None });
+        facts.replaced.push(Replaced { row: 400, by: 1, status: StoredStatus::read("active"), superseded_by: None, cause: None });
+        facts.replaced.push(Replaced { row: 401, by: 2, status: StoredStatus::read("active"), superseded_by: None, cause: None });
+        facts.replaced.push(Replaced { row: 402, by: 13, status: StoredStatus::read("active"), superseded_by: None, cause: None });
         for (row, by) in [(400, 1), (401, 2)] {
-            facts.now.insert(row, Now { status: "superseded".into(), superseded_by: Some(by), ..now(None) });
+            facts.now.insert(row, Now { status: StoredStatus::read("superseded"), superseded_by: Some(by), ..now(None) });
         }
         facts.now.insert(402, now(None));
         facts.extras.push(Extra::Project("r".into()));

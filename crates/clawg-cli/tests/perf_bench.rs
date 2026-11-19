@@ -27,6 +27,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clawg_cli::client::{Call, DaemonClient};
 use clawg_core::memory::portability::format::{render, Filter, Header, Line, MemoryLine, ProjectLine, FORMAT, VERSION};
+use clawg_core::memory::{MemoryStatus, StoredType};
 use serde_json::{json, Value};
 
 const BIN: &str = env!("CARGO_BIN_EXE_clawg");
@@ -153,7 +154,7 @@ fn seed_export(seed: u64, rows: usize, now_ms: i64) -> String {
             agent_id: Some(agent.into()),
             project_id: project,
             content: format!("Row {id}: {}", rng.text(words, rows)),
-            memory_type: TYPES[rng.below(TYPES.len() as u64) as usize].into(),
+            memory_type: StoredType::read(TYPES[rng.below(TYPES.len() as u64) as usize]),
             source: "explicit".into(),
             created_at,
             created_by_type: "agent".into(),
@@ -166,7 +167,7 @@ fn seed_export(seed: u64, rows: usize, now_ms: i64) -> String {
             access_count: rng.below(8) as i64,
             importance: (1 + rng.below(9)) as f64,
             tier: 1 + rng.below(3) as i64,
-            status: if superseded { "superseded" } else { "active" }.into(),
+            status: if superseded { MemoryStatus::Superseded } else { MemoryStatus::Active }.into(),
             superseded_by: superseded.then_some(id + 1),
             supersede_cause: superseded.then(|| "revision".into()),
             dispute_count: 0,
@@ -984,7 +985,7 @@ mod pure {
         assert_eq!(parsed.memories.len(), rows);
         assert_eq!(parsed.projects.len(), PROJECTS.len());
         let count = |f: &dyn Fn(&MemoryLine) -> bool| parsed.memories.iter().filter(|(_, m)| f(m)).count();
-        let superseded = count(&|m| m.status == "superseded");
+        let superseded = count(&|m| m.status.as_str() == "superseded");
         let deleted = count(&|m| m.deleted_at.is_some());
         let unscoped = count(&|m| m.project_id.is_none());
         assert!((150..=250).contains(&superseded), "superseded {superseded}");

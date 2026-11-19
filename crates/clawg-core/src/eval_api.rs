@@ -25,6 +25,7 @@ use serde::Serialize;
 use tokio::sync::mpsc::Sender;
 use tokio::task::JoinHandle;
 
+use crate::memory::domain::record::StoredType;
 use crate::memory::retrieval::access::AccessTracker;
 use crate::memory::store::backup::{check_restorable, known_migrations, open_for_probe, wal_with_commits, BackupError, SchemaPlan};
 use crate::memory::upkeep::bootstrap::is_pooling_upgrade;
@@ -386,7 +387,7 @@ impl EvalStore {
                     tier: h.tier,
                     score: h.score,
                     distance: h.distance,
-                    memory_type: h.memory_type,
+                    memory_type: h.memory_type.to_string(),
                     exact: h.exact,
                 })
                 .collect(),
@@ -705,7 +706,7 @@ fn explicit_event(
         is_error: None,
         source: MemorySource::Explicit,
         timestamp_ms,
-        memory_type: Some(memory_type.to_string()),
+        memory_type: Some(StoredType::read(memory_type)),
         importance: Some(importance),
         derived_from: Vec::new(),
         topic_key: topic_key.map(str::to_string),
@@ -1053,7 +1054,7 @@ pub fn join_pieces(pieces: &[&str]) -> String {
 /// type, the promotion the store applies: a seeded row lands where the store
 /// would have put it.
 pub fn earned_tier(importance: f64, access_count: i64, memory_type: &str) -> i64 {
-    crate::memory::store::tier::compute_tier(3, importance, access_count, memory_type)
+    crate::memory::store::tier::compute_tier(3, importance, access_count, MemoryType::from_db_str(memory_type))
 }
 
 /// Whether a memory type asserts something the detector can pair; a name that

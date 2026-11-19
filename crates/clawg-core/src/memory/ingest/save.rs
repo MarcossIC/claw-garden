@@ -6,6 +6,7 @@
 //! Every rule is checked before the save is queued: once queued, a refusal
 //! could only reach the caller long after it was told the save was accepted.
 
+use crate::memory::domain::record::StoredType;
 use crate::memory::domain::events::{MemoryEvent, MemorySource};
 use crate::memory::domain::record::{MemoryType, UnknownMemoryType};
 use crate::memory::revision::topic::{validate_topic_key, TopicKeyError};
@@ -201,9 +202,9 @@ impl Admitted {
 
     /// The event to queue, stamped with the session the host read for it
     /// and the instant it was accepted, and the caller's operation id. The
-    /// type travels by its name, the text the client sent: the event is
-    /// stored in the outbox, where a row written before the type was checked
-    /// may hold a name that is none of the seven.
+    /// event's type is a stored one: the event is kept in the outbox, where a
+    /// row written before the type was checked may hold a name that is none
+    /// of the seven.
     pub fn into_event(self, session_id: Option<String>, timestamp_ms: u64) -> (MemoryEvent, Option<String>) {
         let save = self.save;
         let event = MemoryEvent {
@@ -218,7 +219,7 @@ impl Admitted {
             // The one source that honours the caller's `memory_type`/`importance`.
             source: MemorySource::Explicit,
             timestamp_ms,
-            memory_type: save.memory_type.map(|t| t.as_str().to_owned()),
+            memory_type: save.memory_type.map(StoredType::from),
             importance: save.importance,
             derived_from: save.derived_from,
             topic_key: save.topic_key,

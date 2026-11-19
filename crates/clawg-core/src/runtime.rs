@@ -1233,7 +1233,7 @@ mod tests {
             assert_eq!(event.is_error, None);
             assert_eq!(event.source, MemorySource::Explicit);
             assert_eq!(event.timestamp_ms, 42);
-            assert_eq!(event.memory_type.as_deref(), Some("user_preference"));
+            assert_eq!(event.memory_type.as_ref().map(|t| t.as_str()), Some("user_preference"));
             assert_eq!(event.importance, Some(8.0));
             assert_eq!(event.derived_from, vec![source]);
             assert_eq!(event.topic_key.as_deref(), Some("style/indent"));

@@ -12,6 +12,7 @@
 //! project's: once any agent looked, the reminder is off for every agent.
 //! Without an agent the caller is the user and sees every row.
 
+use crate::memory::domain::record::{MemoryStatus, StoredStatus};
 use serde::Serialize;
 
 use crate::memory::store::error::{ClosedAs, failed_call};
@@ -80,12 +81,16 @@ pub enum SourceState {
 
 impl SourceState {
     /// From the source's row as `(deleted, status)`, `None` when it has none.
-    pub(crate) fn of(row: Option<(bool, &str)>) -> Self {
+    /// A status this build does not know leaves the source live: nothing says
+    /// it was lost.
+    pub(crate) fn of(row: Option<(bool, &StoredStatus)>) -> Self {
         match row {
             None => Self::Purged,
             Some((true, _)) => Self::Deleted,
-            Some((false, "superseded")) => Self::Superseded,
-            Some(_) => Self::Live,
+            Some((false, status)) => match status.known() {
+                Some(MemoryStatus::Superseded) => Self::Superseded,
+                Some(MemoryStatus::Active | MemoryStatus::Disputed) | None => Self::Live,
+            },
         }
     }
 }
@@ -210,8 +215,9 @@ fn reviews(c: &rusqlite::Connection, conclusions: Vec<MemoryAdminRow>) -> rusqli
             .query_map([conclusion.id], |r| {
                 let exists: bool = r.get(1)?;
                 let deleted: bool = r.get(2)?;
-                let status: Option<String> = r.get(3)?;
-                let state = SourceState::of(exists.then_some((deleted, status.as_deref().unwrap_or(""))));
+                let status: Option<StoredStatus> = r.get(3)?;
+                let status = status.unwrap_or_default();
+                let state = SourceState::of(exists.then_some((deleted, &status)));
                 let superseded_by = if state == SourceState::Superseded { r.get(4)? } else { None };
                 Ok(LostSource { id: r.get(0)?, state, superseded_by })
             })?
@@ -702,9 +708,11 @@ mod tests {
             (Some((false, "superseded")), Superseded),
             (Some((false, "active")), Live),
             (Some((false, "disputed")), Live),
+            (Some((false, "archived")), Live),
         ];
         for (row, want) in cases {
-            assert_eq!(SourceState::of(row), want, "{row:?}");
+            let row = row.map(|(deleted, status)| (deleted, StoredStatus::read(status)));
+            assert_eq!(SourceState::of(row.as_ref().map(|(d, s)| (*d, s))), want, "{row:?}");
         }
     }
 

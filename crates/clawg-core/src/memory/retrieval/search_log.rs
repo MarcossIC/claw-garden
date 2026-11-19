@@ -65,6 +65,7 @@ pub(crate) fn format_channel_attribution(dense: usize, lexical_only: usize) -> S
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::domain::record::{StoredStatus, StoredType};
     use crate::memory::domain::clock::TimestampMs;
 
     // ── format_tier_distribution ─────────────────────────
@@ -73,9 +74,9 @@ mod tests {
         RankedHit {
             id: 1,
             content: String::new(),
-            memory_type: "chat_message".to_string(),
+            memory_type: StoredType::read("chat_message"),
             tier,
-            status: "active".to_string(),
+            status: StoredStatus::read("active"),
             score: 0.0,
             distance: 0.0,
             created_at: TimestampMs::from_unix_millis(0),
