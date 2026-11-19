@@ -16,6 +16,7 @@
 //! *before* it can be expected to have found the token file — and it discloses
 //! nothing a port scan would not.
 
+mod outbox;
 mod sessions;
 #[cfg(test)]
 mod test_support;
@@ -44,7 +45,7 @@ use clawg_core::memory::embedder::{Embedder, EmbedError, EmbedRole};
 use clawg_core::memory::identity::{Disk, Ground, ProjectIdentity};
 use clawg_core::memory::language::{count_saves_in, count_saves_in_projects};
 use clawg_core::memory::merge::{canonical, merge_core, MergeError, MergeReport, undo_merge_core};
-use clawg_core::memory::outbox::{OutboxActionError, OutboxState, OutboxSummary};
+use clawg_core::memory::outbox::{OutboxState, OutboxSummary};
 use clawg_core::memory::portability::timing::{seconds, Step, Timing};
 use clawg_core::memory::portability::{
     ImportControl, Imported, ImportError, ImportInput, ImportOptions, ImportReport, ImportTimings,
@@ -68,7 +69,7 @@ use clawg_core::memory::registry::{
 use clawg_core::memory::relocate::{
     move_memories_core, MoveError, MoveFilter, MoveReport, ProjectFilter, undo_move_core,
 };
-use clawg_core::memory::save::{check_operation_id, NewSave, SaveInput, SaveRejected};
+use clawg_core::memory::save::{NewSave, SaveInput, SaveRejected};
 use clawg_core::memory::sharing::{Reach, Reader};
 use clawg_core::memory::store_insert::MemoryType;
 use clawg_core::memory::subfolder::{declare_subfolder, SubfolderError};
@@ -86,6 +87,7 @@ use clawg_core::metrics::{EventKind, Recorder, Unit};
 use clawg_core::paths::Profile;
 use clawg_core::preferences::Lang;
 use clawg_core::runtime::{Accepted, AcceptError, MemoryRuntime};
+use outbox::{discard_outbox, retry_outbox};
 use serde::{Deserialize, Serialize};
 use sessions::{count_empty_search, count_tool_call, end_session, register_session, sessions_follow};
 use std::sync::Arc;
@@ -989,33 +991,6 @@ impl MoveRequest {
     }
 }
 
-/// Names a save the daemon gave up on: its operation id, and its agent when
-/// another agent holds the same id.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct OutboxRequest {
-    pub operation_id: String,
-    #[serde(default)]
-    pub agent_id: Option<String>,
-}
-
-/// A failed save taken back to pending; `queued` is false when the queue was
-/// full and it waits for the next start.
-#[derive(Debug, Serialize)]
-pub struct RetriedBody {
-    pub operation_id: String,
-    pub agent_id: String,
-    pub queued: bool,
-}
-
-/// A failed save dropped, with the memories it had inserted, now deleted.
-#[derive(Debug, Serialize)]
-pub struct DiscardedBody {
-    pub operation_id: String,
-    pub agent_id: String,
-    pub deleted: Vec<i64>,
-}
-
 /// Closes the dispute between two `memory` rows. Disputes only ever pair
 /// `memory` rows, so there is no `kind`.
 #[derive(Debug, Deserialize)]
@@ -1875,34 +1850,6 @@ async fn restore_memory(
         Err(RestoreError::Embed(_, e)) => Err(embed_failure(e)),
         Err(e @ RestoreError::Store(_)) => Err(ApiError::internal(e)),
     }
-}
-
-fn outbox_error(e: OutboxActionError) -> ApiError {
-    match e {
-        OutboxActionError::NotFound(_) => ApiError::not_found(e.to_string()),
-        OutboxActionError::NotFailed(_) | OutboxActionError::Ambiguous { .. } | OutboxActionError::Unreadable(_) => {
-            ApiError::conflict(e.to_string())
-        }
-        OutboxActionError::Store(_) => ApiError::internal(e),
-    }
-}
-
-/// The operation id of an outbox request, checked as a save checks it.
-fn requested_operation(body: &OutboxRequest) -> ApiResult<String> {
-    let id = check_operation_id(Some(body.operation_id.clone())).map_err(|e| ApiError::bad_request(e.to_string()))?;
-    Ok(id.unwrap_or_default())
-}
-
-async fn retry_outbox(State(app): State<Arc<AppCtx>>, Json(body): Json<OutboxRequest>) -> ApiResult<Json<RetriedBody>> {
-    let operation_id = requested_operation(&body)?;
-    let retried = app.runtime.retry_failed(&operation_id, body.agent_id.as_deref()).await.map_err(outbox_error)?;
-    Ok(Json(RetriedBody { operation_id, agent_id: retried.agent_id, queued: retried.queued }))
-}
-
-async fn discard_outbox(State(app): State<Arc<AppCtx>>, Json(body): Json<OutboxRequest>) -> ApiResult<Json<DiscardedBody>> {
-    let operation_id = requested_operation(&body)?;
-    let discarded = app.runtime.discard_failed(&operation_id, body.agent_id.as_deref()).await.map_err(outbox_error)?;
-    Ok(Json(DiscardedBody { operation_id, agent_id: discarded.agent_id, deleted: discarded.deleted }))
 }
 
 /// The answer every verdict route gives a refused one.
