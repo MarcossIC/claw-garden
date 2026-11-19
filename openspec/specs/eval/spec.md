@@ -23,6 +23,7 @@ Fuente de verdad del comportamiento actual de la evaluación de recuperación: e
 - [agent-eval](../../changes/archive/2026-11-17-agent-eval/proposal.md), archivado el 2026-11-17, que sale en 0.88.0 (AE1 a AE9, en «`agent-eval`: el arnés», antes de la sección de memory-delivery). Es la base del arnés y no toca el producto; memory-delivery se archivó antes porque se aplicó sobre ella sin esperar a su archivado.
 - [agent-eval-sessions](../../changes/archive/2026-11-17-agent-eval-sessions/proposal.md), archivado el 2026-11-17, que sale en 0.88.0 (AS1 a AS22, en «`agent-eval`: las sesiones, el relevo y los artefactos», al final de esta spec; AS1 reemplaza el orden del `MEMORY.md` de `a4` en MD3). La campaña que corrió con él está en su [verify](../../changes/archive/2026-11-17-agent-eval-sessions/verify.md#la-campaña).
 - [protocol-block](../../changes/archive/2026-11-17-protocol-block/proposal.md), archivado el 2026-11-17, que sale en 0.88.0 (sólo PB7, el brazo `a3-short`, en «`agent-eval`: el brazo `a3-short`», al final de esta spec). Sus otros requisitos están en [`specs/setup`](../setup/spec.md), [`specs/doctor`](../doctor/spec.md), [`specs/hooks`](../hooks/spec.md) y [`specs/preferences`](../preferences/spec.md).
+- [repeated-errors](../../changes/archive/2026-11-19-repeated-errors/proposal.md), archivado el 2026-11-19, que sale en 0.90.0 (sólo RE9, el brazo `a3-notools`, en «`agent-eval`: el brazo `a3-notools`», al final de esta spec). Sus otros requisitos están en [`specs/setup`](../setup/spec.md), [`specs/doctor`](../doctor/spec.md) y [`specs/hooks`](../hooks/spec.md).
 
 ## Definiciones
 
@@ -1942,3 +1943,18 @@ El brazo que mide el bloque corto del protocolo. Sus tests corren con la suite, 
 - THEN sus planes son iguales salvo el `CLAUDE.md`, que en `a3-short` es el bloque corto con `protocol=short`
 
 **Tests:** `a3_short_is_a3_with_the_short_block` (`crates/clawg-eval/src/bin/agent-eval/arm.rs`).
+
+## `agent-eval`: el brazo `a3-notools`
+
+El brazo que mide `a3` sin los dos hooks de Bash que aprenden los programas ausentes. Sus tests corren con la suite, como los de las secciones anteriores. Origen: [repeated-errors](../../changes/archive/2026-11-19-repeated-errors/proposal.md). Lo que se midió con él está en su [verify](../../changes/archive/2026-11-19-repeated-errors/verify.md#la-campaña).
+
+### RE9. El brazo `a3-notools`
+
+`agent-eval` MUST tener el brazo `a3-notools`: `a3` sin los grupos de `PostToolUse` y `PostToolUseFailure` de clawg (RE7), y todo lo demás igual a `a3`: el servidor, los otros tres hooks, el bloque del protocolo y la siembra. Los brazos con hooks toman los de `setup::plan` (`crates/clawg-eval/src/bin/agent-eval/arm.rs`), así que `a3` corre con los dos hooks de Bash desde RE7, y el `a3` que se midió antes de RE7 es `a3-notools`. La corrida en seco no corre los hooks del cliente, así que lo que el hook entrega lo prueban RE3 y RE6 contra el binario, no el arnés.
+
+##### Escenario
+- GIVEN el plan de `a3` y el de `a3-notools` para una misma tarea
+- WHEN se comparan sus `settings.json`
+- THEN difieren sólo en que `a3-notools` no tiene los grupos de `PostToolUse` y `PostToolUseFailure`
+
+**Tests:** `a3_notools_is_a3_without_the_tool_hooks`, `a3_notools_reads_and_prints_by_its_name` (`crates/clawg-eval/src/bin/agent-eval/arm.rs`).

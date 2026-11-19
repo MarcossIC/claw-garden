@@ -12,6 +12,7 @@ Fuente de verdad de `clawg doctor`: qué `clawg` resuelve el PATH y qué está m
 - [native-memory-import](../../changes/archive/2026-10-31-native-memory-import/proposal.md), archivado el 2026-10-31, que sale en 0.72.0: el chequeo `native_memory` (NM7). Cómo se importa esa memoria está en [`specs/portability`](../portability/spec.md) (NM1 a NM6).
 - [hook-run-log](../../changes/archive/2026-11-04-hook-run-log/proposal.md), archivado el 2026-11-04, sale en 0.76.0: el chequeo `hooks.runs` (HR6 y HR7). Lo que lee está en [`specs/hooks`](../hooks/spec.md) (HR1 a HR5 y HR8).
 - [protocol-block](../../changes/archive/2026-11-17-protocol-block/proposal.md), archivado el 2026-11-17, que sale en 0.88.0: la frescura del bloque del protocolo (PB2) y el chequeo `protocol_block` con o sin preferencia (PB3), que reemplaza lo que LP14 decía de ese chequeo. El sello y las variantes están en [`specs/setup`](../setup/spec.md).
+- [repeated-errors](../../changes/archive/2026-11-19-repeated-errors/proposal.md), archivado el 2026-11-19, que sale en 0.90.0: los hallazgos `tool_rules` y `tool_hooks` (RE8, al final de esta spec). Lo que aprende el libro está en [`specs/hooks`](../hooks/spec.md) (RE1 a RE6), y los hooks que faltan los instala [`specs/setup`](../setup/spec.md) (RE7).
 
 **Dónde vive:** las decisiones en `crates/clawg-cli/src/doctor/` (`finding.rs`, el sobre y el resumen; `checks.rs`, los chequeos puros; `mcp.rs`, el registro; `mod.rs`, el PATH y la lectura en `run`); los hechos del store en `crates/clawg-core/src/memory/projects/inspect.rs`; la lectura del registro del hook en `crates/clawg-cli/src/hook_log.rs`, y si el hook de Cursor está instalado en `crates/clawg-cli/src/setup/cursor.rs`. Un test citado como «(`doctor`)» está en el `mod tests` de alguno de esos archivos.
 - [retire-legacy-kinds](../../changes/archive/2026-11-07-retire-legacy-kinds/proposal.md), archivado el 2026-11-07, que sale en 0.79.0 (RL8, al final de esta spec; `project_orphans` y `project_deletes` dejan de nombrar las tablas que V32 retira). Los requisitos de ese cambio se numeran R1 a R10 allí y RL1 a RL10 acá, para no chocar con los ids de cada spec.
@@ -315,3 +316,25 @@ Con el hook de Cursor del perfil instalado en `~/.cursor/hooks.json` (la regla d
 Sobre una base recién migrada desde V31 con filas viejas, las invariantes de `inspect` MUST estar vacías, y `clawg doctor` MUST NOT dar ningún hallazgo `error` ni `warn` del almacén ([`specs/storage`](../storage/spec.md), RL1).
 
 **Test:** `a_store_moved_from_trajectories_and_skills_breaks_no_invariant` (`crates/clawg-core/src/memory/store/migrations.rs`); `doctor_passes_over_a_store_whose_trajectories_and_skills_moved` (`crates/clawg-cli/tests/binary.rs`).
+
+## RE8. `clawg doctor` muestra lo que aprendió y los hooks que faltan
+
+`clawg doctor` MUST sumar un hallazgo `tool_rules` de severidad `info`, `reason_code` `learned`, cuando el libro de programas ausentes da alguna regla ([`specs/hooks`](../hooks/spec.md), RE5). Lo calcula con el PATH del proceso de `doctor`. Sus requisitos:
+
+- Su `message`, en el idioma del comando, lista cada programa con sus sesiones y la antigüedad de su último fallo, y dice que borrar `tool-failures.jsonl` y `tool-failures.1.jsonl` del directorio de datos olvida todo.
+- Cuando el `CLAUDE.md` del usuario, o el `CLAUDE.md` o el `.claude/CLAUDE.md` de la carpeta actual, nombra un programa como palabra entera (mayúsculas exactas, sin letras, cifras, `_` ni `-` pegadas), el `message` MUST decir qué archivo lo pide y que conviene instalarlo o sacarlo de ahí. Esos archivos sólo se leen cuando hay reglas.
+- `evidence` trae `rules`, una lista con un objeto por regla: `program`, `tool`, `sessions`, `last_failure_ms` y `named_in` (las rutas que la nombran).
+- `safe_next_step` es nulo.
+
+Sin reglas, MUST NOT haber hallazgo `tool_rules`.
+
+Cuando el `settings.json` del usuario, o el `.claude/settings.local.json` de la carpeta actual, tiene el hook de `session-start` de este perfil y le faltan el de `PostToolUse` o el de `PostToolUseFailure` (matcher `Bash`), MUST sumar un hallazgo `tool_hooks` de severidad `info`, `reason_code` `not_installed`, con `clawg setup claude-code` (o con `--local`, para el archivo de la carpeta) como `safe_next_step`. Sin el hook de `session-start`, no hay hallazgo, porque ese perfil no corre clawg.
+
+Ninguno de los dos hallazgos cambia el código de salida, y `doctor` MUST NOT escribir el libro.
+
+#### Escenario: el `CLAUDE.md` que pide `eza`
+- GIVEN un libro con la regla `eza` y un `CLAUDE.md` del usuario que dice «usar `eza` en lugar de `ls`»
+- WHEN corre `clawg doctor`
+- THEN hay un hallazgo `tool_rules` cuyo `named_in` es la ruta de ese `CLAUDE.md`, y el código de salida no cambia
+
+**Tests:** `the_learned_rules_are_listed_with_the_files_that_ask_for_them`, `no_rules_no_finding`, `a_session_start_hook_without_the_tool_hooks_is_reported` (`crates/clawg-cli/src/doctor/checks.rs`); `doctor_names_what_the_ledger_learned_and_the_hooks_that_are_missing` y `doctor_has_nothing_to_say_without_rules_or_an_install` (`crates/clawg-cli/tests/binary.rs`).

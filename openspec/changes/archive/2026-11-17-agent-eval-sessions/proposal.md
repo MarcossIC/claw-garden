@@ -142,7 +142,7 @@ Sobre `shelf-eza-missing`, 3 corridas por brazo. Un **intento** es una llamada a
 - **Hay efecto:** bajo `a0`, la sesión 3 intenta `eza` al menos una vez en al menos 2 de 3.
 - **La memoria de hoy ya lo evita**, para `a3-notools` o `a4`: 0 intentos en la sesión 3 en 3 de 3.
 
-La memoria de hoy es la de antes de [repeated-errors](../../repeated-errors/proposal.md) (131): `a3-notools`. Desde 131, `a3` trae los hooks de Bash que aprenden el programa que falta, así que bajo `a3` la sesión 3 llega a 0 intentos por lo que 131 agrega, y la fase 4 mediría a 131 en lugar de su línea base. El `a3` de ahora lo corre la campaña de 131.
+La memoria de hoy es la de antes de [repeated-errors](../2026-11-19-repeated-errors/proposal.md) (131): `a3-notools`. Desde 131, `a3` trae los hooks de Bash que aprenden el programa que falta, así que bajo `a3` la sesión 3 llega a 0 intentos por lo que 131 agrega, y la fase 4 mediría a 131 en lugar de su línea base. El `a3` de ahora lo corre la campaña de 131.
 
 Si hay efecto y ninguna memoria lo evita, 131 tiene su línea base y su meta, 0 intentos en 3 de 3. Si no hay efecto, la tarea no mide lo que 131 necesita y 131 la cambia en su propuesta.
 
