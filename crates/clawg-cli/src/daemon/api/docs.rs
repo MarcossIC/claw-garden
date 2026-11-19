@@ -176,23 +176,38 @@ fn not_accepted(root: &std::path::Path, profile: Profile) -> String {
         other => format!(" --profile {}", other.as_str()),
     };
     let root = root.display().to_string();
+    let command = |shell| format!("`clawg projects add {}{flag}`", shell_quoted(&root, shell));
+    let (posix, powershell) = (command(Shell::Posix), command(Shell::PowerShell));
+    let run = if posix == powershell { posix } else { format!("{posix} in a POSIX shell or {powershell} in PowerShell") };
     format!(
         "clawg reads the files of the projects the user added, and of a folder the MCP client has \
          open or a bridge was started in when that folder has a .git or a manifest and is not the \
-         home directory or a filesystem root; {root} is neither. Ask the user to run `clawg projects \
-         add {quoted}{flag}` if they want it searched, then call again",
-        quoted = shell_quoted(&root)
+         home directory or a filesystem root; {root} is neither. Ask the user to run {run} if they \
+         want it searched, then call again"
     )
 }
 
-/// `arg` quoted so a shell passes it as it is: in double quotes, which keep a
+/// The shell a refused root's command is pasted in, which decides how a `'`
+/// is written inside single quotes.
+#[derive(Clone, Copy)]
+enum Shell {
+    Posix,
+    PowerShell,
+}
+
+/// `arg` quoted so `shell` passes it as it is: in double quotes, which keep a
 /// Windows path whole in every shell, unless it holds what a POSIX shell or
 /// PowerShell expands or ends there, or a backslash a POSIX shell reads as an
 /// escape there (`\\`, as in a UNC root, or one before the closing quote); then
-/// in single quotes, each `'` of it closed, escaped and opened again.
-fn shell_quoted(arg: &str) -> String {
+/// in single quotes, each `'` of it closed, escaped and opened again for a
+/// POSIX shell, doubled for PowerShell.
+fn shell_quoted(arg: &str, shell: Shell) -> String {
     if arg.contains(['$', '`', '"', '!']) || arg.contains(r"\\") || arg.ends_with('\\') {
-        format!("'{}'", arg.replace('\'', r"'\''"))
+        let apostrophe = match shell {
+            Shell::Posix => r"'\''",
+            Shell::PowerShell => "''",
+        };
+        format!("'{}'", arg.replace('\'', apostrophe))
     } else {
         format!("\"{arg}\"")
     }
@@ -328,9 +343,9 @@ mod tests {
     fn the_refusal_quotes_a_root_the_shell_would_expand() {
         let refusal = not_accepted(std::path::Path::new("/work/$HOME/it's"), Profile::Dev);
         assert!(refusal.contains(r"`clawg projects add '/work/$HOME/it'\''s' --profile dev`"), "{refusal}");
-        assert_eq!(shell_quoted(r"C:\Users\dev\app"), r#""C:\Users\dev\app""#);
+        assert_eq!(shell_quoted(r"C:\Users\dev\app", Shell::Posix), r#""C:\Users\dev\app""#);
         for root in ["/a/`id`", "/a/\"b", "/a/!x"] {
-            assert!(shell_quoted(root).starts_with('\''), "{root}");
+            assert!(shell_quoted(root, Shell::Posix).starts_with('\''), "{root}");
         }
     }
 
@@ -339,11 +354,27 @@ mod tests {
     /// single quotes; a single backslash before anything else stays as it is.
     #[test]
     fn the_refusal_keeps_the_backslashes_of_a_windows_root() {
-        assert_eq!(shell_quoted(r"\\server\share\app"), r"'\\server\share\app'");
-        assert_eq!(shell_quoted(r"C:\work\app\"), r"'C:\work\app\'");
-        assert_eq!(shell_quoted(r"C:\work\new app"), r#""C:\work\new app""#);
+        assert_eq!(shell_quoted(r"\\server\share\app", Shell::Posix), r"'\\server\share\app'");
+        assert_eq!(shell_quoted(r"C:\work\app\", Shell::Posix), r"'C:\work\app\'");
+        assert_eq!(shell_quoted(r"C:\work\new app", Shell::Posix), r#""C:\work\new app""#);
         let refusal = not_accepted(std::path::Path::new(r"\\server\share\app"), Profile::Prod);
         assert!(refusal.contains(r"`clawg projects add '\\server\share\app'`"), "{refusal}");
+    }
+
+    /// Inside single quotes PowerShell writes a `'` as `''` and a POSIX shell
+    /// closes, escapes and reopens the quote; no form holds for both, so a
+    /// single-quoted root with an apostrophe names one command for each.
+    #[test]
+    fn the_refusal_names_a_command_per_shell_for_a_single_quoted_root_with_an_apostrophe() {
+        let refusal = not_accepted(std::path::Path::new(r"\\server\share\it's"), Profile::Dev);
+        assert!(
+            refusal.contains(r"`clawg projects add '\\server\share\it'\''s' --profile dev` in a POSIX shell"),
+            "{refusal}"
+        );
+        assert!(refusal.contains(r"`clawg projects add '\\server\share\it''s' --profile dev` in PowerShell"), "{refusal}");
+        let plain = not_accepted(std::path::Path::new(r"C:\work\it's"), Profile::Prod);
+        assert!(plain.contains(r#"`clawg projects add "C:\work\it's"` if they"#), "{plain}");
+        assert!(!plain.contains("PowerShell"), "{plain}");
     }
 
     /// A folder the MCP client has open is read as the bridge's own
