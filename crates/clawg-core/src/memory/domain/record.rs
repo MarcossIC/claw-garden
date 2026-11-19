@@ -278,11 +278,12 @@ impl<T: StoredName> Stored<T> {
         }
     }
 
-    /// The name, when this build knows it.
+    /// The name, when this build knows it, whichever variant holds it: an
+    /// `Other` built with a known name reads as `read` would have read it.
     pub fn known(&self) -> Option<T> {
         match self {
             Self::Known(t) => Some(*t),
-            Self::Other(_) => None,
+            Self::Other(s) => T::from_name(s),
         }
     }
 }
@@ -681,6 +682,22 @@ mod tests {
             .collect::<rusqlite::Result<_>>()
             .unwrap();
         assert_eq!(written, [("observation".into(), "archived".into()), ("code_block".into(), "disputed".into())]);
+    }
+
+    #[test]
+    fn an_other_holding_a_known_name_is_live_before_and_after_a_round_trip() {
+        for (name, live) in [("active", true), ("disputed", true), ("superseded", false)] {
+            let other = StoredStatus::Other(name.into());
+            assert_eq!(other.known(), MemoryStatus::from_name(name));
+            assert_eq!(other.is_live(), live, "{name}");
+
+            let back: StoredStatus = serde_json::from_value(serde_json::to_value(&other).unwrap()).unwrap();
+            assert_eq!(back.is_live(), other.is_live(), "serde {name}");
+
+            let c = rusqlite::Connection::open_in_memory().unwrap();
+            let read: StoredStatus = c.query_row("SELECT ?1", [&other], |r| r.get(0)).unwrap();
+            assert_eq!(read.is_live(), other.is_live(), "sqlite {name}");
+        }
     }
 
     #[test]
