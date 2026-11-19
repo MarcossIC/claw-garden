@@ -552,6 +552,9 @@ async fn declare(app: &Arc<AppCtx>, root: &str, subpath: &str, target: &str) -> 
             SubfolderError::Merge(e) => merge_error(e),
             SubfolderError::Store(_) => ApiError::internal(e),
         })?;
+    if let Some(merged) = &declared.merge {
+        sessions_follow(app, merged);
+    }
     Ok(LocatedBody {
         project_id: declared.project_id,
         root_id: registered.root_id,

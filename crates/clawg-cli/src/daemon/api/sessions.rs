@@ -109,10 +109,12 @@ pub(super) fn count_empty_search(app: &AppCtx, agent_id: &str, projects: Option<
     }
 }
 
-/// The sessions of a merged project go to the one that stays. A dry run, or
-/// a merge that wrote nothing, moves none.
+/// The sessions of a merged project go to the one that stays, in the log
+/// and in what the saves that follow are stamped with. A dry run, or a merge
+/// that wrote nothing, moves none.
 pub(super) fn sessions_follow(app: &AppCtx, merged: &MergeReport) {
     if merged.merge_id.is_some() && !merged.dry_run {
         app.runtime.metrics.sessions().merge_project(&merged.source, &merged.target);
+        app.sessions.merge_project(&merged.source, &merged.target);
     }
 }

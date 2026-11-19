@@ -55,18 +55,48 @@ pub fn tool_label(raw: &str) -> &'static str {
 /// and since every prompt registers, that is the one the user spoke to last.
 #[derive(Debug, Default)]
 pub struct SessionRegistry {
-    current: Mutex<HashMap<(String, Option<String>), String>>,
+    current: Mutex<Sessions>,
+}
+
+/// Each session with the order it registered in, so that the entries of two
+/// projects merged into one still tell which came last.
+#[derive(Debug, Default)]
+struct Sessions {
+    by_key: HashMap<(String, Option<String>), (String, u64)>,
+    registered: u64,
 }
 
 impl SessionRegistry {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Sessions> {
+        self.current.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     pub fn register(&self, agent_id: &str, project_id: Option<&str>, session_id: &str) {
         let key = (agent_id.to_string(), project_id.map(str::to_string));
-        self.current.lock().unwrap_or_else(|e| e.into_inner()).insert(key, session_id.to_string());
+        let mut sessions = self.lock();
+        sessions.registered += 1;
+        let order = sessions.registered;
+        sessions.by_key.insert(key, (session_id.to_string(), order));
     }
 
     pub fn current(&self, agent_id: &str, project_id: Option<&str>) -> Option<String> {
         let key = (agent_id.to_string(), project_id.map(str::to_string));
-        self.current.lock().unwrap_or_else(|e| e.into_inner()).get(&key).cloned()
+        self.lock().by_key.get(&key).map(|(session, _)| session.clone())
+    }
+
+    /// The sessions of `source`, merged into `target`, are `target`'s now: a
+    /// bridge keeps the source's id, which leads to `target`. Where an agent
+    /// has a session in both, the one registered last stays.
+    pub fn merge_project(&self, source: &str, target: &str) {
+        let mut sessions = self.lock();
+        let moved: Vec<_> = sessions.by_key.keys().filter(|(_, p)| p.as_deref() == Some(source)).cloned().collect();
+        for key in moved {
+            let Some(entry) = sessions.by_key.remove(&key) else { continue };
+            let into = (key.0, Some(target.to_string()));
+            if sessions.by_key.get(&into).is_none_or(|(_, order)| *order < entry.1) {
+                sessions.by_key.insert(into, entry);
+            }
+        }
     }
 }
 
@@ -87,6 +117,27 @@ mod tests {
         assert_eq!(registry.current("a", None).as_deref(), Some("s3"));
         assert_eq!(registry.current("b", Some("p")), None);
         assert_eq!(registry.current("a", Some("q")), None);
+    }
+
+    #[test]
+    fn a_merge_moves_the_sessions_of_its_source_and_the_last_registered_stays() {
+        let registry = SessionRegistry::default();
+        registry.register("a", Some("target"), "a-older");
+        registry.register("a", Some("source"), "a-newer");
+        registry.register("b", Some("source"), "b-only");
+        registry.register("c", Some("source"), "c-older");
+        registry.register("c", Some("target"), "c-newer");
+        registry.register("a", Some("other"), "a-other");
+
+        registry.merge_project("source", "target");
+
+        assert_eq!(registry.current("a", Some("target")).as_deref(), Some("a-newer"));
+        assert_eq!(registry.current("b", Some("target")).as_deref(), Some("b-only"));
+        assert_eq!(registry.current("c", Some("target")).as_deref(), Some("c-newer"));
+        assert_eq!(registry.current("a", Some("other")).as_deref(), Some("a-other"));
+        for agent in ["a", "b", "c"] {
+            assert_eq!(registry.current(agent, Some("source")), None, "{agent}");
+        }
     }
 
     #[test]
