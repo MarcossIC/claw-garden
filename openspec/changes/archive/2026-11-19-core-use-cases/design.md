@@ -51,7 +51,7 @@ El `match` del handler nombra cada variante del `400`, sin comodín: una variant
 
 **Decisión abierta 2: si `check_content` y `check_operation_id` son de HTTP o de dominio.** Del dominio, los dos:
 
-- **El tope de contenido** sale del outbox: cada pieza de un save largo reescribe su fila con el progreso, y lo que escribe un save crece con el cuadrado de su largo (`api.rs:692-698`, [`specs/ingest`](../../specs/ingest/spec.md)). Otro cliente que guarde sin HTTP tiene el mismo límite.
+- **El tope de contenido** sale del outbox: cada pieza de un save largo reescribe su fila con el progreso, y lo que escribe un save crece con el cuadrado de su largo (`api.rs:692-698`, [`specs/ingest`](../../../specs/ingest/spec.md)). Otro cliente que guarde sin HTTP tiene el mismo límite.
 - **El `operation_id`** es la identidad de una fila del outbox (`outbox_record`), y las rutas del outbox lo comprueban «como un save» (`requested_operation`, `api.rs:2088-2090`). `check_operation_id` queda público para ellas.
 
 Los tres topes (`MAX_CONTENT_BYTES`, `MAX_OPERATION_ID_LEN`, `MAX_SOURCES`) se mudan a `save.rs`. `crates/clawg-cli/tests/api.rs:16` y `crates/clawg-cli/src/mcp/server.rs:2096` importan `MAX_CONTENT_BYTES` de `clawg_cli::daemon::api`, y esos tests no se editan, así que el daemon lo reexporta con `pub use`. Los otros dos sólo los usan los tests que se mudan.

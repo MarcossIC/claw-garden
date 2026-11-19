@@ -1,6 +1,6 @@
 # core-use-cases — Verificación
 
-**Resultado:** las partes 1 (el guardado completo), 2 (las escrituras de proyectos) y 3 (las otras escrituras) aplicadas y verificadas en Linux. En cada una, la suite entera y los dos clippy pasan sobre el último commit de código, y ningún test de respuestas ni ninguno de los dos contratos del agente cambió. Queda lo que se lista en [«Pendiente»](#pendiente), en el [«Pendiente» de la parte 2](#pendiente-de-la-parte-2) y en el [de la parte 3](#pendiente-de-la-parte-3). La parte 4 está en [`tasks.md`](tasks.md#partes-siguientes).
+**Resultado:** las partes 1 (el guardado completo), 2 (las escrituras de proyectos) y 3 (las otras escrituras) aplicadas y verificadas en Linux, y la parte 4 (partir `api.rs`) aplicada y verificada en Windows. En cada una, la suite entera y los dos clippy pasan sobre el último commit de código, y ningún test de respuestas ni ninguno de los dos contratos del agente cambió. Las tres primeras pasaron además el CI de Linux y Windows de su PR. Lo que quedaba para el archivo, en los «Pendiente» de cada parte, está hecho: [«Al archivar»](#al-archivar-2026-11-19).
 
 ## Qué se corrió
 
@@ -261,3 +261,38 @@ Líneas, y tests (`#[test]` y `#[tokio::test]`) que viven en cada uno:
 
 - **Al archivar:** nada de la parte 4 va a `specs/`: R16 es de conservación y no deja una regla nueva.
 - **El CI del PR.** Corre `test (windows-latest)` y `test (ubuntu-latest)`; la parte no agrega código `cfg(windows)`.
+
+## Al archivar (2026-11-19)
+
+- **Los ids cambian al consolidar,** cada uno en la numeración de su spec. Este archivo conserva los ids R.
+
+  | Requisito | Va a | Id nuevo |
+  |---|---|---|
+  | R1 (formato de un save), reglas 1 a 6 y la 7 | [`specs/ingest`](../../../specs/ingest/spec.md), «El formato de un save se comprueba en el núcleo» | sin id: `specs/ingest` no los usa, y sus secciones son subsecciones |
+  | R1, regla 7 (`StatedConclusion`) | [`specs/provenance`](../../../specs/provenance/spec.md) | P7, y la tabla de R1 la conserva en `specs/ingest` |
+  | R2 (el tipo se parsea una vez) | `specs/ingest`, «El tipo se parsea una vez» | sin id |
+  | R3 (las fuentes de una conclusión) | [`specs/synthesis`](../../../specs/synthesis/spec.md) | R10; R3 de esa spec sigue diciendo qué se rechaza y remite a R10 |
+  | R4 (sin embedder que venga) | `specs/ingest`, «Sin embedder que venga, el save no se acepta» | sin id |
+  | R5 (el save va al proyecto vivo) | `specs/ingest`, «El save va al proyecto vivo» | sin id |
+  | R6 (el evento de un save admitido) | `specs/ingest`, «El evento de un save admitido» | sin id |
+  | R8 (la raíz de un registro) | [`specs/project`](../../../specs/project/spec.md) | PL66, después de PL44 |
+  | R9 (ubicar una carpeta) | `specs/project` | PL67, después de SB3 |
+  | R10 (un código de confirmación va con las filas) | `specs/project` | PL68, después de PL25 |
+  | R12 (una sugerencia la responde la persona) | `specs/project` | PL69, después de PL37 |
+  | R13 (sólo se responde una sugerencia pendiente) | `specs/project` | PL70, después de PL69 |
+  | R14 (`new_project` va con `create`) | `specs/project` | PL71, después de PL33 |
+
+  `specs/ingest` no numera sus requisitos, así que R1, R2 y R4 a R6 son cinco subsecciones de «El guardado en el núcleo», con su nombre y sin id. La sección de R1 y la de P7 dicen cada una la regla 7; la de `specs/ingest` es la tabla en orden, y la de `specs/provenance` es la razón y el escenario.
+- **No se consolidan** R7, R11 y R15 (lo que ve un cliente de cada parte no cambia) ni R16 (partir `api.rs`): son de conservación, y los tests que los fijan (`each_*_keeps_its_status_and_body` y los dos contratos del agente) siguen en la suite.- **Los escenarios «hoy no compilan»** de la spec del cambio se quitaron al consolidar: describen el momento antes de escribir el código, y los tests ya existen.
+- **Sale en 0.89.0.**
+- **Las citas que cambiaron:**
+  - SB3 de `specs/project` decía que `locate_project` decide con `own_folder_count` (`registry.rs:816`). Ahora lo cita sin número, como privada de `registry.rs`, y dice que decide `locate_folder` (PL67); `locate_project` sólo traduce, con `located_refused`. La cita del `detail` de `folder_shared` y la del `500` apuntan a `LocateError`.
+  - «El contenido: vacío o sobre el tope» de `specs/ingest` nombraba `check_content` como lo primero que comprueba `save_memory`. Ahora es `NewSave::parse`, que llama a `check_content` (privada de `save.rs`); su escenario de los bytes y la frase «ni se parte en el handler» ya no nombran el handler.
+  - «El tipo de memoria se valida al guardar», «La clave de tema se valida y vuelve en la respuesta» y «Aceptar es durable» de `specs/ingest` decían que el handler valida y que no lo hace el worker; ahora nombran `NewSave::parse` y `MemoryRuntime::admit`, y «Aceptar es durable» pone el orden real de las comprobaciones: contenido, tipo, `operation_id`, clave y cantidad de fuentes en `NewSave::parse`, y después las fuentes, el embedder y el proyecto vivo en `admit`. La frase de antes ponía las fuentes antes que la clave.
+  - «`operation_id`» de `specs/ingest` cita `operation_ids_are_checked` en `api/memories.rs`, y el test pasó a `save.rs` en la parte 1; también dice ahora que `outbox.rs` usa `check_operation_id`.
+  - R3 de `specs/synthesis` citaba `replaced_memory_ids` con un número de línea de `synthesis.rs` y el rechazo sin nombrarlo; ahora nombra `SaveRejected::ReplacedSources` y remite a R10. Los tests puros que cita ya estaban en `save.rs`: lo había dejado el barrido de citas de la parte 4.
+  - R4 de `specs/project` («Registro de proyecto y re-key») decía que `register` responde 400 antes de tocar `project_path`; ahora nombra `check_root` (PL66). PL23 remite a PL68 para el `confirm` sin `with_memories`, PL32 dice que `new_project` sin `create` es un `400` (PL71), PL37 nombra `UserAnswer::new` y `answer_suggestion_core` (PL69, PL70) y PL39 nombra `check_folder` (PL67).
+  - `specs/ingest` («Embedder cargando», «Embedder fallido») nombra `Admitted::waits` y `SaveRejected::EmbedderFailed`.
+  - Toda ruta `crates/…` y todo nombre de test que citan las secciones nuevas y las que se tocaron se comprobó con `rg`: existen. La búsqueda de nombres de test en las cuatro specs sólo deja siete que no están en `crates/` (`a_declaration_into_a_merged_or_deleted_project_is_refused`, `holds_secret`, `in_use`, `only_the_bridges_own_root_is_indexed`, `out_of_reach`, `spans_projects` y `the_logs_restore_every_row_a_registration_moved`), todos de `specs/project` y anteriores a este cambio; no se tocaron.
+- **Ninguna spec viva describe ya una de estas reglas como del daemon.** Los tres textos de `specs/ingest` que lo decían (el tipo, la clave y el tope) se reescribieron, y «El save sella la sesión» sigue diciendo que la sesión se lee en el handler, que es lo que hace el daemon (R6).
+- **De los «Pendiente»:** Windows, cubierto por la suite y los dos clippy de la parte 4 sobre el último commit de código y por el CI de Windows de los PR de las partes 1 a 3. El modelo real y `rag-eval` no se corrieron: ningún cambio toca la recuperación ni `eval_api`, y la ruta que embebe usa el `FakeEmbedder` en todos los tests.

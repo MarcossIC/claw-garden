@@ -2,7 +2,7 @@
 
 Fuente de verdad del comportamiento actual del origen de una memoria: con qué `source` y `created_by_type` se sella cada save, cómo el agente declara que algo lo dijo el usuario, y qué marca muestra cada lector. El origen no cambia ningún par, estado ni puntaje: cómo se forman y se juzgan los pares está en [`specs/disputes`](../disputes/spec.md), y qué es una conclusión, en [`specs/synthesis`](../synthesis/spec.md).
 
-**Origen:** [memory-provenance](../../changes/archive/2026-10-18-memory-provenance/proposal.md), archivado el 2026-10-18. Los ids de requisito son los de esa spec. [preference-model](../../changes/archive/2026-11-06-preference-model/proposal.md), archivado el 2026-11-06, que salió en 0.77.0, sumó PM5 y PM9, con los ids de su spec: la marca de un hit de preferencia, cuyo formato está en [`specs/retrieval`](../retrieval/spec.md), PM5, y el sello de un save declarado que repite una fila. [verdict-on-replace](../../changes/archive/2026-11-12-verdict-on-replace/proposal.md), archivado el 2026-11-12, que sale en 0.85.0, cambió P4: `memory_status` ya no lista los pares ni su marca (VR4 de [`specs/mcp`](../mcp/spec.md)).
+**Origen:** [memory-provenance](../../changes/archive/2026-10-18-memory-provenance/proposal.md), archivado el 2026-10-18. Los ids de requisito son los de esa spec. [preference-model](../../changes/archive/2026-11-06-preference-model/proposal.md), archivado el 2026-11-06, que salió en 0.77.0, sumó PM5 y PM9, con los ids de su spec: la marca de un hit de preferencia, cuyo formato está en [`specs/retrieval`](../retrieval/spec.md), PM5, y el sello de un save declarado que repite una fila. [verdict-on-replace](../../changes/archive/2026-11-12-verdict-on-replace/proposal.md), archivado el 2026-11-12, que sale en 0.85.0, cambió P4: `memory_status` ya no lista los pares ni su marca (VR4 de [`specs/mcp`](../mcp/spec.md)). [core-use-cases](../../changes/archive/2026-11-19-core-use-cases/proposal.md), archivado el 2026-11-19, que sale en 0.89.0, sumó P7 (dónde se decide el rechazo de P2); los demás requisitos del guardado de ese cambio están en [`specs/ingest`](../ingest/spec.md), «El guardado en el núcleo», y en [`specs/synthesis`](../synthesis/spec.md), R10.
 
 ## Definiciones
 
@@ -94,3 +94,14 @@ Un save con `user_stated` cuyo texto ya está vivo en su alcance MUST dejar esa 
 - AND otro save declarado del mismo texto con importancia 2 la deja en 9
 
 **Tests:** `a_stated_save_seals_the_row_it_repeats_as_the_users`, `an_inferred_save_leaves_the_seal_of_the_row_it_repeats`, `a_stated_save_leaves_an_import_and_a_conclusion_as_they_are`, `a_stated_save_raises_the_importance_of_the_row_it_repeats_and_never_lowers_it`, `an_inferred_save_leaves_the_importance_of_the_row_it_repeats`, `a_preference_stated_after_it_was_inferred_enters_the_workspace` y `a_twin_restored_while_the_save_is_embedded_is_reinforced_not_copied` (`crates/clawg-core/src/memory/ingest/worker.rs`).
+
+## P7. Una conclusión no se declara, y lo decide el núcleo
+
+El rechazo de P2 (`user_stated` junto a un `derived_from` no vacío) MUST decidirlo `NewSave::parse` (`crates/clawg-core/src/memory/ingest/save.rs`), no el handler, como `SaveRejected::StatedConclusion` con el texto `user_stated cannot go with derived_from: a conclusion is drawn by the agent, not stated by the user`. MUST ser la última regla de formato de un save, después de la del tope de fuentes ([`specs/ingest`](../ingest/spec.md), «El formato de un save se comprueba en el núcleo»): un save que rompe las dos responde por la del tope. Cuenta las fuentes ya sin repetidos. El daemon lo traduce a `400`, sin escribir en el outbox, como antes.
+
+#### Escenario
+- GIVEN un save con `user_stated` y `derived_from = [1, 1]`
+- WHEN se parsea
+- THEN el rechazo es `StatedConclusion`, y con `derived_from` vacío el mismo save pasa
+
+**Tests:** `a_conclusion_cannot_be_stated_by_the_user` y `the_format_is_checked_in_order` (`crates/clawg-core/src/memory/ingest/save.rs`, mod tests); `user_stated_with_derived_from_is_refused` (`crates/clawg-cli/tests/api.rs`).

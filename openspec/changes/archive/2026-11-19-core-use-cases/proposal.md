@@ -14,7 +14,7 @@ Las reglas de qué es un guardado válido viven en el handler HTTP. Para probar 
    - con el embedder `failed` no se acepta el save (`:1467-1475`);
    - el proyecto se sigue hasta el vivo (`live_project`, `:1477`).
 2. **El tipo se valida y se tira.** `raw.parse::<MemoryType>()` (`:1427-1429`) descarta el resultado; la métrica de la sesión vuelve a parsear y tira el error (`:1482`), y al evento viaja el `String` original (`:1495`).
-3. **Las reglas de formato son funciones de `api.rs`:** `check_content` (`:703`), `check_operation_id` (`:722`), `distinct_sources` (`:331`), `missing_sources` (`:345`) y `replaced_list` (`:350`), con sus tests en el `mod tests` del daemon. El tope de contenido es del producto ([`specs/ingest`](../../specs/ingest/spec.md)), no de HTTP.
+3. **Las reglas de formato son funciones de `api.rs`:** `check_content` (`:703`), `check_operation_id` (`:722`), `distinct_sources` (`:331`), `missing_sources` (`:345`) y `replaced_list` (`:350`), con sus tests en el `mod tests` del daemon. El tope de contenido es del producto ([`specs/ingest`](../../../specs/ingest/spec.md)), no de HTTP.
 
 ## Enfoque
 

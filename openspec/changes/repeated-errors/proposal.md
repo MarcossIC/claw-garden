@@ -32,7 +32,7 @@ B, A y D, en ese orden. C queda afuera.
 
 1. **El libro es un archivo del directorio de datos, no una tabla ni memorias.**
    - Una fila `tool_error` por fallo pasaría por la ingesta y despertaría el modelo de embeddings en cada fallo. Competiría en la búsqueda con todo lo demás, necesitaría el daemon vivo en cada llamada y llegaría al agente como evidencia, que es lo que hoy no funciona.
-   - Una tabla nueva pediría esquema, migración, una ruta en `api.rs` (que core-use-cases va a partir) y el daemon en cada llamada.
+   - Una tabla nueva pediría esquema, migración, una ruta en `crates/clawg-cli/src/daemon/api/` (que core-use-cases partió en un archivo por dominio) y el daemon en cada llamada.
    - El archivo sigue el precedente de `hook-runs.jsonl` (`crates/clawg-cli/src/hook_log.rs:132-141`): una línea por escritura, se renombra a los 64 KiB, nunca crea el directorio de datos y falla en silencio.
    - Es un dato derivado. Borrarlo cuesta sólo volver a aprender, en dos sesiones. No entra en snapshots ni en el export, como el registro de hooks.
    - El alcance es la máquina, por perfil, porque el archivo es del directorio de datos. Es el alcance que A2 mide como el más rendidor (+256 evitables frente al alcance por proyecto).

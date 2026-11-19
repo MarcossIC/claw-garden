@@ -1,6 +1,6 @@
 # core-use-cases — Especificación
 
-Son requisitos sobre [`specs/ingest`](../../specs/ingest/spec.md), [`specs/synthesis`](../../specs/synthesis/spec.md), [`specs/provenance`](../../specs/provenance/spec.md) y [`specs/project`](../../specs/project/spec.md), y se consolidan al archivar. Lo que no se nombra acá sigue como está. R1 a R7 cubren la primera parte del cambio, el guardado (`POST /v1/memories`); R8 a R11, la segunda, las escrituras de proyectos ([«Parte 2»](#parte-2-las-escrituras-de-proyectos)); R12 a R15, la tercera, las otras escrituras ([«Parte 3»](#parte-3-las-otras-escrituras)). La parte 4 no trae requisitos: es un paso mecánico.
+Son requisitos sobre [`specs/ingest`](../../../specs/ingest/spec.md), [`specs/synthesis`](../../../specs/synthesis/spec.md), [`specs/provenance`](../../../specs/provenance/spec.md) y [`specs/project`](../../../specs/project/spec.md), y se consolidan al archivar. Lo que no se nombra acá sigue como está. R1 a R7 cubren la primera parte del cambio, el guardado (`POST /v1/memories`); R8 a R11, la segunda, las escrituras de proyectos ([«Parte 2»](#parte-2-las-escrituras-de-proyectos)); R12 a R15, la tercera, las otras escrituras ([«Parte 3»](#parte-3-las-otras-escrituras)). La parte 4 no trae requisitos: es un paso mecánico.
 
 Términos:
 
@@ -122,7 +122,7 @@ Ninguna respuesta del daemon (estado, cuerpo), del puente MCP (texto, esquema, d
 Términos:
 
 - **Un registro:** el cuerpo de `POST /v1/projects` (`RegisterRequest`), y el registro que `POST /v1/projects/locate` hace de la raíz que ubica.
-- **Ubicar una carpeta:** `POST /v1/projects/locate` sin `subfolder` (`LocateRequest`, [`specs/project`](../../specs/project/spec.md), PL39).
+- **Ubicar una carpeta:** `POST /v1/projects/locate` sin `subfolder` (`LocateRequest`, [`specs/project`](../../../specs/project/spec.md), PL39).
 - **Su proyecto:** el que el registro le da a la carpeta que se ubica. **El nombrado:** el proyecto al que lleva el `project` del cuerpo (`find_project`).
 
 ## R8. La raíz de un registro se comprueba en el núcleo

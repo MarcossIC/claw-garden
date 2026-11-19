@@ -2,7 +2,7 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| transversal | L, por tandas independientes | core-use-cases | exploración (borrador) |
+| transversal | L, por tandas independientes | core-use-cases (archivado) | exploración (borrador) |
 
 **Tesis:** el dominio viaja como `String` e `i64`. El tipo de una memoria se valida y se descarta, el estado se compara con literales de SQL, y un id de una tabla se puede pasar donde va el de otra. Son errores que el compilador podría impedir, y conviene resolverlo antes de definir firmas de almacenamiento, para que esas firmas nazcan bien.
 

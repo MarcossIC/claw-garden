@@ -1,7 +1,8 @@
 change: core-use-cases
 objective: "transversal"
-depends_on: [memory-module-layout]  # aplicado en develop
-phase: verify  # las partes 1 a 3 aplicadas y verificadas en Linux; la parte 4 (partir api.rs) aplicada y verificada en Windows
+depends_on: [memory-module-layout]  # archivado
+phase: archived
+release: "0.89.0"  # las reglas de un save, de los proyectos y de las otras escrituras en clawg-core, y api.rs partido en daemon/api/ (verify.md)
 artifacts:
   exploration: done  # el borrador del 2026-11-01, revisado contra develop el 2026-11-12: rutas, líneas y conteos
   proposal: done  # el enfoque A; la parte 1 es POST /v1/memories
@@ -10,7 +11,7 @@ artifacts:
   tasks: done  # tareas 1 a 5 de la parte 1 (la 3 y la 4 en un commit); 6 a 11 de la parte 2; 12 a 17 de la parte 3; 18 a 27 de la parte 4
   apply: done  # parte 4: api.rs partido en módulos hijos de api, con sus tests; parte 1: la caracterización, memory::save, admit y el handler; parte 2: la caracterización, check_root, locate_folder, ConfirmWithoutRows y los handlers; parte 3: la caracterización, UserAnswer, answer_suggestion_core, NewProjectWithoutCreate y los handlers
   verify: done  # las cuatro partes: la suite y los dos clippy pasan, la parte 4 en Windows; las tres primeras: la suite y los dos clippy pasan en Linux; Windows y lo de archivar en los «Pendiente» de verify.md
-  archive: pending
+  archive: done  # R1, R2, R4 a R6 son seis subsecciones sin id de specs/ingest, R3 es R10 de specs/synthesis, R1 (regla 7) es P7 de specs/provenance, R8 a R10 y R12 a R14 son PL66 a PL71 de specs/project; R7, R11, R15 y R16 son de conservación y no se consolidan (verify.md, «Al archivar»)
 decisions:
   error_texts: display_and_data  # cada SaveRejected muestra el texto de hoy y lleva sus datos (D3)
   format_checks: domain  # check_content y check_operation_id bajan al núcleo (D4)
@@ -24,3 +25,4 @@ decisions:
   api_split: child_modules  # api.rs se parte en módulos hijos de api, en daemon/api/, con los tests de cada dominio y el arnés en test_support (D20, D21)
   answer: two_steps  # UserAnswer::new puro y answer_suggestion_core después (D17)
 updated: 2026-11-19
+main_specs: [openspec/specs/ingest/spec.md, openspec/specs/synthesis/spec.md, openspec/specs/provenance/spec.md, openspec/specs/project/spec.md]

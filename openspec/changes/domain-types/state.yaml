@@ -1,6 +1,6 @@
 change: domain-types
 objective: "transversal"
-depends_on: [core-use-cases]
+depends_on: [core-use-cases]  # archivado
 phase: explore
 artifacts:
   exploration: draft

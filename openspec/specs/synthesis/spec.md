@@ -8,6 +8,7 @@ Fuente de verdad del comportamiento actual de la síntesis dirigida por el agent
 - [agent-authorship](../../changes/archive/2026-10-22-agent-authorship/proposal.md), archivado el 2026-10-22: el alcance, la memoria pendiente, la revisión y las fuentes de otro agente pasan de agente a proyecto, dentro de lo que alcanza el lector.
 - [session-start-context](../../changes/archive/2026-11-04-session-start-context/proposal.md), archivado el 2026-11-04, que salió en 0.76.0: SC6 de esa spec cambia «Memoria sin revisar» y R8, porque el aviso deja afuera lo importado.
 - [retire-legacy-kinds](../../changes/archive/2026-11-07-retire-legacy-kinds/proposal.md), archivado el 2026-11-07, que sale en 0.79.0 (sólo lo que decía de las tablas que V32 retira; no hay requisito nuevo).
+- [core-use-cases](../../changes/archive/2026-11-19-core-use-cases/proposal.md), archivado el 2026-11-19, que sale en 0.89.0 (R10, antes R3 de esa spec: las fuentes de una conclusión se comprueban en el núcleo; R3 de acá sigue diciendo qué se rechaza y R10 dice quién lo decide y en qué orden).
 
 ## Definiciones
 
@@ -55,7 +56,7 @@ El daemon MUST rechazar con 400, sin encolar nada, un save cuyo `derived_from` n
 - WHEN A guarda C con `derived_from = [M, T]`
 - THEN C se guarda con las dos fuentes; con `hide A B`, la respuesta es 400 y nombra `T`
 
-Una conclusión descansa sólo en filas vivas. El daemon MUST rechazar también con 400, sin encolar nada, un save cuyo `derived_from` nombre una fila que alcanza, no borrada y `superseded`, con un mensaje que nombra cada id rechazado con la fila que lo reemplazó y pide sacar la conclusión de las vigentes: `derived_from names memories that were replaced: 5 (by 9); draw the conclusion from the current ones` (`replaced_memory_ids`, `crates/clawg-core/src/memory/upkeep/synthesis.rs:330`; el rechazo en `crates/clawg-core/src/memory/ingest/save.rs`; `replaced_list`, `crates/clawg-core/src/memory/ingest/save.rs`). Se mira después de las que faltan, así que un id ausente, borrado o ajeno responde como arriba. Una fuente `disputed` MUST seguir aceptándose. Como el resto de `derived_from`, se valida antes de encolar: una fila de la cola escrita antes enlaza lo que nombra.
+Una conclusión descansa sólo en filas vivas. El daemon MUST rechazar también con 400, sin encolar nada, un save cuyo `derived_from` nombre una fila que alcanza, no borrada y `superseded`, con un mensaje que nombra cada id rechazado con la fila que lo reemplazó y pide sacar la conclusión de las vigentes: `derived_from names memories that were replaced: 5 (by 9); draw the conclusion from the current ones` (`replaced_memory_ids`, `crates/clawg-core/src/memory/upkeep/synthesis.rs`; el rechazo, `SaveRejected::ReplacedSources`, y su texto, `replaced_list`, en `crates/clawg-core/src/memory/ingest/save.rs`; quién lo decide, en R10). Se mira después de las que faltan, así que un id ausente, borrado o ajeno responde como arriba. Una fuente `disputed` MUST seguir aceptándose. Como el resto de `derived_from`, se valida antes de encolar: una fila de la cola escrita antes enlaza lo que nombra.
 
 #### Escenario: fuente reemplazada
 - GIVEN una memoria A reemplazada por A2 (un save con la misma `topic_key`)
@@ -217,3 +218,19 @@ Una base en V9 MUST abrirse con esta versión aplicando V10 (`memory_derivation`
 Las conclusiones a revisar no cambian el esquema. Un enlace a una fuente purgada que un binario anterior encuentra lo lee como cualquier otro: un `derived_from` que nombra un id que ya no existe, lo mismo que ya veía de una fuente borrada. Volver a ese binario no pide nada; si se quieren sacar esos enlaces, es a mano: `DELETE FROM memory_derivation WHERE source_id NOT IN (SELECT id FROM memory);`.
 
 **Test:** `a_store_from_the_previous_version_opens_with_every_row_untouched` en `crates/clawg-core/src/memory/store/db.rs` (siembra en V9 una memoria, una trayectoria y un skill), `a_spill_without_sources_still_parses` en `crates/clawg-core/src/memory/ingest/spill.rs` y la fila de V10 en `published_migration_checksums_are_pinned`.
+
+## R10. Las fuentes de una conclusión están vivas y al alcance, y lo decide el núcleo
+
+`MemoryRuntime::admit(NewSave)` (`crates/clawg-core/src/runtime.rs`) MUST, cuando `derived_from` no está vacío, leer la política de `sharing.json` del directorio del runtime para el agente del save y rechazar, en este orden:
+
+1. con `SaveRejected::MissingSources(ids)` si algún id no nombra una fila no borrada que el agente alcanza: `derived_from names memories that do not exist or were deleted: <ids separados por ", ">`, en el orden de `derived_from`. Una fila que la política oculta MUST contar como inexistente (R3);
+2. con `SaveRejected::ReplacedSources(pares)` si alguno nombra una fila `superseded`: `derived_from names memories that were replaced: <id (by <id>), …>; draw the conclusion from the current ones`.
+
+Sin `derived_from`, `admit` MUST NOT leer `sharing.json` ni consultar las fuentes. Un error del store MUST ser `SaveRejected::Store`, con el texto del `MemoryError`. Las dos reglas de formato de las fuentes, que no sean más de 50 ids distintos y que `derived_from` quede con cada id una vez y en orden ascendente, las decide antes `NewSave::parse` ([`specs/ingest`](../ingest/spec.md), «El formato de un save se comprueba en el núcleo»). El daemon traduce los tres rechazos: `MissingSources` y `ReplacedSources` a `400`, `Store` a `500`.
+
+#### Escenario
+- GIVEN una fila viva de `a`, una borrada, una de `b` que `sharing.json` le oculta a `a`, y una reemplazada por otra
+- WHEN `a` admite una conclusión de cada una
+- THEN las tres primeras dan `MissingSources` con los ids que faltan, la reemplazada da `ReplacedSources` con su reemplazo, y la viva sola se admite
+
+**Tests:** `a_conclusion_from_missing_or_hidden_sources_is_refused`, `a_conclusion_from_a_replaced_source_is_refused` y `a_store_that_fails_refuses_the_save_with_its_error` (`crates/clawg-core/src/runtime.rs`, mod tests, sin HTTP); `missing_sources_are_the_ones_that_were_not_found` y `replaced_sources_name_what_replaced_them` (`crates/clawg-core/src/memory/ingest/save.rs`, mod tests).
