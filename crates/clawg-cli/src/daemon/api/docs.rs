@@ -187,10 +187,11 @@ fn not_accepted(root: &std::path::Path, profile: Profile) -> String {
 
 /// `arg` quoted so a shell passes it as it is: in double quotes, which keep a
 /// Windows path whole in every shell, unless it holds what a POSIX shell or
-/// PowerShell expands or ends there; then in single quotes, each `'` of it
-/// closed, escaped and opened again.
+/// PowerShell expands or ends there, or a backslash a POSIX shell reads as an
+/// escape there (`\\`, as in a UNC root, or one before the closing quote); then
+/// in single quotes, each `'` of it closed, escaped and opened again.
 fn shell_quoted(arg: &str) -> String {
-    if arg.contains(['$', '`', '"', '!']) {
+    if arg.contains(['$', '`', '"', '!']) || arg.contains(r"\\") || arg.ends_with('\\') {
         format!("'{}'", arg.replace('\'', r"'\''"))
     } else {
         format!("\"{arg}\"")
@@ -331,6 +332,18 @@ mod tests {
         for root in ["/a/`id`", "/a/\"b", "/a/!x"] {
             assert!(shell_quoted(root).starts_with('\''), "{root}");
         }
+    }
+
+    /// Inside double quotes a POSIX shell reads `\\` as one backslash and `\"`
+    /// as a quote, so a UNC root, or one that ends in a backslash, goes in
+    /// single quotes; a single backslash before anything else stays as it is.
+    #[test]
+    fn the_refusal_keeps_the_backslashes_of_a_windows_root() {
+        assert_eq!(shell_quoted(r"\\server\share\app"), r"'\\server\share\app'");
+        assert_eq!(shell_quoted(r"C:\work\app\"), r"'C:\work\app\'");
+        assert_eq!(shell_quoted(r"C:\work\new app"), r#""C:\work\new app""#);
+        let refusal = not_accepted(std::path::Path::new(r"\\server\share\app"), Profile::Prod);
+        assert!(refusal.contains(r"`clawg projects add '\\server\share\app'`"), "{refusal}");
     }
 
     /// A folder the MCP client has open is read as the bridge's own
