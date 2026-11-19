@@ -111,19 +111,23 @@ fn no_production_code_names_the_retired_tables() {
     assert!(found.is_empty(), "these lines name a table V32 dropped:\n{}", found.join("\n"));
 }
 
-/// The quoted names a line of SQL compares `status` or `memory_type` with, as
-/// `(column, name)`: after `=`, `<>` or `!=`, and each quoted item of an `IN`
-/// list. A column whose name only ends in one of them (`from_status`) is
+/// The quoted names the first line of `text` compares `status` or
+/// `memory_type` with, as `(column, name)`: after `=`, `<>` or `!=`, and each
+/// quoted item of an `IN` list. The column is named on that line and its
+/// operand may run on into the lines after it, as a list split over several
+/// lines does; the `\` or `"` that ends a line of a Rust string is no part of
+/// an item. A column whose name only ends in one of them (`from_status`) is
 /// another column; an operand that is not a quoted literal names nothing.
-fn compared_names(line: &str) -> Vec<(&'static str, String)> {
+fn compared_names(text: &str) -> Vec<(&'static str, String)> {
     let continues = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let line = &text[..text.find('\n').unwrap_or(text.len())];
     let mut found = Vec::new();
     for column in ["status", "memory_type"] {
         for (at, _) in line.match_indices(column) {
             if line[..at].chars().next_back().is_some_and(continues) {
                 continue;
             }
-            let rest = &line[at + column.len()..];
+            let rest = &text[at + column.len()..];
             if rest.starts_with(continues) {
                 continue;
             }
@@ -131,7 +135,7 @@ fn compared_names(line: &str) -> Vec<(&'static str, String)> {
             let after_not = rest.strip_prefix("NOT ").map_or(rest, str::trim_start);
             if let Some(list) = after_not.strip_prefix("IN").map(str::trim_start).and_then(|r| r.strip_prefix('(')) {
                 let list = &list[..list.find(')').unwrap_or(list.len())];
-                for item in list.split(',').map(str::trim) {
+                for item in list.split(',').map(|i| i.trim_matches(|c: char| c.is_whitespace() || c == '\\' || c == '"')) {
                     if let Some(name) = item.strip_prefix('\'').and_then(|i| i.strip_suffix('\'')) {
                         found.push((column, name.to_string()));
                     }
@@ -153,7 +157,7 @@ fn compared_names(line: &str) -> Vec<(&'static str, String)> {
 
 #[test]
 fn compared_names_reads_the_literals_a_line_compares() {
-    let cases: [(&str, &[(&str, &str)]); 8] = [
+    let cases: [(&str, &[(&str, &str)]); 11] = [
         ("WHERE m.status IN ('active', 'disputed')", &[("status", "active"), ("status", "disputed")]),
         ("AND status <> 'superseded' AND", &[("status", "superseded")]),
         ("SET status = 'superseded', superseded_by = ?2", &[("status", "superseded")]),
@@ -162,6 +166,9 @@ fn compared_names_reads_the_literals_a_line_compares() {
         ("AND status = ? AND memory_type IN (SELECT value FROM json_each(?))", &[]),
         ("judgment_status = 'x', memory_types = 'y'", &[]),
         ("    status: String,", &[]),
+        ("WHERE status IN ('active',\n                 'disputed')", &[("status", "active"), ("status", "disputed")]),
+        ("AND memory_type NOT IN ('session_summary', \\\n       'code_block')", &[("memory_type", "session_summary"), ("memory_type", "code_block")]),
+        ("AND x = 1\nAND status = 'active'", &[]),
     ];
     for (line, want) in cases {
         let want: Vec<(&str, String)> = want.iter().map(|(c, n)| (*c, n.to_string())).collect();
@@ -183,13 +190,13 @@ fn every_status_and_type_the_sql_compares_is_one_the_code_knows() {
         rust_files(&krate.path().join("src"), &mut files);
     }
     assert!(!files.is_empty(), "no sources found under {}", crates.display());
-    let mut lines: Vec<(String, usize, String)> = Vec::new();
+    let mut compared = Vec::new();
     for file in &files {
         let shown = file.strip_prefix(crates).unwrap_or(file).to_string_lossy().replace('\\', "/");
         let source = fs::read_to_string(file).unwrap_or_else(|e| panic!("read {}: {e}", file.display()));
-        let all: Vec<&str> = source.lines().collect();
-        for n in production_lines_naming(&source, |line| !compared_names(line).is_empty()) {
-            lines.push((shown.clone(), n, all[n - 1].to_string()));
+        let end = production_end(&source.lines().collect::<Vec<_>>());
+        for (n, text) in lines_onward(&source).take(end) {
+            compared.extend(compared_names(text).into_iter().map(|(column, name)| (format!("{shown}:{n}"), column, name)));
         }
     }
     let migrations = crates.join("clawg-core/migrations");
@@ -197,27 +204,34 @@ fn every_status_and_type_the_sql_compares_is_one_the_code_knows() {
         let path = entry.path();
         let source = fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
         let shown = path.strip_prefix(crates).unwrap_or(&path).to_string_lossy().replace('\\', "/");
-        for (n, line) in source.lines().enumerate() {
-            lines.push((shown.clone(), n + 1, line.to_string()));
+        for (n, text) in lines_onward(&source) {
+            compared.extend(compared_names(text).into_iter().map(|(column, name)| (format!("{shown}:{n}"), column, name)));
         }
     }
 
-    let mut compared = 0;
     let mut unknown = Vec::new();
-    for (file, n, line) in &lines {
-        for (column, name) in compared_names(line) {
-            compared += 1;
-            let known = match column {
-                "status" => MemoryStatus::from_name(&name).is_some(),
-                _ => name.parse::<MemoryType>().is_ok(),
-            };
-            if !known {
-                unknown.push(format!("{file}:{n}: {column} {name:?}"));
-            }
+    for (at, column, name) in &compared {
+        let known = match *column {
+            "status" => MemoryStatus::from_name(name).is_some(),
+            _ => name.parse::<MemoryType>().is_ok(),
+        };
+        if !known {
+            unknown.push(format!("{at}: {column} {name:?}"));
         }
     }
-    assert!(compared > 0, "no SQL compares a status or a type: the scan reads nothing");
+    assert!(!compared.is_empty(), "no SQL compares a status or a type: the scan reads nothing");
     assert!(unknown.is_empty(), "these lines compare a name the code does not know:\n{}", unknown.join("\n"));
+}
+
+/// Each line of `source`, from 1, with the text from its start to the end of
+/// `source`, so a reader of the line can follow what it starts onto the next.
+fn lines_onward(source: &str) -> impl Iterator<Item = (usize, &str)> {
+    let mut at = 0;
+    source.split_inclusive('\n').enumerate().map(move |(n, line)| {
+        let text = &source[at..];
+        at += line.len();
+        (n + 1, text)
+    })
 }
 
 /// A failed call on the store's connection is worded in one place,
