@@ -175,13 +175,26 @@ fn not_accepted(root: &std::path::Path, profile: Profile) -> String {
         Profile::Prod => String::new(),
         other => format!(" --profile {}", other.as_str()),
     };
+    let root = root.display().to_string();
     format!(
         "clawg reads the files of the projects the user added, and of a folder the MCP client has \
          open or a bridge was started in when that folder has a .git or a manifest and is not the \
          home directory or a filesystem root; {root} is neither. Ask the user to run `clawg projects \
-         add \"{root}\"{flag}` if they want it searched, then call again",
-        root = root.display()
+         add {quoted}{flag}` if they want it searched, then call again",
+        quoted = shell_quoted(&root)
     )
+}
+
+/// `arg` quoted so a shell passes it as it is: in double quotes, which keep a
+/// Windows path whole in every shell, unless it holds what a POSIX shell or
+/// PowerShell expands or ends there; then in single quotes, each `'` of it
+/// closed, escaped and opened again.
+fn shell_quoted(arg: &str) -> String {
+    if arg.contains(['$', '`', '"', '!']) {
+        format!("'{}'", arg.replace('\'', r"'\''"))
+    } else {
+        format!("\"{arg}\"")
+    }
 }
 
 /// Searches a registered project's documentation. When the last refresh is
@@ -303,6 +316,18 @@ mod tests {
         let root = std::path::Path::new("/work/other");
         assert!(not_accepted(root, Profile::Prod).contains("`clawg projects add \"/work/other\"`"));
         assert!(not_accepted(root, Profile::Dev).contains("`clawg projects add \"/work/other\" --profile dev`"));
+    }
+
+    /// A root a shell would expand inside double quotes is named in single
+    /// quotes, so the command the user copies adds that root and no other.
+    #[test]
+    fn the_refusal_quotes_a_root_the_shell_would_expand() {
+        let refusal = not_accepted(std::path::Path::new("/work/$HOME/it's"), Profile::Dev);
+        assert!(refusal.contains(r"`clawg projects add '/work/$HOME/it'\''s' --profile dev`"), "{refusal}");
+        assert_eq!(shell_quoted(r"C:\Users\dev\app"), r#""C:\Users\dev\app""#);
+        for root in ["/a/`id`", "/a/\"b", "/a/!x"] {
+            assert!(shell_quoted(root).starts_with('\''), "{root}");
+        }
     }
 
     /// A folder the MCP client has open is read as the bridge's own
