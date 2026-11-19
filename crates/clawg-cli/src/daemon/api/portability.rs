@@ -930,8 +930,13 @@ mod tests {
         std::fs::write(&path, rows_file(3)).expect("an export file");
         let request: ImportJobRequest = serde_json::from_value(serde_json::json!({ "path": path })).expect("a request");
 
-        let gone = tokio::time::timeout(Duration::ZERO, accept_job(app.clone(), request, ImportControl::default())).await;
-        assert!(gone.is_err(), "the request goes before it is answered");
+        // Polled once and dropped: a zero timeout is not enough, since its
+        // deadline rounds up to the timer's next tick and a fast read can
+        // answer before it fires.
+        let mut asked = Box::pin(accept_job(app.clone(), request, ImportControl::default()));
+        let polled = std::future::Future::poll(asked.as_mut(), &mut std::task::Context::from_waker(std::task::Waker::noop()));
+        assert!(polled.is_pending(), "the request goes before it is answered");
+        drop(asked);
         tokio::task::yield_now().await;
 
         assert!(matches!(app.imports.reserve(), Err(Busy::Running(1))), "the read still holds the slot");
