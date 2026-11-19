@@ -10,6 +10,7 @@
 
 use crate::memory::store::error::{ClosedAs, failed_call};
 use crate::memory::store::error::MemoryError;
+use crate::memory::domain::record::{MemoryType, StoredType};
 
 // ---------------------------------------------------------------------------
 // Pure-Rust functions (no SQL, fully unit-testable)
@@ -24,7 +25,7 @@ pub(crate) fn compute_tier(
     current: i64,
     importance: f64,
     access_count: i64,
-    memory_type: &str,
+    memory_type: Option<MemoryType>,
 ) -> i64 {
     // Rule 1: pivotal fast-track — high-importance memories always land at tier 1.
     if importance >= 9.0 {
@@ -33,7 +34,7 @@ pub(crate) fn compute_tier(
 
     match memory_type {
         // Rule 2: type-based tier-1 types (initial and always).
-        "user_preference" => current.min(1),
+        Some(MemoryType::UserPreference) => current.min(1),
 
         // Rule 3: architectural_decision / session_summary
         //   – access_count >= 3: promote to tier 1.
@@ -47,7 +48,7 @@ pub(crate) fn compute_tier(
         //   access_count >= 3 threshold is crossed by the SECOND reinforcement of
         //   an inserted row, not the third. Pinned in store_insert.rs so a change
         //   to either number is caught instead of silently shifting this boundary.
-        "architectural_decision" | "session_summary" => {
+        Some(MemoryType::ArchitecturalDecision | MemoryType::SessionSummary) => {
             if access_count >= 3 {
                 current.min(1)
             } else {
@@ -55,8 +56,9 @@ pub(crate) fn compute_tier(
             }
         }
 
-        // No rule for chat_message or unknown types.
-        _ => current,
+        // No rule for the other types, nor for one this build does not know.
+        Some(MemoryType::ChatMessage | MemoryType::ToolError | MemoryType::CodeBlock | MemoryType::SemanticFact)
+        | None => current,
     }
 }
 
@@ -104,8 +106,8 @@ pub(crate) fn demote_inactive(
 }
 
 /// The tier a row keeps after someone changes its importance or type from
-/// `before` to `after` (each an `(importance, memory_type)` pair, with the
-/// table literal standing in for the type outside `memory`).
+/// `before` to `after` (each an `(importance, memory_type)` pair, `None` for
+/// a type this build does not know).
 ///
 /// A change that takes away what the rules were awarding drops the row to
 /// what they still award, but never above a tier it already lost to
@@ -115,8 +117,8 @@ pub(crate) fn demote_inactive(
 pub(crate) fn retier(
     current: i64,
     access_count: i64,
-    before: (f64, &str),
-    after: (f64, &str),
+    before: (f64, Option<MemoryType>),
+    after: (f64, Option<MemoryType>),
 ) -> i64 {
     let earned_before = compute_tier(3, before.0, access_count, before.1);
     let earned_after = compute_tier(3, after.0, access_count, after.1);
@@ -149,8 +151,8 @@ pub(crate) async fn register_tier_udf(
             let current: i64 = ctx.get(0)?;
             let importance: f64 = ctx.get(1)?;
             let access_count: i64 = ctx.get(2)?;
-            let memory_type: String = ctx.get(3)?;
-            Ok(compute_tier(current, importance, access_count, &memory_type))
+            let memory_type: StoredType = ctx.get(3)?;
+            Ok(compute_tier(current, importance, access_count, memory_type.known()))
         })?;
 
         Ok(())
@@ -201,26 +203,26 @@ mod tests {
 
     #[test]
     fn compute_tier_user_preference_inserts_at_tier_1() {
-        assert_eq!(compute_tier(3, 5.0, 0, "user_preference"), 1);
+        assert_eq!(compute_tier(3, 5.0, 0, Some(MemoryType::UserPreference)), 1);
     }
 
     // INSERT tier-2 types (compute_tier(3, importance, 0, type) → 2)
 
     #[test]
     fn compute_tier_architectural_decision_inserts_at_tier_2() {
-        assert_eq!(compute_tier(3, 5.0, 0, "architectural_decision"), 2);
+        assert_eq!(compute_tier(3, 5.0, 0, Some(MemoryType::ArchitecturalDecision)), 2);
     }
 
     #[test]
     fn compute_tier_session_summary_inserts_at_tier_2() {
-        assert_eq!(compute_tier(3, 5.0, 0, "session_summary"), 2);
+        assert_eq!(compute_tier(3, 5.0, 0, Some(MemoryType::SessionSummary)), 2);
     }
 
     // INSERT tier-3 types (compute_tier(3, importance, 0, type) → 3)
 
     #[test]
     fn compute_tier_chat_message_inserts_at_tier_3() {
-        assert_eq!(compute_tier(3, 5.0, 0, "chat_message"), 3);
+        assert_eq!(compute_tier(3, 5.0, 0, Some(MemoryType::ChatMessage)), 3);
     }
 
     // Promote-only invariant — result MUST NOT exceed current.
@@ -228,7 +230,7 @@ mod tests {
     #[test]
     fn compute_tier_promote_only_chat_message_at_tier_1_stays_1() {
         // No rule fires for chat_message, returns current = 1.
-        assert_eq!(compute_tier(1, 1.0, 0, "chat_message"), 1);
+        assert_eq!(compute_tier(1, 1.0, 0, Some(MemoryType::ChatMessage)), 1);
     }
 
     // No rule fires → returns current unchanged.
@@ -236,15 +238,15 @@ mod tests {
     #[test]
     fn compute_tier_no_rule_fires_returns_current_unchanged() {
         // chat_message at tier 2 with access_count=1 — no rule fires.
-        assert_eq!(compute_tier(2, 2.0, 1, "chat_message"), 2);
+        assert_eq!(compute_tier(2, 2.0, 1, Some(MemoryType::ChatMessage)), 2);
     }
 
     // Importance >= 9.0 fast-track.
 
     #[test]
     fn compute_tier_high_importance_promotes_any_type_to_tier_1() {
-        assert_eq!(compute_tier(3, 9.0, 0, "chat_message"), 1);
-        assert_eq!(compute_tier(2, 9.5, 1, "session_summary"), 1);
+        assert_eq!(compute_tier(3, 9.0, 0, Some(MemoryType::ChatMessage)), 1);
+        assert_eq!(compute_tier(2, 9.5, 1, Some(MemoryType::SessionSummary)), 1);
     }
 
     // Extra: promote-only invariant on architectural_decision below threshold.
@@ -252,7 +254,7 @@ mod tests {
     #[test]
     fn compute_tier_arch_decision_below_threshold_capped_at_current_if_lower() {
         // current=1, access_count=0 → min(2, 1) = 1, never demotes.
-        assert_eq!(compute_tier(1, 5.0, 0, "architectural_decision"), 1);
+        assert_eq!(compute_tier(1, 5.0, 0, Some(MemoryType::ArchitecturalDecision)), 1);
     }
 
     // ── flush re-evaluation rule (pure Rust)
@@ -260,12 +262,12 @@ mod tests {
     #[test]
     fn compute_tier_architectural_decision_access_count_3_promotes_to_tier_1() {
         // current=2, access_count=3 → flush re-eval fires → 1.
-        assert_eq!(compute_tier(2, 7.0, 3, "architectural_decision"), 1);
+        assert_eq!(compute_tier(2, 7.0, 3, Some(MemoryType::ArchitecturalDecision)), 1);
     }
 
     #[test]
     fn compute_tier_session_summary_access_count_3_promotes_to_tier_1() {
-        assert_eq!(compute_tier(2, 5.0, 3, "session_summary"), 1);
+        assert_eq!(compute_tier(2, 5.0, 3, Some(MemoryType::SessionSummary)), 1);
     }
 
     // ── demote_inactive truth table ─────────────────────────────────────────
@@ -274,45 +276,45 @@ mod tests {
 
     #[test]
     fn lowering_the_importance_that_gave_tier_1_takes_it_away() {
-        assert_eq!(retier(1, 1, (9.5, "semantic_fact"), (2.0, "semantic_fact")), 3);
+        assert_eq!(retier(1, 1, (9.5, Some(MemoryType::SemanticFact)), (2.0, Some(MemoryType::SemanticFact))), 3);
     }
 
     #[test]
     fn lowering_to_a_value_that_still_earns_the_tier_keeps_it() {
-        assert_eq!(retier(1, 1, (9.5, "semantic_fact"), (9.0, "semantic_fact")), 1);
+        assert_eq!(retier(1, 1, (9.5, Some(MemoryType::SemanticFact)), (9.0, Some(MemoryType::SemanticFact))), 1);
     }
 
     #[test]
     fn a_tier_earned_by_access_survives_lowering_the_importance() {
-        assert_eq!(retier(1, 3, (9.5, "architectural_decision"), (2.0, "architectural_decision")), 1);
+        assert_eq!(retier(1, 3, (9.5, Some(MemoryType::ArchitecturalDecision)), (2.0, Some(MemoryType::ArchitecturalDecision))), 1);
     }
 
     #[test]
     fn a_lost_tier_falls_only_to_what_the_rest_still_earns() {
-        assert_eq!(retier(1, 1, (9.5, "architectural_decision"), (2.0, "architectural_decision")), 2);
+        assert_eq!(retier(1, 1, (9.5, Some(MemoryType::ArchitecturalDecision)), (2.0, Some(MemoryType::ArchitecturalDecision))), 2);
     }
 
     #[test]
     fn a_type_that_gave_tier_1_takes_it_with_it() {
-        assert_eq!(retier(1, 1, (5.0, "user_preference"), (5.0, "semantic_fact")), 3);
+        assert_eq!(retier(1, 1, (5.0, Some(MemoryType::UserPreference)), (5.0, Some(MemoryType::SemanticFact))), 3);
     }
 
     #[test]
     fn a_tier_the_rules_never_gave_survives_any_change() {
-        assert_eq!(retier(1, 1, (5.0, "semantic_fact"), (3.0, "semantic_fact")), 1);
-        assert_eq!(retier(1, 1, (5.0, "semantic_fact"), (5.0, "chat_message")), 1);
-        assert_eq!(retier(2, 1, (5.0, "tool_error"), (1.0, "tool_error")), 2);
+        assert_eq!(retier(1, 1, (5.0, Some(MemoryType::SemanticFact)), (3.0, Some(MemoryType::SemanticFact))), 1);
+        assert_eq!(retier(1, 1, (5.0, Some(MemoryType::SemanticFact)), (5.0, Some(MemoryType::ChatMessage))), 1);
+        assert_eq!(retier(2, 1, (5.0, Some(MemoryType::ToolError)), (1.0, Some(MemoryType::ToolError))), 2);
     }
 
     #[test]
     fn a_tier_lost_to_inactivity_is_not_given_back_by_lowering() {
-        assert_eq!(retier(3, 1, (9.5, "architectural_decision"), (2.0, "architectural_decision")), 3);
+        assert_eq!(retier(3, 1, (9.5, Some(MemoryType::ArchitecturalDecision)), (2.0, Some(MemoryType::ArchitecturalDecision))), 3);
     }
 
     #[test]
     fn raising_still_promotes() {
-        assert_eq!(retier(3, 1, (5.0, "semantic_fact"), (9.0, "semantic_fact")), 1);
-        assert_eq!(retier(3, 1, (5.0, "semantic_fact"), (5.0, "user_preference")), 1);
+        assert_eq!(retier(3, 1, (5.0, Some(MemoryType::SemanticFact)), (9.0, Some(MemoryType::SemanticFact))), 1);
+        assert_eq!(retier(3, 1, (5.0, Some(MemoryType::SemanticFact)), (5.0, Some(MemoryType::UserPreference))), 1);
     }
 
     // Tier 1 → 2 when days > 90 AND importance < 9.0.
@@ -387,6 +389,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(v, 1, "expected tier 1 (user_preference INSERT), got {v}");
+    }
+
+    #[tokio::test]
+    async fn the_tier_udf_keeps_the_tier_of_a_type_it_does_not_know() {
+        let store = crate::memory::store::db::MemoryStore::new_for_test().await.unwrap();
+        let v: i64 = store
+            .conn
+            .call(|c| c.query_row("SELECT compute_tier(3, 5.0, 9, 'observation')", [], |r| r.get(0)))
+            .await
+            .unwrap();
+        assert_eq!(v, 3);
     }
 
     // ── register_demote_udf — SQL callable ──────────────────────────────────

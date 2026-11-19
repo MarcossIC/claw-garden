@@ -31,7 +31,7 @@ use clawg_core::memory::synthesis::{
     SynthesisParams, unreviewed_count,
 };
 use clawg_core::memory::worker::{ChunkOutcome, IngestFailure, IngestReport, SavedChunk};
-use clawg_core::memory::{RankedHit, read_save_core, SaveText, search_all_memories, SearchScope};
+use clawg_core::memory::{MemoryStatus, RankedHit, read_save_core, SaveText, search_all_memories, SearchScope, StoredStatus, StoredType};
 use clawg_core::metrics::sessions::{Activity, UNSPECIFIED};
 use clawg_core::metrics::{Recorder, Unit};
 use clawg_core::preferences::Lang;
@@ -83,9 +83,6 @@ fn retired_kind(kind: &str) -> String {
     )
 }
 
-/// The lifecycle states a memory row can be filtered by.
-const STATUSES: [&str; 3] = ["active", "disputed", "superseded"];
-
 /// Validates a listing request and turns it into the core's parameters.
 ///
 /// Pure, so each refusal is testable without a server. Every refusal is a 400
@@ -96,13 +93,14 @@ pub fn list_params_from_query(q: ListQuery) -> ApiResult<ListParams> {
         parse_kind(raw)?;
     }
 
-    if let Some(status) = q.status.as_deref() {
-        if !STATUSES.contains(&status) {
-            return Err(ApiError::bad_request(format!(
-                "unknown status {status:?}: accepted values are \"active\", \"disputed\" and \"superseded\""
-            )));
-        }
-    }
+    let status = match q.status.as_deref() {
+        None => None,
+        Some(raw) => Some(MemoryStatus::from_name(raw).ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "unknown status {raw:?}: accepted values are \"active\", \"disputed\" and \"superseded\""
+            ))
+        })?),
+    };
 
     let deleted = q.deleted.unwrap_or(false);
     if deleted && q.q.is_some() {
@@ -126,11 +124,11 @@ pub fn list_params_from_query(q: ListQuery) -> ApiResult<ListParams> {
 
     Ok(ListParams {
         tier: q.tier,
-        memory_type: q.memory_type,
+        memory_type: q.memory_type.as_deref().map(StoredType::read),
         agent_id: q.agent,
         project_id: q.project,
         no_project,
-        status: q.status,
+        status: status.map(StoredStatus::from),
         origin_project: q.origin_project,
         query: q.q,
         limit: q.limit,
@@ -637,7 +635,7 @@ impl From<Deleted> for DeletedBody {
 pub struct RestoredBody {
     pub restored: usize,
     pub id: i64,
-    pub status: String,
+    pub status: StoredStatus,
     pub superseded_by: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub topic_key: Option<String>,
@@ -727,7 +725,7 @@ impl MoveRequest {
             ids: self.ids,
             from,
             agent_id: self.agent,
-            memory_type: self.memory_type,
+            memory_type: self.memory_type.as_deref().map(StoredType::read),
             source: self.source,
             session_id: self.session_id,
             query: self.q,
@@ -1538,10 +1536,10 @@ mod tests {
         .expect("valid");
 
         assert_eq!(params.tier, Some(2));
-        assert_eq!(params.memory_type.as_deref(), Some("semantic_fact"));
+        assert_eq!(params.memory_type.as_ref().map(|t| t.as_str()), Some("semantic_fact"));
         assert_eq!(params.agent_id.as_deref(), Some("a1"));
         assert_eq!(params.project_id.as_deref(), Some("p1"));
-        assert_eq!(params.status.as_deref(), Some("disputed"));
+        assert_eq!(params.status.as_ref().map(|t| t.as_str()), Some("disputed"));
         assert_eq!(params.query.as_deref(), Some("deploy"));
         assert_eq!((params.limit, params.offset), (Some(5), Some(10)));
     }

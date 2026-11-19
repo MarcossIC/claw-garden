@@ -14,6 +14,7 @@ use crate::memory::domain::vector::to_unit;
 use crate::memory::ingest::outbox::{apply_note, OutboxNote};
 use crate::memory::domain::provenance::{is_stated, seal};
 pub use crate::memory::domain::record::{MemoryType, UnknownMemoryType};
+use crate::memory::domain::record::StoredType;
 pub(crate) use crate::memory::domain::record::CreatedByType;
 use crate::memory::retrieval::search::{reach_predicate, reader_bind};
 use crate::memory::domain::sharing::Reader;
@@ -73,16 +74,17 @@ impl NewMemoryRecord {
             // importance. Both overrides are therefore honoured — and only
             // here, so a chat turn can never talk its way out of its derivation.
             //
-            // The type arrives as a free string (that is what an MCP client can
-            // express) but is mapped onto `MemoryType` rather than stored raw:
-            // the `memory_type` column is untyped TEXT, so a raw string WOULD
+            // The daemon only queues a type it parsed, but an outbox row
+            // another version wrote may hold one this build does not know. It
+            // is mapped onto `MemoryType` rather than stored raw: the
+            // `memory_type` column is untyped TEXT, so the raw text WOULD
             // persist, but `compute_tier` and the contradiction gate both
             // classify by this enum, and an unrecognised value silently opts
             // the row out of both. Falling back is the honest failure.
             let memory_type = evt
                 .memory_type
-                .as_deref()
-                .and_then(MemoryType::from_db_str)
+                .as_ref()
+                .and_then(StoredType::known)
                 .unwrap_or(MemoryType::SemanticFact);
             // `SemanticFact` as the fallback because a user-declared memory
             // with no stated type IS an asserted fact — and, being
@@ -469,7 +471,7 @@ impl PreparedRow {
             // Compute the initial tier explicitly instead of relying
             // on the schema DEFAULT — the single source of truth for every
             // producer. PROMOTE-ONLY, starts from current=3 (see memory/tier.rs).
-            tier: crate::memory::store::tier::compute_tier(3, record.importance, 0, record.memory_type.as_str()),
+            tier: crate::memory::store::tier::compute_tier(3, record.importance, 0, Some(record.memory_type)),
             status: if disputed { "disputed" } else { "active" },
             disputed_against: disputed
                 .then(|| serde_json::to_string(&escalated).expect("Vec<i64> serialises infallibly")),
@@ -766,7 +768,7 @@ mod tests {
             is_error: None,
             source: MemorySource::Explicit,
             timestamp_ms: 0,
-            memory_type: memory_type.map(str::to_owned),
+            memory_type: memory_type.map(StoredType::read),
             importance,
             derived_from: Vec::new(),
             topic_key: None,

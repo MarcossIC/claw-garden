@@ -1111,6 +1111,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::memory::domain::record::StoredType;
     use crate::memory::domain::events::{MemoryEvent, MemorySource};
     use crate::memory::projects::identity::{FakeGround, RootCommit};
     use crate::memory::projects::relocate::{move_memories_core, undo_move_core, MoveFilter};
@@ -1175,7 +1176,7 @@ mod tests {
             is_error: None,
             source: MemorySource::Explicit,
             timestamp_ms: 1,
-            memory_type: Some("semantic_fact".into()),
+            memory_type: Some(StoredType::read("semantic_fact")),
             importance: None,
             derived_from: Vec::new(),
             topic_key: None,

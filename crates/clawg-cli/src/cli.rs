@@ -8,6 +8,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use clawg_core::memory::sharing;
+use clawg_core::memory::MemoryStatus;
 use clawg_core::paths::{Profile, ProfileError};
 use clawg_core::preferences::Lang;
 
@@ -1017,13 +1018,12 @@ pub enum StatusArg {
     Superseded,
 }
 
-impl StatusArg {
-    /// The spelling the daemon's API takes.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            StatusArg::Active => "active",
-            StatusArg::Disputed => "disputed",
-            StatusArg::Superseded => "superseded",
+impl From<StatusArg> for MemoryStatus {
+    fn from(s: StatusArg) -> Self {
+        match s {
+            StatusArg::Active => MemoryStatus::Active,
+            StatusArg::Disputed => MemoryStatus::Disputed,
+            StatusArg::Superseded => MemoryStatus::Superseded,
         }
     }
 }

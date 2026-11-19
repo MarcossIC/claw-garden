@@ -588,6 +588,7 @@ impl MemoryStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::domain::record::StoredType;
     use crate::memory::domain::events::MemorySource;
     use crate::models::chat::Role;
 
@@ -600,7 +601,7 @@ mod tests {
             is_error: None,
             source: MemorySource::Explicit,
             timestamp_ms: 42,
-            memory_type: Some("decision".into()),
+            memory_type: Some(StoredType::read("decision")),
             importance: Some(8.0),
             derived_from: vec![3],
             topic_key: None,

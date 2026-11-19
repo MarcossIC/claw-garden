@@ -1218,6 +1218,7 @@ where
 mod tests {
     use std::sync::Arc;
     use super::*;
+    use crate::memory::domain::record::StoredType;
     use crate::memory::store::db::MemoryStore;
     use crate::memory::embedding::embedder::{EmbedError, Embedder, FakeEmbedder};
     use crate::memory::domain::events::MemorySource;
@@ -2279,7 +2280,7 @@ mod tests {
         let code = "fn main() {\n    println!(\"hi\");\n}";
         let mut evt = make_event(Role::User, code, None, 1);
         evt.source = MemorySource::Explicit;
-        evt.memory_type = Some("code_block".to_string());
+        evt.memory_type = Some(StoredType::read("code_block"));
 
         let report = process_with(Arc::new(FakeEmbedder::default()), &store, &evt).await;
 
@@ -2327,7 +2328,7 @@ mod tests {
     fn explicit_fact(content: &str) -> MemoryEvent {
         MemoryEvent {
             source: MemorySource::Explicit,
-            memory_type: Some("semantic_fact".into()),
+            memory_type: Some(StoredType::read("semantic_fact")),
             ..make_event(Role::User, content, None, 1)
         }
     }
@@ -2374,7 +2375,7 @@ mod tests {
     }
 
     fn explicit(content: &str, memory_type: &str) -> MemoryEvent {
-        MemoryEvent { memory_type: Some(memory_type.into()), ..explicit_fact(content) }
+        MemoryEvent { memory_type: Some(StoredType::read(memory_type)), ..explicit_fact(content) }
     }
 
     #[tokio::test]
@@ -3093,7 +3094,7 @@ mod tests {
         let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
         let embedder = || -> Arc<dyn Embedder> { Arc::new(FakeEmbedder::default()) };
         let preference = |user_stated, importance, ts| MemoryEvent {
-            memory_type: Some("user_preference".to_string()),
+            memory_type: Some(StoredType::read("user_preference")),
             importance,
             ..deliberate_save("answer in short sentences", user_stated, ts)
         };
@@ -4868,7 +4869,7 @@ mod tests {
     async fn a_revision_keeps_the_type_and_importance_it_does_not_name() {
         let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
         let first = MemoryEvent { importance: Some(8.0), ..keyed("Indent with tabs", "style/indent") };
-        let first = MemoryEvent { memory_type: Some("user_preference".into()), ..first };
+        let first = MemoryEvent { memory_type: Some(StoredType::read("user_preference")), ..first };
         save(&store, &first).await;
 
         let revised = MemoryEvent { memory_type: None, importance: None, ..keyed("Indent with four spaces", "style/indent") };
@@ -4945,12 +4946,12 @@ mod tests {
         let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
         let placed = |angle| Arc::new(PlacedEmbedder { vectors: vec![turned(1, angle)] }) as Arc<dyn Embedder>;
         let other = process_with(placed(0.30), &store, &explicit_fact("Storage engine notes")).await.memories[0].id;
-        let old = process_with(placed(0.0), &store, &MemoryEvent { memory_type: Some("semantic_fact".into()), ..keyed("Storage engine is SQLite", "storage/engine") })
+        let old = process_with(placed(0.0), &store, &MemoryEvent { memory_type: Some(StoredType::read("semantic_fact")), ..keyed("Storage engine is SQLite", "storage/engine") })
             .await
             .memories[0]
             .id;
 
-        let report = process_with(placed(0.15), &store, &MemoryEvent { memory_type: Some("semantic_fact".into()), ..keyed("Storage engine moved to Postgres", "storage/engine") }).await;
+        let report = process_with(placed(0.15), &store, &MemoryEvent { memory_type: Some(StoredType::read("semantic_fact")), ..keyed("Storage engine moved to Postgres", "storage/engine") }).await;
         let new = only_id(&report);
 
         let found = pairs(&store).await;

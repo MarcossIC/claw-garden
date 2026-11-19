@@ -17,7 +17,7 @@ pub trait MemoryRecord {
     fn importance(&self) -> f64;
     /// Tier level: 1 (highest priority) to 3 (lowest priority).
     fn tier(&self) -> u8;
-    fn status(&self) -> &str;
+    fn status(&self) -> &StoredStatus;
     fn dispute_count(&self) -> u32;
     /// Raw JSON array of disputed-against record IDs, or `None` if not disputed.
     /// For the parsed form use `disputed_against_ids`, whose default implementation
@@ -51,7 +51,7 @@ pub struct MemoryRow {
     pub agent_id: Option<String>,
     pub project_id: Option<String>,
     pub content: String,
-    pub memory_type: String,
+    pub memory_type: StoredType,
     pub source: String,
     pub created_at: i64,
     pub created_by_type: String,
@@ -65,7 +65,7 @@ pub struct MemoryRow {
     pub importance: f64,
     pub tier: i64,
     pub superseded_by: Option<i64>,
-    pub status: String,
+    pub status: StoredStatus,
     pub dispute_count: i64,
     pub disputed_against: Option<String>,
     pub last_disputed_at: Option<i64>,
@@ -81,7 +81,7 @@ impl MemoryRecord for MemoryRow {
     fn last_accessed_at(&self) -> i64 { self.last_accessed_at }
     fn importance(&self) -> f64 { self.importance }
     fn tier(&self) -> u8 { self.tier as u8 }
-    fn status(&self) -> &str { &self.status }
+    fn status(&self) -> &StoredStatus { &self.status }
     fn dispute_count(&self) -> u32 { self.dispute_count as u32 }
     fn disputed_against(&self) -> Option<&str> { self.disputed_against.as_deref() }
 }
@@ -145,11 +145,6 @@ impl MemoryType {
         }
     }
 
-    /// A stored type the parser does not know is not protected.
-    pub(crate) fn is_protected_name(s: &str) -> bool {
-        Self::from_db_str(s).is_some_and(Self::is_protected)
-    }
-
     /// Parses the raw DB string. Unknown or legacy values return `None` —
     /// treated as not eligible for the contradiction type gate rather than
     /// panicking on a value written by a future or foreign schema version.
@@ -167,6 +162,12 @@ impl MemoryType {
     }
 }
 
+impl std::fmt::Display for MemoryType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// A `memory_type` a caller named that is not one of [`MemoryType::ALL`].
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("unknown memory_type {:?}; expected one of {}", .0, MemoryType::ALL.map(MemoryType::as_str).join(", "))]
@@ -179,6 +180,181 @@ impl std::str::FromStr for MemoryType {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Self::from_db_str(s).ok_or_else(|| UnknownMemoryType(s.to_string()))
+    }
+}
+
+/// Where a row is in its life. A search reads only the live ones
+/// ([`MemoryStatus::is_live`]); a listing shows every one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MemoryStatus {
+    /// The column's `DEFAULT`.
+    #[default]
+    Active,
+    /// Replaced by a newer row (`superseded_by`), by a revision, a verdict or
+    /// a merge.
+    Superseded,
+    /// Live, with a possible contradiction recorded against another row.
+    Disputed,
+}
+
+impl MemoryStatus {
+    pub const ALL: [MemoryStatus; 3] = [Self::Active, Self::Superseded, Self::Disputed];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Superseded => "superseded",
+            Self::Disputed => "disputed",
+        }
+    }
+
+    pub fn from_name(s: &str) -> Option<Self> {
+        match s {
+            "active" => Some(Self::Active),
+            "superseded" => Some(Self::Superseded),
+            "disputed" => Some(Self::Disputed),
+            _ => None,
+        }
+    }
+
+    /// The statuses `status IN ('active', 'disputed')` admits: what a search
+    /// may return.
+    pub fn is_live(self) -> bool {
+        match self {
+            Self::Active | Self::Disputed => true,
+            Self::Superseded => false,
+        }
+    }
+}
+
+/// A closed set of names a column of `memory` holds.
+pub trait StoredName: Copy + Eq + 'static {
+    fn as_str(self) -> &'static str;
+    fn from_name(s: &str) -> Option<Self>;
+}
+
+impl StoredName for MemoryType {
+    fn as_str(self) -> &'static str {
+        MemoryType::as_str(self)
+    }
+    fn from_name(s: &str) -> Option<Self> {
+        MemoryType::from_db_str(s)
+    }
+}
+
+impl StoredName for MemoryStatus {
+    fn as_str(self) -> &'static str {
+        MemoryStatus::as_str(self)
+    }
+    fn from_name(s: &str) -> Option<Self> {
+        MemoryStatus::from_name(s)
+    }
+}
+
+/// A value read from the store, or from what a store sent: one of the names
+/// this build knows, or the text another version or an import wrote. Reading
+/// never fails on a name it does not know, so no row is lost to it, and the
+/// text is written and serialized back exactly as it was read.
+#[derive(Clone)]
+pub enum Stored<T> {
+    Known(T),
+    Other(String),
+}
+
+/// The `memory_type` of a stored row.
+pub type StoredType = Stored<MemoryType>;
+/// The `status` of a stored row.
+pub type StoredStatus = Stored<MemoryStatus>;
+
+impl<T: StoredName> Stored<T> {
+    pub fn read(s: &str) -> Self {
+        T::from_name(s).map_or_else(|| Self::Other(s.to_string()), Self::Known)
+    }
+
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Known(t) => t.as_str(),
+            Self::Other(s) => s,
+        }
+    }
+
+    /// The name, when this build knows it.
+    pub fn known(&self) -> Option<T> {
+        match self {
+            Self::Known(t) => Some(*t),
+            Self::Other(_) => None,
+        }
+    }
+}
+
+impl StoredStatus {
+    /// An unknown status is not live: the search's SQL leaves it out.
+    pub fn is_live(&self) -> bool {
+        self.known().is_some_and(MemoryStatus::is_live)
+    }
+}
+
+impl<T> From<T> for Stored<T> {
+    fn from(t: T) -> Self {
+        Self::Known(t)
+    }
+}
+
+impl<T: Default> Default for Stored<T> {
+    fn default() -> Self {
+        Self::Known(T::default())
+    }
+}
+
+// By text, so an `Other` that holds a known name still equals its variant.
+impl<T: StoredName> PartialEq for Stored<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+
+impl<T: StoredName> Eq for Stored<T> {}
+
+impl<T: StoredName> PartialEq<T> for Stored<T> {
+    fn eq(&self, other: &T) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+
+// As the text a `String` field showed, so a row's `{:?}` reads as it did.
+impl<T: StoredName> std::fmt::Debug for Stored<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(self.as_str(), f)
+    }
+}
+
+impl<T: StoredName> std::fmt::Display for Stored<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl<T: StoredName> Serialize for Stored<T> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de, T: StoredName> Deserialize<'de> for Stored<T> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        <std::borrow::Cow<'de, str>>::deserialize(deserializer).map(|s| Self::read(&s))
+    }
+}
+
+impl<T: StoredName> rusqlite::types::ToSql for Stored<T> {
+    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
+        Ok(rusqlite::types::ToSqlOutput::from(self.as_str()))
+    }
+}
+
+impl<T: StoredName> rusqlite::types::FromSql for Stored<T> {
+    fn column_result(value: rusqlite::types::ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
+        value.as_str().map(Self::read)
     }
 }
 
@@ -212,7 +388,7 @@ mod tests {
             agent_id: Some("agent-1".to_string()),
             project_id: None,
             content: "test content".to_string(),
-            memory_type: "observation".to_string(),
+            memory_type: StoredType::read("observation"),
             source: "agent".to_string(),
             created_at: 0,
             created_by_type: "agent".to_string(),
@@ -226,7 +402,7 @@ mod tests {
             importance: 5.0,
             tier: 3,
             superseded_by: None,
-            status: "active".to_string(),
+            status: MemoryStatus::Active.into(),
             dispute_count: 0,
             disputed_against: None,
             last_disputed_at: None,
@@ -255,6 +431,8 @@ mod tests {
         let row = make_memory_row();
         assert_eq!(row.id(), 42);
         assert_eq!(row.scope(), "agent");
+        assert_eq!(*row.status(), MemoryStatus::Active);
+        assert_eq!(row.memory_type.as_str(), "observation");
     }
 
     /// dyn MemoryRecord works.
@@ -407,5 +585,108 @@ mod tests {
         assert_eq!(MemoryType::from_db_str("episode"), None);
         assert_eq!(MemoryType::from_db_str("not_a_real_type"), None);
         assert_eq!(MemoryType::from_db_str(""), None);
+    }
+
+    // ── Values read from the store ─────────────────────────────────────────
+
+    #[test]
+    fn a_stored_name_the_code_knows_reads_as_its_variant() {
+        for t in MemoryType::ALL {
+            assert_eq!(StoredType::read(t.as_str()), StoredType::Known(t));
+        }
+        for s in MemoryStatus::ALL {
+            assert_eq!(StoredStatus::read(s.as_str()), StoredStatus::Known(s));
+        }
+    }
+
+    #[test]
+    fn a_stored_name_the_code_does_not_know_keeps_its_text() {
+        for raw in ["observation", "", "Active", "archived"] {
+            let t = StoredType::read(raw);
+            assert_eq!(t, StoredType::Other(raw.to_string()));
+            assert_eq!(t.as_str(), raw);
+            assert_eq!(t.known(), None);
+        }
+        assert_eq!(StoredStatus::read("archived").as_str(), "archived");
+        assert_eq!(StoredStatus::read("archived").known(), None);
+    }
+
+    #[test]
+    fn every_status_has_its_stored_name() {
+        let named = |s: MemoryStatus| match s {
+            MemoryStatus::Active => "active",
+            MemoryStatus::Superseded => "superseded",
+            MemoryStatus::Disputed => "disputed",
+        };
+        for s in MemoryStatus::ALL {
+            assert_eq!(s.as_str(), named(s));
+            assert_eq!(MemoryStatus::from_name(s.as_str()), Some(s));
+        }
+        assert_eq!(MemoryStatus::from_name("Active"), None);
+    }
+
+    #[test]
+    fn only_an_active_or_disputed_row_is_live() {
+        assert!(MemoryStatus::Active.is_live());
+        assert!(MemoryStatus::Disputed.is_live());
+        assert!(!MemoryStatus::Superseded.is_live());
+        assert!(StoredStatus::Known(MemoryStatus::Disputed).is_live());
+        assert!(!StoredStatus::read("archived").is_live());
+    }
+
+    #[test]
+    fn a_stored_value_compares_by_its_text() {
+        assert_eq!(StoredType::Other("semantic_fact".into()), StoredType::Known(MemoryType::SemanticFact));
+        assert_eq!(StoredStatus::read("active"), MemoryStatus::Active);
+        assert_ne!(StoredStatus::read("archived"), MemoryStatus::Active);
+        assert_eq!(StoredType::from(MemoryType::CodeBlock).to_string(), "code_block");
+        assert_eq!(format!("{:?}", StoredStatus::read("archived")), format!("{:?}", "archived"));
+    }
+
+    #[test]
+    fn a_stored_value_serializes_as_its_bare_text() {
+        let json = serde_json::json!({
+            "known": StoredType::Known(MemoryType::UserPreference),
+            "other": StoredType::read("observation"),
+            "status": StoredStatus::read("archived"),
+        });
+        assert_eq!(json.to_string(), r#"{"known":"user_preference","other":"observation","status":"archived"}"#);
+        let back: Vec<StoredType> = serde_json::from_str(r#"["semantic_fact","observation"]"#).unwrap();
+        assert_eq!(back, [StoredType::Known(MemoryType::SemanticFact), StoredType::Other("observation".into())]);
+    }
+
+    #[test]
+    fn a_stored_value_round_trips_through_sqlite_unchanged() {
+        let c = rusqlite::Connection::open_in_memory().unwrap();
+        c.execute("CREATE TABLE t (memory_type TEXT NOT NULL, status TEXT NOT NULL)", []).unwrap();
+        c.execute("INSERT INTO t VALUES ('observation', 'archived'), ('code_block', 'disputed')", []).unwrap();
+        let rows: Vec<(StoredType, StoredStatus)> = c
+            .prepare("SELECT memory_type, status FROM t ORDER BY rowid")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(rows[0], (StoredType::Other("observation".into()), StoredStatus::Other("archived".into())));
+        assert_eq!(rows[1], (StoredType::Known(MemoryType::CodeBlock), StoredStatus::Known(MemoryStatus::Disputed)));
+
+        for (t, s) in &rows {
+            c.execute("INSERT INTO t VALUES (?1, ?2)", rusqlite::params![t, s]).unwrap();
+        }
+        let written: Vec<(String, String)> = c
+            .prepare("SELECT memory_type, status FROM t WHERE rowid > 2 ORDER BY rowid")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(written, [("observation".into(), "archived".into()), ("code_block".into(), "disputed".into())]);
+    }
+
+    #[test]
+    fn a_stored_value_that_is_not_text_is_a_type_error() {
+        let c = rusqlite::Connection::open_in_memory().unwrap();
+        let err = c.query_row("SELECT 7", [], |r| r.get::<_, StoredStatus>(0)).unwrap_err();
+        assert!(matches!(err, rusqlite::Error::InvalidColumnType(..)), "{err:?}");
     }
 }

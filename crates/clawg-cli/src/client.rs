@@ -30,6 +30,7 @@ use clawg_core::memory::registry::{
 };
 use clawg_core::memory::relocate::MoveReport;
 use clawg_core::memory::store_lock::{StoreHolder, StoreLock, StoreOwner};
+use clawg_core::memory::{StoredStatus, StoredType};
 use clawg_core::build_info;
 use clawg_core::paths::{data_dir, socket_file, PathsError, Profile};
 use clawg_core::preferences::Lang;
@@ -213,7 +214,7 @@ pub struct Hit {
     /// `"Memory"`, the only kind, as the daemon spells it in a hit.
     pub kind: String,
     pub content: String,
-    pub memory_type: String,
+    pub memory_type: StoredType,
     pub tier: i64,
     pub score: f64,
     /// Who saved it. A daemon older than sharing does not send it, and every
@@ -267,12 +268,12 @@ pub struct MemoryRow {
     pub id: i64,
     /// `"memory"`, the only kind: a hit spells it `"Memory"`.
     pub kind: String,
-    pub memory_type: Option<String>,
+    pub memory_type: Option<StoredType>,
     /// The row's full content, not a preview.
     pub summary: String,
     pub tier: i64,
     pub importance: f64,
-    pub status: String,
+    pub status: StoredStatus,
     pub access_count: i64,
     #[serde(default)]
     pub scope: Option<String>,
@@ -525,7 +526,7 @@ pub struct Updated {
     pub id: i64,
     pub importance: f64,
     /// Only `memory` rows have one.
-    pub memory_type: Option<String>,
+    pub memory_type: Option<StoredType>,
     pub tier: i64,
     /// The project the row is in after the change; a daemon that predates
     /// moves sends none.
@@ -559,7 +560,7 @@ pub struct OutboxDiscarded {
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 pub struct Restored {
     pub id: i64,
-    pub status: String,
+    pub status: StoredStatus,
     pub superseded_by: Option<i64>,
     #[serde(default)]
     pub topic_key: Option<String>,
@@ -613,7 +614,7 @@ pub struct SavedText {
     /// The type of the row asked for. A daemon that predates the field does
     /// not send it.
     #[serde(default)]
-    pub memory_type: Option<String>,
+    pub memory_type: Option<StoredType>,
 }
 
 #[derive(Serialize)]
@@ -2572,7 +2573,7 @@ pub(crate) mod tests {
         }
         assert_eq!(rows.len(), 1, "the saved memory must become exactly one row");
         assert_eq!(rows[0].summary, content);
-        assert_eq!(rows[0].memory_type.as_deref(), Some("semantic_fact"));
+        assert_eq!(rows[0].memory_type.as_ref().map(|t| t.as_str()), Some("semantic_fact"));
         let id = rows[0].id;
 
         let hits = c

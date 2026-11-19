@@ -7,7 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::memory::domain::record::MemoryType;
+use crate::memory::domain::record::{StoredStatus, StoredType};
 use crate::memory::revision::topic::validate_topic_key;
 
 /// The `format` every header names.
@@ -96,7 +96,7 @@ pub struct MemoryLine {
     #[serde(default)]
     pub project_id: Option<String>,
     pub content: String,
-    pub memory_type: String,
+    pub memory_type: StoredType,
     pub source: String,
     pub created_at: i64,
     pub created_by_type: String,
@@ -114,7 +114,7 @@ pub struct MemoryLine {
     pub access_count: i64,
     pub importance: f64,
     pub tier: i64,
-    pub status: String,
+    pub status: StoredStatus,
     #[serde(default)]
     pub superseded_by: Option<i64>,
     #[serde(default)]
@@ -280,11 +280,11 @@ fn check_memory(m: &MemoryLine) -> Result<(), String> {
     if m.content.trim().is_empty() {
         return Err("empty content".into());
     }
-    if MemoryType::from_db_str(&m.memory_type).is_none() {
-        return Err(format!("unknown memory_type {:?}", m.memory_type));
+    if m.memory_type.known().is_none() {
+        return Err(format!("unknown memory_type {:?}", m.memory_type.as_str()));
     }
-    if !["active", "disputed", "superseded"].contains(&m.status.as_str()) {
-        return Err(format!("unknown status {:?}", m.status));
+    if m.status.known().is_none() {
+        return Err(format!("unknown status {:?}", m.status.as_str()));
     }
     let scoped = match m.scope.as_str() {
         "agent" => m.agent_id.is_some(),

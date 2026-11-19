@@ -663,6 +663,7 @@ pub async fn merge_core(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::domain::record::StoredType;
     use crate::memory::store::db::MemoryStore;
 
     async fn store_with(projects: &[(&'static str, Option<&'static str>)]) -> MemoryStore {
@@ -793,7 +794,7 @@ mod tests {
                 is_error: None,
                 source: MemorySource::Explicit,
                 timestamp_ms: at,
-                memory_type: Some("semantic_fact".into()),
+                memory_type: Some(StoredType::read("semantic_fact")),
                 importance: None,
                 derived_from: Vec::new(),
                 topic_key: key.map(str::to_string),

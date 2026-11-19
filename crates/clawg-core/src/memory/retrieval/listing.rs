@@ -9,6 +9,7 @@ use serde::Serialize;
 use crate::memory::store::error::{ClosedAs, failed_call};
 use crate::memory::retrieval::search::{reach_predicate, reader_bind, viewer_match_expression};
 use crate::memory::domain::sharing::Reader;
+use crate::memory::domain::record::{StoredStatus, StoredType};
 use crate::memory::{store::error::MemoryError, store::db::MemoryStore};
 
 // ---------------------------------------------------------------------------
@@ -33,11 +34,11 @@ pub struct MemoryAdminRow {
     pub scope: String,
     pub agent_id: Option<String>,
     pub project_id: Option<String>,
-    pub memory_type: String,
+    pub memory_type: StoredType,
     pub summary: String,
     pub tier: i64,
     pub importance: f64,
-    pub status: String,
+    pub status: StoredStatus,
     pub access_count: i64,
     pub created_at: i64,
     pub last_accessed_at: i64,
@@ -64,7 +65,8 @@ pub struct MemoryAdminRow {
 }
 
 /// Filter/pagination params for `list_memories_core`. `agent_id`,
-/// `project_id` and `status` are exact matches.
+/// `project_id` and `status` are exact matches. A type or status this build
+/// does not know is still a filter: it lists the rows that hold it.
 ///
 /// `agent_id` filters by author; `reader` is the agent the listing is for,
 /// which sees what the sharing policy lets it reach. Without one the listing
@@ -73,13 +75,13 @@ pub struct MemoryAdminRow {
 pub struct ListParams {
     pub reader: Option<Reader>,
     pub tier: Option<i64>,
-    pub memory_type: Option<String>,
+    pub memory_type: Option<StoredType>,
     pub agent_id: Option<String>,
     pub project_id: Option<String>,
     /// Only the rows saved in no project, which a search reaches from every
     /// project; the caller does not set `project_id` with it.
     pub no_project: bool,
-    pub status: Option<String>,
+    pub status: Option<StoredStatus>,
     /// The project the row had in the tool it came from, compared whole.
     pub origin_project: Option<String>,
     /// Free text over `memory.content`: every token must match, each as a
@@ -106,11 +108,11 @@ struct RowFilter {
     /// The reader's reach as `reader_bind` binds it.
     reach: Option<String>,
     tier: Option<i64>,
-    memory_type: Option<String>,
+    memory_type: Option<StoredType>,
     agent_id: Option<String>,
     project_id: Option<String>,
     no_project: bool,
-    status: Option<String>,
+    status: Option<StoredStatus>,
     origin_project: Option<String>,
     match_expr: Option<String>,
     deleted: bool,
@@ -156,11 +158,11 @@ fn push_filters(sql: &mut String, params: &mut Vec<rusqlite::types::Value>, f: &
     }
     if let Some(s) = &f.status {
         sql.push_str(" AND status = ?");
-        params.push(Value::Text(s.clone()));
+        params.push(Value::Text(s.as_str().to_owned()));
     }
     if let Some(mt) = &f.memory_type {
         sql.push_str(" AND memory_type = ?");
-        params.push(Value::Text(mt.clone()));
+        params.push(Value::Text(mt.as_str().to_owned()));
     }
     if let Some(o) = &f.origin_project {
         sql.push_str(" AND origin_project = ?");
@@ -531,7 +533,7 @@ mod tests {
         let rows = list_memories_core(&store, ListParams { deleted: true, ..Default::default() }).await.unwrap();
         let only_memory = list_memories_core(
             &store,
-            ListParams { deleted: true, memory_type: Some("semantic_fact".into()), ..Default::default() },
+            ListParams { deleted: true, memory_type: Some(StoredType::read("semantic_fact")), ..Default::default() },
         )
         .await
         .unwrap();
@@ -830,12 +832,38 @@ mod tests {
 
         let rows = list_memories_core(
             &store,
-            ListParams { status: Some("disputed".into()), ..Default::default() },
+            ListParams { status: Some(StoredStatus::read("disputed")), ..Default::default() },
         )
         .await
         .unwrap();
 
         assert_eq!(ids_of(&rows), vec![disputed]);
+    }
+
+    /// Names another version or an import wrote stay listed, with their text,
+    /// and filter as any other: no row is hidden by a name this build does
+    /// not know.
+    #[tokio::test]
+    async fn rows_of_a_type_or_status_the_code_does_not_know_stay_listed() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let typed = seed_memory_full(&store, "observation", 3, "active", false, 10).await;
+        let archived = seed_memory_full(&store, "semantic_fact", 3, "archived", false, 20).await;
+
+        let rows = list_memories_core(&store, ListParams::default()).await.unwrap();
+        assert_eq!(rows.iter().map(|r| r.id).collect::<Vec<_>>(), vec![archived, typed], "newest first");
+        assert_eq!((rows[0].memory_type.as_str(), rows[0].status.as_str()), ("semantic_fact", "archived"));
+        assert_eq!(rows[0].status.known(), None);
+        assert_eq!((rows[1].memory_type.as_str(), rows[1].status.as_str()), ("observation", "active"));
+        assert_eq!(rows[1].memory_type.known(), None);
+
+        let by_type = ListParams { memory_type: Some(StoredType::read("observation")), ..Default::default() };
+        assert_eq!(ids_of(&list_memories_core(&store, by_type).await.unwrap()), vec![typed]);
+        let by_status = ListParams { status: Some(StoredStatus::read("archived")), ..Default::default() };
+        assert_eq!(ids_of(&list_memories_core(&store, by_status).await.unwrap()), vec![archived]);
+
+        let one = get_memory_core(&store, archived).await.unwrap().expect("read by id");
+        let json = serde_json::to_value(&one).unwrap();
+        assert_eq!((json["memory_type"].as_str(), json["status"].as_str()), (Some("semantic_fact"), Some("archived")));
     }
 
     #[tokio::test]
@@ -1064,6 +1092,6 @@ mod tests {
 
         assert_eq!(rows.len(), 1, "deleted row must be excluded");
         assert_eq!(rows[0].id, superseded_id);
-        assert_eq!(rows[0].status, "superseded", "superseded rows must remain visible");
+        assert_eq!(rows[0].status.as_str(), "superseded", "superseded rows must remain visible");
     }
 }

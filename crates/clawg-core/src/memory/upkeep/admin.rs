@@ -16,7 +16,7 @@ use crate::memory::revision::revival::{revive_after_delete, revive_after_delete_
 use crate::memory::embedding::embedder::{EmbedError, EmbedRole, Embedder};
 use crate::memory::retrieval::search::{reader_bind, reader_predicate};
 use crate::memory::domain::sharing::{Reach, Reader};
-use crate::memory::domain::record::{MemoryType, UnknownMemoryType};
+use crate::memory::domain::record::{MemoryStatus, MemoryType, StoredStatus, StoredType, UnknownMemoryType};
 use crate::memory::store::tier::retier;
 use crate::memory::revision::topic::Replaced;
 use crate::memory::{store::error::MemoryError, store::db::MemoryStore};
@@ -95,12 +95,12 @@ pub enum UpdateError {
         "memory {id} is a {from}, so it loses that type only on the user's word: ask the user, \
          then call again with `user_answered`"
     )]
-    NeedsUser { id: i64, from: String },
+    NeedsUser { id: i64, from: MemoryType },
     #[error(
         "memory {id} is a {from}, so it changes project only on the user's word: ask the user, \
          then call again with `user_answered`"
     )]
-    MoveNeedsUser { id: i64, from: String },
+    MoveNeedsUser { id: i64, from: MemoryType },
     #[error(transparent)]
     Move(#[from] MoveError),
     #[error(transparent)]
@@ -112,7 +112,7 @@ pub enum UpdateError {
 pub struct UpdatedRow {
     pub id: i64,
     pub importance: f64,
-    pub memory_type: String,
+    pub memory_type: StoredType,
     pub tier: i64,
     /// The project the row is in after the change, `None` without one.
     pub project_id: Option<String>,
@@ -160,7 +160,7 @@ pub async fn update_memory_core(
         .call(move |c| -> Result<Option<UpdatedRow>, UpdateError> {
             use rusqlite::OptionalExtension;
             let tx = c.transaction().map_err(MemoryError::from)?;
-            let current: Option<(i64, f64, String, i64, Option<String>)> = tx
+            let current: Option<(i64, f64, StoredType, i64, Option<String>)> = tx
                 .query_row(UPDATE_READ, rusqlite::params![id, reach], |r| {
                     Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
                 })
@@ -170,8 +170,8 @@ pub async fn update_memory_core(
                 return Ok(None);
             };
             let demoted = patch.memory_type.is_some_and(|t| !t.is_protected());
-            if demoted && MemoryType::is_protected_name(&memory_type) && !patch.user_answered {
-                return Err(UpdateError::NeedsUser { id, from: memory_type });
+            if let Some(from) = memory_type.known().filter(|t| demoted && t.is_protected() && !patch.user_answered) {
+                return Err(UpdateError::NeedsUser { id, from });
             }
             let mut moved: Option<MoveReport> = match &patch.project {
                 Some(target) => Some(plan_one_in(&tx, id, target.as_deref(), reach.as_deref())?),
@@ -181,14 +181,14 @@ pub async fn update_memory_core(
                 if let Some(skipped) = report.skipped.first() {
                     return Err(MoveError::Refused(skipped.clone()).into());
                 }
-                let protected = report.moved.iter().find_map(|m| Some((m.id, m.protected.clone()?)));
+                let protected = report.moved.iter().find_map(|m| Some((m.id, m.protected?)));
                 if let (Some((row, from)), false) = (protected, patch.user_answered) {
                     return Err(UpdateError::MoveNeedsUser { id: row, from });
                 }
             }
             let new_importance = patch.importance.unwrap_or(importance);
-            let new_type = patch.memory_type.map_or(memory_type.clone(), |t| t.as_str().to_string());
-            let new_tier = retier(tier, access_count, (importance, &memory_type), (new_importance, &new_type));
+            let new_type = patch.memory_type.map_or(memory_type.clone(), StoredType::Known);
+            let new_tier = retier(tier, access_count, (importance, memory_type.known()), (new_importance, new_type.known()));
             if patch.importance.is_some() || patch.memory_type.is_some() {
                 tx.execute(UPDATE_WRITE, rusqlite::params![new_importance, new_type, new_tier, now_ms, id])
                     .map_err(MemoryError::from)?;
@@ -324,7 +324,7 @@ pub enum RestoreError {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RestoredRow {
     pub id: i64,
-    pub status: String,
+    pub status: StoredStatus,
     pub superseded_by: Option<i64>,
     pub topic_key: Option<String>,
     /// The rows its delete had brought back, superseded by it again.
@@ -339,7 +339,7 @@ struct DeletedRow {
     content: String,
     context: Option<String>,
     project_id: Option<String>,
-    memory_type: String,
+    memory_type: StoredType,
 }
 
 /// The deleted row, scoped like the update read, with the head its vector was
@@ -377,9 +377,9 @@ async fn restore_candidates(
     content: &str,
     reader: Option<&Reader>,
     project_id: Option<String>,
-    memory_type: &str,
+    memory_type: &StoredType,
 ) -> Result<Vec<Candidate>, MemoryError> {
-    let Some(memory_type) = MemoryType::from_db_str(memory_type) else {
+    let Some(memory_type) = memory_type.known() else {
         return Ok(Vec::new());
     };
     let saver = reader.cloned().unwrap_or_else(|| Reader::new("", Reach::AllBut(Vec::new())));
@@ -544,11 +544,11 @@ pub async fn restore_memory_core(
             tx.execute(DELETE_VEC_MEMORY, [id])?;
             tx.execute("INSERT INTO memory_vectors(rowid, embedding) VALUES (?1, ?2)", rusqlite::params![id, bytes])?;
             tx.execute(RESTORE_TEXT_INDEX, [id])?;
-            let (status, superseded_by): (String, Option<i64>) =
+            let (status, superseded_by): (StoredStatus, Option<i64>) =
                 tx.query_row("SELECT status, superseded_by FROM memory WHERE id = ?1", [id], |r| {
                     Ok((r.get(0)?, r.get(1)?))
                 })?;
-            let (replaced, related) = match superseded_by.filter(|_| status == "superseded") {
+            let (replaced, related) = match superseded_by.filter(|_| status == MemoryStatus::Superseded) {
                 None => (take_back_revived(&tx, id, now)?, note_restored_pairs(&tx, id, deleted_at, &candidates, now)?),
                 Some(by) => {
                     revive_after_delete(&tx, by, now)?;
@@ -877,7 +877,7 @@ mod tests {
             Some(UpdatedRow {
                 id,
                 importance: 8.0,
-                memory_type: "user_preference".into(),
+                memory_type: StoredType::read("user_preference"),
                 tier: 1,
                 project_id: None,
                 move_id: None,
@@ -904,7 +904,7 @@ mod tests {
             let refused = update_memory_core(&store, id, &demote, None).await;
 
             assert!(
-                matches!(&refused, Err(UpdateError::NeedsUser { id: refused_id, from }) if *refused_id == id && from == protected),
+                matches!(&refused, Err(UpdateError::NeedsUser { id: refused_id, from }) if *refused_id == id && from.as_str() == protected),
                 "{refused:?}"
             );
             let (memory_type, update_count, ..) = memory_columns(&store, id).await;
@@ -1427,7 +1427,7 @@ mod tests {
 
         let row = restore(&store, id, Some(&shared("a"))).await.unwrap();
 
-        assert_eq!(row, RestoredRow { id, status: "active".into(), ..RestoredRow::default() });
+        assert_eq!(row, RestoredRow { id, status: StoredStatus::read("active"), ..RestoredRow::default() });
         let query = passage(content).await;
         let hits = search_all_memories(&store, &query, None, "a", SearchScope::all_default(), 10).await.unwrap();
         assert!(hits.iter().any(|h| h.id == id), "the vector search finds it again");
@@ -1470,7 +1470,7 @@ mod tests {
         assert!(text_index_is_whole(&store).await);
 
         let row = restore(&store, theirs, Some(&shared("a"))).await.unwrap();
-        assert_eq!(row.status, "active", "another agent restores what it reaches");
+        assert_eq!(row.status.as_str(), "active", "another agent restores what it reaches");
         assert!(stored_vector(&store, theirs).await.is_some());
     }
 
@@ -1518,7 +1518,7 @@ mod tests {
         assert_eq!(stored_vector(&store, first).await, None);
 
         delete(&store, current).await;
-        assert_eq!(restore(&store, first, Some(&shared("a"))).await.unwrap().status, "active");
+        assert_eq!(restore(&store, first, Some(&shared("a"))).await.unwrap().status.as_str(), "active");
     }
 
     #[tokio::test]
@@ -1534,7 +1534,7 @@ mod tests {
         assert!(matches!(err, RestoreError::TopicTaken { live, .. } if live == theirs), "{err:?}");
 
         let row = restore(&store, first, Some(&hiding("a", "b"))).await.unwrap();
-        assert_eq!(row.status, "active", "a holder the reader cannot see does not hold the key for it");
+        assert_eq!(row.status.as_str(), "active", "a holder the reader cannot see does not hold the key for it");
     }
 
     #[tokio::test]
@@ -1631,7 +1631,7 @@ mod tests {
 
         let row = restore(&store, new, None).await.unwrap();
 
-        assert_eq!(row.status, "active", "the row it disputed is still deleted");
+        assert_eq!(row.status.as_str(), "active", "the row it disputed is still deleted");
         assert_eq!(memory_status(&store, other).await, "disputed", "its dispute with the restored row is back");
     }
 
@@ -1683,7 +1683,7 @@ mod tests {
 
         let row = restore(&store, id, None).await.unwrap();
 
-        assert_eq!(row, RestoredRow { id, status: "superseded".into(), superseded_by: Some(keep), ..RestoredRow::default() });
+        assert_eq!(row, RestoredRow { id, status: StoredStatus::read("superseded"), superseded_by: Some(keep), ..RestoredRow::default() });
         let (deleted_at, status, update_count, access_count, last_accessed_at, tier) = columns(&store, id).await;
         assert_eq!(
             (deleted_at, status.as_str(), update_count, access_count, last_accessed_at, tier),
@@ -1746,7 +1746,7 @@ mod tests {
             row,
             RestoredRow {
                 id: second,
-                status: "active".into(),
+                status: StoredStatus::read("active"),
                 topic_key: Some("ledger/notes".into()),
                 ..RestoredRow::default()
             }
@@ -1766,7 +1766,7 @@ mod tests {
         }
 
         for id in [first, second, third] {
-            assert_eq!(restore(&store, id, Some(&shared("a"))).await.unwrap().status, "active", "piece #{id}");
+            assert_eq!(restore(&store, id, Some(&shared("a"))).await.unwrap().status.as_str(), "active", "piece #{id}");
         }
     }
 
@@ -2023,7 +2023,7 @@ mod tests {
             row,
             RestoredRow {
                 id: v2,
-                status: "active".into(),
+                status: StoredStatus::read("active"),
                 topic_key: Some("storage/engine".into()),
                 replaced: vec![Replaced { id: v1, excerpt: "Storage engine is SQLite".into() }],
                 ..RestoredRow::default()
@@ -2082,7 +2082,7 @@ mod tests {
             row,
             RestoredRow {
                 id: loser,
-                status: "superseded".into(),
+                status: StoredStatus::read("superseded"),
                 superseded_by: Some(winner),
                 superseded_by_deleted: true,
                 ..RestoredRow::default()
@@ -2182,7 +2182,7 @@ mod tests {
         assert_eq!(row.related[0].excerpt, "the api listens on 9090");
         assert_eq!(pairs(&store).await, vec![(newer, restored, "pending".into(), None)]);
         assert_eq!(memory_status(&store, newer).await, "active");
-        assert_eq!(row.status, "active");
+        assert_eq!(row.status.as_str(), "active");
     }
 
     #[tokio::test]
@@ -2198,7 +2198,7 @@ mod tests {
         assert_eq!(row.related.iter().map(|c| (c.id, c.escalated)).collect::<Vec<_>>(), vec![(newer, true)]);
         assert_eq!(pairs(&store).await, vec![(newer, restored, "escalated".into(), None)]);
         assert_eq!(memory_status(&store, newer).await, "disputed");
-        assert_eq!(row.status, "active", "the newer row carries the dispute");
+        assert_eq!(row.status.as_str(), "active", "the newer row carries the dispute");
         let named: Option<String> = store
             .conn
             .call(move |c| c.query_row("SELECT disputed_against FROM memory WHERE id = ?1", [newer], |r| r.get(0)))

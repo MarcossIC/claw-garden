@@ -15,7 +15,7 @@ use clawg_core::memory::clock::TimestampMs;
 use clawg_core::memory::events::{MemoryEvent, MemorySource};
 use clawg_core::memory::store_lock::StoreHolder;
 use clawg_core::memory::{
-    search_all_memories, MemoryError, MemoryStore, RankedHit, SearchScope,
+    search_all_memories, MemoryError, MemoryStore, RankedHit, SearchScope, StoredStatus, StoredType,
 };
 #[cfg(feature = "testing")]
 use clawg_core::models::chat::Role;
@@ -63,9 +63,9 @@ fn ranked_hit_serializes_to_json() {
     let hit = RankedHit {
         id: 7,
         content: "hello".into(),
-        memory_type: "semantic_fact".into(),
+        memory_type: StoredType::read("semantic_fact"),
         tier: 2,
-        status: "active".into(),
+        status: StoredStatus::read("active"),
         score: 0.75,
         distance: 0.25,
         created_at: TimestampMs::now(),
@@ -81,7 +81,7 @@ fn ranked_hit_serializes_to_json() {
     assert_eq!(json["memory_type"], "semantic_fact");
     assert!(json["created_at"].is_i64(), "created_at must serialize as a millisecond number");
     assert!(json.get("origin").is_none(), "a hit with no mark sends none: {json}");
-    let inferred = RankedHit { memory_type: "user_preference".into(), origin: Some("inferred"), ..hit };
+    let inferred = RankedHit { memory_type: StoredType::read("user_preference"), origin: Some("inferred"), ..hit };
     assert_eq!(serde_json::to_value(&inferred).unwrap()["origin"], "inferred");
 }
 
@@ -97,7 +97,7 @@ fn explicit_event(content: &str, memory_type: Option<&str>, importance: Option<f
         is_error: None,
         source: MemorySource::Explicit,
         timestamp_ms: 1,
-        memory_type: memory_type.map(str::to_owned),
+        memory_type: memory_type.map(StoredType::read),
         importance,
         derived_from: Vec::new(),
         topic_key: None,

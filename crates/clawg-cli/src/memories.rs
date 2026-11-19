@@ -9,6 +9,7 @@ use std::fmt::Write as _;
 
 use clawg_core::memory::identity::Disk;
 use clawg_core::memory::portability::export::project_id_of;
+use clawg_core::memory::{MemoryStatus, StoredType};
 use clawg_core::paths::Profile;
 use clawg_core::preferences::Lang;
 
@@ -153,10 +154,10 @@ fn render_rows(lang: Lang, rows: &[MemoryRow], now_ms: i64, limit: u32, offset: 
             moment.map_or_else(|| "-".to_string(), |t| format_age(now_ms, t)),
             r.tier.to_string(),
             format!("{:.1}", r.importance),
-            or_dash(&r.memory_type),
+            or_dash(&r.memory_type.as_ref().map(StoredType::to_string)),
             or_dash(&r.agent_id),
             or_dash(&r.project_id),
-            r.status.clone(),
+            r.status.to_string(),
             truncate_content(&r.summary, CONTENT_WIDTH),
         ]);
     }
@@ -235,7 +236,7 @@ pub fn render_detail(row: &MemoryRow, now_ms: i64) -> String {
         (None, _) => "-".to_string(),
     };
     let grid: Vec<(&str, String)> = vec![
-        ("type", or_dash(&row.memory_type)),
+        ("type", or_dash(&row.memory_type.as_ref().map(StoredType::to_string))),
         ("tier", row.tier.to_string()),
         ("importance", format!("{:.1}", row.importance)),
         ("agent", or_dash(&row.agent_id)),
@@ -378,7 +379,7 @@ fn filter_args(filters: &Filters, project: Option<String>) -> ListArgs {
         agent: filters.scope.agent.clone(),
         project,
         no_project: filters.no_project,
-        status: filters.status.map(|s| s.as_str().to_owned()),
+        status: filters.status.map(|s| MemoryStatus::from(s).as_str().to_owned()),
         ..ListArgs::default()
     }
 }
@@ -483,6 +484,7 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clawg_core::memory::StoredStatus;
 
     use crate::cli::{
         Filters, ListOpts, ProfileArg, Scope, SearchOpts, ShowOpts, StatsOpts, StatusArg,
@@ -499,11 +501,11 @@ mod tests {
         MemoryRow {
             id,
             kind: kind.into(),
-            memory_type: Some("semantic_fact".into()),
+            memory_type: Some(StoredType::read("semantic_fact")),
             summary: summary.into(),
             tier: 2,
             importance: 5.0,
-            status: "active".into(),
+            status: StoredStatus::read("active"),
             access_count: 3,
             scope: Some("agent".into()),
             agent_id: Some("agent-a".into()),
@@ -563,7 +565,7 @@ mod tests {
     fn columns_align_by_chars_not_bytes() {
         let mut a = row(1, "memory", "one");
         a.agent_id = Some("ñandú-é".into());
-        a.memory_type = Some("preferencia".into());
+        a.memory_type = Some(StoredType::read("preferencia"));
         let mut b = row(22, "memory", "two");
         b.agent_id = Some("🚀🚀🚀".into());
         b.project_id = Some("proyecto-ó".into());
@@ -627,7 +629,7 @@ mod tests {
             kind: "memory".into(),
             summary: "x".into(),
             tier: 3,
-            status: "active".into(),
+            status: StoredStatus::read("active"),
             ..Default::default()
         };
         let out = render_table(Lang::En, &[bare], NOW, 20, 0);

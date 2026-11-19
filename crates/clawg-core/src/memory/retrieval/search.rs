@@ -8,6 +8,7 @@ use crate::memory::store::error::{ClosedAs, failed_call};
 use crate::memory::domain::clock::TimestampMs;
 use crate::memory::retrieval::pieces::SaveLink;
 use crate::memory::domain::provenance::preference_mark;
+use crate::memory::domain::record::{StoredStatus, StoredType};
 use crate::memory::retrieval::score::{score as compute_score, RawHit, ScoringConfig};
 use crate::memory::domain::sharing::{Reach, Reader};
 use crate::memory::domain::vector::to_unit;
@@ -142,9 +143,9 @@ pub(crate) fn project_bind(project: Option<&str>) -> Option<String> {
 pub struct RankedHit {
     pub id: i64,
     pub content: String,
-    pub memory_type: String,
+    pub memory_type: StoredType,
     pub tier: i64,
-    pub status: String,
+    pub status: StoredStatus,
     pub score: f64,
     pub distance: f64,   // raw KNN distance — consumed by contradiction.rs to threshold-filter near-duplicate candidates
     pub created_at: TimestampMs, // for RECENT vs LONG-TERM bucketing in prompt_builder
@@ -502,7 +503,7 @@ async fn knn_one(
                     rusqlite::params![q, k as i64, agent, proj],
                     |row| {
                         let id = row.get(0)?;
-                        let memory_type: String = row.get(2)?;
+                        let memory_type: StoredType = row.get(2)?;
                         let (source, by): (Option<String>, Option<String>) = (row.get(12)?, row.get(13)?);
                         Ok(RawHit {
                             id,
@@ -1108,7 +1109,7 @@ async fn score_lexical_candidates(
 
         let rows = stmt.query_map(rusqlite::params_from_iter(binds), |row| {
             let id = row.get(0)?;
-            let memory_type: String = row.get(2)?;
+            let memory_type: StoredType = row.get(2)?;
             let (source, by): (Option<String>, Option<String>) = (row.get(12)?, row.get(13)?);
             Ok(RawHit {
                 id,
@@ -1385,6 +1386,7 @@ mod tests {
     use crate::memory::store::db::MemoryStore;
     use crate::memory::embedding::embedder::{EmbedRole, Embedder};
     use rusqlite::params;
+    use crate::memory::domain::record::MemoryStatus;
 
     /// The bind every agent-filtered query takes, for an agent with no grants.
     fn only(agent: &str) -> String {
@@ -1485,9 +1487,9 @@ mod tests {
         let h1 = RankedHit {
             id: 1,
             content: "a".into(),
-            memory_type: "chat_message".into(),
+            memory_type: StoredType::read("chat_message"),
             tier: 3,
-            status: "active".into(),
+            status: StoredStatus::read("active"),
             score: 0.9,
             distance: 0.1,
             created_at: TimestampMs::from_unix_millis(0),
@@ -1501,9 +1503,9 @@ mod tests {
         let h2 = RankedHit {
             id: 2,
             content: "b".into(),
-            memory_type: "chat_message".into(),
+            memory_type: StoredType::read("chat_message"),
             tier: 3,
-            status: "active".into(),
+            status: StoredStatus::read("active"),
             score: 0.3,
             distance: 0.7,
             created_at: TimestampMs::from_unix_millis(0),
@@ -1528,9 +1530,9 @@ mod tests {
             RankedHit {
                 id,
                 content: String::new(),
-                memory_type: String::new(),
+                memory_type: StoredType::read(""),
                 tier: 3,
-                status: "active".into(),
+                status: StoredStatus::read("active"),
                 score,
                 distance: 0.0,
                 created_at: TimestampMs::from_unix_millis(0),
@@ -1676,7 +1678,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(hits.iter().all(|h| h.status != "superseded"), "superseded rows must not appear");
+        assert!(hits.iter().all(|h| h.status.as_str() != "superseded"), "superseded rows must not appear");
         assert_eq!(hits.len(), 1);
     }
 
@@ -1693,7 +1695,7 @@ mod tests {
             .await
             .unwrap();
 
-        let disputed = hits.iter().find(|h| h.status == "disputed");
+        let disputed = hits.iter().find(|h| h.status.as_str() == "disputed");
         assert!(disputed.is_some(), "disputed row must appear in results");
     }
 
@@ -1857,6 +1859,34 @@ mod tests {
 
         assert_eq!(score_of(disputed_id), score_of(active_id),
             "a disputed row must rank like an active one");
+    }
+
+    /// A database another version or an import wrote can hold names this
+    /// build does not know. The row stays found, with the text it holds; a
+    /// status outside the live ones stays out, as the SQL has always left it.
+    #[tokio::test]
+    async fn a_row_of_a_type_the_code_does_not_know_is_still_found() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let emb = unit_basis_embedding();
+        let agent = "agent-unknown-names";
+        let active = insert_memory_row(&store, agent, "an old note", "observation", 3, 5.0, "active", emb.clone()).await;
+        let disputed = insert_memory_row(&store, agent, "a disputed note", "observation", 3, 5.0, "disputed", emb.clone()).await;
+        let archived = insert_memory_row(&store, agent, "an archived fact", "semantic_fact", 3, 5.0, "archived", emb).await;
+
+        let hits = search_all_memories(&store, &unit_basis_vec(), None, agent, SearchScope::all_default(), 10)
+            .await
+            .unwrap();
+
+        let found = |id: i64| hits.iter().find(|h| h.id == id);
+        let hit = found(active).expect("a row of an unknown type is found");
+        assert_eq!(hit.memory_type, StoredType::Other("observation".into()));
+        assert_eq!(hit.status, MemoryStatus::Active);
+        assert!(hit.score > 0.0, "it ranks as a live row");
+        assert_eq!(found(disputed).map(|h| h.status.as_str()), Some("disputed"));
+        assert!(found(archived).is_none(), "a status outside the live ones is never searched");
+
+        let json = serde_json::to_value(hit).unwrap();
+        assert_eq!((json["memory_type"].as_str(), json["status"].as_str()), (Some("observation"), Some("active")));
     }
 
     #[tokio::test]
@@ -4684,9 +4714,9 @@ mod tests {
         RankedHit {
             id,
             content: format!("row {id}"),
-            memory_type: "chat_message".to_string(),
+            memory_type: StoredType::read("chat_message"),
             tier: 3,
-            status: "active".to_string(),
+            status: StoredStatus::read("active"),
             score,
             distance: 0.0,
             created_at: TimestampMs::from_unix_millis(0),

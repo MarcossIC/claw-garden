@@ -14,6 +14,7 @@ use crate::memory::embedding::chunker::token_splitter::MIN_OVERLAP_CHARS;
 use crate::memory::store::error::MemoryError;
 use crate::memory::retrieval::search::PiecePosition;
 use crate::memory::domain::sharing::Reader;
+use crate::memory::domain::record::StoredType;
 use crate::memory::store::db::MemoryStore;
 
 /// One piece the worker stored: the row that holds it and the head its
@@ -52,7 +53,7 @@ pub struct SaveText {
     /// as `null` rather than left out, as a search hit's is.
     pub project_id: Option<String>,
     /// The type of the row asked for.
-    pub memory_type: String,
+    pub memory_type: StoredType,
 }
 
 /// Farthest back an overlap is looked for. The chunker repeats at least 24

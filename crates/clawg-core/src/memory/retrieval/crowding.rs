@@ -21,7 +21,7 @@ use crate::memory::revision::contradiction::{detect_contradiction, CONTRADICTION
 use crate::memory::retrieval::score::ScoringConfig;
 use crate::memory::retrieval::search::{memory_project_predicate, project_bind, reach_predicate, reader_bind, search_all_memories, SearchScope};
 use crate::memory::domain::sharing::{Reach, Reader};
-use crate::memory::domain::record::MemoryType;
+use crate::memory::domain::record::{MemoryStatus, MemoryType};
 use crate::memory::store::store_lock::StoreHolder;
 use crate::memory::domain::vector::{to_unit, EMBEDDING_DIM};
 use crate::memory::store::db::MemoryStore;
@@ -442,7 +442,7 @@ async fn seed(corpus: &Corpus) -> Seeded {
         .rows
         .iter()
         .map(|r| {
-            let status = if r.superseded { "superseded" } else { "active" };
+            let status = if r.superseded { MemoryStatus::Superseded } else { MemoryStatus::Active }.as_str();
             (agent_id(r.agent), r.project.map(project_id), memory_type(r).as_str(), status, (!r.deleted).then(|| bytes(&r.vector)))
         })
         .collect();

@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 #[cfg(test)]
 use crate::models::chat::ChatMessage;
+use crate::memory::domain::record::StoredType;
 use crate::models::chat::Role;
 
 /// One persisted chat message → one event on the ingest channel.
@@ -32,7 +33,7 @@ pub struct MemoryEvent {
     /// `#[serde(default)]` so every payload written before this field existed
     /// still parses, and so an MCP client may simply omit it.
     #[serde(default)]
-    pub memory_type: Option<String>,
+    pub memory_type: Option<StoredType>,
     /// Client-declared importance on the store's 0–10 scale, honoured only for
     /// [`MemorySource::Explicit`] and clamped on the way in. Same rationale and
     /// same `#[serde(default)]` contract as [`MemoryEvent::memory_type`].
@@ -244,7 +245,7 @@ mod tests {
             is_error: None,
             source: MemorySource::Explicit,
             timestamp_ms: 7,
-            memory_type: Some("user_preference".into()),
+            memory_type: Some(StoredType::read("user_preference")),
             importance: Some(9.5),
             derived_from: Vec::new(),
             topic_key: None,
@@ -254,7 +255,7 @@ mod tests {
         let json = serde_json::to_string(&evt).expect("serialize");
         let back: MemoryEvent = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back.source, MemorySource::Explicit);
-        assert_eq!(back.memory_type.as_deref(), Some("user_preference"));
+        assert_eq!(back.memory_type.as_ref().map(|t| t.as_str()), Some("user_preference"));
         assert_eq!(back.importance, Some(9.5));
     }
 
@@ -274,6 +275,17 @@ mod tests {
         let evt: MemoryEvent = serde_json::from_str(json).expect("legacy payload must still parse");
         assert_eq!(evt.memory_type, None);
         assert_eq!(evt.importance, None);
+    }
+
+    /// An outbox row another version queued may name a type this build does
+    /// not know: it still parses, and is written back as it was.
+    #[test]
+    fn an_event_of_a_type_the_code_does_not_know_parses_and_keeps_it() {
+        let json = r#"{"agent_id":"a","project_id":null,"role":"user","content":"hello","is_error":null,"source":"explicit","timestamp_ms":0,"memory_type":"observation"}"#;
+        let evt: MemoryEvent = serde_json::from_str(json).expect("an outbox row of an unknown type parses");
+        assert_eq!(evt.memory_type, Some(StoredType::Other("observation".into())));
+        let again = serde_json::to_value(&evt).unwrap();
+        assert_eq!(again["memory_type"], "observation");
     }
 
     #[test]

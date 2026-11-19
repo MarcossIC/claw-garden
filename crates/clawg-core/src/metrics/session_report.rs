@@ -7,9 +7,7 @@ use std::collections::BTreeMap;
 use serde::Serialize;
 
 use super::sessions::{idle_closed, CountKind, SessionRow, IDLE, IDLE_CLOSE_MS};
-
-/// The memory type of a save that closes a session with its summary.
-const SUMMARY: &str = "session_summary";
+use crate::memory::domain::record::MemoryType;
 
 /// What the sessions are grouped by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -202,7 +200,7 @@ pub fn report(rows: &[SessionRow], by: SessionsBy, since_ms: i64, now_ms: i64) -
         for (memory_type, n) in &view.saves {
             *group.saves.entry(memory_type.clone()).or_default() += n;
         }
-        if view.saves.get(SUMMARY).is_some_and(|n| *n > 0) {
+        if view.saves.get(MemoryType::SessionSummary.as_str()).is_some_and(|n| *n > 0) {
             group.with_summary += 1;
         }
     }
