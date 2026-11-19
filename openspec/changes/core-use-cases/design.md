@@ -248,3 +248,45 @@ Como [D14](#d14-cómo-se-comprueba-la-segunda-parte):
 2. **Los tests de respuestas no se tocan:** `git diff develop...HEAD -- crates/clawg-cli/tests/ crates/clawg-cli/src/mcp/` vacío, y los dos contratos del agente pasan sin `CLAWG_BLESS`.
 3. **El diff de `api.rs`** no cambia ningún `StatusCode` ni el texto de ningún `ApiError`: los textos que se van del handler llegan como `Display` de las variantes.
 4. **Los tests del núcleo**, sin HTTP: `UserAnswer::new` puro; `answer_suggestion_core` y `resolve_project` sobre `MemoryStore::new_for_test` con las filas sembradas con SQL, como los demás tests de `registry.rs`; el store que falla es uno cerrado.
+
+## D20. Dónde van los archivos de `api`
+
+Los archivos de dominio son **módulos hijos** de `api`, en `crates/clawg-cli/src/daemon/api/`; `api.rs` sigue siendo la raíz y los declara con `mod`. La línea que decía `crates/clawg-cli/src/daemon/routes/` en «Partes siguientes» se corrige: un hermano `routes/` no ve lo privado de `api.rs` (`AppCtx` y sus ayudas, `ApiError`, `ApiResult`, `reader`, `ready_embedder`) y habría que ensancharlo todo, y los caminos públicos `daemon::api::X` se moverían. Un hijo ve lo privado de su padre: nada se ensancha por tener que cruzar un módulo, y los caminos públicos no cambian.
+
+| Archivo | Qué lleva |
+|---|---|
+| `api.rs` | `AppCtx`, la forma del error (`ErrorBody`, `ApiError`, `ApiResult`), las constantes y las puras compartidas, el router (`router`, `router_on`, `serve_ephemeral`, `admit_loopback`, `require_bearer`), las ayudas compartidas (`reader`, `named_reader`, `reach`, `ready_embedder`, `embed_failure`, `live_project`, `ReaderQuery`) y las rutas `health`, `shutdown`, `metrics` y `stats` |
+| `api/memories.rs` | guardar, buscar, `context`, listar, leer, actualizar, mover, borrar, restaurar y la síntesis, con sus cuerpos y sus puras |
+| `api/sessions.rs` | registrar y cerrar una sesión, contar una llamada y una búsqueda vacía, y `sessions_follow` |
+| `api/outbox.rs` | reintentar y descartar un save del outbox |
+| `api/disputes.rs` | resolver, juzgar y listar las disputas |
+| `api/portability.rs` | `backup`, importar, los trabajos de importación y deshacer una importación |
+| `api/projects.rs` | registrar, listar, renombrar, unir, borrar, mantener aparte, resolver, responder una sugerencia, ubicar una carpeta y declarar una subcarpeta |
+| `api/docs.rs` | el refresco de los docs de un proyecto, la búsqueda en ellos y sus topes |
+| `api/test_support.rs` | el arnés de los tests (D21) |
+
+- **`portability.rs` y no `imports.rs`.** `daemon/imports.rs` ya existe (`ImportJobs`, `JobView`) y un hijo `api::imports` obligaría a escribir `crate::daemon::imports` en cada cita para no confundirlos. El dominio es el de `clawg_core::memory::portability`, y el nombre lo dice.
+- **Los handlers son `pub(super)`**, tan anchos como los necesita el router, y un tipo privado que aparece en la firma de uno pasa a `pub(super)` con él. Los items que ya eran `pub` siguen siéndolo.
+- **Lo que se usa fuera de `api` se reexporta desde `api.rs` con `pub use` explícito**, sin comodín: `DocsSearchBody`, `REFRESH_GRACE` y lo demás que usa el espacio de trabajo. `MAX_CONTENT_BYTES` ya se reexportaba.
+- **`ReaderQuery` queda en la raíz**, con `reader`, `named_reader` y `reach`: es la forma de «quién pregunta» que usan la memoria, las disputas y `stats`.
+- **`sessions_follow` es de `sessions.rs`** y lo llaman las rutas de proyectos y la de actualizar: `pub(super)`.
+
+**Descartado:**
+
+- **Un `daemon/routes/` hermano.** Por lo de arriba: ensancha la visibilidad de lo compartido y mueve los caminos públicos.
+- **Un archivo por ruta.** Más de sesenta archivos de veinte líneas; el dominio es la unidad que se lee junta con sus cuerpos y sus puras.
+- **Un `use super::*` en cada dominio.** Esconde de dónde viene cada nombre; cada archivo importa lo que usa.
+
+## D21. Los tests
+
+Cada test se muda al `#[cfg(test)] mod tests` del archivo cuyo código prueba, con su nombre intacto. El arnés que comparten (`daemon_on`, `daemon_for_jobs`, `daemon_embedding_with`, `daemon_without_embedder`, `status_and_body`, `answer_of`, `seed_memory`, `run_sql`, `count`, `reader_query`) va a `crates/clawg-cli/src/daemon/api/test_support.rs`, declarado en `api.rs` como `#[cfg(test)] mod test_support;`, con sus items `pub(super)`. Los tests de lo que se queda en la raíz (`serve_ephemeral`, `constant_time_eq`) se quedan en `api.rs`. Los ayudantes de un solo dominio (los de los trabajos de importación, `chunk`, `query`) van con sus tests.
+
+## D22. Las citas
+
+Los documentos vivos que citan `crates/clawg-cli/src/daemon/api.rs` (`docs/reference/*.md` y `openspec/specs/*/spec.md`) pasan a citar el archivo donde vive cada item, por el nombre del item y **sin número de línea**: un número de línea se vuelve falso en la próxima edición. No se confunde con `crates/clawg-cli/tests/api.rs`, que no se mueve. Los cambios archivados (`openspec/changes/archive/`) y los demás cambios activos son historia: no se tocan. Las citas con línea de las partes 1 a 3 de este mismo cambio son del `develop` de entonces y quedan como están.
+
+## D23. Cómo se comprueba la cuarta parte
+
+1. **Los nombres de los tests.** Antes de empezar se guarda `cargo test -p clawg-cli --lib -- --list` ordenado; al terminar se compara, ignorando el camino del módulo. Son los mismos.
+2. **Los tests de respuestas y los contratos no se tocan:** `git diff develop...HEAD -- crates/clawg-cli/tests/ crates/clawg-cli/src/mcp/` vacío.
+3. **Cada commit compila sin avisos** y pasa `cargo test -p clawg-cli --lib daemon::api`; la suite entera y los dos clippy corren una vez, sobre el último commit de código.

@@ -287,3 +287,23 @@ Ninguna respuesta del daemon (estado, cuerpo), del puente MCP (texto, esquema, d
 - `each_memory_update_keeps_its_status_and_body`, `each_memory_delete_and_restore_keeps_its_status_and_body`, `each_resolved_dispute_keeps_its_status_and_body`, `each_answered_suggestion_keeps_its_status_and_body` y `each_resolved_project_keeps_its_status_and_body` (`mod tests` de `crates/clawg-cli/src/daemon/api.rs`), que llaman al handler con un `AppCtx` de prueba y comparan el estado y el cuerpo JSON entero de cada rechazo y de cada respuesta aceptada. Se escriben primero y pasan sobre el código de `develop`.
 - La suite entera, sin editar `crates/clawg-cli/tests/api.rs` ni los tests de `crates/clawg-cli/src/mcp/`.
 - `the_agent_contract_matches_its_file` y `the_spanish_agent_contract_matches_its_file`, sin `CLAWG_BLESS`.
+
+## Parte 4. Partir `api.rs`
+
+La parte 4 no agrega ninguna regla de dominio: parte `crates/clawg-cli/src/daemon/api.rs` en un archivo por dominio, como un movimiento mecánico. Sus decisiones son D20 a D23 de [`design.md`](design.md#d20-dónde-van-los-archivos-de-api).
+
+## R16. Partir `api.rs` no cambia nada
+
+Es de conservación: los tests pasan antes y después, y ninguno se edita.
+
+1. Cada test que hoy existe, el de `mod tests` de `api.rs`, los de `crates/clawg-cli/tests/api.rs` y las caracterizaciones `each_*_keeps_its_status_and_body`, MUST pasar sin cambiar una aserción ni un nombre: los de `api.rs` sólo cambian de archivo.
+2. Los dos contratos del agente (`crates/clawg-cli/src/mcp/agent_contract.json` y `agent_contract.es.json`) MUST quedar sin cambios.
+3. Cada camino que el resto del espacio de trabajo usa hoy MUST seguir resolviendo: `clawg_cli::daemon::api::{router, router_on, serve_ephemeral, AppCtx, SAVE_CONFIRM_TIMEOUT, MAX_CONTENT_BYTES, REFRESH_GRACE, DocsSearchBody}` y cualquier otro `daemon::api::` que encuentre `rg`.
+4. Ninguna respuesta del daemon (estado, cuerpo), del puente MCP ni de la CLI MUST cambiar, ni el orden en que se rechaza.
+
+#### Escenario
+- GIVEN el árbol de `develop` y el de la parte 4
+- WHEN se listan los tests de `clawg-cli --lib` en los dos, ordenados
+- THEN las dos listas son la misma salvo el camino del módulo de cada test, y `git diff` de los dos contratos del agente no muestra nada
+
+**Tests:** la suite entera, sin editar `crates/clawg-cli/tests/api.rs` ni los tests de `crates/clawg-cli/src/mcp/`; `the_agent_contract_matches_its_file` y `the_spanish_agent_contract_matches_its_file`, sin `CLAWG_BLESS`; y `tests/conventions.rs`.

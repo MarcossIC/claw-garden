@@ -7,7 +7,7 @@
 - **Commits.** Cada tarea es un commit convencional que compila y pasa los tests de los archivos que cambia, nombrados al final de la tarea. La suite entera y los dos clippy corren una vez, sobre el último commit (tarea 5).
 - **Windows.** Cada `cargo` lleva `--target-dir target-test`.
 
-La parte 1, el guardado completo, son las tareas 1 a 5; la 3 y la 4 quedaron en un solo commit ([tarea 3](#3-el-guardado-en-el-núcleo-r1-a-r7)). La parte 2, las escrituras de proyectos, son las tareas 6 a 11 ([«Parte 2»](#parte-2-las-escrituras-de-proyectos)). La parte 3, las otras escrituras, son las tareas 12 a 17 ([«Parte 3»](#parte-3-las-otras-escrituras)). Lo demás está en [«Partes siguientes»](#partes-siguientes).
+La parte 1, el guardado completo, son las tareas 1 a 5; la 3 y la 4 quedaron en un solo commit ([tarea 3](#3-el-guardado-en-el-núcleo-r1-a-r7)). La parte 2, las escrituras de proyectos, son las tareas 6 a 11 ([«Parte 2»](#parte-2-las-escrituras-de-proyectos)). La parte 3, las otras escrituras, son las tareas 12 a 17 ([«Parte 3»](#parte-3-las-otras-escrituras)). La parte 4, partir `api.rs`, son las tareas 18 a 27 ([«Parte 4»](#parte-4-partir-apirs)). Lo demás está en [«Partes siguientes»](#partes-siguientes).
 
 ## 1. Artefactos
 
@@ -259,10 +259,142 @@ Los requisitos son R12 a R15 de [`spec.md`](spec.md#parte-3-las-otras-escrituras
 - [x] `verify.md`, con la parte 3 y su «Pendiente».
 - Commit: `docs(openspec): record core-use-cases part 3 applied`
 
+## Parte 4. Partir `api.rs`
+
+El requisito es R16 de [`spec.md`](spec.md#parte-4-partir-apirs) y las decisiones, D20 a D23 de [`design.md`](design.md#d20-dónde-van-los-archivos-de-api). No hay tests en rojo ni caracterización nueva: es un movimiento, y las caracterizaciones de las partes 1 a 3 son la prueba de que nada cambia. Cada commit mueve el código de un dominio **con sus tests**.
+
+## 18. Artefactos de la parte 4
+
+- [x] R16 en `spec.md`, D20 a D23 en `design.md`, estas tareas y `state.yaml`.
+- Commit: `docs(openspec): add the api.rs split to core-use-cases`
+
+## 19. Las rutas de sessions
+
+- [ ] Las rutas de sessions y sus tests pasan a `sessions.rs`, con el arnés de los tests en `test_support.rs` ([D20](design.md#d20-dónde-van-los-archivos-de-api), [D21](design.md#d21-los-tests)).
+- Commit: `refactor(daemon): move the sessions routes out of api.rs`
+- Tests al cerrar:
+
+  ```bash
+  cargo test -p clawg-cli --lib --target-dir target-test daemon::api
+  ```
+
+  ```bash
+  cargo check -p clawg-cli --all-targets --target-dir target-test
+  ```
+
+## 20. Las rutas de outbox
+
+- [ ] Las rutas de outbox y sus tests pasan a `outbox.rs` ([D20](design.md#d20-dónde-van-los-archivos-de-api), [D21](design.md#d21-los-tests)).
+- Commit: `refactor(daemon): move the outbox routes out of api.rs`
+- Tests al cerrar:
+
+  ```bash
+  cargo test -p clawg-cli --lib --target-dir target-test daemon::api
+  ```
+
+  ```bash
+  cargo check -p clawg-cli --all-targets --target-dir target-test
+  ```
+
+## 21. Las rutas de disputes
+
+- [ ] Las rutas de disputes y sus tests pasan a `disputes.rs` ([D20](design.md#d20-dónde-van-los-archivos-de-api), [D21](design.md#d21-los-tests)).
+- Commit: `refactor(daemon): move the disputes routes out of api.rs`
+- Tests al cerrar:
+
+  ```bash
+  cargo test -p clawg-cli --lib --target-dir target-test daemon::api
+  ```
+
+  ```bash
+  cargo check -p clawg-cli --all-targets --target-dir target-test
+  ```
+
+## 22. Las rutas de portability
+
+- [ ] Las rutas de portability y sus tests pasan a `portability.rs`, con los trabajos de importación y sus tests ([D20](design.md#d20-dónde-van-los-archivos-de-api), [D21](design.md#d21-los-tests)).
+- Commit: `refactor(daemon): move the portability routes out of api.rs`
+- Tests al cerrar:
+
+  ```bash
+  cargo test -p clawg-cli --lib --target-dir target-test daemon::api
+  ```
+
+  ```bash
+  cargo check -p clawg-cli --all-targets --target-dir target-test
+  ```
+
+## 23. Las rutas de projects
+
+- [ ] Las rutas de projects y sus tests pasan a `projects.rs` ([D20](design.md#d20-dónde-van-los-archivos-de-api), [D21](design.md#d21-los-tests)).
+- Commit: `refactor(daemon): move the projects routes out of api.rs`
+- Tests al cerrar:
+
+  ```bash
+  cargo test -p clawg-cli --lib --target-dir target-test daemon::api
+  ```
+
+  ```bash
+  cargo check -p clawg-cli --all-targets --target-dir target-test
+  ```
+
+## 24. Las rutas de docs
+
+- [ ] Las rutas de docs y sus tests pasan a `docs.rs` ([D20](design.md#d20-dónde-van-los-archivos-de-api), [D21](design.md#d21-los-tests)).
+- Commit: `refactor(daemon): move the docs routes out of api.rs`
+- Tests al cerrar:
+
+  ```bash
+  cargo test -p clawg-cli --lib --target-dir target-test daemon::api
+  ```
+
+  ```bash
+  cargo check -p clawg-cli --all-targets --target-dir target-test
+  ```
+
+## 25. Las rutas de memories
+
+- [ ] Las rutas de memories y sus tests pasan a `memories.rs`, y `api.rs` queda con la raíz ([D20](design.md#d20-dónde-van-los-archivos-de-api), [D21](design.md#d21-los-tests)).
+- Commit: `refactor(daemon): move the memories routes out of api.rs`
+- Tests al cerrar:
+
+  ```bash
+  cargo test -p clawg-cli --lib --target-dir target-test daemon::api
+  ```
+
+  ```bash
+  cargo check -p clawg-cli --all-targets --target-dir target-test
+  ```
+
+## 26. Las citas
+
+- [ ] Los documentos vivos citan cada item por el archivo donde vive, sin número de línea ([D22](design.md#d22-las-citas)).
+- Commit: `docs: cite the daemon routes by the file they moved to`
+
+## 27. Verificación de la parte 4
+
+- [ ] Sobre el último commit de código, en Windows:
+
+  ```bash
+  cargo test --workspace --target-dir target-test
+  ```
+
+  ```bash
+  cargo clippy --workspace --all-targets --target-dir target-test -- -D warnings
+  ```
+
+  ```bash
+  cargo clippy -p clawg-cli --target-dir target-test -- -D warnings
+  ```
+
+- [ ] Las comprobaciones de [D23](design.md#d23-cómo-se-comprueba-la-cuarta-parte).
+- [ ] `verify.md`, con la parte 4.
+- Commit: `docs(openspec): record core-use-cases part 4 applied`
+
 ## Partes siguientes
 
 Cada una es un PR, con sus requisitos agregados a `spec.md` y sus decisiones a `design.md` antes de aplicar, y el mismo método: caracterización, tests en rojo en core, el handler que sólo traduce.
 
 - **Parte 3. Las otras escrituras**, en [«Parte 3»](#parte-3-las-otras-escrituras): `PATCH /v1/memories/...` (que también parsea `memory_type`), restaurar, borrar y las disputas (`resolve`), y las dos rutas de proyectos que la revisión de [D13](design.md#d13-lo-que-deciden-las-demás-rutas-de-proyectos) encontró con reglas del dominio, `answer_suggestion` y `resolve_projects`.
-- **Parte 4. Partir `api.rs`** en `crates/clawg-cli/src/daemon/routes/`, un archivo por dominio, como paso mecánico sin cambio de conducta.
+- **Parte 4. Partir `api.rs`** en módulos hijos de `api`, en `crates/clawg-cli/src/daemon/api/`, un archivo por dominio, como paso mecánico sin cambio de conducta, en [«Parte 4»](#parte-4-partir-apirs) ([D20](design.md#d20-dónde-van-los-archivos-de-api)).
 - **Fuera:** `context`, salvo que storage-read-side le dé un caso de uso ([D7](design.md#d7-qué-handlers-entran)), y `eval_api` ([D6](design.md#d6-eval_api-no-cambia)).
