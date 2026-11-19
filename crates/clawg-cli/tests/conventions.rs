@@ -111,6 +111,115 @@ fn no_production_code_names_the_retired_tables() {
     assert!(found.is_empty(), "these lines name a table V32 dropped:\n{}", found.join("\n"));
 }
 
+/// The quoted names a line of SQL compares `status` or `memory_type` with, as
+/// `(column, name)`: after `=`, `<>` or `!=`, and each quoted item of an `IN`
+/// list. A column whose name only ends in one of them (`from_status`) is
+/// another column; an operand that is not a quoted literal names nothing.
+fn compared_names(line: &str) -> Vec<(&'static str, String)> {
+    let continues = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let mut found = Vec::new();
+    for column in ["status", "memory_type"] {
+        for (at, _) in line.match_indices(column) {
+            if line[..at].chars().next_back().is_some_and(continues) {
+                continue;
+            }
+            let rest = &line[at + column.len()..];
+            if rest.starts_with(continues) {
+                continue;
+            }
+            let rest = rest.trim_start();
+            let after_not = rest.strip_prefix("NOT ").map_or(rest, str::trim_start);
+            if let Some(list) = after_not.strip_prefix("IN").map(str::trim_start).and_then(|r| r.strip_prefix('(')) {
+                let list = &list[..list.find(')').unwrap_or(list.len())];
+                for item in list.split(',').map(str::trim) {
+                    if let Some(name) = item.strip_prefix('\'').and_then(|i| i.strip_suffix('\'')) {
+                        found.push((column, name.to_string()));
+                    }
+                }
+                continue;
+            }
+            let Some(operand) = ["<>", "!=", "="].iter().find_map(|op| rest.strip_prefix(op)) else {
+                continue;
+            };
+            if let Some(quoted) = operand.trim_start().strip_prefix('\'') {
+                if let Some(end) = quoted.find('\'') {
+                    found.push((column, quoted[..end].to_string()));
+                }
+            }
+        }
+    }
+    found
+}
+
+#[test]
+fn compared_names_reads_the_literals_a_line_compares() {
+    let cases: [(&str, &[(&str, &str)]); 8] = [
+        ("WHERE m.status IN ('active', 'disputed')", &[("status", "active"), ("status", "disputed")]),
+        ("AND status <> 'superseded' AND", &[("status", "superseded")]),
+        ("SET status = 'superseded', superseded_by = ?2", &[("status", "superseded")]),
+        ("WHERE memory_type = 'session_summary' AND status NOT IN ('superseded')", &[("status", "superseded"), ("memory_type", "session_summary")]),
+        ("(move_id, row_id, from_status) SELECT status, superseded_by", &[]),
+        ("AND status = ? AND memory_type IN (SELECT value FROM json_each(?))", &[]),
+        ("judgment_status = 'x', memory_types = 'y'", &[]),
+        ("    status: String,", &[]),
+    ];
+    for (line, want) in cases {
+        let want: Vec<(&str, String)> = want.iter().map(|(c, n)| (*c, n.to_string())).collect();
+        assert_eq!(compared_names(line), want, "{line}");
+    }
+}
+
+/// The SQL keeps its status and type names as literals, which the partial
+/// indexes of the migrations need to match a query. Each one is a name the
+/// code knows, so a misspelt literal fails here instead of matching no row.
+#[test]
+fn every_status_and_type_the_sql_compares_is_one_the_code_knows() {
+    use clawg_core::memory::store_insert::MemoryType;
+    use clawg_core::memory::MemoryStatus;
+
+    let crates = Path::new(env!("CARGO_MANIFEST_DIR")).parent().expect("the crates directory");
+    let mut files = Vec::new();
+    for krate in fs::read_dir(crates).expect("read crates/").flatten() {
+        rust_files(&krate.path().join("src"), &mut files);
+    }
+    assert!(!files.is_empty(), "no sources found under {}", crates.display());
+    let mut lines: Vec<(String, usize, String)> = Vec::new();
+    for file in &files {
+        let shown = file.strip_prefix(crates).unwrap_or(file).to_string_lossy().replace('\\', "/");
+        let source = fs::read_to_string(file).unwrap_or_else(|e| panic!("read {}: {e}", file.display()));
+        let all: Vec<&str> = source.lines().collect();
+        for n in production_lines_naming(&source, |line| !compared_names(line).is_empty()) {
+            lines.push((shown.clone(), n, all[n - 1].to_string()));
+        }
+    }
+    let migrations = crates.join("clawg-core/migrations");
+    for entry in fs::read_dir(&migrations).expect("read the migrations").flatten() {
+        let path = entry.path();
+        let source = fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let shown = path.strip_prefix(crates).unwrap_or(&path).to_string_lossy().replace('\\', "/");
+        for (n, line) in source.lines().enumerate() {
+            lines.push((shown.clone(), n + 1, line.to_string()));
+        }
+    }
+
+    let mut compared = 0;
+    let mut unknown = Vec::new();
+    for (file, n, line) in &lines {
+        for (column, name) in compared_names(line) {
+            compared += 1;
+            let known = match column {
+                "status" => MemoryStatus::from_name(&name).is_some(),
+                _ => name.parse::<MemoryType>().is_ok(),
+            };
+            if !known {
+                unknown.push(format!("{file}:{n}: {column} {name:?}"));
+            }
+        }
+    }
+    assert!(compared > 0, "no SQL compares a status or a type: the scan reads nothing");
+    assert!(unknown.is_empty(), "these lines compare a name the code does not know:\n{}", unknown.join("\n"));
+}
+
 /// A failed call on the store's connection is worded in one place,
 /// `memory/store/error.rs`, so no other code of the core matches on the connection's
 /// error.
