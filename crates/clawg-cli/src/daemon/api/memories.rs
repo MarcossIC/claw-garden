@@ -45,7 +45,7 @@ use crate::relevance::shown_hits;
 
 use super::sessions::count_empty_search;
 use super::{
-    ApiError, ApiResult, AppCtx, embed_failure, live_project, named_reader, reach, reader,
+    ApiError, ApiResult, AppCtx, embed_failure, live_project, named_reader, reader,
     ReaderQuery, ready_embedder,
 };
 
@@ -1033,13 +1033,15 @@ pub(super) async fn context(
     let project_id = live_project(&app, body.project_id.clone()).await?;
     let project_id = project_id.as_deref();
     let query = body.query.as_deref().filter(|q| !q.trim().is_empty());
-    let reach = reach(&app, &body.agent_id);
+    // One read of the policy for the passages and the counts alike.
+    let caller = reader(&app, &body.agent_id);
+    let reach = &caller.reach;
 
     // Unconditional regen (~2-5 ms). A failure degrades to "no ids were
     // emitted", which can make the prompt repeat a row — a degraded prompt
     // beats a failed request.
     let emitted = workspace
-        .regenerate_auto_section(&body.agent_id, project_id, &reach, &app.runtime.store)
+        .regenerate_auto_section(&body.agent_id, project_id, reach, &app.runtime.store)
         .await
         .unwrap_or_else(|e| {
             log::warn!("workspace regen failed: {e}");
@@ -1055,7 +1057,7 @@ pub(super) async fn context(
                 app.runtime.embedder.get().cloned(),
                 &body.agent_id,
                 project_id,
-                &reach,
+                reach,
                 QueryTexts { lexical: query, embedded: query },
                 &emitted,
                 Some(app.runtime.access_tracker.as_ref()),
@@ -1070,7 +1072,7 @@ pub(super) async fn context(
                 &workspace,
                 &body.agent_id,
                 project_id,
-                &reach,
+                reach,
                 &emitted,
                 budget,
             )
@@ -1081,7 +1083,6 @@ pub(super) async fn context(
 
     // Same degradation as the regen above: a reminder that cannot be counted
     // is a reminder skipped, not a failed request.
-    let caller = reader(&app, &body.agent_id);
     let unreviewed = unreviewed_count(&app.runtime.store, Some(&caller), project_id).await.unwrap_or_else(|e| {
         log::warn!("unreviewed count failed: {e}");
         0

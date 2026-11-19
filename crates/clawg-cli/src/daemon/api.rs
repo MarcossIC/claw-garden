@@ -37,7 +37,7 @@ use clawg_core::memory::bootstrap::EmbedderStatus;
 use clawg_core::memory::embedder::{Embedder, EmbedError};
 use clawg_core::memory::merge::canonical;
 use clawg_core::memory::outbox::OutboxSummary;
-use clawg_core::memory::sharing::{Reach, Reader};
+use clawg_core::memory::sharing::Reader;
 use clawg_core::memory::{project_docs, sharing};
 use clawg_core::paths::Profile;
 use clawg_core::runtime::MemoryRuntime;
@@ -467,11 +467,6 @@ fn reader(app: &AppCtx, agent: &str) -> Reader {
 /// The reader a call by id names, or `None` for the user's own call.
 fn named_reader(app: &AppCtx, agent: Option<&str>) -> Option<Reader> {
     agent.map(|a| reader(app, a))
-}
-
-/// What `agent`'s searches reach.
-fn reach(app: &AppCtx, agent: &str) -> Reach {
-    reader(app, agent).reach
 }
 
 /// Counts what is stored, optionally narrowed to an agent and/or project.
