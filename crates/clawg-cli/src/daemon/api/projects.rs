@@ -8,7 +8,7 @@ use clawg_core::memory::merge::{merge_core, MergeError, MergeReport, undo_merge_
 use clawg_core::memory::project::{check_root, register_project, RegisterError, RegisterOutcome, Registration};
 use clawg_core::memory::project_delete::{delete_core, DeleteError, DeleteReport, undo_delete_core};
 use clawg_core::memory::registry::{
-    answer_suggestion_core, Answered, AnswerError, Born, check_folder, find_project, keep_apart,
+    answer_suggestion_core, Answered, AnswerError, Born, check_folder, check_located_target, find_project, keep_apart,
     KeepApartError, KeptApart, list_deletes, list_projects, ListedDelete, ListedProject,
     locate_folder, Located, LocateError, Named, Project, rename_project, RenameError,
     Resolution as ProjectResolution, resolve_project, ResolveError as ProjectResolveError,
@@ -475,6 +475,9 @@ pub(super) async fn locate_project(State(app): State<Arc<AppCtx>>, Json(body): J
             })
         }
     };
+    // Refused before the folder is registered, so a refusal leaves the store
+    // as it was; the merge or the declaration checks it again as it writes.
+    check_located_target(store, &target).await.map_err(merge_error)?;
     if let Some((root, subpath)) = subfolder {
         return declare(&app, &root, &subpath, &target).await.map(Json);
     }
@@ -566,7 +569,7 @@ mod tests {
     use super::*;
     use axum::response::IntoResponse;
 
-    use super::super::test_support::{answer_of, daemon_for_jobs, run_sql, status_and_body};
+    use super::super::test_support::{answer_of, count, daemon_for_jobs, run_sql, status_and_body};
 
     /// The status and the whole body `register` answers a refused
     /// registration with, for every rule and in the order it checks them.
@@ -727,10 +730,25 @@ mod tests {
                 })
             )
         );
-        assert_eq!(
-            located(&app, json!({ "project": "gone-7a8b", "root_path": path(&three) })).await,
-            (StatusCode::CONFLICT, json!({ "error": "project_deleted", "detail": "project gone-7a8b is deleted" }))
-        );
+        run_sql(
+            &app,
+            format!("INSERT INTO project (id, name, born, reviewed, created_at, merged_into, merged_at) VALUES ('old-0004', 'old', 'user', 1, 1, '{ideas}', 2);"),
+        )
+        .await;
+        let sub = repo.join("sub");
+        std::fs::create_dir(&sub).expect("a subfolder");
+        let folders = count(&app, "SELECT COUNT(*) FROM project_path").await;
+        let deleted = (StatusCode::CONFLICT, json!({ "error": "project_deleted", "detail": "project gone-7a8b is deleted" }));
+        let merged = (StatusCode::CONFLICT, json!({ "error": "project_merged", "detail": format!("project old-0004 was merged into {ideas}") }));
+        for (body, expected) in [
+            (json!({ "project": "gone-7a8b", "root_path": path(&three) }), deleted.clone()),
+            (json!({ "project": "gone-7a8b", "root_path": path(&sub), "subfolder": true }), deleted),
+            (json!({ "project": "old-0004", "root_path": path(&three) }), merged.clone()),
+            (json!({ "project": "old-0004", "root_path": path(&sub), "subfolder": true }), merged),
+        ] {
+            assert_eq!(located(&app, body.clone()).await, expected, "{body}");
+        }
+        assert_eq!(count(&app, "SELECT COUNT(*) FROM project_path").await, folders, "a refused locate registers no folder");
 
         let notes_folder = registered(&app, &notes).await;
         let (status, mut body) = located(&app, json!({ "project": "Ideas", "root_path": path(&notes) })).await;

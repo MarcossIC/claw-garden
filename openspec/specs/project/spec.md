@@ -986,6 +986,8 @@ Las reglas de la ruta las decide el núcleo, y el handler (`answer_suggestion`, 
 3. con `apart`, responder como `keep_apart` (PL16; su rechazo, `Pair`) y devolver `Answered::Apart`;
 4. con `merge`, unir `other_id` en `project_id` como `merge_core` sin prueba en seco (PL13) y devolver `Answered::Merged(informe)`. Una unión rechazada MUST ser `AnswerError::Merge(MergeError)`, con el error tal cual.
 
+La sugerencia MUST buscarse otra vez en la transacción que escribe la respuesta (la de `keep_apart`, o cada pase de la unión, `merge_checked`): si otra respuesta la contestó entre el paso 1 y la escritura, MUST rechazarse con `NoSuggestion` sin escribir nada, así de dos respuestas a una sugerencia sólo queda la primera. Una unión pedida con `POST /v1/projects/merge` no mira sugerencias.
+
 El daemon MUST traducir `NoSuggestion` a `404 no_suggestion` con el texto en `detail`, `Pair(e)` como `kept_apart_error` en `POST /v1/projects/keep-apart` y `Merge(e)` como `merge_error` en `POST /v1/projects/merge`. `Answered::Apart` y `Answered::Merged` dan el `AnsweredBody` de siempre: `answer` en `apart` sin `merge`, o en `merge` con el informe de la unión y `trajectories` y `skills` en 0. Las sesiones siguen la unión en el daemon (`sessions_follow`).
 
 #### Escenario
@@ -993,7 +995,7 @@ El daemon MUST traducir `NoSuggestion` a `404 no_suggestion` con el texto en `de
 - WHEN se responde `apart` entre `web` y `notas`, y `merge` entre `app` y `copia`
 - THEN la primera da `NoSuggestion` y no escribe nada, y la segunda da `Merged` con `copia` unida en `app`
 
-**Tests** (`registry.rs`, mod tests, sin HTTP): `an_answer_needs_a_pending_suggestion`, `an_answer_checks_both_projects`, `apart_keeps_the_two_from_being_suggested_again`, `merge_merges_the_other_into_the_project`, `a_refused_merge_refuses_the_answer` y `a_store_that_fails_refuses_the_answer`.
+**Tests** (`registry.rs`, mod tests, sin HTTP): `an_answer_needs_a_pending_suggestion`, `an_answer_checks_both_projects`, `apart_keeps_the_two_from_being_suggested_again`, `merge_merges_the_other_into_the_project`, `a_refused_merge_refuses_the_answer`, `a_store_that_fails_refuses_the_answer`, `of_two_answers_to_one_suggestion_one_is_written` y `keeping_apart_only_what_is_pending_writes_nothing_without_a_suggestion`; `a_check_that_stops_holding_before_the_write_refuses_the_merge` (`merge.rs`, mod tests).
 
 ## PL38. Una carpeta con el nombre de un proyecto cuyas carpetas ya no están
 
@@ -1012,7 +1014,7 @@ Un proyecto con una carpeta presente, uno sin carpetas, una lápida y un borrado
 ## PL39. `clawg projects create` y `clawg projects locate`
 
 - `clawg projects create <NOMBRE> [--new] [--profile P]` MUST resolver NOMBRE con `create` y `born = 'user'` (PL32), con `new_project` si se pasa `--new`. Imprime el proyecto creado, o el que ya tenía ese nombre, o los candidatos y que `--new` crea uno aparte (sale con 1).
-- `clawg projects locate <PROYECTO> <CAMINO> [--profile P]` MUST hacer que la raíz de CAMINO lleve a PROYECTO (un id o un nombre, que no sigue la lápida). El daemon registra la raíz como un puente (`POST /v1/projects/locate`, con `{"project", "root_path"}`; CAMINO tiene que ser un directorio, `check_folder`, PL67). Si su proyecto ya es PROYECTO, no hace nada. Si no, ese proyecto MUST tener esa carpeta sola, o la respuesta es 409 `folder_shared`, que nombra el proyecto y la unión que haría falta; y con una sola carpeta MUST unirlo en PROYECTO como `POST /v1/projects/merge` (PL13), con su `--undo`, que es la forma de volver atrás. No tiene prueba en seco: la raíz se registra antes de saber a qué proyecto lleva.
+- `clawg projects locate <PROYECTO> <CAMINO> [--profile P]` MUST hacer que la raíz de CAMINO lleve a PROYECTO (un id o un nombre, que no sigue la lápida). El daemon registra la raíz como un puente (`POST /v1/projects/locate`, con `{"project", "root_path"}`; CAMINO tiene que ser un directorio, `check_folder`, PL67). Si su proyecto ya es PROYECTO, no hace nada. Si no, ese proyecto MUST tener esa carpeta sola, o la respuesta es 409 `folder_shared`, que nombra el proyecto y la unión que haría falta; y con una sola carpeta MUST unirlo en PROYECTO como `POST /v1/projects/merge` (PL13), con su `--undo`, que es la forma de volver atrás. No tiene prueba en seco: la raíz se registra antes de saber a qué proyecto lleva, aunque un PROYECTO que es una lápida o está borrado se rechaza antes de registrarla.
 
 Los dos MUST hablar con el daemon que corre, sin arrancar uno, e imprimir en el idioma de la preferencia, con una sentencia por `match` sobre `Lang`.
 
@@ -1042,7 +1044,9 @@ Los dos MUST hablar con el daemon que corre, sin arrancar uno, e imprimir en el 
 
 1. con `own` igual a `target`, devolver `Located::Already` sin leer el store;
 2. si `own` tiene más de una carpeta (`own_folder_count`, SB3), rechazar con `LocateError::FolderShared { folder, own, folders, target }`, cuyo texto es el `detail` de SB3;
-3. si no, unir `own` en `target` como `merge_core` sin prueba en seco (PL13), y devolver `Located::Merged(informe)`. Una unión rechazada MUST ser `LocateError::Merge(MergeError)`, con el error de la unión tal cual.
+3. si no, unir `own` en `target` como `merge_core` sin prueba en seco (PL13), y devolver `Located::Merged(informe)`. Una unión rechazada MUST ser `LocateError::Merge(MergeError)`, con el error de la unión tal cual. Las carpetas de `own` MUST contarse otra vez en cada pase de la unión (`merge_checked`), el que la escribe incluido: si otra carpeta llegó a `own` desde el paso 2, MUST rechazarse con `FolderShared` sin escribir nada. Una unión pedida con `POST /v1/projects/merge` se lleva todas las carpetas.
+
+Antes de registrar la carpeta, `POST /v1/projects/locate` MUST rechazar un proyecto nombrado que es una lápida o está borrado (`check_located_target`, `registry.rs`), con el `409 project_merged` o `project_deleted` de `merge_error`, sin escribir nada; con `subfolder` también. La unión o la declaración lo vuelven a comprobar al escribir.
 
 Un error de la cuenta MUST ser `LocateError::Store(StorageError)`, con el texto del `StorageError`. El daemon traduce `FolderShared` a `409 folder_shared`, `Merge(e)` como `merge_error` en `POST /v1/projects/merge`, `Store` a `500`, y da el `LocatedBody` de siempre: `already` en `true` sin `merge`, o en `false` con el informe de la unión. Las sesiones siguen la unión en el daemon (`sessions_follow`).
 

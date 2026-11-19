@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use crate::memory::store::error::{ClosedAs, failed_call};
 use crate::memory::domain::clock::TimestampMs;
 use crate::memory::projects::identity::Ground;
-use crate::memory::projects::merge::{canonical_in, merge_core, MergeError, MergeReport, MAX_MERGE_HOPS};
+use crate::memory::projects::merge::{canonical_in, merge_checked, Checked, MergeError, MergeReport, MAX_MERGE_HOPS};
 use crate::memory::projects::project::is_project_id;
 use crate::memory::projects::project_delete::{deleted_in, deleted_message};
 use crate::memory::retrieval::workspace::WorkspaceManager;
@@ -587,6 +587,13 @@ pub enum KeepApartError {
 /// a registration from suggesting it later: a suggestion is made once per
 /// pair.
 pub async fn keep_apart(store: &MemoryStore, a: &str, b: &str) -> Result<KeptApart, KeepApartError> {
+    kept_apart(store, a, b, false).await
+}
+
+/// [`keep_apart`], which with `only_pending` writes nothing and answers 0
+/// when no suggestion is pending between the two: the check and the answer
+/// are one transaction.
+async fn kept_apart(store: &MemoryStore, a: &str, b: &str, only_pending: bool) -> Result<KeptApart, KeepApartError> {
     let (a, b) = (a.to_string(), b.to_string());
     store
         .conn
@@ -631,6 +638,9 @@ pub async fn keep_apart(store: &MemoryStore, a: &str, b: &str) -> Result<KeptApa
                 }
             }
             if answered == 0 {
+                if only_pending {
+                    return Ok(KeptApart { project_id: a, other_id: b, answered });
+                }
                 tx.execute(
                     "INSERT OR IGNORE INTO project_suggestion (project_id, other_id, reason, created_at, answer, answered_at) \
                      VALUES (?1, ?2, 'user', ?3, 'apart', ?3)",
@@ -709,7 +719,8 @@ pub enum Answered {
 /// `apart` as [`keep_apart`] does, `merge` by merging `other_id` into
 /// `project_id` as `projects merge` does. Only a suggestion nobody answered
 /// is answered, so an agent merges no projects nobody suggested; without one
-/// nothing is written.
+/// nothing is written. It is looked for again in the transaction that writes
+/// the answer, so of two answers to one suggestion only the first is written.
 pub async fn answer_suggestion_core(
     store: &MemoryStore,
     workspaces: &WorkspaceManager,
@@ -721,12 +732,26 @@ pub async fn answer_suggestion_core(
     if suggestion_between(store, project_id, other_id).await?.is_none() {
         return Err(AnswerError::NoSuggestion { project_id: project_id.to_string(), other_id: other_id.to_string() });
     }
+    let no_suggestion = || AnswerError::NoSuggestion { project_id: project_id.to_string(), other_id: other_id.to_string() };
     match answer.answer {
-        SuggestionAnswer::Apart => {
-            keep_apart(store, project_id, other_id).await?;
-            Ok(Answered::Apart)
+        SuggestionAnswer::Apart => match kept_apart(store, project_id, other_id, true).await? {
+            KeptApart { answered: 0, .. } => Err(no_suggestion()),
+            _ => Ok(Answered::Apart),
+        },
+        SuggestionAnswer::Merge => {
+            let (project, other) = (project_id.to_string(), other_id.to_string());
+            let pending = move |c: &Connection| -> Result<(), Checked<AnswerError>> {
+                if pending_suggestions_in(c, &project)?.iter().any(|s| s.other_id == other) {
+                    return Ok(());
+                }
+                Err(Checked::Check(AnswerError::NoSuggestion { project_id: project.clone(), other_id: other.clone() }))
+            };
+            match merge_checked(store, workspaces, backups, other_id, project_id, false, pending).await {
+                Ok(merged) => Ok(Answered::Merged(merged)),
+                Err(Checked::Merge(e)) => Err(AnswerError::Merge(e)),
+                Err(Checked::Check(e)) => Err(e),
+            }
         }
-        SuggestionAnswer::Merge => Ok(Answered::Merged(merge_core(store, workspaces, backups, other_id, project_id, false).await?)),
     }
 }
 
@@ -956,11 +981,46 @@ pub async fn locate_folder(
     if own == target {
         return Ok(Located::Already);
     }
+    let shared = |folders: usize| LocateError::FolderShared { folder: folder.to_path_buf(), own: own.to_string(), folders, target: target.to_string() };
     let folders = own_folder_count(store, own).await?;
     if folders > 1 {
-        return Err(LocateError::FolderShared { folder: folder.to_path_buf(), own: own.to_string(), folders, target: target.to_string() });
+        return Err(shared(folders));
     }
-    Ok(Located::Merged(merge_core(store, workspaces, backups, own, target, false).await?))
+    // Counted again where the merge is written: a folder that joined `own`
+    // since would go along with it.
+    let source = own.to_string();
+    let alone = move |c: &Connection| -> Result<(), Checked<usize>> {
+        match own_folders_in(c, &source)?.len() {
+            0 | 1 => Ok(()),
+            folders => Err(Checked::Check(folders)),
+        }
+    };
+    match merge_checked(store, workspaces, backups, own, target, false, alone).await {
+        Ok(merged) => Ok(Located::Merged(merged)),
+        Err(Checked::Merge(e)) => Err(LocateError::Merge(e)),
+        Err(Checked::Check(folders)) => Err(shared(folders)),
+    }
+}
+
+/// Refuses `target` as the project a folder is located in when it is a
+/// tombstone or deleted, as the merge or the declaration that follows would
+/// refuse it, so that a refused locate registers no folder.
+pub async fn check_located_target(store: &MemoryStore, target: &str) -> Result<(), MergeError> {
+    let target = target.to_string();
+    store
+        .conn
+        .call(move |c| {
+            let into = canonical_in(c, &target)?;
+            if into != target {
+                return Err(MergeError::Merged { id: target, into });
+            }
+            if let Some(deleted) = deleted_in(c, &target)? {
+                return Err(MergeError::Deleted { id: target, delete_id: deleted.delete_id });
+            }
+            Ok(())
+        })
+        .await
+        .map_err(failed_call(ClosedAs::AsIs))
 }
 
 fn own_folders_in(c: &Connection, project: &str) -> rusqlite::Result<Vec<ResolvedFolder>> {
@@ -2149,6 +2209,37 @@ mod tests {
 
         assert_eq!(f.answers().await, before, "nothing is written");
         assert_eq!((f.merged_into("web-0001").await, f.merged_into("notas-0002").await), (None, None));
+    }
+
+    /// Two answers sent at once both find the suggestion pending, and only
+    /// the first one written stands: each looks for it again where it writes.
+    #[tokio::test]
+    async fn of_two_answers_to_one_suggestion_one_is_written() {
+        let f = Answering::new().await;
+
+        let (apart, merge) = tokio::join!(f.answer("app-1a2b", "copia-85a9", "apart"), f.answer("app-1a2b", "copia-85a9", "merge"));
+
+        let merged = f.merged_into("copia-85a9").await;
+        match (&apart, &merge) {
+            (Ok(Answered::Apart), Err(AnswerError::NoSuggestion { .. })) => assert_eq!(merged, None),
+            (Err(AnswerError::Pair(KeepApartError::Merged { .. })), Ok(Answered::Merged(_))) => {
+                assert_eq!(merged.as_deref(), Some("app-1a2b"))
+            }
+            other => panic!("both answers were written, or neither: {other:?}"),
+        }
+    }
+
+    /// Asked only to answer what is pending, a pair nobody suggested is left
+    /// as it was, not recorded apart.
+    #[tokio::test]
+    async fn keeping_apart_only_what_is_pending_writes_nothing_without_a_suggestion() {
+        let f = Answering::new().await;
+        let before = f.answers().await;
+
+        let kept = kept_apart(&f.store, "web-0001", "notas-0002", true).await.expect("both are live");
+
+        assert_eq!(kept.answered, 0);
+        assert_eq!(f.answers().await, before);
     }
 
     #[tokio::test]

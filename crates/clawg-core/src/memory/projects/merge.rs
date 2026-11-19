@@ -394,15 +394,59 @@ where
     }
 }
 
-async fn pass(
+/// A merge's refusal, or that of what its caller checks in the transactions
+/// that decide and write it.
+#[derive(Debug)]
+pub(crate) enum Checked<G> {
+    Merge(MergeError),
+    Check(G),
+}
+
+impl<G> From<rusqlite::Error> for Checked<G> {
+    fn from(e: rusqlite::Error) -> Self {
+        Checked::Merge(e.into())
+    }
+}
+
+impl<G> From<MemoryError> for Checked<G> {
+    fn from(e: MemoryError) -> Self {
+        Checked::Merge(MergeError::Store(e))
+    }
+}
+
+impl<G: std::fmt::Display> std::fmt::Display for Checked<G> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Checked::Merge(e) => e.fmt(f),
+            Checked::Check(g) => g.fmt(f),
+        }
+    }
+}
+
+impl<G: std::fmt::Display + Send + 'static> Retried for Checked<G> {
+    fn saves_pending(&self) -> bool {
+        matches!(self, Checked::Merge(MergeError::SavesPending(_)))
+    }
+}
+
+async fn pass<G, C>(
     store: &MemoryStore,
     source: &str,
     target: &str,
     snapshot: Option<String>,
     write: bool,
-) -> Result<MergeReport, MergeError> {
+    check: C,
+) -> Result<MergeReport, Checked<G>>
+where
+    G: std::fmt::Display + Send + 'static,
+    C: Fn(&Connection) -> Result<(), Checked<G>> + Clone + Send + 'static,
+{
     let (source, target) = (source.to_string(), target.to_string());
-    retrying(store, write, move |c| merge_pass(c, &source, &target, snapshot.as_deref(), TimestampMs::now())).await
+    retrying(store, write, move |c| {
+        check(c)?;
+        merge_pass(c, &source, &target, snapshot.as_deref(), TimestampMs::now()).map_err(Checked::Merge)
+    })
+    .await
 }
 
 /// Takes merge `merge_id` back inside the caller's transaction: its source
@@ -627,7 +671,30 @@ pub async fn merge_core(
     target: &str,
     dry_run: bool,
 ) -> Result<MergeReport, MergeError> {
-    let found = pass(store, source, target, None, false).await?;
+    let nothing = |_: &Connection| Ok::<(), Checked<std::convert::Infallible>>(());
+    merge_checked(store, workspaces, backups, source, target, dry_run, nothing).await.map_err(|e| match e {
+        Checked::Merge(e) => e,
+        Checked::Check(never) => match never {},
+    })
+}
+
+/// [`merge_core`], refused also by `check`, which runs in each transaction
+/// that decides the merge, the one that writes it among them, so what it
+/// checks still holds when the merge is written.
+pub(crate) async fn merge_checked<G, C>(
+    store: &MemoryStore,
+    workspaces: &WorkspaceManager,
+    backups: &Path,
+    source: &str,
+    target: &str,
+    dry_run: bool,
+    check: C,
+) -> Result<MergeReport, Checked<G>>
+where
+    G: std::fmt::Display + Send + 'static,
+    C: Fn(&Connection) -> Result<(), Checked<G>> + Clone + Send + 'static,
+{
+    let found = pass(store, source, target, None, false, check.clone()).await?;
     if found.merge_id.is_none() {
         return Ok(MergeReport { dry_run, ..found });
     }
@@ -639,7 +706,7 @@ pub async fn merge_core(
         return Ok(MergeReport { dry_run, merge_id: None, move_id: None, workspaces, ..found });
     }
     let snapshot = store.snapshot(backups.to_path_buf(), Reason::PreMerge).await?.display().to_string();
-    let mut report = pass(store, source, target, Some(snapshot.clone()), true).await?;
+    let mut report = pass(store, source, target, Some(snapshot.clone()), true, check).await?;
     report.snapshot = Some(snapshot);
     let Some(merge_id) = report.merge_id else {
         return Ok(report);
@@ -944,6 +1011,28 @@ mod tests {
             f.rows("SELECT id, merged_into FROM project ORDER BY id", |r| Ok((r.get(0)?, r.get(1)?))).await;
         assert_eq!(merged, vec![(C.to_string(), None), (A.to_string(), Some(C.to_string())), (B.to_string(), Some(C.to_string()))]);
         assert_eq!(canonical(&f.store, A).await.unwrap(), C);
+    }
+
+    /// What a caller checks is checked again in the transaction that writes
+    /// the merge: once it stops holding there, nothing is written.
+    #[tokio::test]
+    async fn a_check_that_stops_holding_before_the_write_refuses_the_merge() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let f = Fixture::new(&[A, B]).await;
+        f.save("the daemon listens on clawg.sock", A, None, 1).await;
+        let before = f.everything().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = calls.clone();
+        let first_only = move |_: &Connection| match counted.fetch_add(1, Ordering::SeqCst) {
+            0 => Ok(()),
+            _ => Err(Checked::Check("it changed")),
+        };
+
+        let refused = merge_checked(&f.store, &f.workspaces, &f.backups, A, B, false, first_only).await;
+
+        assert!(matches!(refused, Err(Checked::Check("it changed"))), "{refused:?}");
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "once to decide, once where the merge is written");
+        assert_eq!(f.everything().await, before);
     }
 
     #[tokio::test]
