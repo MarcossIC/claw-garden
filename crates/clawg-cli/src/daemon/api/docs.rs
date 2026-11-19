@@ -231,12 +231,15 @@ pub(super) async fn search_docs(
         index.wait_idle(&body.project_id, limit).await;
         app.runtime.metrics.observe("docs.search.inline_wait", Unit::Micros, &[], micros(started.elapsed()));
     }
+    // Read before the hits: a refresh that ends while they are read may have
+    // left them partial, and the answer still says so.
+    let indexing = index.is_running(&body.project_id);
     let hits = project_docs::search(store, embedder.as_ref(), &body.project_id, &body.query, clamp_docs_limit(body.limit))
         .await
         .map_err(ApiError::internal)?;
     let docs = docs_in(store, &body.project_id).await?;
     let warning = index.last_error(&body.project_id);
-    Ok(Json(DocsSearchBody { hits, docs, indexing: index.is_running(&body.project_id), warning }))
+    Ok(Json(DocsSearchBody { hits, docs, indexing, warning }))
 }
 
 #[cfg(test)]
