@@ -102,7 +102,7 @@ Ninguno.
 | W2, el nombre del test | `60f1e295` | `only_a_program_that_never_worked_and_is_missing_is_a_rule` |
 | S4 y S5, visibilidad y comentarios | `5e6d7052` | `pub(crate)` en lo que sólo usa `clawg-cli`; `RULES_BLOCK_MAX` en el módulo de tests; los comentarios de `INPUT_LIMIT` y de `respond_reading` |
 
-W3 se cerró con la puerta de latencia, aceptando el costo (ver [la puerta, medida otra vez](#la-puerta-medida-otra-vez-con-lo-que-agrega-el-hook)). S7 se probó y no se commitea. Quedan abiertos S2, S3, S6 y S8. Con W1 arreglado, una respuesta con `stderr` vacío y la firma en `stdout`, sin `2>&1`, cuenta como llamada sin firma: un shell no escribe ahí su `command not found`, así que es lo buscado.
+W3 se cerró con la puerta de latencia, aceptando el costo (ver [la puerta, medida otra vez](#la-puerta-medida-otra-vez-con-lo-que-agrega-el-hook)). S7 se probó y no se commitea. Quedan abiertos S2, S3, S6 y S8. Con W1 arreglado, un `stderr` con texto es el único lugar donde se busca la firma. Con un `stderr` vacío, en cambio, se busca en todos los textos, también `stdout`, porque ahí deja el cliente las palabras del shell después de una llamada que terminó bien (el arreglo de [la campaña](#la-campaña)). Eso deja un falso positivo abierto: si el comando imprime una firma vieja que nombra a uno de sus propios programas, como `rg "command not found" build.log` con un log que trae `rg: command not found`, sale un fallo de ese programa. Si el libro no tiene un `ok` de ese programa en la ventana, también sale el aviso del mismo turno, aunque el programa esté instalado. Para que llegue a regla hacen falta dos sesiones, ningún éxito en 30 días y que el programa no esté en el PATH del hook.
 
 ## La campaña
 
