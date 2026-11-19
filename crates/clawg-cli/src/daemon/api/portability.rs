@@ -362,20 +362,41 @@ pub(super) async fn start_import_job(State(app): State<Arc<AppCtx>>, body: Bytes
 /// The checks of `POST /v1/import` in its order, with the slot taken after
 /// what only reads the request and before the file is opened, so two requests
 /// never read a file at once.
+///
+/// They run in a task of their own: a request that goes while the file is
+/// read cannot stop the blocking read, so the slot stays taken until the read
+/// ends, and the job nobody waits for is not started.
 async fn accept_job(app: Arc<AppCtx>, request: ImportJobRequest, control: ImportControl) -> ApiResult<Arc<JobView>> {
+    let (answer, answered) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let accepted = accept_job_for(&app, request, control, &answer).await;
+        let _ = answer.send(accepted);
+    });
+    answered.await.map_err(|_| ApiError::internal("the import request ended without an answer"))?
+}
+
+async fn accept_job_for(
+    app: &Arc<AppCtx>,
+    request: ImportJobRequest,
+    control: ImportControl,
+    answer: &tokio::sync::oneshot::Sender<ApiResult<Arc<JobView>>>,
+) -> ApiResult<Arc<JobView>> {
     let started = Instant::now();
     let ImportJobRequest { path, from, dry_run, agent, map_roots, project_map } = request;
     let path = std::path::PathBuf::from(path);
     if !path.is_absolute() {
         return Err(ApiError::bad_request("path must be absolute"));
     }
-    let Asked { source, options } = checked_fields(&app, ImportFields { from, dry_run, agent, map_roots, project_map }).await?;
+    let Asked { source, options } = checked_fields(app, ImportFields { from, dry_run, agent, map_roots, project_map }).await?;
     let reservation = app.imports.reserve().map_err(job_refused)?;
     let input = tokio::task::spawn_blocking(move || read_export(&path, source)).await.map_err(ApiError::internal)??;
-    tokenizer_for(&app, &input)?;
+    tokenizer_for(app, &input)?;
     let mut timings = ImportTimings::new(dry_run).with_memory(crate::daemon::process::private_bytes);
     timings.record(Timing { elapsed: started.elapsed(), ..Timing::new(Step::Read) });
-    let embedder = embedder_for(&app, dry_run)?;
+    let embedder = embedder_for(app, dry_run)?;
+    if answer.is_closed() {
+        return Err(ApiError::internal("the import request went away before its job started"));
+    }
     // A model let go for being idle loads while the job plans and decides.
     if let Some(embedder) = &embedder {
         embedder.wake();
@@ -898,5 +919,24 @@ mod tests {
 
         assert_eq!((refused.status, refused.message.as_str(), refused.retryable), (StatusCode::SERVICE_UNAVAILABLE, "shutting_down", Some(true)));
         assert!(refused.job_id.is_none());
+    }
+
+    /// The read cannot be stopped, so the slot stays taken until it ends,
+    /// and the job of a request that went is not started.
+    #[tokio::test]
+    async fn a_request_that_goes_while_its_file_is_read_holds_the_slot_and_starts_no_job() {
+        let (app, dir) = daemon_for_jobs().await;
+        let path = dir.path().join("export.jsonl");
+        std::fs::write(&path, rows_file(3)).expect("an export file");
+        let request: ImportJobRequest = serde_json::from_value(serde_json::json!({ "path": path })).expect("a request");
+
+        let gone = tokio::time::timeout(Duration::ZERO, accept_job(app.clone(), request, ImportControl::default())).await;
+        assert!(gone.is_err(), "the request goes before it is answered");
+        tokio::task::yield_now().await;
+
+        assert!(matches!(app.imports.reserve(), Err(Busy::Running(1))), "the read still holds the slot");
+        tokio::time::timeout(Duration::from_secs(10), app.imports.settled()).await.expect("the slot is given back once the read ends");
+        assert!(app.imports.view(1).is_none(), "no job was started");
+        assert_eq!(count(&app, "SELECT COUNT(*) FROM memory_import").await, 0);
     }
 }
