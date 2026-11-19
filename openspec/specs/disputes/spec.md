@@ -73,7 +73,7 @@ Lo mismo vale cuando el save se guarda en más de una toma (una pausa del apagad
 
 ## Las candidatas en la respuesta del save
 
-Un save confirmado cuyo detector anotó pares MUST listarlos en `related` (`SaveBody`, `crates/clawg-cli/src/daemon/api.rs:602`; cada uno `RelatedMemory`, `api.rs:664`, con `kind`, `id`, `escalated` y la primera línea de la candidata cortada a `EXCERPT_CHARS` = 80 caracteres, `contradiction.rs:73`), uno por fila vieja. Sin pares, MUST NOT llevar el campo. El texto de `save_memory` MUST sumar una línea `close to earlier memories: #id "<línea>"` (con `, asks the user` en las que escalan), sólo cuando hay alguna (`related_text`, `crates/clawg-cli/src/mcp/server.rs:391`). Un puente que no conoce el campo muestra el save igual.
+Un save confirmado cuyo detector anotó pares MUST listarlos en `related` (`SaveBody`, `crates/clawg-cli/src/daemon/api/memories.rs`; cada uno `RelatedMemory`, `api/memories.rs`, con `kind`, `id`, `escalated` y la primera línea de la candidata cortada a `EXCERPT_CHARS` = 80 caracteres, `contradiction.rs:73`), uno por fila vieja. Sin pares, MUST NOT llevar el campo. El texto de `save_memory` MUST sumar una línea `close to earlier memories: #id "<línea>"` (con `, asks the user` en las que escalan), sólo cuando hay alguna (`related_text`, `crates/clawg-cli/src/mcp/server.rs:391`). Un puente que no conoce el campo muestra el save igual.
 
 **VR1. La línea pide la llamada sólo para un reemplazo.** Lo que sigue a la lista MUST pedir `resolve_conflict` con `supersedes` (y `keep` = el id nuevo) si el save reemplaza una de las nombradas, y con `conflicts` si sólo la persona puede decir cuál vale, y MUST decir que si valen las dos no hay que hacer nada. La línea MUST NOT nombrar `compatible` ni `scoped`: casi todos los pares que el agente juzgaba eran `compatible`, que no cambia lo que se recupera (R2), y se juzgaban sin leer la memoria vieja. Los dos veredictos siguen aceptándose (R2), así que un agente con el protocolo anterior sigue funcionando. En inglés termina en `If this save replaces one, call resolve_conflict with verdict supersedes (keep = the new id), or conflicts if only the user can tell; if both hold, do nothing`, y en español en `Si este save reemplaza una, llama a resolve_conflict con verdict supersedes (keep = el id nuevo), o conflicts si sólo la persona puede decirlo; si valen las dos, no hagas nada`.
 
@@ -84,7 +84,7 @@ Un save confirmado cuyo detector anotó pares MUST listarlos en `related` (`Save
 - AND termina en `if both hold, do nothing`
 - AND no contiene `compatible` ni `scoped`
 
-**Tests:** `a_confirmed_save_names_its_candidates` en `worker.rs`; `save_outcome_text_names_related_memories` en `server.rs`, en los dos idiomas; `save_body_leaves_related_out_when_empty` en `api.rs`.
+**Tests:** `a_confirmed_save_names_its_candidates` en `worker.rs`; `save_outcome_text_names_related_memories` en `server.rs`, en los dos idiomas; `save_body_leaves_related_out_when_empty` en `api/memories.rs`.
 
 ## R1. `supersedes`: una gana
 
@@ -203,7 +203,7 @@ Cuando una fila X se borra (`delete_memory_core`, `crates/clawg-core/src/memory/
 
 Restaurar X (`restore_memory_core`, `admin.rs:511`; el resto del restore está en [`specs/restore`](../restore/spec.md)) MUST llevar a su estado de reposo a X y a toda fila cuyo `disputed_against` la nombra (`settle_row` y `settle_challengers`, `dispute.rs:222` y `dispute.rs:215`, llamadas en `listing.rs:30-31`): el par escalado vuelve con ella.
 
-Restaurar una fila borrada que tenía `topic_key` MUST fallar sin cambiar nada cuando el alcance de su clave ya tiene una fila viva de otro save (las demás piezas de su propio save no cuentan) (`RESTORE_TOPIC_HOLDER`, `admin.rs:381`; `RestoreError::TopicTaken`, `admin.rs:355`). El error MUST nombrar la clave y la fila que la tiene, y la fila restaurada se queda borrada: restaurarla dejaría dos versiones vivas de un tema que una revisión mantiene en una. `POST /v1/memories/memory/{id}/restore` MUST responder `409` (`restore_memory`, `crates/clawg-cli/src/daemon/api.rs:1750`, el brazo del `409` en `api.rs:1765`), como con un gemelo vivo o un secreto.
+Restaurar una fila borrada que tenía `topic_key` MUST fallar sin cambiar nada cuando el alcance de su clave ya tiene una fila viva de otro save (las demás piezas de su propio save no cuentan) (`RESTORE_TOPIC_HOLDER`, `admin.rs:381`; `RestoreError::TopicTaken`, `admin.rs:355`). El error MUST nombrar la clave y la fila que la tiene, y la fila restaurada se queda borrada: restaurarla dejaría dos versiones vivas de un tema que una revisión mantiene en una. `POST /v1/memories/memory/{id}/restore` MUST responder `409` (`restore_memory`, `crates/clawg-cli/src/daemon/api/memories.rs`, el brazo del `409` en `api/memories.rs`), como con un gemelo vivo o un secreto.
 
 Purgar X (`purge`, `crates/clawg-core/src/memory/upkeep/secrets.rs:163`) MUST borrar los pares que la nombran (`secrets.rs:214`). El `reason` de un veredicto se guarda enmascarado ([`specs/secrets`](../secrets/spec.md) R7).
 
@@ -262,13 +262,13 @@ Cubre las huérfanas que dejaron las versiones que borraban sin liberar. La mism
 
 ## R6. HTTP y MCP
 
-Detrás del token, sobre filas de `memory` (rutas en `crates/clawg-cli/src/daemon/api.rs:1038-1040`):
+Detrás del token, sobre filas de `memory` (rutas en `crates/clawg-cli/src/daemon/api.rs`):
 
-- `POST /v1/disputes/judge` MUST aceptar `{"keep": <id>, "other": <id>, "verdict": "supersedes" | "compatible" | "scoped" | "conflicts", "reason": <opcional>, "user_answered": <bool, opcional, false por defecto>, "agent_id": <opcional>}` (`JudgeRequest`, `api.rs:988`; `judge_dispute`, `api.rs:1826`). Un cuerpo sin `user_answered` se lee sin la declaración.
+- `POST /v1/disputes/judge` MUST aceptar `{"keep": <id>, "other": <id>, "verdict": "supersedes" | "compatible" | "scoped" | "conflicts", "reason": <opcional>, "user_answered": <bool, opcional, false por defecto>, "agent_id": <opcional>}` (`JudgeRequest`, `api/disputes.rs`; `judge_dispute`, `api/disputes.rs`). Un cuerpo sin `user_answered` se lee sin la declaración.
 - `POST /v1/disputes/resolve` MUST seguir aceptando `{"keep", "other", "keep_both": <bool, opcional, false por defecto>, "agent_id"}` para los puentes anteriores, y guardar `compatible` (con `keep_both`) o `supersedes` (`resolve_dispute_core`, `dispute.rs:381`). No tiene dónde declarar y juzga sin la declaración, así que un puente anterior nunca reemplaza una fila protegida.
-- `GET /v1/disputes?agent_id=&project_id=` MUST devolver `{pending, escalated, pairs}`: los conteos de pares abiertos entre filas vivas que el agente alcanza, de cualquier autor, cuya fila nueva cumple el predicado de proyecto de la búsqueda (sin `project_id`, todo el store), y hasta 5 pares pendientes (`OPEN_PAIRS_SHOWN`, `api.rs:1017`), los más viejos primero (`open_pairs`, `dispute.rs:529`), cada lado con la marca de su origen (P4 de [`specs/provenance`](../provenance/spec.md)).
+- `GET /v1/disputes?agent_id=&project_id=` MUST devolver `{pending, escalated, pairs}`: los conteos de pares abiertos entre filas vivas que el agente alcanza, de cualquier autor, cuya fila nueva cumple el predicado de proyecto de la búsqueda (sin `project_id`, todo el store), y hasta 5 pares pendientes (`OPEN_PAIRS_SHOWN`, `api/disputes.rs`), los más viejos primero (`open_pairs`, `dispute.rs:529`), cada lado con la marca de su origen (P4 de [`specs/provenance`](../provenance/spec.md)).
 
-Las dos rutas de veredicto responden igual (`resolve_error`, `api.rs:1801`):
+Las dos rutas de veredicto responden igual (`resolve_error`, `api/disputes.rs`):
 
 | Caso | Respuesta |
 |---|---|

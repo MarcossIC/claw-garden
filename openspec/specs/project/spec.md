@@ -118,11 +118,11 @@ El puente MCP (las raíces del cliente, su cwd y `project_path`) y `clawg memori
 
 ## R4. Registro de proyecto y re-key
 
-`POST /v1/projects`, con token, recibe `{ "root_path": "...", "legacy_ids": ["..."], "index_docs": <bool>, "assigned": <bool>, "path": "..." }` (`path`, el camino crudo, es opcional y sólo cuenta con `assigned`: PL44) y responde `{ "project_id": "...", "root_id": "...", "rekeyed": <n> }` (`register`, `crates/clawg-cli/src/daemon/api.rs`; `register_project`, `crates/clawg-core/src/memory/projects/project.rs`).
+`POST /v1/projects`, con token, recibe `{ "root_path": "...", "legacy_ids": ["..."], "index_docs": <bool>, "assigned": <bool>, "path": "..." }` (`path`, el camino crudo, es opcional y sólo cuenta con `assigned`: PL44) y responde `{ "project_id": "...", "root_id": "...", "rekeyed": <n> }` (`register`, `crates/clawg-cli/src/daemon/api/projects.rs`; `register_project`, `crates/clawg-core/src/memory/projects/project.rs`).
 
 - El daemon MUST decidir los ids él mismo, de `root_path` y de las huellas que lee de su checkout (PL3); no los recibe. Con `assigned` los asigna (R15, R16); sin él (un cliente anterior) el id de raíz y de proyecto es `derive_project_id(root_path)`, sin clave (R18).
-- `index_docs` dice si el daemon puede leer los archivos de la raíz ([`specs/project-docs`](../project-docs/spec.md), «Qué raíces se leen»). Si falta MUST tomarse como `false` (`RegisterRequest::index_docs`, `api.rs:1920`): un puente de una versión anterior registra sin indexar, y lo arregla `clawg projects add` o un puente actual en esa raíz cuando es un proyecto.
-- Con `index_docs: true` y una `root_path` que no es un directorio, MUST responder 400 antes de tocar `project_path` (`register`, `api.rs`). Sin `index_docs`, la misma ruta se sigue registrando como siempre.
+- `index_docs` dice si el daemon puede leer los archivos de la raíz ([`specs/project-docs`](../project-docs/spec.md), «Qué raíces se leen»). Si falta MUST tomarse como `false` (`RegisterRequest::index_docs`, `api/projects.rs`): un puente de una versión anterior registra sin indexar, y lo arregla `clawg projects add` o un puente actual en esa raíz cuando es un proyecto.
+- Con `index_docs: true` y una `root_path` que no es un directorio, MUST responder 400 antes de tocar `project_path` (`register`, `api/projects.rs`). Sin `index_docs`, la misma ruta se sigue registrando como siempre.
 - MUST guardar en `project_path` la carpeta de la raíz (su id de raíz, `root_path`, `index_docs`, su proyecto y sus huellas, PL4) cuando ninguna carpeta del camino le sirve, y crear en `project` su proyecto cuando no existe.
 - Si la fila existe con la misma raíz y el registro pide indexar, MUST pasar `index_docs` de 0 a 1. MUST NOT bajarlo de 1 a 0: un save en otra sesión no le quita a una raíz aceptada su índice (`project.rs:98-100`). El resultado (`RegisterOutcome::index_docs`) lleva el valor que quedó guardado.
 - Sin `assigned`, si `derive_project_id(root_path)` ya está registrado con **otra** `root_path`, o la raíz está guardada con otro id, MUST responder 409 sin mover ninguna fila y sin tocar la marca de la otra raíz. El cuerpo es `{ "error": "project_root_collision", "detail": "<raíz> gets the project id <id>, which already belongs to <otra raíz>" }`. Con `assigned` MUST NOT responder 409 por un choque.
@@ -258,13 +258,13 @@ Cada fila que un movimiento cambia, por cualquier puerta, MUST dejar en `memory_
 
 `POST /v1/memories/move` MUST tomar `dry_run` y una selección (al menos uno de `ids`, `from_project`/`from_none`, `agent`, `memory_type`, `source`, `session_id` o `q`; sin `include_deleted`, filas no borradas; `q` con `include_deleted` es un 400) con un destino (`to_project` o `to_none`), o `undo`. Es del usuario: sin lector y sin `user_answered`; cuenta en `protected` las preferencias y decisiones vivas que movió. Con algo que mover y sin `dry_run`, MUST tomar antes el snapshot `pre-move`. Un ensayo MUST responder lo mismo que el movimiento, salvo `move_id` y `snapshot`, sin escribir nada. `clawg projects move` manda ese pedido al daemon que corre, sin arrancar uno, e imprime el reporte; su análisis de argumentos es puro (`MoveOpts::request`).
 
-**Test:** `a_dry_run_reports_what_a_move_does_and_writes_nothing`, `a_selection_needs_a_filter_and_text_only_over_live_rows` y `the_filters_narrow_the_selection` (`relocate.rs`); `a_move_asks_for_one_target_or_an_undo` (`api.rs`); `the_batch_moves_reports_and_snapshots` y `a_batch_without_a_selection_or_a_target_is_400` (`tests/api.rs`); `move_takes_a_selection_and_one_target_or_an_undo` (`cli.rs`); `a_move_report_names_what_moved_what_stayed_and_the_way_back` y `projects_move_moves_a_memory_and_undoes_it` (`projects.rs`); `projects_move_moves_and_undoes_a_seeded_store` (`tests/binary.rs`).
+**Test:** `a_dry_run_reports_what_a_move_does_and_writes_nothing`, `a_selection_needs_a_filter_and_text_only_over_live_rows` y `the_filters_narrow_the_selection` (`relocate.rs`); `a_move_asks_for_one_target_or_an_undo` (`api/memories.rs`); `the_batch_moves_reports_and_snapshots` y `a_batch_without_a_selection_or_a_target_is_400` (`tests/api.rs`); `move_takes_a_selection_and_one_target_or_an_undo` (`cli.rs`); `a_move_report_names_what_moved_what_stayed_and_the_way_back` y `projects_move_moves_a_memory_and_undoes_it` (`projects.rs`); `projects_move_moves_and_undoes_a_seeded_store` (`tests/binary.rs`).
 
 ## R13. Listar lo que no tiene proyecto
 
 `GET /v1/memories?no_project=true` MUST listar sólo las filas sin proyecto; con `project` es un 400. `clawg memories list` y `search` toman `--no-project`.
 
-**Test:** `a_listing_of_rows_without_a_project` (`admin.rs`), `no_project_and_project_together_are_refused` (`api.rs`), `the_listing_reaches_the_rows_without_a_project` (`tests/api.rs`), `list_and_search_take_no_project` (`cli.rs`).
+**Test:** `a_listing_of_rows_without_a_project` (`admin.rs`), `no_project_and_project_together_are_refused` (`api/memories.rs`), `the_listing_reaches_the_rows_without_a_project` (`tests/api.rs`), `list_and_search_take_no_project` (`cli.rs`).
 
 ## HI3. Elegir filas por su proyecto de origen
 
@@ -620,7 +620,7 @@ Desde V32 no existen `episodic_trajectory` ni `procedural_skill` (RL1 de [`specs
 
 ## PL23. Borrar un proyecto vacío (etapa 1)
 
-`POST /v1/projects/delete` con `{"project_id": X}`, detrás del token (`delete_core`, `project_delete.rs`; `delete_projects`, `crates/clawg-cli/src/daemon/api.rs`). Se rechaza sin escribir, y en este orden:
+`POST /v1/projects/delete` con `{"project_id": X}`, detrás del token (`delete_core`, `project_delete.rs`; `delete_projects`, `crates/clawg-cli/src/daemon/api/projects.rs`). Se rechaza sin escribir, y en este orden:
 
 - 404 si X no está en `project`;
 - 409 `project_merged` si X es una lápida, con `detail` que nombra el proyecto vivo;
@@ -956,7 +956,7 @@ Los dos MUST hablar con el daemon que corre, sin arrancar uno, e imprimir en el 
 
 `registry::own_folder_count(store, project)` (`crates/clawg-core/src/memory/projects/registry.rs:816`) MUST devolver cuántas carpetas de `project_path` llevan a `project`: las que tienen su `project_id`, y una de antes de V27 cuyo `id` es el del proyecto. Su error MUST ser `StorageError` ([`specs/storage`](../storage/spec.md), SB5).
 
-`locate_project` (`POST /v1/projects/locate`, `crates/clawg-cli/src/daemon/api.rs:3097`) MUST decidir con ese número, sin leer la base por su cuenta (SB1 de `specs/storage`):
+`locate_project` (`POST /v1/projects/locate`, `crates/clawg-cli/src/daemon/api/projects.rs`) MUST decidir con ese número, sin leer la base por su cuenta (SB1 de `specs/storage`):
 
 - con más de una carpeta, el 409 `folder_shared` MUST llevar el `detail` `<CAMINO> leads to project <P>, which has <N> folders; `clawg projects merge <P> --into <PROYECTO>` merges them all`;
 - el 500 de una consulta que falla MUST salir de `ApiError::internal`, con el texto del `StorageError`.

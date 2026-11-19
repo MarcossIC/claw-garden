@@ -131,7 +131,7 @@ Una fila de la lectura de arranque que se reintenta retiene también la copia qu
 
 ### Una fila `failed` se reintenta o se descarta
 
-`MemoryRuntime::retry_failed` y `discard_failed` (`crates/clawg-core/src/runtime.rs:267` y `:282`), detrás de `POST /v1/outbox/retry` y `POST /v1/outbox/discard` (`{"operation_id", "agent_id"?}`, `crates/clawg-cli/src/daemon/api.rs:1870` y `:1794`) y de `clawg outbox retry|discard <OPERATION_ID> [--agent NAME]` (`crates/clawg-cli/src/outbox.rs`), MUST actuar sobre la fila `failed` de ese `operation_id`: la del agente nombrado, o la única que lo tenga (`outbox_find_failed`, `outbox.rs:382`). MUST responder `404` sin fila, y `409` con una fila `pending` (el worker puede estar en ella), con un `operation_id` que tienen varios agentes (la frase de `error` los nombra) o con un evento que ya no parsea (`OutboxActionError`). Un `operation_id` inválido es un `400`, como en un save. El comando va por el daemon en marcha y MUST NOT arrancar uno.
+`MemoryRuntime::retry_failed` y `discard_failed` (`crates/clawg-core/src/runtime.rs:267` y `:282`), detrás de `POST /v1/outbox/retry` y `POST /v1/outbox/discard` (`{"operation_id", "agent_id"?}`, `crates/clawg-cli/src/daemon/api/outbox.rs`) y de `clawg outbox retry|discard <OPERATION_ID> [--agent NAME]` (`crates/clawg-cli/src/outbox.rs`), MUST actuar sobre la fila `failed` de ese `operation_id`: la del agente nombrado, o la única que lo tenga (`outbox_find_failed`, `outbox.rs:382`). MUST responder `404` sin fila, y `409` con una fila `pending` (el worker puede estar en ella), con un `operation_id` que tienen varios agentes (la frase de `error` los nombra) o con un evento que ya no parsea (`OutboxActionError`). Un `operation_id` inválido es un `400`, como en un save. El comando va por el daemon en marcha y MUST NOT arrancar uno.
 
 - **Reintentar** MUST escribir otra vez la fila, en una transacción, con otro `id`, `pending`, `attempts = 0`, sin `last_error` y con su progreso (`outbox_requeue`, `outbox.rs:420`), y encolarla. Otro `id` porque el worker reconoce por `id` las filas de su lectura de arranque, y tomaría una que estaba `pending` al arrancar por la segunda entrega de sí misma. Si la cola no la admite, la fila queda `pending` para el próximo arranque y la respuesta lo dice (`queued: false`).
 - **Descartar** MUST borrar suavemente, con el borrado de siempre (`delete_memory_core`), los pedazos que ese save insertó según su progreso y siguen vivos, y después la fila. Como el save no terminó, su revisión no corrió y la versión anterior de su clave sigue viva: borrar sus pedazos no revive nada. `clawg undelete` trae cada uno. La respuesta los nombra, y el `operation_id` queda libre otra vez.
@@ -305,7 +305,7 @@ Con un trabajo activo, el apagado MUST levantar la señal con causa apagado en e
 - WHEN llega la orden de apagado
 - THEN queda `interrupted` con notas enteras, `finished_at` nulo, y tras abandonarlo no se manda nada a la conexión
 
-**Tests:** `shutdown_stops_a_job_in_embedding_within_the_grace`, `shutdown_stops_a_job_in_writing_between_whole_notes` y `an_abandoned_job_sends_nothing_to_the_connection` (en `mod tests` de `crates/clawg-cli/src/daemon/api.rs`, que arma un `AppCtx`; la segunda con tiempo real y la tercera con tiempo pausado, porque con el reloj pausado `HTTP_GRACE` vence mientras el lote está en el hilo de la conexión), más `an_abandoned_job_is_interrupted_and_named` (unidad del registro, `crates/clawg-cli/src/daemon/imports.rs`: `abandon` deja `abandoned: true` y el paso) y `a_finish_after_abandon_changes_nothing`. **Guarda:** `every_phase_of_a_shutdown_fits_inside_the_stop_timeout` (`crates/clawg-cli/src/stop.rs`) sigue verde sin cambios. Los embedders `stalled` y `blocked` no sirven para esta prueba: nunca llenan la celda del modelo y una importación real sin modelo es `503` antes del `202`; el embedder de prueba del registro es uno que retiene el lote.
+**Tests:** `shutdown_stops_a_job_in_embedding_within_the_grace`, `shutdown_stops_a_job_in_writing_between_whole_notes` y `an_abandoned_job_sends_nothing_to_the_connection` (en `mod tests` de `crates/clawg-cli/src/daemon/api/portability.rs`, que arma un `AppCtx`; la segunda con tiempo real y la tercera con tiempo pausado, porque con el reloj pausado `HTTP_GRACE` vence mientras el lote está en el hilo de la conexión), más `an_abandoned_job_is_interrupted_and_named` (unidad del registro, `crates/clawg-cli/src/daemon/imports.rs`: `abandon` deja `abandoned: true` y el paso) y `a_finish_after_abandon_changes_nothing`. **Guarda:** `every_phase_of_a_shutdown_fits_inside_the_stop_timeout` (`crates/clawg-cli/src/stop.rs`) sigue verde sin cambios. Los embedders `stalled` y `blocked` no sirven para esta prueba: nunca llenan la celda del modelo y una importación real sin modelo es `503` antes del `202`; el embedder de prueba del registro es uno que retiene el lote.
 
 **Riesgo señalado:** abortar durante `snapshot` o `linking` marca `interrupted` un trabajo cuya última llamada igual puede confirmarse antes del cierre (el `links` es una transacción); el estado queda en el proceso que muere, y lo que vale es `memory_import`.
 
@@ -713,7 +713,7 @@ El cerrojo del modelo queda tomado lo que tarda leer y hashear la caché, nunca 
 #### Escenario: un archivo borrado del modelo suelto
 - GIVEN el modelo suelto, `tokenizer_config.json` borrado de la caché y una descarga que tarda
 - WHEN llegan dos búsquedas seguidas
-- THEN las dos responden `503 embedder_not_ready` (`embed_failure`, `crates/clawg-cli/src/daemon/api.rs:1431`) sin esperar la descarga, y hay una sola en curso
+- THEN las dos responden `503 embedder_not_ready` (`embed_failure`, `crates/clawg-cli/src/daemon/api.rs`) sin esperar la descarga, y hay una sola en curso
 - AND cuando la descarga termina, la búsqueda siguiente carga el modelo y responde
 
 #### Escenario: la recarga corta en el primer archivo que falla
@@ -781,7 +781,7 @@ Buscar, guardar, restaurar y `recall_context` con el modelo suelto MUST esperar 
 
 ### Registrar un proyecto despierta el modelo
 
-`POST /v1/projects` MUST empezar a cargar un modelo suelto y MUST responder sin esperar esa carga (`embedder.wake()`, `api.rs:2210`; `wake`, `idle_embedder.rs:357`). Con el modelo residente MUST NOT cargar nada. Un modelo despertado MUST contar como recién usado.
+`POST /v1/projects` MUST empezar a cargar un modelo suelto y MUST responder sin esperar esa carga (`embedder.wake()`, `api/projects.rs`; `wake`, `idle_embedder.rs:357`). Con el modelo residente MUST NOT cargar nada. Un modelo despertado MUST contar como recién usado.
 
 #### Escenario: el puente empieza una sesión
 - GIVEN el modelo suelto
@@ -962,7 +962,7 @@ Después de cada snapshot automático, el directorio de backups MUST conservar l
 
 `clawg backup [--profile P]` (`crates/clawg-cli/src/main.rs:140`) MUST producir un snapshot `manual` e imprimir su ruta.
 
-- Con el daemon andando, MUST pedirlo por `POST /v1/backup` (con el token; `crates/clawg-cli/src/daemon/api.rs:1934`, ruta en `:1046`), que lo hace en una conexión propia y corta, dentro de `spawn_blocking`, para que el `VACUUM INTO` no deje esperando detrás a cada llamada de la conexión del daemon (`MemoryStore::snapshot`, `crates/clawg-core/src/memory/store/db.rs:280`), y responde `{"path": "..."}`. El store en memoria de las pruebas, sin archivo, copia por su propia conexión.
+- Con el daemon andando, MUST pedirlo por `POST /v1/backup` (con el token; `crates/clawg-cli/src/daemon/api/portability.rs`, la ruta en `router`), que lo hace en una conexión propia y corta, dentro de `spawn_blocking`, para que el `VACUUM INTO` no deje esperando detrás a cada llamada de la conexión del daemon (`MemoryStore::snapshot`, `crates/clawg-core/src/memory/store/db.rs:280`), y responde `{"path": "..."}`. El store en memoria de las pruebas, sin archivo, copia por su propia conexión.
 - Sin daemon, MUST tomar el lock del store con el titular `Maintenance` (`crates/clawg-core/src/memory/store/store_lock.rs:59`), copiar sin migrar y soltar el lock (`backup_offline`, `backup.rs:339`).
 - Sin `memory.db`, MUST decir que no hay base, sin crear el directorio de datos.
 
