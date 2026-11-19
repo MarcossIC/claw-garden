@@ -194,7 +194,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 
 // ── Request / response bodies ───────────────────────────────────────────────
 
-/// Strict for the same reason as [`ListQuery`](memories::ListQuery): a misspelt filter would answer
+/// Strict for the same reason as `ListQuery`: a misspelt filter would answer
 /// with the totals of everything.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -208,7 +208,7 @@ pub struct StatsQuery {
 /// Which agent a call by id acts for: it reaches what `sharing.json` lets
 /// that agent read, whoever saved it, and a row out of its reach is answered
 /// as missing. Absent, the call is the user's and reaches any row. Strict for
-/// the same reason as [`ListQuery`](memories::ListQuery): a misspelt `agent` would quietly lift the
+/// the same reason as `ListQuery`: a misspelt `agent` would quietly lift the
 /// reach.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
