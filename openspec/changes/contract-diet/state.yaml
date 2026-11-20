@@ -9,6 +9,6 @@ artifacts:
   design: done  # D2, D3, D5, D6, D9, D10 y la regla de decisión, fijada antes de correr
   tasks: done
   apply: done  # la variante lean, --protocol lean y el brazo a3-lean
-  verify: partial  # los requisitos cumplen; la campaña paga queda pendiente, ver «Pendiente: la campaña» en verify.md
+  verify: partial  # los requisitos cumplen; la campaña corrió el 2026-11-20: lean no pasa (T −9,2 % contra el 10 % de D5) y queda full; falta el CI
   archive: pending
-updated: 2026-11-18
+updated: 2026-11-20

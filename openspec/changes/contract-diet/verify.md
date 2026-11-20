@@ -1,6 +1,6 @@
 # contract-diet — Verificación (el bloque `lean`)
 
-Verifica la clase (b), enfoque B1: la variante `lean`, su sello y el brazo `a3-lean`. La clase (a) se verificó al hacerse ([exploración](exploration.md#hecho-la-clase-a)). **La campaña no corrió**: es paga y queda [pendiente](#pendiente-la-campaña), con su regla fijada en [design](design.md#la-regla-de-decisión).
+Verifica la clase (b), enfoque B1: la variante `lean`, su sello y el brazo `a3-lean`. La clase (a) se verificó al hacerse ([exploración](exploration.md#hecho-la-clase-a)). **La campaña corrió el 2026-11-20 y `lean` no pasa**: cumple las seis condiciones de D6 y falla la séptima, la del ahorro, por 0,8 puntos; el valor por defecto queda `full` ([la campaña](#la-campaña)).
 
 ## Qué se revisó
 
@@ -59,7 +59,9 @@ Cada regla del bloque `full` sigue en `lean` o en un texto que el agente lee: la
 - **Finales de línea.** `lean` pasa los dos archivos a `\n`, como `short`; `the_lean_protocol_keeps_the_head_of_the_full_one` lo exige, y `freshness` compara sin mirarlos.
 - **La sección de tipos nombra los siete tipos** aunque el `enum` ya los liste: `the_protocol_names_only_what_exists` pide que cada protocolo nombre cada herramienta y cada tipo, y la exploración contaba la lista entre lo que se podía sacar. Quedan como nombres, sin su definición.
 
-## Pendiente: la campaña
+## La campaña
+
+### La regla, tal como se fijó antes de correr
 
 Paga, y la autoriza la persona. Corre con una versión que traiga `lean` y con el mismo build en los dos brazos; este cambio no sube la versión.
 
@@ -76,6 +78,33 @@ Paga, y la autoriza la persona. Corre con una versión que traiga `lean` y con e
   6. T(`lean`) < T(`a3`);
   7. T(`lean`) ≤ 0,9 × T(`a3`).
 - **Qué se decide:** si pasa, un commit propio cambia `DEFAULT_VARIANT` (`setup.rs:680`) a `Lean`; si no, queda `full` y `lean` sigue elegible con `--protocol lean`. No se agregan corridas para desempatar. Si J falla y los saves de D van sin `topic_key`, la causa es la viñeta, que `lean` tiene entera: sería otra hipótesis, no otra lectura de la regla.
+
+### Qué corrió
+
+18 corridas en `C:\ae-c4\c133\fase-1`, del build de `develop` en `d658c8a9`, los dos brazos con el mismo `clawg.exe`, Claude Code 2.1.322, `claude-sonnet-5-5` con esfuerzo `high` y el ruido de 15 reglas: la K larga, D partida y R bifurcada (continua y nueva), 3 por brazo. **Ninguna corrida tuvo un artefacto**, así que no hay exclusiones, y ninguna sesión trajo el aviso del bloque viejo en su `SessionStart`. Gasto según agent-eval: 5,91 USD de los 15 del tope (`a3` 3,05; `a3-lean` 2,86). La Console del workspace marcaba 23,31 USD antes de la campaña.
+
+Las métricas se contaron como en la campaña de protocol-block, y el mismo cálculo sobre `C:\ae-c3\c132\fase-1` da exactamente los números publicados de `a3-short` y `l0`: T es la mediana, sobre las sesiones jugadas (la primera de R una sola vez), de la suma de entrada, caché leída y caché escrita de cada pedido de la sesión.
+
+### El resultado
+
+| Métrica | `a3` | `a3-lean` | Condición | |
+|---|---|---|---|---|
+| E, corridas que aprueban | 11 de 12 (R nueva 2 de 3) | 11 de 12 (R nueva 2 de 3) | ≥ 10, y ninguna tarea de todas a ninguna | cumple |
+| B, buscan antes de su primer `Write` o `Edit` | 7 de 12 | 7 de 12 | ≥ 6 | cumple |
+| G, hechos guardados antes de usarse | 18 de 18 | 18 de 18 | ≥ 17 | cumple |
+| S, `session_summary` completos | 0 de 9 | 0 de 9 | ≥ −1 | cumple |
+| J, `resolve_conflict` por save con cercanas | 2 / 5 = 0,40 | 0 / 0 = 0 | ≤ 0,90 | cumple |
+| T, mediana por sesión de los tokens de entrada | 207.796 | 188.734 | < 207.796 | cumple |
+| T contra el umbral de D5 | | 188.734 | ≤ 187.016 | **no cumple** |
+
+**`lean` no pasa.** El ahorro de T es del 9,2 %, contra el 10 % que pide D5 y el 10,7 % que estimaba la [propuesta](proposal.md). **El valor por defecto queda `full`**, y `lean` sigue elegible con `--protocol lean`.
+
+Lo que muestran los datos y no decide:
+- `lean` no pierde ninguna conducta medida. Las seis condiciones de D6 se cumplen con margen o empatadas, y los dos brazos fallan la misma celda una vez.
+- Las dos fallas son de R nueva y no son del protocolo: bajo `lean` el agente escribió los valores en prosa en `docs/user/advanced.rst` («4.5 seconds to connect and 41 seconds to read») y el check pide el literal `4.5, 41`; bajo `a3` frenó a preguntar por la duda que `TIMEOUTS.md` y la memoria dejan abierta (si un `timeout=None` explícito también toma el valor) en lugar de implementar.
+- En D, los seis saves de la decisión llevan `topic_key` en los dos brazos. Bajo `lean`, las tres sesiones que revisan la decisión la guardan bajo la misma clave de la primera, y la versión nueva reemplaza sola a la anterior. Bajo `a3`, dos de las tres inventan una clave distinta (`redact-url-credentials/placeholder` contra `utils/redact-url-credentials-placeholder`), el save sale con cercanas y el agente resuelve a mano con `supersedes`, que es el veredicto correcto. De ahí viene la J de `a3`.
+- El bloque pesa 1.124 tokens menos por pedido (el primero: 20.524 contra 19.400); el resto de la diferencia de T sale de los turnos (en la K, 16,0 contra 14,7 de media), que con 3 corridas por celda es ruido. El costo baja un 6,1 %.
+- Ninguna sesión guardó un `session_summary`: S sigue sin separar variantes en tareas con `-p`.
 
 ## Pendiente en local
 
