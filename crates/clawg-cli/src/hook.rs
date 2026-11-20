@@ -1556,7 +1556,7 @@ mod tests {
 
     /// The block this binary, at 0.88.0, writes for `language`.
     fn written_block(language: Option<Lang>) -> String {
-        crate::setup::block("\n", language, crate::mcp::protocol::Variant::Full, crate::setup::Stamp { version: version("0.88.0"), choice: None })
+        crate::setup::block("\n", language, crate::mcp::protocol::Variant::Lean, crate::setup::Stamp { version: version("0.88.0"), choice: None })
     }
 
     #[test]
