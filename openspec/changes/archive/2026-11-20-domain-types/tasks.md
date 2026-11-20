@@ -72,12 +72,12 @@ Es un solo commit: cambiar el tipo de un campo de `RankedHit` o de `MemoryAdminR
   ```
 
 - [x] Los dos contratos del agente pasan sin `CLAWG_BLESS`, y `crates/clawg-cli/tests/api.rs` no cambia.
-- [ ] Windows: la suite y los dos clippy con `--target-dir target-test`.
+- [x] Windows: la suite y los dos clippy con `--target-dir target-test`, en local, y el CI de Linux y Windows (run 44591210821), en [`verify.md`](verify.md#windows).
 - [x] `verify.md`.
 
 ## 5. Archivo
 
-Con la verificación hecha, en local: R1 a R6 a `specs/storage` y `specs/retrieval`, el cambio a `changes/archive/`, su fila de `openspec/README.md` a `changes/archive/README.md`, `openspec/ROADMAP.md`, y el minor de la versión (`chore: bump version to X.Y.0`).
+- [x] Con la verificación hecha: R1 a R6 (DT1 a DT6) a `specs/storage` (DT1, DT3, DT4 y DT6) y `specs/retrieval` (DT2 y DT5), el cambio a `changes/archive/`, su fila de `openspec/README.md` a `changes/archive/README.md`, `openspec/ROADMAP.md`, y el minor de la versión (`chore: bump version to 0.92.0`). El código ya había salido en 0.90.0.
 
 ## Tandas siguientes
 

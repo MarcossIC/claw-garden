@@ -25,6 +25,7 @@ Fuente de verdad del comportamiento actual de la recuperación: el corte relativ
 - [preference-model](../../changes/archive/2026-11-06-preference-model/proposal.md), archivado el 2026-11-06, que salió en 0.77.0 (PM1, PM2, PM3, PM5 y PM7 de esa spec, con esos nombres; las tres definiciones de las preferencias, y lo que cambian en «Hits de otros agentes», «Línea de hit en `recall_context`», «El parser de `rag-eval --agent-view`» y «Fuera de esta spec»). Dónde se muestra la marca y el sello de un save que repite una fila están en [`specs/provenance`](../provenance/spec.md), PM5 y PM9; `all_projects`, el protocolo y la clave de una preferencia sin proyecto, en [`specs/mcp`](../mcp/spec.md), PM4, PM6 y PM8.
 - [bridge-project-identity](../../changes/archive/2026-11-07-bridge-project-identity/proposal.md), archivado el 2026-11-07, que salió en 0.78.0 (sólo BI6 de esa spec, con ese nombre). De qué carpetas sale el grupo y cómo lo muestra el puente está en [`specs/mcp`](../mcp/spec.md), BI1 a BI5.
 - [retire-legacy-kinds](../../changes/archive/2026-11-07-retire-legacy-kinds/proposal.md), archivado el 2026-11-07, que sale en 0.79.0 (RL4 de esa spec, que se llama R4 allí: un solo KNN sobre `memory`, sin brazos por tabla; lo demás de RL4 está en [`specs/storage`](../storage/spec.md)). Los requisitos de ese cambio se numeran R1 a R10 allí y RL1 a RL10 acá, para no chocar con los ids de cada spec.
+- [domain-types](../../changes/archive/2026-11-20-domain-types/proposal.md), archivado el 2026-11-20, que sale en 0.90.0 (sus R2 y R5, que aquí son DT2 y DT5, al final de la spec): una fila de `memory_type` o de `status` que este código no conoce sigue apareciendo en la búsqueda, el listado y el outbox donde aparecía, y los filtros y la API de tipo y estado siguen como estaban. Lo que se lee y se escribe, y las decisiones sobre el tipo, están en [`specs/storage`](../storage/spec.md) (DT1, DT3, DT4 y DT6), y las definiciones de «Nombre conocido» y «Nombre desconocido» también.
 
 ## Definiciones
 
@@ -854,3 +855,32 @@ El daemon toma el idioma del pedido (`check_lang`, `crates/clawg-cli/src/daemon/
 - AND recortado a 200 bytes, el bloque `BUDGET` dice `Recortado para entrar en 200 bytes; el contexto completo mide …`
 
 **Test:** `the_notes_of_the_prompt_follow_its_language` (`prompt_builder.rs`); `a_context_in_spanish_keeps_its_markers` (`tests/api.rs`), contra el daemon, con un contexto sin consulta: LAST SESSION de otro agente, `by b]` y `=== SHARED ===` intactos y la nota en español, y en inglés sin `lang`. Los tests anteriores del prompt pasan con `Lang::En` sin cambiar su texto.
+
+## DT2. Una fila de nombre desconocido sigue apareciendo donde hoy aparece
+
+- Una búsqueda MUST devolver una fila de `memory_type` desconocido y `status` `active` o `disputed`, con su texto y un score mayor que 0.
+- Una búsqueda MUST NOT devolver una fila de `status` desconocido: sólo entran `active` y `disputed`.
+- Un listado MUST devolver las filas de `memory_type` o `status` desconocido, con su texto, y un filtro por ese texto MUST devolverlas.
+- Un evento del outbox con un `memory_type` desconocido MUST leerse, y su fila MUST guardarse como `semantic_fact`.
+
+Qué es un nombre desconocido y cómo se lee está en [`specs/storage`](../storage/spec.md), «Nombre desconocido» y DT1.
+
+#### Escenario: búsqueda
+- GIVEN tres filas con el vector de la consulta: `observation`/`active`, `observation`/`disputed` y `semantic_fact`/`archived`
+- WHEN se busca
+- THEN vuelven las dos primeras, con `memory_type` `observation`, y la tercera no
+
+#### Escenario: listado
+- GIVEN una fila `observation`/`active` y una `semantic_fact`/`archived`
+- WHEN se lista sin filtro, por `memory_type` `observation` y por `status` `archived`
+- THEN la primera lista ambas, la más nueva primero, y cada filtro la suya
+
+**Tests:** `a_row_of_a_type_the_code_does_not_know_is_still_found` (`crates/clawg-core/src/memory/retrieval/search.rs`), `rows_of_a_type_or_status_the_code_does_not_know_stay_listed` (`crates/clawg-core/src/memory/retrieval/listing.rs`), `an_event_of_a_type_the_code_does_not_know_parses_and_keeps_it` (`crates/clawg-core/src/memory/domain/events.rs`) y `explicit_source_with_an_unknown_type_override_falls_back_to_semantic_fact` (`crates/clawg-core/src/memory/ingest/store_insert.rs`).
+
+## DT5. Lo que entra por la API sigue siendo estricto
+
+- `POST /v1/memories` y `PATCH /v1/memories/{kind}/{id}` MUST rechazar un `memory_type` que no es un nombre conocido, con el texto de siempre.
+- `GET /v1/memories?status=` MUST rechazar un estado que no es un nombre conocido con `unknown status "<valor>": accepted values are "active", "disputed" and "superseded"`, validado con `MemoryStatus::from_name`.
+- El filtro `memory_type` de `GET /v1/memories` y de `POST /v1/memories/move` MUST aceptar cualquier texto, para que las filas de un tipo desconocido se puedan listar y mover.
+
+**Tests:** los de la API en `crates/clawg-cli/src/daemon/api/memories.rs` y `crates/clawg-cli/tests/api.rs`, sin editar sus literales.

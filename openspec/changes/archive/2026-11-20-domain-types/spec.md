@@ -1,6 +1,6 @@
 # domain-types — Especificación
 
-Son requisitos sobre [`specs/storage`](../../specs/storage/spec.md) y [`specs/retrieval`](../../specs/retrieval/spec.md), y se consolidan al archivar. Lo que no se nombra acá sigue como está.
+Son requisitos sobre [`specs/storage`](../../../specs/storage/spec.md) y [`specs/retrieval`](../../../specs/retrieval/spec.md), y se consolidan al archivar. Lo que no se nombra acá sigue como está.
 
 Términos:
 
