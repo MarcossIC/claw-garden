@@ -2937,11 +2937,17 @@ mod tests {
             && span.split('_').all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_lowercase()))
     }
 
-    /// The full protocol and the lean one, without a preference and with each language.
+    /// The full protocol and the lean one, without a preference and with each
+    /// language: the lean one with the server's instructions, which carry the
+    /// opening it leaves out.
     fn every_protocol() -> Vec<String> {
         [None, Some(Lang::En), Some(Lang::Es)]
             .into_iter()
-            .flat_map(|l| [protocol::text(l).into_owned(), protocol::lean(l)])
+            .flat_map(|l| {
+                let full = protocol::text(l).into_owned();
+                let lean = format!("{}\n\n{}", protocol::opening(&full), protocol::lean(l));
+                [full, lean]
+            })
             .collect()
     }
 
@@ -2964,7 +2970,7 @@ mod tests {
     /// characters, and they are paid for in every session.
     #[test]
     fn the_instructions_fit_older_clients() {
-        for protocol in every_protocol() {
+        for protocol in [None, Some(Lang::En), Some(Lang::Es)].map(protocol::text) {
             let length = opening(&protocol).chars().count();
             assert!(length <= 2048, "the instructions are {length} characters: {}", opening(&protocol));
         }
