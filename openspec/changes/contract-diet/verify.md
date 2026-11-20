@@ -110,7 +110,7 @@ Lo que falta para pasar es ahorro, no conducta. La hipótesis siguiente, [D11](d
 
 ### D11: `lean` sin la apertura
 
-Corrieron las 9 corridas de `a3-lean-bare` en `C:e-c4b\c133base-1` el mismo día, con el `agent-eval` de `43d7002d` y el `bin` de la campaña de `lean`: el mismo `clawg.exe` (igual byte por byte), la misma copia de Claude Code, el mismo modelo, esfuerzo y ruido. El `CLAUDE.md` de `a3` que arma ese `agent-eval` es idéntico al de la campaña de `lean`, así que el `a3` de comparación es el de esa campaña, como fija D11. Ninguna corrida tuvo un artefacto y ninguna sesión trajo el aviso del bloque. Gasto: 2,81 USD de los 8 del tope. El bloque pesa 5.144 bytes, contra 7.176 de `lean` y 10.785 de `full`, y el primer pedido 18.784 tokens, contra 19.400 y 20.524.
+Corrieron las 9 corridas de `a3-lean-bare` en `C:\ae-c4b\c133b\fase-1` el mismo día, con el `agent-eval` de `43d7002d` y el `bin` de la campaña de `lean`: el mismo `clawg.exe` (igual byte por byte), la misma copia de Claude Code, el mismo modelo, esfuerzo y ruido. El `CLAUDE.md` de `a3` que arma ese `agent-eval` es idéntico al de la campaña de `lean`, así que el `a3` de comparación es el de esa campaña, como fija D11. Ninguna corrida tuvo un artefacto y ninguna sesión trajo el aviso del bloque. Gasto: 2,81 USD de los 8 del tope. El bloque pesa 5.144 bytes, contra 7.176 de `lean` y 10.785 de `full`, y el primer pedido 18.784 tokens, contra 19.400 y 20.524.
 
 | Métrica | `a3` | `a3-lean-bare` | Condición | |
 |---|---|---|---|---|
