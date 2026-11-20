@@ -108,6 +108,28 @@ Lo que muestran los datos y no decide:
 
 Lo que falta para pasar es ahorro, no conducta. La hipótesis siguiente, [D11](design.md#d11-después-de-la-campaña-lean-sin-la-apertura), mide `lean` sin la apertura, que el agente ya lee en las instrucciones del servidor, con su regla fijada antes de correr.
 
+### D11: `lean` sin la apertura
+
+Corrieron las 9 corridas de `a3-lean-bare` en `C:e-c4b\c133base-1` el mismo día, con el `agent-eval` de `43d7002d` y el `bin` de la campaña de `lean`: el mismo `clawg.exe` (igual byte por byte), la misma copia de Claude Code, el mismo modelo, esfuerzo y ruido. El `CLAUDE.md` de `a3` que arma ese `agent-eval` es idéntico al de la campaña de `lean`, así que el `a3` de comparación es el de esa campaña, como fija D11. Ninguna corrida tuvo un artefacto y ninguna sesión trajo el aviso del bloque. Gasto: 2,81 USD de los 8 del tope. El bloque pesa 5.144 bytes, contra 7.176 de `lean` y 10.785 de `full`, y el primer pedido 18.784 tokens, contra 19.400 y 20.524.
+
+| Métrica | `a3` | `a3-lean-bare` | Condición | |
+|---|---|---|---|---|
+| E | 11 de 12 | 12 de 12 | ≥ 10, y ninguna tarea de todas a ninguna | cumple |
+| B | 7 de 12 | 7 de 12 | ≥ 6 | cumple |
+| G | 18 de 18 | 18 de 18 | ≥ 17 | cumple |
+| S | 0 de 9 | 0 de 9 | ≥ −1 | cumple |
+| J | 2 / 5 = 0,40 | 1 / 2 = 0,50 | ≤ 0,90 | cumple |
+| T | 207.796 | 167.778 | < 207.796 | cumple |
+| T contra el umbral de D5 | | 167.778 | ≤ 187.016 | cumple |
+
+**`a3-lean-bare` pasa.** T baja el 19,3 %, y baja en las tres tareas (la K 167.778 contra 261.032, D 92.417 contra 99.142, R 304.911 contra 367.321). El costo de sus 9 corridas es 2,81 USD, contra 3,05 de `a3` y 2,86 de `a3-lean`.
+
+Lo que muestran los datos y no decide:
+- La sospecha de D3 no se sostiene: sin la apertura en el `CLAUDE.md`, B queda igual que con ella (7 de 12, como `a3` y `a3-lean`). Lo que hizo perder B a `short` fueron las secciones que sacó, no la apertura.
+- El ahorro mecánico frente a `full` son 1.740 tokens por pedido; el resto de la diferencia de T sale de los turnos, que con 3 corridas por celda varían. El umbral de D5 se cumple con margen.
+- El save con cercanas de D es otra vez una clave inventada en la sesión que revisa la decisión (`redact-url-credentials/placeholder` contra `requests-utils/…`), resuelta con `supersedes`, como las dos de `a3`.
+- La campaña corre en inglés; el bloque en español sale de las mismas piezas (`protocol.lean.es.md` sin la apertura de `protocol.es.md`), sin medir.
+
 ## Pendiente en local
 
 - **CI** en verde en Linux y Windows sobre el último commit.
