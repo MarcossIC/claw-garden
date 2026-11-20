@@ -107,3 +107,23 @@ Se fija ahora, antes de correr, y no se cambia después de ver resultados.
 **Qué se decide:** si pasa, el valor por defecto pasa a `lean` en un commit propio (`DEFAULT_VARIANT`, `setup.rs:680`), y el aviso del bloque llega una vez a cada máquina que no eligió variante. Si no pasa, queda `full` y `lean` sigue como variante elegible. No se agregan corridas para desempatar.
 
 **Lo que no decide:** si el bloque `lean` en español vale lo mismo (la campaña corre en inglés), ni nada sobre el `session_summary`, que S no mide en tareas con `-p`.
+
+## D11. Después de la campaña: `lean` sin la apertura
+
+La campaña de `lean` (2026-11-20, [verify](verify.md#la-campaña)) separó lo que la de protocol-block no podía separar: `lean` comprime las secciones, conserva la apertura y no pierde ninguna conducta, pero ahorra el 9,2 % de T, menos que el 10 % de D5. La apertura del bloque es, párrafo por párrafo, el texto de las instrucciones del servidor (`opening`, `protocol.rs:60`), que el agente ya lee en cada pedido: es la única repetición literal del bloque. Es una hipótesis nueva, no otra lectura de la regla de `lean`, y se fija antes de correr.
+
+**Hipótesis:** el bloque `lean` sin la apertura (el título y las secciones de `protocol.lean.md`) conserva las conductas de `a3` y ahorra al menos el 10 % de T. Lo que pone en riesgo es B: `short` y `l0`, los dos brazos que perdieron B en protocol-block, son también los dos que no tienen la apertura en el `CLAUDE.md`.
+
+**Brazo:** `a3-lean-bare`, sólo del arnés: el plan de `a3-lean` con la apertura quitada del bloque, y el resto igual. No es una variante de `setup`; si pasa, llevarlo al producto es un cambio aparte. El sello queda `protocol=lean`: el `clawg.exe` de la corrida lo lee y, con el perfil `dev` y su misma versión, el hook no avisa (`hook.rs:154`).
+
+| Alternativa | Tradeoff |
+|---|---|
+| Una variante nueva en `setup` antes de medir | Código en el producto que se descarta si no pasa |
+| Achicar la apertura (B4) | Cambia las instrucciones del servidor, que leen los tres clientes, y el contrato fijado |
+| **Un brazo del arnés** | Mide lo único que cambia, sin tocar el producto ni el contrato |
+
+**Corridas:** 9 de `a3-lean-bare`: la K larga, D partida y R bifurcada, 3 de cada una, con los topes por proceso de la campaña de `lean` (0,50; 0,50; 1,20 USD) y un tope propio de 6 USD. Corren con el `clawg.exe`, la copia de Claude Code, el modelo, el esfuerzo y el ruido de `C:\ae-c4\bin` y la campaña de `lean`; sólo cambia `agent-eval.exe`, por el brazo. Por eso el `a3` de comparación es el de esa campaña: el mismo `clawg.exe` y el mismo texto, como protocol-block tomó el `a3` de agent-eval-sessions. Valen las reglas de lectura de 129 tal como están.
+
+**`a3-lean-bare` pasa** si cumple las siete condiciones de [la regla de decisión](#la-regla-de-decisión) frente a ese `a3`, con `a3-lean-bare` en el lugar de `lean`. Se informa también contra `a3-lean`, sin decidir con eso.
+
+**Qué se decide:** si pasa, un cambio propio propone llevar el bloque sin apertura al producto como valor por defecto. Si no pasa, queda `full` y la apertura se queda en el bloque; si la que falla es B, la apertura del `CLAUDE.md` es lo que sostiene la búsqueda antes de editar. No se agregan corridas para desempatar.

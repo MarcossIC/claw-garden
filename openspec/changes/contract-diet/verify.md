@@ -106,6 +106,8 @@ Lo que muestran los datos y no decide:
 - El bloque pesa 1.124 tokens menos por pedido (el primero: 20.524 contra 19.400); el resto de la diferencia de T sale de los turnos (en la K, 16,0 contra 14,7 de media), que con 3 corridas por celda es ruido. El costo baja un 6,1 %.
 - Ninguna sesión guardó un `session_summary`: S sigue sin separar variantes en tareas con `-p`.
 
+Lo que falta para pasar es ahorro, no conducta. La hipótesis siguiente, [D11](design.md#d11-después-de-la-campaña-lean-sin-la-apertura), mide `lean` sin la apertura, que el agente ya lee en las instrucciones del servidor, con su regla fijada antes de correr.
+
 ## Pendiente en local
 
 - **CI** en verde en Linux y Windows sobre el último commit.
