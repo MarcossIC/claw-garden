@@ -1,0 +1,15 @@
+change: conflicts-on-demand
+objective: "1"
+depends_on: []  # se coordina con session-lifecycle (99) y memory-links (134), sin esperarlos
+phase: propose
+artifacts:
+  exploration: done
+  proposal: done  # A2, B1, C1, P1, D5 nada en el arranque, D6 las dos vías, y context.cut con state
+  spec: pending
+  design: skipped  # las alternativas y su costo están en la exploración; la propuesta las cierra
+  tasks: pending
+  apply: pending
+  verify: pending
+  archive: pending
+updated: 2026-11-20
+main_spec: openspec/specs/retrieval/spec.md, openspec/specs/disputes/spec.md, openspec/specs/mcp/spec.md, openspec/specs/hooks/spec.md, openspec/specs/metrics/spec.md

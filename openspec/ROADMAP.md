@@ -29,13 +29,15 @@ Se publica lo anterior y se instalan los hooks de Claude Code en un repositorio 
 
 **Pasa si:**
 - responde 10 preguntas reales cuya respuesta sólo está en el historial;
-- al abrir una sesión, el contexto trae entero el resumen de la sesión anterior;
+- al abrir una sesión, el contexto trae entero el resumen de la sesión anterior (hoy falla: lo arregla [conflicts-on-demand](changes/conflicts-on-demand/proposal.md), 141, abajo);
 - `clawg doctor` no da errores y `ingest.failed` queda en 0;
-- una memoria guardada desde Cursor aparece en Claude Code y al revés, en el proyecto correcto;
+- una memoria guardada desde Cursor aparece en Claude Code y al revés, en el proyecto correcto (sale del piloto: Cursor tuvo 0 sesiones en tres semanas);
 - ninguna ventana se abre sola;
 - la RAM es aceptable: esta semana decide el brazo B de ram-footprint-gates, porque cada evento de hook despierta el modelo.
 
 ## En la nube mientras corre el piloto
+
+**Lo que sigue:** [conflicts-on-demand](changes/conflicts-on-demand/proposal.md) (141). Va antes que todo lo pendiente porque arregla un criterio del piloto que hoy falla: al abrir una sesión, el presupuesto corta LAST SESSION antes que ACTIVE CONFLICTS, y en 12 días del piloto `context.cut` cortó el resumen en 134 de 250 contextos. Saca el bloque del contexto sin consulta, marca en cada fila que muestra con qué otra está en disputa, deja el bloque en `recall_context` con consulta cortándolo antes que el resumen, y suma a `list_memories` la lista de los pares que esperan a la persona. Va en la nube: son el armado del contexto, el puente y sus textos, que se prueban en Linux con el embedder falso, y no toca `memory.db`. Queda en local, después de publicar, medir el corte en el perfil real con `context.cut` separado por `state`, con el umbral de su propuesta.
 
 [session-usage](changes/archive/2026-11-11-session-usage/proposal.md) (121), partes A, B, C y D, archivado el 2026-11-11, sale en 0.81.0 ([verify](changes/archive/2026-11-11-session-usage/verify.md)). Va ahora y no después del corte porque mide: lo que entre en una versión al empezar la semana deja contadas las sesiones del piloto. El conteo dice cuántas sesiones buscan, cuántas guardan, cuántas cierran con resumen y cuántas compactan, el dato que agent-eval y la parte B de session-lifecycle esperan para decidir. No toca `memory.db`, así que subir una versión durante el piloto no arriesga las memorias. La parte D entra en la misma versión: quien ya corrió `setup` lo corre otra vez para tener el hook de cierre. Lo que sólo se ve con los clientes del piloto pasó al párrafo del piloto. [store-boundary](changes/archive/2026-11-12-store-boundary/proposal.md) (104) se implementó en la nube durante el piloto, cuando session-usage, el otro cambio que tocaba `crates/clawg-cli/src/daemon/api.rs`, ya estaba en `develop`. Su PR entró a `develop` el 2026-11-12 y el cambio está archivado ese día, y sale en 0.84.0 ([verify](changes/archive/2026-11-12-store-boundary/verify.md)).
 
@@ -49,16 +51,18 @@ Se publica lo anterior y se instalan los hooks de Claude Code en un repositorio 
 
 [contract-diet](changes/archive/2026-11-20-contract-diet/proposal.md) (133) está archivado el 2026-11-20 y sale en 0.92.0 ([verify](changes/archive/2026-11-20-contract-diet/verify.md)). El ruido del generador de esquemas salió del contrato sin cambiar ninguna palabra que el agente lee: 1.856 caracteres menos en las 13 herramientas. El bloque `lean` es ahora el valor por defecto, sin la apertura, que dan las instrucciones del servidor. Quien instaló a nivel usuario con el bloque entero y sin elegir variante recibe el aviso del bloque al empezar cada sesión, hasta que `clawg setup claude-code --profile P` lo reescribe como `lean` ([pendiente](changes/archive/2026-11-20-contract-diet/verify.md#pendiente-después-de-publicar)). Quien eligió una variante con `--protocol` la conserva. Sacar las secciones del resumen espera a memory-links (134).
 
-## Corte (una noche local, con el piloto aprobado)
+## Corte (una noche local)
 
-La reimportación del historial ya se hizo, el 2026-11-08 y antes del piloto ([history-reimport](changes/archive/2026-11-12-history-reimport/verify.md#el-corte-en-prod)). Queda:
+La reimportación del historial se hizo el 2026-11-08, antes del piloto ([history-reimport](changes/archive/2026-11-12-history-reimport/verify.md#el-corte-en-prod)). El resto del corte se hizo el 2026-11-20:
 
-1. `clawg setup claude-code --remove` y `clawg setup claude-code`, porque el servidor ya registrado sin `--agent` no se actualiza solo. Después `clawg setup cursor`.
-2. Sacar el plugin de Engram, su bloque de protocolo del `CLAUDE.md` global y su servidor de Cursor.
-3. Decidir dónde guarda sus artefactos el flujo SDD de los skills de usuario: hoy usa Engram por omisión. Recomendado: `openspec`, que ya existe y no depende de una herramienta de memoria. No actualizar Engram antes del último export: clawg lee los formatos `0.1.0` y `0.2.0`.
-4. Decidir si clawg necesita capturar en `Stop` y `SubagentStop`, donde hoy no instala hooks. Para `Stop` hay una forma que no es la puerta descartada: pedir el `session_summary` una sola vez por sesión, sólo si esa conversación guardó sin resumen, y dejar terminar ([ideas.md](ideas.md#mejoras-propuestas)). Lo decide el conteo de session-usage: cuántas sesiones del piloto cierran sin resumen.
-5. Mirar el `--dry-run` de `clawg import --from claude-code` y decidir.
-6. Dejar Engram instalado y sin escrituras dos semanas, como vuelta atrás. Después, se desinstala.
+- **Claude Code:** `clawg setup claude-code` sumó los hooks `PostToolUse` y `PostToolUseFailure` de repeated-errors (131). El servidor ya estaba registrado como hace falta, así que no hizo falta `--remove`.
+- **Engram salió de Claude Code:** se desinstalaron su plugin y su marketplace, y su bloque de protocolo salió del `CLAUDE.md` de usuario.
+- **El flujo SDD** de los skills de usuario guarda ahora en `openspec` por omisión: ya existe y no depende de una herramienta de memoria.
+- **No se importa nada más de Engram:** lo que guardó después de la reimportación queda en su archivo y no pasa a clawg. Se eligió cortar sin otra importación, y desde el corte Engram ya no recibe escrituras. Por eso salen el último export de Engram y el `--dry-run` de `clawg import --from claude-code`.
+- **Engram no queda de respaldo:** sin escrituras, dos semanas instalado no guardarían nada que clawg no tenga, y la vuelta atrás de lo que está en clawg son sus propias copias (`pre-import`, `pre-undo`) y `clawg import --undo`.
+- **Cursor no se toca:** tuvo 0 sesiones en el piloto, así que ni `clawg setup cursor` ni sacarle el servidor de Engram tienen nada que medir.
+
+Queda abierto un paso: decidir si clawg necesita capturar en `Stop` y `SubagentStop`, donde hoy no instala hooks. Para `Stop` hay una forma que no es la puerta descartada: pedir el `session_summary` una sola vez por sesión, sólo si esa conversación guardó sin resumen, y dejar terminar ([ideas.md](ideas.md#mejoras-propuestas)). El conteo de session-usage ya da el dato: sólo 27 de las 122 sesiones con prompts guardaron un `session_summary`.
 
 ## Sube sólo si el piloto lo pide
 
