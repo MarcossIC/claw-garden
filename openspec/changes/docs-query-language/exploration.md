@@ -42,7 +42,7 @@ Mismo idioma: 4 de 18 en el top 3 (5 de 18 en el top 10). Idiomas distintos o mi
 **2. Una prueba a mano sobre un repositorio público (no se puede reproducir desde este repositorio).** El 2026-11-20 se indexó con `clawg projects add` un repositorio público en inglés, de código y docs, y se hicieron tres preguntas con respuesta conocida:
 
 - La fusión de los resultados densos y BM25 en la búsqueda híbrida, en español: 0 de 3 pasajes útiles. Trajo un script de ejemplos de rendimiento, el módulo de puntaje léxico (sólo imports) y una página de ejemplos; lo que coincidió fueron términos sueltos como BM25, por el canal léxico.
-- Cómo se les pone nombre a los tópicos del grafo semántico, en español: 0 de 3.
+- Una segunda pregunta en español, sobre otra función del repositorio: 0 de 3.
 - «How are dense and sparse scores fused in hybrid search? convex combination rrf», en inglés: 3 de 3 (las dos piezas del módulo de búsqueda híbrida y el método de búsqueda de la clase base).
 
 **La confusión.** La pregunta que acertó difiere de las que fallaron en **dos** cosas: el idioma y que agrega términos exactos del código (`convex combination`, `rrf`). El canal léxico pudo haberla resuelto solo, sin que el denso cruzara nada. Con tres preguntas no se separan. Es lo primero que mide la puerta.

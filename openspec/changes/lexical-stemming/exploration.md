@@ -158,7 +158,7 @@ Por `config.yaml`, un cambio de esquema lleva un test que siembra datos de la ve
 ## Riesgos
 
 - **Medir demasiado pronto.** Antes de 136, el canal léxico casi no pesa: un resultado cero no cierra la idea.
-- **Falsos amigos entre idiomas.** Las dos raíces sobre todo el texto dejan que la raíz inglesa de una palabra choque con la española de otra. Aquí lo mide el punto 4 de la etapa 2 y la muestra a mano del censo.
+- **Falsos amigos entre idiomas.** Las dos raíces sobre todo el texto dejan que la raíz inglesa de una palabra choque con la española de otra. Lo miden el punto 4 de la etapa 2 y la muestra a mano del censo.
 - **Un MATCH que busca en una columna de más.** Es el fallo silencioso de A: ninguno de los cuatro sitios de producción da error, sólo cambia qué encuentran.
 - **La base del usuario.** Una migración que toca el índice de todas las memorias es el cambio más delicado de este cambio: por eso la puerta va antes, el snapshot `pre-migration` y la vuelta atrás se escriben y se prueban, y B (tokenizer en el esquema) queda al final.
 
