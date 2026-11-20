@@ -200,7 +200,7 @@ Con el bloque instalado igual al planeado salvo por la versión del sello, el pa
 
 ## CD1. El texto de `lean`
 
-`protocol::lean(language)` MUST devolver, con finales de línea `\n`, el título de `protocol::text(language)` (su primera línea, sin la apertura), seguido de las secciones de `protocol.lean.md`, o de `protocol.lean.es.md` para `Some(Es)`. Con la preferencia `en`, la regla del idioma del save MUST quedar reescrita como la reescribe `text` (`SAVE_RULE`, `protocol.rs:28`), y MUST aparecer una vez en `protocol.lean.md`. `opening(lean(l))` MUST ser vacío para `None`, `Some(En)` y `Some(Es)`: la apertura la ponen en cada pedido las instrucciones del servidor, `opening(text(l))` ([D11](../../changes/archive/2026-11-20-contract-diet/design.md#d11-después-de-la-campaña-lean-sin-la-apertura)).
+`protocol::lean(language)` MUST devolver, con finales de línea `\n`, el título de `protocol::text(language)` (su primera línea, sin la apertura), seguido de las secciones de `protocol.lean.md`, o de `protocol.lean.es.md` para `Some(Es)`. Con la preferencia `en`, la regla del idioma del save MUST quedar reescrita como la reescribe `text` (`SAVE_RULE`, `protocol.rs:28`), y MUST aparecer una vez en `protocol.lean.md`; la otra regla del idioma, la de la respuesta, va sólo en las instrucciones del servidor. `opening(lean(l))` MUST ser vacío para `None`, `Some(En)` y `Some(Es)`: la apertura la ponen en cada pedido las instrucciones del servidor, `opening(text(l))` ([D11](../../changes/archive/2026-11-20-contract-diet/design.md#d11-después-de-la-campaña-lean-sin-la-apertura)).
 
 El texto MUST cumplir, en las dos lenguas:
 
@@ -224,9 +224,10 @@ El texto MUST cumplir, en las dos lenguas:
 #### Escenario: inglés por preferencia
 - GIVEN la preferencia `en`
 - WHEN se arma `lean`
-- THEN dice «Save memories and search in English:» en la apertura y «still in Spanish, search again with the query in Spanish.» en «How to write a save»
+- THEN dice «still in Spanish, search again with the query in Spanish.» en «How to write a save», y no dice «Save memories and search in English:»
+- AND las instrucciones del servidor dicen «Save memories and search in English:» y «Reply to the user in English unless»
 
-**Tests:** `the_lean_protocol_keeps_the_head_of_the_full_one` (sin la apertura, desde D11), `the_lean_protocol_keeps_the_topic_key_rule_and_the_session_summary`, `the_lean_protocol_names_what_the_full_one_names`, `a_language_rewrites_both_rules_of_the_lean_protocol` y `the_lean_protocol_is_at_most_seventy_percent_of_the_full_one` (`protocol.rs`); las pruebas del protocolo de `server.rs` con `lean` (CD2).
+**Tests:** `the_lean_protocol_keeps_the_title_and_leaves_the_opening_to_the_servers_instructions`, `the_lean_protocol_keeps_the_topic_key_rule_and_the_session_summary`, `the_lean_protocol_and_the_servers_instructions_name_what_the_full_one_names`, `a_language_rewrites_the_save_rule_of_the_lean_protocol_and_the_server_says_the_other` y `the_lean_protocol_is_at_most_seventy_percent_of_the_full_one` (`protocol.rs`); las pruebas del protocolo de `server.rs` con `lean` (CD2).
 
 ## CD3. El bloque `lean` y su sello
 

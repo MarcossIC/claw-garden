@@ -134,7 +134,7 @@ Lo que muestran los datos y no decide:
 ### Lo que se aplicó
 
 - `fd32de60`: `protocol::lean` es el título y las secciones, sin la apertura (CD1 enmendado). El `CLAUDE.md` que `agent-eval prepare --arm a3-lean` arma con ese build es idéntico, byte por byte, al de las corridas de `a3-lean-bare` (5.144 bytes), así que el texto que se lleva al producto es el que se midió. El brazo `a3-lean-bare` se quitó: con ese texto era el mismo bloque que `a3-lean`. Las pruebas que pedían que cada protocolo nombrara cada herramienta, y que el español nombrara lo mismo que el inglés, miden ahora el bloque junto con las instrucciones del servidor, que es lo que el agente lee.
-- El commit que sigue: `DEFAULT_VARIANT` pasa a `Lean` (CD7), y el brazo `a3-lean` pasa a ser `a3-full` (CD5 enmendado), porque `a3` ya lleva `lean`. Una máquina con el bloque entero sin elección recibe el aviso del bloque una vez, y `setup` sin `--protocol` lo reescribe como `lean`; quien eligió una variante la conserva.
+- El commit que sigue: `DEFAULT_VARIANT` pasa a `Lean` (CD7), y el brazo `a3-lean` pasa a ser `a3-full` (CD5 enmendado), porque `a3` ya lleva `lean`. Una máquina con el bloque entero sin elección recibe el aviso del bloque en cada sesión (`block_notice`, `hook.rs:147`, no guarda estado) hasta que `setup` sin `--protocol` lo reescribe como `lean`; quien eligió una variante la conserva.
 - Al escribir esto faltaban el CI en Linux y Windows (ya pasó, ver «Qué se revisó») y el bloque de una máquina real con la versión instalada (ver «Pendiente después de publicar»).
 
 ## Al archivar (2026-11-20)

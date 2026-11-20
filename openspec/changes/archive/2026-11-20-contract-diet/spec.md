@@ -28,11 +28,13 @@ El texto MUST cumplir, en las dos lenguas:
 
 `protocol.md` y `protocol.es.md` MUST NOT cambiar: `text` y `short` devuelven lo mismo que antes de este cambio.
 
-#### Escenario: la apertura intacta
+#### Escenario: sin la apertura
 - GIVEN cualquier preferencia de idioma, o ninguna
 - WHEN se arma `lean`
-- THEN su cabeza es la de `full` y `opening` de los dos es la misma
-- AND son las instrucciones que el servidor manda en `initialize`
+- THEN su primera línea es el título de `full` y `opening(lean)` es vacío
+- AND la apertura es la que las instrucciones del servidor mandan en `initialize`
+
+Enmendado el 2026-11-20 por D11, como la viñeta de arriba: antes la cabeza de `lean` era la de `full`.
 
 #### Escenario: lo que queda entero
 - GIVEN la preferencia `es`
@@ -42,9 +44,10 @@ El texto MUST cumplir, en las dos lenguas:
 #### Escenario: inglés por preferencia
 - GIVEN la preferencia `en`
 - WHEN se arma `lean`
-- THEN dice «Save memories and search in English:» en la apertura y «still in Spanish, search again with the query in Spanish.» en «How to write a save»
+- THEN dice «still in Spanish, search again with the query in Spanish.» en «How to write a save», y no dice «Save memories and search in English:»
+- AND las instrucciones del servidor dicen «Save memories and search in English:» y «Reply to the user in English unless»
 
-**Tests:** `the_lean_protocol_keeps_the_head_of_the_full_one`, `the_lean_protocol_keeps_the_topic_key_rule_and_the_session_summary`, `the_lean_protocol_names_what_the_full_one_names`, `a_language_rewrites_both_rules_of_the_lean_protocol` y `the_lean_protocol_is_at_most_seventy_percent_of_the_full_one` (`protocol.rs`). Hoy fallan: `lean` no existe.
+**Tests:** `the_lean_protocol_keeps_the_title_and_leaves_the_opening_to_the_servers_instructions`, `the_lean_protocol_keeps_the_topic_key_rule_and_the_session_summary`, `the_lean_protocol_and_the_servers_instructions_name_what_the_full_one_names`, `a_language_rewrites_the_save_rule_of_the_lean_protocol_and_the_server_says_the_other` y `the_lean_protocol_is_at_most_seventy_percent_of_the_full_one` (`protocol.rs`), con los nombres que tienen desde D11. Antes de este cambio fallaban: `lean` no existía.
 
 ## CD2. Las pruebas del protocolo valen para `lean`
 
