@@ -13,6 +13,7 @@ Fuente de verdad de `clawg doctor`: qué `clawg` resuelve el PATH y qué está m
 - [hook-run-log](../../changes/archive/2026-11-04-hook-run-log/proposal.md), archivado el 2026-11-04, sale en 0.76.0: el chequeo `hooks.runs` (HR6 y HR7). Lo que lee está en [`specs/hooks`](../hooks/spec.md) (HR1 a HR5 y HR8).
 - [protocol-block](../../changes/archive/2026-11-17-protocol-block/proposal.md), archivado el 2026-11-17, que sale en 0.88.0: la frescura del bloque del protocolo (PB2) y el chequeo `protocol_block` con o sin preferencia (PB3), que reemplaza lo que LP14 decía de ese chequeo. El sello y las variantes están en [`specs/setup`](../setup/spec.md).
 - [repeated-errors](../../changes/archive/2026-11-19-repeated-errors/proposal.md), archivado el 2026-11-19, que sale en 0.90.0: los hallazgos `tool_rules` y `tool_hooks` (RE8, al final de esta spec). Lo que aprende el libro está en [`specs/hooks`](../hooks/spec.md) (RE1 a RE6), y los hooks que faltan los instala [`specs/setup`](../setup/spec.md) (RE7).
+- [contract-diet](../../changes/archive/2026-11-20-contract-diet/proposal.md), archivado el 2026-11-20, sale en 0.91.0: la frescura de un sello con una variante desconocida (CD4), que da `stale`. El bloque `lean` no cambia la clasificación: se compara con el texto de su variante como cualquier otro (PB2).
 
 **Dónde vive:** las decisiones en `crates/clawg-cli/src/doctor/` (`finding.rs`, el sobre y el resumen; `checks.rs`, los chequeos puros; `mcp.rs`, el registro; `mod.rs`, el PATH y la lectura en `run`); los hechos del store en `crates/clawg-core/src/memory/projects/inspect.rs`; la lectura del registro del hook en `crates/clawg-cli/src/hook_log.rs`, y si el hook de Cursor está instalado en `crates/clawg-cli/src/setup/cursor.rs`. Un test citado como «(`doctor`)» está en el `mod tests` de alguno de esos archivos.
 - [retire-legacy-kinds](../../changes/archive/2026-11-07-retire-legacy-kinds/proposal.md), archivado el 2026-11-07, que sale en 0.79.0 (RL8, al final de esta spec; `project_orphans` y `project_deletes` dejan de nombrar las tablas que V32 retira). Los requisitos de ese cambio se numeran R1 a R10 allí y RL1 a RL10 acá, para no chocar con los ids de cada spec.
@@ -154,7 +155,12 @@ Bloque, sello, variante, cuerpo y versión propia son los de [`specs/setup`](../
 - WHEN se clasifica con la versión propia `0.88.0`
 - THEN es `newer`
 
-**Tests:** `a_block_is_current_stale_or_newer` (`setup.rs`).
+#### Escenario: una variante que este binario no conoce
+- GIVEN un bloque con el sello `<!-- clawg 0.99.0 protocol=leaner -->` y la versión propia `0.88.0`
+- WHEN se clasifica
+- THEN es `stale`, no `newer`, porque el sello se lee como ilegible (CD4 de [`specs/setup`](../setup/spec.md))
+
+**Tests:** `a_block_is_current_stale_or_newer` y `a_stamp_with_an_unknown_variant_reads_as_stale` (`setup.rs`).
 
 ## PB3. `doctor` revisa el bloque con preferencia o sin ella
 

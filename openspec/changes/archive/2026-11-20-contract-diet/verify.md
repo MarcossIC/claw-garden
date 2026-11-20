@@ -1,10 +1,11 @@
 # contract-diet — Verificación (el bloque `lean`)
 
-Verifica la clase (b), enfoque B1: la variante `lean`, su sello y el brazo `a3-lean`. La clase (a) se verificó al hacerse ([exploración](exploration.md#hecho-la-clase-a)). **La campaña corrió el 2026-11-20 y `lean` no pasa**: cumple las seis condiciones de D6 y falla la séptima, la del ahorro, por 0,8 puntos; el valor por defecto queda `full` ([la campaña](#la-campaña)).
+Verifica la clase (b), enfoque B1: la variante `lean`, su sello y el brazo `a3-lean`. La clase (a) se verificó al hacerse ([exploración](exploration.md#hecho-la-clase-a)). **Veredicto: cumple CD1 a CD7, y el CI de Linux y Windows pasó.** La campaña tuvo dos resultados: `lean` con la apertura no pasó (cumple las seis condiciones de D6 y falla la séptima, la del ahorro, por 0,8 puntos), y `lean` sin la apertura (D11) pasó. El valor por defecto es `lean` sin la apertura desde `49b6a418` (CD7); `full` sigue eligible con `--protocol full` ([la campaña](#la-campaña)). Lo que falta es la prueba en una máquina real con la versión instalada ([pendiente](#pendiente-después-de-publicar)).
 
 ## Qué se revisó
 
 - Los commits de la serie sobre `develop`: la propuesta (`docs(openspec): propose the lean protocol block for contract-diet`), `feat(mcp): write a lean protocol that keeps the opening and every rule`, `feat(setup): choose the lean protocol block with --protocol lean` y `feat(agent-eval): add the a3-lean arm with the lean protocol block`.
+- CI de Linux y Windows (`test (ubuntu-latest)` y `test (windows-latest)`, run 44716906999 del pull request a `main`): pasó sobre `a04e7001`, que lleva todo el código del cambio; los tres commits de después son docs de otras exploraciones.
 - Sobre el último, con `cargo clean --workspace` antes, en Linux con el embedder falso: `cargo test --locked --workspace`, `cargo clippy --locked --workspace --all-targets -- -D warnings` y `cargo clippy --locked -p clawg-cli -- -D warnings`. La suite pasa y los dos clippy no dan ningún hallazgo.
 - `git diff develop` no toca `protocol.md`, `protocol.es.md`, `agent_contract.json`, `agent_contract.es.json`, `crates/clawg-cli/src/daemon/`, `crates/clawg-cli/src/hook.rs` ni `crates/clawg-cli/src/doctor/` (CD6). `the_agent_contract_matches_its_file` y `the_spanish_agent_contract_matches_its_file` pasan sin `CLAWG_BLESS=1`.
 
@@ -68,7 +69,7 @@ Paga, y la autoriza la persona. Corre con una versión que traiga `lean` y con e
 - **Brazos:** `a3` y `a3-lean`. Si el build no es el de las corridas de `a3` de protocol-block, `a3` se corre otra vez con el de `a3-lean`.
 - **Tareas:** `requests-timeout-decision-relay` (R, continua y nueva), `requests-redact-decision-revised` (D partida) y `requests-history-owner-convention` (la K larga), con el ruido de 15 reglas: 3 corridas por celda, 12 de `a3-lean`, unos 3,7 USD a los 0,30 USD por corrida de protocol-block; con `a3` otra vez, unos 7,4. Tope: 15 USD.
 - **Lectura:** las reglas de 129 tal como están (corridas fijas, las mismas causas de exclusión, la fase que se detiene con más de 2 exclusiones).
-- **Métricas:** E, B, G, S, J y T como en [D6 de protocol-block](../archive/2026-11-17-protocol-block/design.md#d6-la-regla-de-decisión-del-valor-por-defecto); aparte, el gasto en USD de cada brazo y cuántos saves de la decisión de D llevan `topic_key`.
+- **Métricas:** E, B, G, S, J y T como en [D6 de protocol-block](../2026-11-17-protocol-block/design.md#d6-la-regla-de-decisión-del-valor-por-defecto); aparte, el gasto en USD de cada brazo y cuántos saves de la decisión de D llevan `topic_key`.
 - **`lean` pasa** si cumple las seis condiciones de D6 y además la séptima de D5:
   1. E(`lean`) ≥ E(`a3`) − 1, y ninguna tarea pasa de aprobar en todas sus corridas a no aprobar en ninguna;
   2. B(`lean`) ≥ B(`a3`) − 1;
@@ -134,9 +135,17 @@ Lo que muestran los datos y no decide:
 
 - `fd32de60`: `protocol::lean` es el título y las secciones, sin la apertura (CD1 enmendado). El `CLAUDE.md` que `agent-eval prepare --arm a3-lean` arma con ese build es idéntico, byte por byte, al de las corridas de `a3-lean-bare` (5.144 bytes), así que el texto que se lleva al producto es el que se midió. El brazo `a3-lean-bare` se quitó: con ese texto era el mismo bloque que `a3-lean`. Las pruebas que pedían que cada protocolo nombrara cada herramienta, y que el español nombrara lo mismo que el inglés, miden ahora el bloque junto con las instrucciones del servidor, que es lo que el agente lee.
 - El commit que sigue: `DEFAULT_VARIANT` pasa a `Lean` (CD7), y el brazo `a3-lean` pasa a ser `a3-full` (CD5 enmendado), porque `a3` ya lleva `lean`. Una máquina con el bloque entero sin elección recibe el aviso del bloque una vez, y `setup` sin `--protocol` lo reescribe como `lean`; quien eligió una variante la conserva.
-- Falta, como antes: el CI en Linux y Windows, y el bloque de una máquina real con la versión instalada, ahora sin `--protocol` (ver abajo).
+- Al escribir esto faltaban el CI en Linux y Windows (ya pasó, ver «Qué se revisó») y el bloque de una máquina real con la versión instalada (ver «Pendiente después de publicar»).
 
-## Pendiente en local
+## Al archivar (2026-11-20)
 
-- **CI** en verde en Linux y Windows sobre el último commit.
-- **El bloque de una máquina real**, con la versión instalada: `clawg setup claude-code --profile prod --dry-run`, sin `--protocol`, dice `would update it (protocol=lean)` sobre el bloque entero de antes; después de correrlo sin `--dry-run`, `clawg doctor --profile prod` da `protocol_block` `ok` `healthy`, y la primera sesión no trae el aviso del bloque.
+- CD1, CD3, CD4 y CD7 pasan a [`specs/setup`](../../../specs/setup/spec.md), junto a PB5 y PB6 (las variantes y `--protocol`, que ahora nombran `lean`) y PB1. CD7 reemplaza la frase de PB6 que fijaba `full` como valor por defecto. CD4, en su parte de frescura, pasa a [`specs/doctor`](../../../specs/doctor/spec.md), junto a PB2. CD5 (el brazo `a3-full`) pasa a [`specs/eval`](../../../specs/eval/spec.md), junto a PB7. CD2 y CD6 no se consolidan: son pruebas y lo que no cambia.
+- `docs/reference/commands.md` y `docs/reference/testing.md` ya dicen que `lean` es el valor por defecto y que el brazo es `a3-full` (`49b6a418` y `fd32de60`); no hizo falta cambiarlos.
+- Sale en 0.91.0: `fd32de60` y `49b6a418` no están en ninguna versión publicada, y la 0.90.0 trae la variante `lean`, `--protocol lean` y el brazo `a3-lean`.
+- Lo que sigue de la exploración, sacar las secciones del resumen del bloque `lean`, no entra aquí: espera a memory-links (134), que decide si puede hacerse ([exploración de memory-links](../../memory-links/exploration.md)).
+
+## Pendiente después de publicar
+
+Local, con la versión instalada.
+
+- **El bloque de una máquina real.** Con 0.91.0 instalada, en una máquina con el bloque entero de antes de `lean`: `clawg setup claude-code --profile prod --dry-run`, sin `--protocol`, tiene que decir `would update it (protocol=lean)` sobre ese bloque (con la preferencia `es`, `se actualizaría (protocol=lean)`). Después de correrlo sin `--dry-run`, `clawg doctor --profile prod` tiene que dar `protocol_block` `ok` `healthy`, y la primera sesión no trae el aviso del bloque.

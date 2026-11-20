@@ -92,7 +92,7 @@ Se fija ahora, antes de correr, y no se cambia después de ver resultados.
 
 **Tareas y corridas:** las de la campaña de protocol-block: `requests-timeout-decision-relay` (R, continua y nueva), `requests-redact-decision-revised` (D partida) y `requests-history-owner-convention` (la K larga), 3 corridas por celda: 12 corridas de `a3-lean`, con los topes de `--max-budget-usd` de 129 y un tope propio de 15 USD. Valen las reglas de lectura de 129 tal como están: corridas fijas, las mismas causas de exclusión y la fase que se detiene con más de 2 exclusiones.
 
-**Métricas:** E, B, G, S, J y T tal como las define [D6 de protocol-block](../archive/2026-11-17-protocol-block/design.md#d6-la-regla-de-decisión-del-valor-por-defecto), y aparte el gasto en USD de cada brazo, porque T no pondera la caché leída. Además se cuenta, sin decidir con eso, cuántos saves de la decisión de D llevan `topic_key`: si J falla y los `topic_key` también, la causa es la regla comprimida.
+**Métricas:** E, B, G, S, J y T tal como las define [D6 de protocol-block](../2026-11-17-protocol-block/design.md#d6-la-regla-de-decisión-del-valor-por-defecto), y aparte el gasto en USD de cada brazo, porque T no pondera la caché leída. Además se cuenta, sin decidir con eso, cuántos saves de la decisión de D llevan `topic_key`: si J falla y los `topic_key` también, la causa es la regla comprimida.
 
 **`lean` pasa** frente a `a3` si cumple las siete:
 

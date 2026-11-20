@@ -4,7 +4,7 @@ Suma una cuarta variante del bloque del protocolo, `lean`, que `clawg setup clau
 
 ## Definiciones
 
-- **Bloque, sello, cuerpo, versión propia:** como en [`specs/setup`](../../specs/setup/spec.md) (PB1) y [`specs/doctor`](../../specs/doctor/spec.md) (PB2).
+- **Bloque, sello, cuerpo, versión propia:** como en [`specs/setup`](../../../specs/setup/spec.md) (PB1) y [`specs/doctor`](../../../specs/doctor/spec.md) (PB2).
 - **Variante:** `full`, `short`, `lean` u `off`.
 - **Cabeza** de un protocolo: su texto hasta la primera línea que empieza por `## `, es decir el título y la apertura (`opening`, `crates/clawg-cli/src/mcp/protocol.rs:57`).
 - **Sección** `## H` de un protocolo: desde esa línea hasta la siguiente que empieza por `## `, o el final.
@@ -116,7 +116,7 @@ Agregado el 2026-11-20, después de que `lean` sin la apertura pasara la regla d
 
 ## Specs que se consolidan al archivar
 
-- CD1, CD3, CD4 y CD7 en [`specs/setup`](../../specs/setup/spec.md), con CD7 en lugar de la frase «la de por defecto MUST ser `full`», junto a PB5 y PB6 (la lista de variantes y `--protocol`) y PB1 (el sello ilegible).
-- CD4, la parte de `freshness`, en [`specs/doctor`](../../specs/doctor/spec.md), junto a PB2.
-- CD5 en [`specs/eval`](../../specs/eval/spec.md), junto a PB7.
+- CD1, CD3, CD4 y CD7 en [`specs/setup`](../../../specs/setup/spec.md), con CD7 en lugar de la frase «la de por defecto MUST ser `full`», junto a PB5 y PB6 (la lista de variantes y `--protocol`) y PB1 (el sello ilegible).
+- CD4, la parte de `freshness`, en [`specs/doctor`](../../../specs/doctor/spec.md), junto a PB2.
+- CD5 en [`specs/eval`](../../../specs/eval/spec.md), junto a PB7.
 - CD2 y CD6 no se consolidan.
