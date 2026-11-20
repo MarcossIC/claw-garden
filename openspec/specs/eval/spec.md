@@ -24,7 +24,7 @@ Fuente de verdad del comportamiento actual de la evaluación de recuperación: e
 - [agent-eval-sessions](../../changes/archive/2026-11-17-agent-eval-sessions/proposal.md), archivado el 2026-11-17, que sale en 0.88.0 (AS1 a AS22, en «`agent-eval`: las sesiones, el relevo y los artefactos», al final de esta spec; AS1 reemplaza el orden del `MEMORY.md` de `a4` en MD3). La campaña que corrió con él está en su [verify](../../changes/archive/2026-11-17-agent-eval-sessions/verify.md#la-campaña).
 - [protocol-block](../../changes/archive/2026-11-17-protocol-block/proposal.md), archivado el 2026-11-17, que sale en 0.88.0 (sólo PB7, el brazo `a3-short`, en «`agent-eval`: el brazo `a3-short`», al final de esta spec). Sus otros requisitos están en [`specs/setup`](../setup/spec.md), [`specs/doctor`](../doctor/spec.md), [`specs/hooks`](../hooks/spec.md) y [`specs/preferences`](../preferences/spec.md).
 - [repeated-errors](../../changes/archive/2026-11-19-repeated-errors/proposal.md), archivado el 2026-11-19, que sale en 0.90.0 (sólo RE9, el brazo `a3-notools`, en «`agent-eval`: el brazo `a3-notools`», al final de esta spec). Sus otros requisitos están en [`specs/setup`](../setup/spec.md), [`specs/doctor`](../doctor/spec.md) y [`specs/hooks`](../hooks/spec.md).
-- [contract-diet](../../changes/archive/2026-11-20-contract-diet/proposal.md), archivado el 2026-11-20, sale en 0.91.0 (sólo CD5, el brazo `a3-full`, en «`agent-eval`: el brazo `a3-full`», después del brazo `a3-short`). Sus otros requisitos están en [`specs/setup`](../setup/spec.md) y [`specs/doctor`](../doctor/spec.md).
+- [contract-diet](../../changes/archive/2026-11-20-contract-diet/proposal.md), archivado el 2026-11-20, sale en 0.92.0 (sólo CD5, el brazo `a3-full`, en «`agent-eval`: el brazo `a3-full`», después del brazo `a3-short`). Sus otros requisitos están en [`specs/setup`](../setup/spec.md) y [`specs/doctor`](../doctor/spec.md).
 
 ## Definiciones
 
@@ -1932,11 +1932,11 @@ La causa (d) no tiene lugar en el resultado: una corrida paga con un comando que
 
 ## `agent-eval`: el brazo `a3-short`
 
-El brazo que mide el bloque corto del protocolo. Sus tests corren con la suite, como los de las secciones anteriores. Origen: [protocol-block](../../changes/archive/2026-11-17-protocol-block/proposal.md). Lo que se midió con él, 18 corridas sobre las tareas largas de la sección anterior, está en su [verify](../../changes/archive/2026-11-17-protocol-block/verify.md#la-campaña): `short` y `off` no pasan la regla D6, y el valor por defecto de `setup` era `full` cuando se midió; `lean` lo reemplazó en 0.91.0 ([contract-diet](../../changes/archive/2026-11-20-contract-diet/verify.md#la-campaña)).
+El brazo que mide el bloque corto del protocolo. Sus tests corren con la suite, como los de las secciones anteriores. Origen: [protocol-block](../../changes/archive/2026-11-17-protocol-block/proposal.md). Lo que se midió con él, 18 corridas sobre las tareas largas de la sección anterior, está en su [verify](../../changes/archive/2026-11-17-protocol-block/verify.md#la-campaña): `short` y `off` no pasan la regla D6, y el valor por defecto de `setup` era `full` cuando se midió; `lean` lo reemplazó en 0.92.0 ([contract-diet](../../changes/archive/2026-11-20-contract-diet/verify.md#la-campaña)).
 
 ### PB7. El brazo `a3-short`
 
-`agent-eval` MUST tener el brazo `a3-short`: `a3` con el bloque `short` que planea `setup::plan` con `--protocol short`, y todo lo demás (servidor, hooks, daemon, memorias, argumentos del cliente) igual a `a3`. `a3` MUST escribir el bloque por defecto, que es `lean` desde 0.91.0 (CD7), y `l0` ninguno.
+`agent-eval` MUST tener el brazo `a3-short`: `a3` con el bloque `short` que planea `setup::plan` con `--protocol short`, y todo lo demás (servidor, hooks, daemon, memorias, argumentos del cliente) igual a `a3`. `a3` MUST escribir el bloque por defecto, que es `lean` desde 0.92.0 (CD7), y `l0` ninguno.
 
 ##### Escenario
 - GIVEN una tarea con memorias

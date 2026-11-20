@@ -2,7 +2,7 @@ change: contract-diet
 objective: "1"
 depends_on: []  # sin cambios activos de los que dependa; el valor por defecto lo fijó la campaña de a3-lean (verify.md, D11), no una dependencia
 phase: archived
-release: "0.91.0"  # lean sin la apertura como valor por defecto (CD7) y el brazo a3-full (CD5); la variante lean, --protocol lean y el brazo a3-lean salieron antes, en 0.90.0 (verify.md, «Al archivar»)
+release: "0.92.0"  # lean sin la apertura como valor por defecto (CD7) y el brazo a3-full (CD5); la variante lean, --protocol lean y el brazo a3-lean salieron antes, en 0.90.0 (verify.md, «Al archivar»)
 artifacts:
   exploration: done  # la clase (a) hecha; la clase (b) siguió con el enfoque B1
   proposal: done  # B1, el bloque lean; D2, D3 y D6 de la exploración cerradas con su opción recomendada

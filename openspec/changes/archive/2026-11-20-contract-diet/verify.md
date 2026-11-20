@@ -141,11 +141,11 @@ Lo que muestran los datos y no decide:
 
 - CD1, CD3, CD4 y CD7 pasan a [`specs/setup`](../../../specs/setup/spec.md), junto a PB5 y PB6 (las variantes y `--protocol`, que ahora nombran `lean`) y PB1. CD7 reemplaza la frase de PB6 que fijaba `full` como valor por defecto. CD4, en su parte de frescura, pasa a [`specs/doctor`](../../../specs/doctor/spec.md), junto a PB2. CD5 (el brazo `a3-full`) pasa a [`specs/eval`](../../../specs/eval/spec.md), junto a PB7. CD2 y CD6 no se consolidan: son pruebas y lo que no cambia.
 - `docs/reference/commands.md` y `docs/reference/testing.md` ya dicen que `lean` es el valor por defecto y que el brazo es `a3-full` (`49b6a418` y `fd32de60`); no hizo falta cambiarlos.
-- Sale en 0.91.0: `fd32de60` y `49b6a418` no están en ninguna versión publicada, y la 0.90.0 trae la variante `lean`, `--protocol lean` y el brazo `a3-lean`.
+- Sale en 0.92.0: `fd32de60` y `49b6a418` no están en ninguna versión publicada, y la 0.90.0 trae la variante `lean`, `--protocol lean` y el brazo `a3-lean`. La 0.91.0 no llegó a publicarse: `develop` pasó a 0.92.0 al archivar domain-types, antes de subir a `main`.
 - Lo que sigue de la exploración, sacar las secciones del resumen del bloque `lean`, no entra aquí: espera a memory-links (134), que decide si puede hacerse ([exploración de memory-links](../../memory-links/exploration.md)).
 
 ## Pendiente después de publicar
 
 Local, con la versión instalada.
 
-- **El bloque de una máquina real.** Con 0.91.0 instalada, en una máquina con el bloque entero de antes de `lean`: `clawg setup claude-code --profile prod --dry-run`, sin `--protocol`, tiene que decir `would update it (protocol=lean)` sobre ese bloque (con la preferencia `es`, `se actualizaría (protocol=lean)`). Después de correrlo sin `--dry-run`, `clawg doctor --profile prod` tiene que dar `protocol_block` `ok` `healthy`, y la primera sesión no trae el aviso del bloque.
+- **El bloque de una máquina real.** Con 0.92.0 instalada, en una máquina con el bloque entero de antes de `lean`: `clawg setup claude-code --profile prod --dry-run`, sin `--protocol`, tiene que decir `would update it (protocol=lean)` sobre ese bloque (con la preferencia `es`, `se actualizaría (protocol=lean)`). Después de correrlo sin `--dry-run`, `clawg doctor --profile prod` tiene que dar `protocol_block` `ok` `healthy`, y la primera sesión no trae el aviso del bloque.
