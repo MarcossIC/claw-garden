@@ -15,7 +15,7 @@ Suma una cuarta variante del bloque del protocolo, `lean`, que `clawg setup clau
 
 `protocol::lean(language)` MUST devolver, con finales de línea `\n`:
 
-- la cabeza de `protocol::text(language)` sin cambiar un carácter, de modo que `opening(lean(l)) == opening(text(l))` para `None`, `Some(En)` y `Some(Es)`;
+- el título de `protocol::text(language)`, su primera línea, sin la apertura: `opening(lean(l))` MUST ser vacío para `None`, `Some(En)` y `Some(Es)`, porque la apertura la ponen en cada pedido las instrucciones del servidor, `opening(text(l))` (enmendado el 2026-11-20 por [D11](design.md#d11-después-de-la-campaña-lean-sin-la-apertura); antes era la cabeza entera);
 - seguida de las secciones de `protocol.lean.md`, o de `protocol.lean.es.md` para `Some(Es)`;
 - con la preferencia `en`, la regla del idioma del save reescrita como la reescribe `text` (`SAVE_RULE`, `protocol.rs:28`), que MUST aparecer una vez en `protocol.lean.md`.
 
@@ -23,7 +23,7 @@ El texto MUST cumplir, en las dos lenguas:
 
 - los mismos encabezados `## ` que `text(language)`, en el mismo orden;
 - la viñeta de `topic_key` de `text(language)` entera, y las secciones «Session summary» y «After a compaction» («Resumen de sesión», «Después de una compactación») iguales a las de `text(language)`;
-- los mismos nombres que `text(language)`, y los mismos marcadores de texto plano (`ACTIVE CONFLICTS`, `LAST SESSION`, `supersedes`, `conflicts`, `inferred`, `imported`, `conclusion`, `merge`, `apart`);
+- junto con las instrucciones del servidor, los mismos nombres que `text(language)` y los mismos marcadores de texto plano (`ACTIVE CONFLICTS`, `LAST SESSION`, `supersedes`, `conflicts`, `inferred`, `imported`, `conclusion`, `merge`, `apart`);
 - como mucho el 70 % de los bytes de `text(language)`.
 
 `protocol.md` y `protocol.es.md` MUST NOT cambiar: `text` y `short` devuelven lo mismo que antes de este cambio.
@@ -85,26 +85,38 @@ Un sello cuya variante este binario no conoce (la `lean` leída por un binario a
 
 **Tests:** `a_stamp_with_an_unknown_variant_reads_as_stale` (`setup.rs`). Es un requisito sobre conducta que ya existe: el test fija que `lean` no la cambia.
 
-## CD5. El brazo `a3-lean`
+## CD5. El brazo `a3-full`
 
-`agent-eval` MUST tener el brazo `a3-lean`, junto a `a3-short` en `ARMS`: `a3` con el bloque que planea `setup::plan` con `--protocol lean`, y todo lo demás (servidor, hooks, daemon, memorias, argumentos y variables del cliente) igual a `a3`. `a3` MUST seguir escribiendo el bloque `full`.
+Enmendado el 2026-11-20: con `lean` por defecto (CD7), `a3` ya lleva el bloque `lean`, y el brazo `a3-lean` de la campaña pasa a ser `a3-full`. `agent-eval` MUST tener el brazo `a3-full`, junto a `a3-short` en `ARMS`: `a3` con el bloque que planea `setup::plan` con `--protocol full`, y todo lo demás (servidor, hooks, daemon, memorias, argumentos y variables del cliente) igual a `a3`. `a3` MUST escribir el bloque por defecto.
 
 #### Escenario
 - GIVEN una tarea con memorias
-- WHEN se planean `a3` y `a3-lean`
-- THEN sus planes son iguales salvo el `CLAUDE.md`, que en `a3-lean` es el bloque `lean` con `protocol=lean`
+- WHEN se planean `a3` y `a3-full`
+- THEN sus planes son iguales salvo el `CLAUDE.md`, que en `a3` es el bloque `lean` y en `a3-full` el entero con `protocol=full`
 
-**Tests:** `a3_lean_is_a3_with_the_lean_block` (`crates/clawg-eval/src/bin/agent-eval/arm.rs`), y el brazo en las listas de brazos con daemon, con `setup` y con bloque; hoy falla: el brazo no existe.
+**Tests:** `a3_full_is_a3_with_the_whole_block` y `a3_full_reads_and_prints_by_its_name` (`crates/clawg-eval/src/bin/agent-eval/arm.rs`), y el brazo en las listas de brazos con daemon, con `setup` y con bloque.
 
 ## CD6. Lo que no cambia
 
-La variante por defecto MUST seguir siendo `full`. `protocol.md`, `protocol.es.md`, las instrucciones del servidor (`server.rs:2081`) y la lista de herramientas MUST NOT cambiar: `the_agent_contract_matches_its_file` y `the_spanish_agent_contract_matches_its_file` (`server.rs:3468`, `:3491`) MUST pasar sin regenerar los archivos con `CLAWG_BLESS=1`. `crates/clawg-cli/src/daemon/` y `crates/clawg-cli/src/hook.rs` MUST NOT cambiar.
+La variante por defecto la fija CD7. `protocol.md`, `protocol.es.md`, las instrucciones del servidor (`server.rs:2081`) y la lista de herramientas MUST NOT cambiar: `the_agent_contract_matches_its_file` y `the_spanish_agent_contract_matches_its_file` (`server.rs:3468`, `:3491`) MUST pasar sin regenerar los archivos con `CLAWG_BLESS=1`. `crates/clawg-cli/src/daemon/` MUST NOT cambiar, y `crates/clawg-cli/src/hook.rs` sólo en el bloque de su test (`written_block`), que es el de por defecto.
+
+## CD7. `lean` es el valor por defecto
+
+Agregado el 2026-11-20, después de que `lean` sin la apertura pasara la regla de [D11](design.md#d11-después-de-la-campaña-lean-sin-la-apertura) ([verify](verify.md#d11-lean-sin-la-apertura)). `setup claude-code` sin `--protocol` MUST escribir `lean` sin `protocol=` en el sello cuando el bloque instalado no trae `protocol=`, y MUST mantener la variante elegida cuando lo trae (PB6). Un bloque `full` sin `protocol=` MUST leerse `stale`, y `setup` sin la opción MUST reescribirlo como `lean`. `--protocol full` MUST seguir eligiendo el entero.
+
+#### Escenario: una máquina con el bloque entero de antes
+- GIVEN un `CLAUDE.md` con el bloque `full` sin `protocol=`
+- WHEN corre `clawg setup claude-code --profile dev` sin `--protocol`
+- THEN el bloque es el de `lean`, sin `protocol=` en el sello, y el texto fuera de los marcadores no cambió
+- AND el reporte dice `(protocol=lean)`
+
+**Tests:** `the_protocol_option_writes_its_variant_and_a_run_without_it_keeps_it`, `a_stamp_with_an_unknown_variant_reads_as_stale`, `each_variant_is_its_block`, `a_block_is_current_stale_or_newer` y `the_block_follows_the_preferred_language` (`setup.rs`); `session_start_says_when_the_block_is_stale` (`hook.rs`).
 
 **Tests:** los dos del contrato y `without_a_language_the_protocol_is_the_file` (`protocol.rs`), que ya pasan y tienen que seguir pasando.
 
 ## Specs que se consolidan al archivar
 
-- CD1, CD3 y CD4 en [`specs/setup`](../../specs/setup/spec.md), junto a PB5 y PB6 (la lista de variantes y `--protocol`) y PB1 (el sello ilegible).
+- CD1, CD3, CD4 y CD7 en [`specs/setup`](../../specs/setup/spec.md), con CD7 en lugar de la frase «la de por defecto MUST ser `full`», junto a PB5 y PB6 (la lista de variantes y `--protocol`) y PB1 (el sello ilegible).
 - CD4, la parte de `freshness`, en [`specs/doctor`](../../specs/doctor/spec.md), junto a PB2.
 - CD5 en [`specs/eval`](../../specs/eval/spec.md), junto a PB7.
 - CD2 y CD6 no se consolidan.

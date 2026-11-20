@@ -130,7 +130,13 @@ Lo que muestran los datos y no decide:
 - El save con cercanas de D es otra vez una clave inventada en la sesión que revisa la decisión (`redact-url-credentials/placeholder` contra `requests-utils/…`), resuelta con `supersedes`, como las dos de `a3`.
 - La campaña corre en inglés; el bloque en español sale de las mismas piezas (`protocol.lean.es.md` sin la apertura de `protocol.es.md`), sin medir.
 
+### Lo que se aplicó
+
+- `fd32de60`: `protocol::lean` es el título y las secciones, sin la apertura (CD1 enmendado). El `CLAUDE.md` que `agent-eval prepare --arm a3-lean` arma con ese build es idéntico, byte por byte, al de las corridas de `a3-lean-bare` (5.144 bytes), así que el texto que se lleva al producto es el que se midió. El brazo `a3-lean-bare` se quitó: con ese texto era el mismo bloque que `a3-lean`. Las pruebas que pedían que cada protocolo nombrara cada herramienta, y que el español nombrara lo mismo que el inglés, miden ahora el bloque junto con las instrucciones del servidor, que es lo que el agente lee.
+- El commit que sigue: `DEFAULT_VARIANT` pasa a `Lean` (CD7), y el brazo `a3-lean` pasa a ser `a3-full` (CD5 enmendado), porque `a3` ya lleva `lean`. Una máquina con el bloque entero sin elección recibe el aviso del bloque una vez, y `setup` sin `--protocol` lo reescribe como `lean`; quien eligió una variante la conserva.
+- Falta, como antes: el CI en Linux y Windows, y el bloque de una máquina real con la versión instalada, ahora sin `--protocol` (ver abajo).
+
 ## Pendiente en local
 
 - **CI** en verde en Linux y Windows sobre el último commit.
-- **El bloque de una máquina real**, con la versión instalada: `clawg setup claude-code --protocol lean --profile prod --dry-run` dice `would update it (protocol=lean)`; después de correrlo sin `--dry-run`, `clawg doctor --profile prod` da `protocol_block` `ok` `healthy`, y la primera sesión no trae el aviso del bloque.
+- **El bloque de una máquina real**, con la versión instalada: `clawg setup claude-code --profile prod --dry-run`, sin `--protocol`, dice `would update it (protocol=lean)` sobre el bloque entero de antes; después de correrlo sin `--dry-run`, `clawg doctor --profile prod` da `protocol_block` `ok` `healthy`, y la primera sesión no trae el aviso del bloque.

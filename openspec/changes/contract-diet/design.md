@@ -26,7 +26,7 @@ Las decisiones llevan el número de la [exploración](exploration.md#decisiones-
 
 ## D3. La apertura no se toca
 
-**Decisión:** la cabeza de `lean` es la de `full`, byte por byte, en cada idioma y con cada preferencia, y `opening` no cambia. Un test lo fija comparando las cabezas.
+**Decisión:** la cabeza de `lean` es la de `full`, byte por byte, en cada idioma y con cada preferencia, y `opening` no cambia. Un test lo fija comparando las cabezas. **Reemplazada por [D11](#d11-después-de-la-campaña-lean-sin-la-apertura)** después de la campaña: `lean` lleva sólo el título, y `opening` sigue sin cambiar.
 
 | Alternativa | Tradeoff |
 |---|---|
