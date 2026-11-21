@@ -86,21 +86,21 @@ La hipótesis es que la fusión va primero y esto después, midiendo contra la l
 Un script en un directorio ignorado, con un stemmer de Snowball (español e inglés) **fuera del producto**: así la dependencia no entra en `Cargo.lock` hasta que la puerta abra.
 
 1. Para cada caso de `golden.json` y de `golden-expanded.json`, tomar los tokens de contenido de la consulta (los de `fts_tokens`, sin acentos, en minúscula, sin las palabras de parada del español y del inglés, con una lista fija escrita en el script antes de leer los datos) y los de las filas esperadas (`expected_refs`).
-2. Clasificar cada caso: **(a)** algún token de la consulta aparece igual en una fila esperada; **(b)** ninguno aparece igual, pero uno comparte raíz (la del español o la del inglés) con una palabra de una fila esperada; **(c)** ni eso.
-3. Cruzar con la línea base de `rag-eval --real` (el archivo `docs/eval/results/2026-10-16-real-eval-rigor-tip-anchor.json` que cita `config.yaml` trae los aciertos por caso): **M = casos de clase (b) que esa línea base no acierta en el top 5.** Son los únicos que el stemming puede mover. Informar también cuántos de (b) son `es` y cuántos `en`, y cuántos de los 30 `lexical_related` caen en (b).
-4. Revisar a mano 20 casos de (b) tomados al azar **antes de ver el recuento**: ¿la raíz común es de verdad la misma palabra, o un falso amigo (`memoria`, `memory`)?
+2. Clasificar cada caso: **(a)** algún token de la consulta aparece igual en una fila esperada; **(b)** ninguno aparece igual, pero uno comparte raíz (la del español o la del inglés) con una palabra de una fila esperada; **(c)** ni eso. Dentro de (a), **(a+)** son los casos con además un token que no aparece igual en ninguna fila esperada y sí comparte raíz con una palabra de una: la palabra exacta no los deja afuera, porque con raíces suman una coincidencia y suben en bm25.
+3. Cruzar con la línea base de `rag-eval --real` (el archivo `docs/eval/results/2026-10-16-real-eval-rigor-tip-anchor.json` que cita `config.yaml` trae los aciertos por caso): **M = casos de clase (b) o (a+) que esa línea base no acierta en el top 5.** Son los candidatos que el stemming puede mover: los de (b) ganan su primera coincidencia y los de (a+) una más. El censo no dice cuáles se mueven: eso lo cuenta la etapa 1. Informar (b) y (a+) por separado, cuántos de cada una son `es` y cuántos `en`, y cuántos de los 30 `lexical_related` caen en cada una.
+4. Revisar a mano 20 casos de (b) o (a+) tomados al azar **antes de ver el recuento**: ¿la raíz común es de verdad la misma palabra, o un falso amigo (`memoria`, `memory`)? En un caso de (a+) se mira el token que comparte raíz, no el exacto.
 
 **Umbral:**
 
 - Si **M < 6 en el golden ampliado** (y también en el de 46), nada puede dar una conclusión según las reglas de `--diff` (hacen falta al menos 6 casos en un sentido): **cierra, queda D**, y se archiva en «Ideas evaluadas» del README.
 - Si **M ≥ 6 en el ampliado**, sigue la etapa 1. Con el de 46 sólo se informa.
-- **Un tope por el otro lado:** si más de la mitad de la muestra a mano de (b) son falsos amigos, el censo sobreestima y el umbral sube a **M ≥ 12**.
+- **Un tope por el otro lado:** si más de la mitad de la muestra a mano son falsos amigos, el censo sobreestima y el umbral sube a **M ≥ 12**.
 
 ### Etapa 1: el canal léxico solo (no depende de 136)
 
 `rag-eval --real --lexical-only` sobre el ampliado, dos corridas: la línea base (hoy: R@1 0,3478, R@5 0,5000, R@10 0,5000, MRR 0,4040 en el set de 46, `docs/eval/results/2026-10-16-real-lexical-only.json`) y la variante, comparadas con `--diff`. La variante de esta etapa es **C** (la consulta con raíces y prefijo sobre el índice actual), que no pide migración, más una corrida de **A** sobre una tienda de eval si el arnés puede armar la columna (el arnés cambia el DDL con una plantilla; sería otra plantilla y otro rechazo en `ALLOWED_FTS_TOKENIZERS`).
 
-**Umbral:** **recall@5 sube con al menos 6 casos entrando al top 5 y ninguno saliendo** (la regla de `--diff`: cada caso que va al revés sube el piso, y el veredicto dice cuántos más hacen falta). Con menos, «no distinguible», nunca «sin diferencia»: no se pasa a la etapa 2.
+**Umbral:** **recall@5 sube con al menos 6 casos entrando al top 5 y ninguno saliendo** (la regla de `--diff`: cada caso que va al revés sube el piso, y el veredicto dice cuántos más hacen falta). Con menos, «no distinguible», nunca «sin diferencia»: no se pasa a la etapa 2. Las mejoras que cuentan son las que `--diff` ve caso por caso sobre todo el set, también las de (a), no las que el censo predijo: M decide si vale correr esta etapa, y esta etapa cuenta lo que se movió.
 
 ### Etapa 2: punta a punta, **después de 136**, contra la línea base que deje 136
 
