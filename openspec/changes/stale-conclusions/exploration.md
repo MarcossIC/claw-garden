@@ -129,13 +129,13 @@ El mismo lugar que ya usa la causa «fuente perdida», **sin herramienta nueva**
 **Puerta, fijada antes de medir:**
 
 - **Mínimo de datos:** al menos **10** conclusiones vivas en total y al menos **10** marcadas por la unión. Con menos, el resultado es «no concluyente»: el cambio **espera**, por la regla 4 del [ROADMAP](../../ROADMAP.md) («lo que sólo vale si un problema aparece»), y se repite cuando haya más.
-- **Se abre** si, con la unión de las definiciones baratas (todas menos (b)) o con (b) a 0.42, se cumplen las cuatro:
+- **Se abre** si, con la unión de las definiciones baratas, (a), (d) y (e) (sin (b), que se mide aparte, ni (c), que es la línea base nula), o con (b) a 0.42, se cumplen las cuatro:
   1. la **precisión** sobre la muestra, *atrasada* ÷ (*atrasada* + *vigente*), es de **50 % o más**;
   2. al menos **la mitad** de las *atrasadas* son **nuevas** (no estaban en la lista por fuente perdida ni en un par abierto): la señal tiene que sumar;
   3. la unión marca **no más del 50 %** de las conclusiones vivas: una señal que marca casi todo no dice nada (la línea base (c) mide el techo);
   4. hay **al menos 5** conclusiones *atrasadas* y nuevas en el store: con menos, la lista casi no se vería.
 - **Se cierra** (se archiva en «Ideas evaluadas» del README) si la precisión es **menor que 25 %**, o si menos de un cuarto de las *atrasadas* son nuevas: el detector y la lista de fuentes perdidas ya cubren lo que hay.
-- **Entre medio** (precisión de 25 % a 50 %, o la unión marca más del 50 %): una sola vuelta de ajuste, **fijada ahora**: probar (b) a 0.35 en vez de 0.42 y la unión sin (c). Se mide de nuevo sobre las mismas conclusiones, con el mismo etiquetado, y se aplica la misma puerta. Si sigue en el medio, se cierra.
+- **Entre medio** (precisión de 25 % a 50 %, o la unión marca más del 50 %): una sola vuelta de ajuste, **fijada ahora**: probar (b) a 0.35 en vez de 0.42; la unión barata sigue siendo la de (a), (d) y (e), sin (c). Se mide de nuevo sobre las mismas conclusiones, con el mismo etiquetado, y se aplica la misma puerta. Si sigue en el medio, se cierra.
 - **Si (b) es la única definición que pasa**, el cambio se abre sólo en el lugar A (al listar en `synthesize`), nunca en el conteo del contexto (costo B). Su costo se mide aparte antes del diseño.
 
 **Costo:** horas de una persona (la muestra de 40 a mano y un script de unas 100 líneas; el modelo local para (b)). Sin créditos de API.
