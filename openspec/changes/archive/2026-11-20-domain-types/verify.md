@@ -1,6 +1,6 @@
 # domain-types — Verificación
 
-**Resultado:** la tanda 1 aplicada y verificada en Linux. La suite entera y los dos clippy pasan sobre el último commit de código, y ni `crates/clawg-cli/tests/api.rs`, ni los dos contratos del agente, ni las migraciones cambian. Falta Windows ([«Pendiente»](#pendiente)).
+**Resultado:** la tanda 1 aplicada y verificada en Linux, en el CI de Linux y Windows y en Windows en local ([«Windows»](#windows)). La suite entera y los dos clippy pasan sobre el último commit de código, y ni `crates/clawg-cli/tests/api.rs`, ni los dos contratos del agente, ni las migraciones cambian. Salió en 0.90.0.
 
 ## Qué se corrió
 
@@ -36,7 +36,12 @@ Con `status = 'superseded'` cambiado a mano por `'superseeded'` en `REVIVE_SQL` 
 - **`rag-eval --diff`:** el golden set de `docs/eval/` está fuera de git y no estaba en el clon donde se verificó. El ranking no cambia por construcción: `lambda_for` y la puerta de estado devuelven, para cada nombre, el valor que devolvía el literal, y los tests de `score.rs` lo fijan, incluido el nombre desconocido.
 - **`perf-bench`:** no se corrió. Un `Stored<T>` conocido es un enum `Copy` sin asignación; uno desconocido guarda el mismo `String` que se leía antes.
 
+## Windows
+
+- CI de Linux y Windows: workflow run 44591210821 sobre `d658c8a9` (head del PR #155, que publicó 0.90.0), jobs `test (ubuntu-latest)` y `test (windows-latest)`. `d658c8a9` contiene los cuatro commits de código: `01b4c546`, `7878784d`, `6ac1108f` y `fe74b010`.
+- Las dos correcciones, `6ac1108f` (`fix(core): read a known name held in Stored::Other as its variant`) y `fe74b010` (`test(conventions): follow a compared SQL name onto the lines after it`), llegaron después de la corrida de Linux de arriba. Las cubren el CI y la corrida local de Windows.
+- Local, en Windows, sobre `fbb8d91f` y después de `cargo clean --workspace --target-dir target-test`: `cargo test --workspace --target-dir target-test` pasa sin ningún fallo, y `cargo clippy --workspace --all-targets --target-dir target-test -- -D warnings` y `cargo clippy -p clawg-cli --target-dir target-test -- -D warnings` no tienen hallazgos.
+
 ## Pendiente
 
-- Windows: la suite y los dos clippy con `--target-dir target-test`.
-- Al archivar: R1 a R6 a `specs/storage` y `specs/retrieval`, la fila del README a `changes/archive/README.md`, `openspec/ROADMAP.md` y el minor de la versión.
+Nada bloquea el archivo; lo que no se midió está en [«Lo que no se midió»](#lo-que-no-se-midió). Las tandas 2 a 5 son cambios propios, en [«Tandas siguientes»](tasks.md#tandas-siguientes).

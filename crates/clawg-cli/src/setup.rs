@@ -712,8 +712,10 @@ impl Stamp {
     }
 }
 
-/// What the block holds when the person chose no variant: the whole protocol.
-const DEFAULT_VARIANT: Variant = Variant::Full;
+/// What the block holds when the person chose no variant: the lean protocol,
+/// which kept every behaviour of the whole one in agent-eval at a tenth less
+/// context per session.
+const DEFAULT_VARIANT: Variant = Variant::Lean;
 
 /// The protocol for `language` as `variant` has it ([`protocol::text`],
 /// [`protocol::short`] or nothing) between its markers, with `stamp` after the
@@ -1419,7 +1421,7 @@ mod tests {
 
     /// The block as this binary writes it, in a file with LF line endings.
     fn installed_block(language: Option<Lang>) -> String {
-        block("\n", language, Variant::Full, Stamp { version: v("0.88.0"), choice: None })
+        block("\n", language, DEFAULT_VARIANT, Stamp { version: v("0.88.0"), choice: None })
     }
 
     fn written(step: &FileStep) -> &str {
@@ -1545,11 +1547,11 @@ mod tests {
     #[test]
     fn a_block_is_current_stale_or_newer() {
         let own = v("0.88.0");
-        let older = block("\n", None, Variant::Full, Stamp { version: v("0.87.0"), choice: None });
+        let older = block("\n", None, DEFAULT_VARIANT, Stamp { version: v("0.87.0"), choice: None });
         assert_eq!(freshness(&older, None, own), Freshness::Current, "the same text of another version");
         assert_eq!(freshness(&older.replace('\n', "\r\n"), None, own), Freshness::Current, "the same text with CRLF");
         assert_eq!(freshness(&older, Some(Lang::Es), own), Freshness::Stale, "the other language is other text");
-        let spanish = block("\n", Some(Lang::Es), Variant::Full, Stamp { version: own, choice: None });
+        let spanish = block("\n", Some(Lang::Es), DEFAULT_VARIANT, Stamp { version: own, choice: None });
         assert_eq!(freshness(&spanish, Some(Lang::Es), own), Freshness::Current);
 
         let before_stamps = format!(
@@ -1570,8 +1572,9 @@ mod tests {
         let own = v("0.88.0");
         let stamp = |choice| Stamp { version: own, choice };
         for language in [None, Some(Lang::Es)] {
-            let full = block("\n", language, Variant::Full, stamp(None));
-            assert_eq!(full, installed_block(language));
+            let default = block("\n", language, DEFAULT_VARIANT, stamp(None));
+            assert_eq!(default, installed_block(language));
+            let full = block("\n", language, Variant::Full, stamp(Some(Variant::Full)));
             assert!(full.contains(protocol::text(language).replace("\r\n", "\n").trim_end()), "the whole protocol");
 
             let short = block("\n", language, Variant::Short, stamp(Some(Variant::Short)));
@@ -1589,7 +1592,7 @@ mod tests {
             let off = block("\n", language, Variant::Off, stamp(Some(Variant::Off)));
             assert_eq!(off, format!("{BEGIN_MARKER}\n<!-- clawg 0.88.0 protocol=off -->\n{END_MARKER}"));
 
-            for (text, choice) in [(&full, None), (&short, Some(Variant::Short)), (&lean, Some(Variant::Lean)), (&off, Some(Variant::Off))] {
+            for (text, choice) in [(&default, None), (&full, Some(Variant::Full)), (&short, Some(Variant::Short)), (&lean, Some(Variant::Lean)), (&off, Some(Variant::Off))] {
                 assert_eq!(freshness(text, language, own), Freshness::Current, "{choice:?} is what its own stamp asks for");
                 assert_eq!(read_stamp(text), Some(stamp(choice)));
             }
@@ -1612,7 +1615,7 @@ mod tests {
         assert_eq!(read_stamp(&later), None, "its stamp reads as none");
         assert_eq!(freshness(&later, None, own), Freshness::Stale, "stale, not newer: the version is never read");
         let plan_ = plan(&asking_for(None, &later), Mode::Install).unwrap();
-        assert_eq!((plan_.block, plan_.variant), (BlockStep::Rewritten, Some(Variant::Full)), "setup writes the default over it");
+        assert_eq!((plan_.block, plan_.variant), (BlockStep::Rewritten, Some(Variant::Lean)), "setup writes the default over it");
     }
 
     fn asking_for(protocol: Option<Variant>, instructions: &str) -> State {
@@ -1638,11 +1641,11 @@ mod tests {
         }
 
         let from_short = mine(&block("\n", None, Variant::Short, Stamp { version: v("0.88.0"), choice: Some(Variant::Short) }));
-        let back = plan(&asking_for(Some(Variant::Full), &from_short), Mode::Install).unwrap();
-        assert!(written(&back.instructions).contains("<!-- clawg 0.88.0 protocol=full -->"), "a chosen variant is written even when it is the default");
+        let back = plan(&asking_for(Some(Variant::Lean), &from_short), Mode::Install).unwrap();
+        assert!(written(&back.instructions).contains("<!-- clawg 0.88.0 protocol=lean -->"), "a chosen variant is written even when it is the default");
 
         let none = plan(&asking_for(None, &before_stamps), Mode::Install).unwrap();
-        assert_eq!((none.block, none.variant), (BlockStep::Unchanged, Some(Variant::Full)), "no choice, the default");
+        assert_eq!((none.block, none.variant), (BlockStep::Rewritten, Some(Variant::Lean)), "no choice: the default, over the whole block of before");
 
         let fresh = plan(&State { protocol: Some(Variant::Short), ..state(None, None, None) }, Mode::Install).unwrap();
         assert!(written(&fresh.instructions).starts_with(&format!("{BEGIN_MARKER}\n<!-- clawg 0.88.0 protocol=short -->\n# Claw Garden memory protocol\n")));
@@ -1652,7 +1655,7 @@ mod tests {
         let (text, _) = report(&plan(&s, Mode::Install).unwrap(), &s, None);
         assert!(text.contains("would update it (protocol=short)"), "{text}");
         let (text, _) = report(&plan(&state(None, None, Some(&before_stamps)), Mode::Install).unwrap(), &state(None, None, None), None);
-        assert!(text.contains("up to date (protocol=full)"), "{text}");
+        assert!(text.contains("would update it (protocol=lean)"), "{text}");
     }
 
     #[test]
@@ -1660,12 +1663,12 @@ mod tests {
         for (choice, requested) in
             [(None, None), (Some(Variant::Short), None), (Some(Variant::Short), Some(Variant::Short)), (Some(Variant::Lean), None), (Some(Variant::Off), None)]
         {
-            let variant = choice.unwrap_or(Variant::Full);
+            let variant = choice.unwrap_or(DEFAULT_VARIANT);
             let older = block("\n", None, variant, Stamp { version: v("0.87.0"), choice });
             let plan_ = plan(&asking_for(requested, &older), Mode::Install).unwrap();
             assert_eq!((plan_.block, &plan_.instructions), (BlockStep::Unchanged, &FileStep::Unchanged), "{choice:?} {requested:?}");
         }
-        let crlf = block("\r\n", None, Variant::Full, Stamp { version: v("0.87.0"), choice: None }) + "\r\n";
+        let crlf = block("\r\n", None, DEFAULT_VARIANT, Stamp { version: v("0.87.0"), choice: None }) + "\r\n";
         assert_eq!(plan(&asking_for(None, &crlf), Mode::Install).unwrap().block, BlockStep::Unchanged);
     }
 
@@ -1850,7 +1853,7 @@ mod tests {
         let plan_ = plan(&spanish, Mode::Install).unwrap();
         let text = written(&plan_.instructions);
         assert!(text.contains("# Protocolo de memoria de Claw Garden"), "{text}");
-        assert!(text.contains("Responde a la persona en español salvo que escriba en otro idioma"), "{text}");
+        assert!(text.contains("Escríbela en español, y busca en español también."), "{text}");
         assert_eq!(text, format!("{}\n", installed_block(Some(Lang::Es))));
         assert_ne!(installed_block(Some(Lang::Es)), installed_block(None));
     }

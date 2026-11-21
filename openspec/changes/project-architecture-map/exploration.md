@@ -58,7 +58,7 @@ La opción d contesta buena parte del «analizar fallas» sin ninguna pieza grá
 | Una página HTML suelta e interactiva | Es lo que sirve para explorar un grafo grande: buscar, filtrar, abrir un grupo | Lleva una biblioteca de JavaScript adentro o la baja de una CDN, y es una superficie nueva que mantener |
 | Texto para el agente, por una herramienta | Sirve al análisis sin dibujar | No es un mapa visual |
 
-Para evaluar primero: el JSON más Mermaid por nivel (carpeta, después módulo), porque ninguno suma una dependencia. La página HTML sólo si esos dos no alcanzan.
+Para evaluar primero: el JSON más Mermaid por nivel (carpeta, después módulo), porque ninguno suma una dependencia. La página HTML sólo si esos dos no alcanzan. Si llega a hacer falta, una página así no necesita una biblioteca: alcanza con comunidades por Louvain y un dibujo de fuerzas Barnes-Hut propios, deterministas (la misma entrada da el mismo dibujo) y en un Web Worker. Pasado cierto tamaño (unos miles de nodos), el grafo se agrupa antes por prefijo de ruta, en quien lo genera.
 
 ### 5. ¿Quién analiza?
 

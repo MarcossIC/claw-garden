@@ -12,6 +12,7 @@ Fuente de verdad del comportamiento actual de `clawg setup <cliente>`: el subcom
 - [session-usage](../../changes/archive/2026-11-11-session-usage/proposal.md), archivado el 2026-11-11, sale en 0.81.0: SU10 de esa spec, repartido en los requisitos que listan los hooks (R3 y R6 para Claude Code, CU1, CU3 a CU5 para Cursor y SL2 para `--local`) en lugar de una sección propia: el hook `SessionEnd` de Claude Code, con y sin `--local`, y `sessionEnd` de Cursor. Qué hace ese hook y qué cuenta el daemon con él, en [`specs/hooks`](../hooks/spec.md) (SU9) y [`specs/metrics`](../metrics/spec.md) (SU3 y SU10).
 - [protocol-block](../../changes/archive/2026-11-17-protocol-block/proposal.md), archivado el 2026-11-17, que sale en 0.88.0: el sello con la versión del bloque (PB1), las variantes `full`, `short` y `off` (PB5) y `--protocol` (PB6). La frescura del bloque y su revisión están en [`specs/doctor`](../doctor/spec.md) (PB2 y PB3) y el aviso de `session-start` en [`specs/hooks`](../hooks/spec.md) (PB4); el brazo `a3-short`, en [`specs/eval`](../eval/spec.md) (PB7). La campaña que dejó el valor por defecto en `full` está en su [verify](../../changes/archive/2026-11-17-protocol-block/verify.md#la-campaña).
 - [repeated-errors](../../changes/archive/2026-11-19-repeated-errors/proposal.md), archivado el 2026-11-19, que sale en 0.90.0: los hooks `PostToolUse` y `PostToolUseFailure`, con matcher `Bash`, en R3 y R6 (RE7), y en SL2 para `--local`. Qué hacen esos hooks está en [`specs/hooks`](../hooks/spec.md) (RE1 a RE6).
+- [contract-diet](../../changes/archive/2026-11-20-contract-diet/proposal.md), archivado el 2026-11-20, sale en 0.92.0: la variante `lean` del bloque (CD1 y CD3), el sello ilegible cuando la variante es desconocida (CD4) y `lean` como valor por defecto (CD7). CD2 y CD6 no se consolidan aquí: son pruebas y lo que no cambia. Lo que se midió, en su [verify](../../changes/archive/2026-11-20-contract-diet/verify.md#la-campaña).
 
 ## Definiciones
 
@@ -25,7 +26,7 @@ Fuente de verdad del comportamiento actual de `clawg setup <cliente>`: el subcom
 - **Forma heredada idéntica:** una forma heredada cuyas palabras son exactamente `<clawg> hook <evento> --agent claude-code --profile P` y cuyo `command` es la cadena que generaban las versiones anteriores de `setup` para esa ruta: la ruta sin comillas si sólo tiene letras ASCII, dígitos y `/._-:`, si no entre comillas dobles con `"`, `$`, `` ` `` y `\` escapados, seguida de los argumentos separados por un espacio (`is_legacy_hook`, `setup.rs:453`; `legacy_command`, `setup.rs:360`, que sólo reconoce y ya no escribe). En Windows esas versiones ya habían pasado la ruta a `/`.
 - **Bloque:** el texto de `crates/clawg-cli/src/mcp/protocol.md` entre `<!-- BEGIN CLAWG MEMORY PROTOCOL -->` y `<!-- END CLAWG MEMORY PROTOCOL -->`, con el sello que sigue al marcador de apertura (`BEGIN_MARKER`, `END_MARKER`, `crates/clawg-cli/src/setup.rs:36-37`; `find_block`, `setup.rs:612`).
 - **Sello:** la línea que sigue al marcador de apertura, `<!-- clawg X.Y.Z -->` o `<!-- clawg X.Y.Z protocol=V -->`, con `X.Y.Z` como lo lee `Version::parse` (`crates/clawg-cli/src/update/version.rs:21`) y `V` una de las variantes (PB1).
-- **Variante:** `full`, `short` u `off` (PB5).
+- **Variante:** `full`, `short`, `lean` u `off` (PB5).
 - **Cuerpo:** el bloque sin el sello, con los finales de línea pasados a `\n`.
 - **Versión propia:** la de `clawg_core::build_info::version()`.
 - **Directorio de Cursor:** `~/.cursor`, con el home de `clawg_core::paths::home_dir` (el de `CLAWG_TEST_HOME` en un build de tests). Ahí viven `mcp.json` (los servidores de usuario, en `mcpServers`) y `hooks.json` (los hooks de usuario, en `hooks.<evento>`).
@@ -157,6 +158,7 @@ Cada archivo MUST escribirse por un temporal en el directorio del archivo real y
 
 - `full`: `protocol::text(language)`, el protocolo entero (`crates/clawg-cli/src/mcp/protocol.rs:58`);
 - `short`: el título del protocolo del idioma, la línea fija de [design](../../changes/archive/2026-11-17-protocol-block/design.md#d4-tres-variantes-de-un-solo-archivo) y las secciones «Session summary» y «After a compaction» (en español, «Resumen de sesión» y «Después de una compactación») tal como están en ese mismo texto, cada una hasta la sección siguiente;
+- `lean`: `protocol::lean(language)`, el protocolo sin su apertura, con sus secciones (CD1);
 - `off`: nada; el bloque son los dos marcadores y el sello.
 
 El bloque `short` MUST ocupar menos de 2.000 bytes en los dos idiomas, y MUST NOT contener la apertura.
@@ -171,7 +173,7 @@ El bloque `short` MUST ocupar menos de 2.000 bytes en los dos idiomas, y MUST NO
 
 ## PB6. `--protocol`
 
-`clawg setup claude-code` MUST tomar `--protocol full|short|off`. Con la opción MUST escribir esa variante, con `protocol=V` en el sello. Sin la opción MUST mantener la variante del sello del bloque instalado cuando trae `protocol=`, y si no, escribir la de por defecto sin `protocol=`. La de por defecto MUST ser `full`: la campaña sobre las tareas largas de agent-eval-sessions no dio un caso para cambiarla, y la regla D6 fija que sólo un cambio propio, con una medición nueva, la mueve ([verify](../../changes/archive/2026-11-17-protocol-block/verify.md#la-celda-k-de-a3)). `--protocol` MUST ser un error de uso (clap, sale con 2) con `--remove`, con `--local` o `--path`. Con `setup cursor` MUST salir con 1, con `SetupError::ProtocolForCursor`, como el `FolderForCursor` de antes: no es un error de uso de clap, y no escribe nada. El reporte MUST nombrar la variante que quedó.
+`clawg setup claude-code` MUST tomar `--protocol full|short|lean|off`. Con la opción MUST escribir esa variante, con `protocol=V` en el sello. Sin la opción MUST mantener la variante del sello del bloque instalado cuando trae `protocol=`, y si no, escribir la de por defecto sin `protocol=`. La de por defecto es `lean` desde 0.92.0 (CD7). Antes fue `full`, y la campaña que lo cambió está en su [verify](../../changes/archive/2026-11-20-contract-diet/verify.md#la-campaña). `--protocol` MUST ser un error de uso (clap, sale con 2) con `--remove`, con `--local` o `--path`. Con `setup cursor` MUST salir con 1, con `SetupError::ProtocolForCursor`, como el `FolderForCursor` de antes: no es un error de uso de clap, y no escribe nada. El reporte MUST nombrar la variante que quedó.
 
 Con el bloque instalado igual al planeado salvo por la versión del sello, el paso MUST ser `Unchanged` y el sello MUST quedar como estaba (R4 y R5).
 
@@ -184,7 +186,7 @@ Con el bloque instalado igual al planeado salvo por la versión del sello, el pa
 #### Escenario: sin elección, la de por defecto
 - GIVEN un bloque `full` sin `protocol=` en el sello
 - WHEN corre `clawg setup claude-code` sin `--protocol`
-- THEN el bloque queda `Unchanged`
+- THEN el bloque es el de `lean`, sin `protocol=` en el sello (CD7)
 
 #### Escenario: con `--local`
 - WHEN corre `clawg setup claude-code --local --protocol short`
@@ -195,6 +197,74 @@ Con el bloque instalado igual al planeado salvo por la versión del sello, el pa
 - THEN sale con 1 y no escribe nada
 
 **Tests:** `the_protocol_option_writes_its_variant_and_a_run_without_it_keeps_it`, `a_new_version_with_the_same_text_rewrites_nothing` (`setup.rs`); `the_protocol_option_parses_and_excludes_local_remove_and_cursor` (`cli.rs`); `setup_protocol_short_writes_the_short_block` y `setup_cursor_refuses_a_protocol` (`tests/binary.rs`).
+
+## CD1. El texto de `lean`
+
+`protocol::lean(language)` MUST devolver, con finales de línea `\n`, el título de `protocol::text(language)` (su primera línea, sin la apertura), seguido de las secciones de `protocol.lean.md`, o de `protocol.lean.es.md` para `Some(Es)`. Con la preferencia `en`, la regla del idioma del save MUST quedar reescrita como la reescribe `text` (`SAVE_RULE`, `protocol.rs:28`), y MUST aparecer una vez en `protocol.lean.md`; la otra regla del idioma, la de la respuesta, va sólo en las instrucciones del servidor. `opening(lean(l))` MUST ser vacío para `None`, `Some(En)` y `Some(Es)`: la apertura la ponen en cada pedido las instrucciones del servidor, `opening(text(l))` ([D11](../../changes/archive/2026-11-20-contract-diet/design.md#d11-después-de-la-campaña-lean-sin-la-apertura)).
+
+El texto MUST cumplir, en las dos lenguas:
+
+- los mismos encabezados `## ` que `text(language)`, en el mismo orden;
+- la viñeta de `topic_key` de `text(language)` entera, y las secciones «Session summary» y «After a compaction» (en español, «Resumen de sesión» y «Después de una compactación») iguales a las de `text(language)`;
+- junto con las instrucciones del servidor, los mismos nombres que `text(language)` y los mismos marcadores de texto plano (`ACTIVE CONFLICTS`, `LAST SESSION`, `supersedes`, `conflicts`, `inferred`, `imported`, `conclusion`, `merge`, `apart`);
+- como mucho el 70 % de los bytes de `text(language)`.
+
+`protocol.md` y `protocol.es.md` MUST NOT cambiar: `text` y `short` devuelven lo mismo que antes.
+
+#### Escenario: sin la apertura
+- GIVEN cualquier preferencia de idioma, o ninguna
+- WHEN se arma `lean`
+- THEN `opening(lean)` es vacío, y la apertura es la que las instrucciones del servidor mandan en `initialize`
+
+#### Escenario: lo que queda entero
+- GIVEN la preferencia `es`
+- WHEN se arma `lean`
+- THEN contiene la viñeta de `topic_key` de `protocol.es.md`, `## Resumen de sesión` con `Objetivo:` … `Validación:` y `## Después de una compactación`, tal como están en `full`
+
+#### Escenario: inglés por preferencia
+- GIVEN la preferencia `en`
+- WHEN se arma `lean`
+- THEN dice «still in Spanish, search again with the query in Spanish.» en «How to write a save», y no dice «Save memories and search in English:»
+- AND las instrucciones del servidor dicen «Save memories and search in English:» y «Reply to the user in English unless»
+
+**Tests:** `the_lean_protocol_keeps_the_title_and_leaves_the_opening_to_the_servers_instructions`, `the_lean_protocol_keeps_the_topic_key_rule_and_the_session_summary`, `the_lean_protocol_and_the_servers_instructions_name_what_the_full_one_names`, `a_language_rewrites_the_save_rule_of_the_lean_protocol_and_the_server_says_the_other` y `the_lean_protocol_is_at_most_seventy_percent_of_the_full_one` (`protocol.rs`); las pruebas del protocolo de `server.rs` con `lean` (CD2).
+
+## CD3. El bloque `lean` y su sello
+
+`block` MUST armar, para `Variant::Lean`, `protocol::lean(language)` entre los marcadores, después del sello. `Variant::ALL` MUST ser `full`, `short`, `lean`, `off`, y `Variant::parse("lean")` MUST dar `Lean`. `setup claude-code --protocol lean` MUST escribir el bloque `lean` con `protocol=lean` en el sello; sin la opción, sobre un bloque con `protocol=lean`, MUST conservarlo (PB6). `freshness` MUST dar `current` a un bloque `lean` con su sello, en su idioma, y `stale` en el otro idioma. El error de uso de un `--protocol` desconocido MUST nombrar las cuatro variantes. El reporte MUST decir `(protocol=lean)`.
+
+#### Escenario: elegir `lean` y conservarlo
+- GIVEN un `CLAUDE.md` con el bloque `full` de antes del sello
+- WHEN corre `clawg setup claude-code --protocol lean --profile dev`
+- THEN el bloque es el de `lean` con `<!-- clawg X.Y.Z protocol=lean -->`, y el texto fuera de los marcadores no cambió
+- AND una segunda corrida sin `--protocol` no escribe nada
+- AND `clawg doctor --profile dev` da `protocol_block` `ok` `healthy`
+
+**Tests:** `each_variant_is_its_block`, `the_protocol_option_writes_its_variant_and_a_run_without_it_keeps_it` y `a_new_version_with_the_same_text_rewrites_nothing` (`setup.rs`); `a_variant_is_named_by_its_option` (`protocol.rs`); `the_protocol_option_parses_and_excludes_local_remove_and_cursor` (`cli.rs`); `doctor_marks_an_old_block_stale_without_a_preference` (`tests/binary.rs`).
+
+## CD4. Un sello con una variante desconocida
+
+Un sello cuya variante este binario no conoce (la `lean` leída por un binario anterior, o una variante posterior leída por este) MUST leerse como un sello ilegible (PB1): `Stamp::parse` da `None`, la línea cuenta como parte del cuerpo, y `freshness` MUST dar `stale`, no `newer`, aunque la versión del sello sea posterior a la propia, porque esa versión no se llega a leer. `setup` sin `--protocol` sobre ese bloque escribe la variante por defecto. El chequeo `doctor` de la frescura está en [`specs/doctor`](../doctor/spec.md) (PB2).
+
+#### Escenario
+- GIVEN un bloque con el sello `<!-- clawg 0.99.0 protocol=leaner -->` y la versión propia `0.88.0`
+- WHEN se clasifica
+- THEN es `stale`
+- AND su sello se lee como ausente
+
+**Tests:** `a_stamp_with_an_unknown_variant_reads_as_stale` (`setup.rs`).
+
+## CD7. `lean` es el valor por defecto
+
+`setup claude-code` sin `--protocol` MUST escribir `lean` sin `protocol=` en el sello cuando el bloque instalado no trae `protocol=`, y MUST mantener la variante elegida cuando lo trae (PB6). Un bloque `full` sin `protocol=` MUST leerse `stale` cuando su sello no tiene una versión posterior a la propia (también sin sello o con uno que no se lee), y `newer` cuando la tiene, como dice PB2 de [`specs/doctor`](../doctor/spec.md); en los dos casos `setup` sin la opción MUST reescribirlo como `lean`, porque el bloque difiere del planeado (R4). `--protocol full` MUST seguir eligiendo el entero. Este requisito reemplaza la frase de PB6 que fijaba `full` como la variante por defecto.
+
+#### Escenario: una máquina con el bloque entero de antes
+- GIVEN un `CLAUDE.md` con el bloque `full` sin `protocol=`
+- WHEN corre `clawg setup claude-code --profile dev` sin `--protocol`
+- THEN el bloque es el de `lean`, sin `protocol=` en el sello, y el texto fuera de los marcadores no cambió
+- AND el reporte dice `(protocol=lean)`
+
+**Tests:** `the_protocol_option_writes_its_variant_and_a_run_without_it_keeps_it`, `a_stamp_with_an_unknown_variant_reads_as_stale`, `each_variant_is_its_block`, `a_block_is_current_stale_or_newer` y `the_block_follows_the_preferred_language` (`setup.rs`); `session_start_says_when_the_block_is_stale` (`hook.rs`).
 
 ## CU1. `clawg setup cursor`
 

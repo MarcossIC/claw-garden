@@ -39,5 +39,5 @@ La clase (a) ya está hecha ([exploración](exploration.md#hecho-la-clase-a)); e
 
 ## Después de este cambio
 
-- [ ] **La campaña**, paga, después de publicar y con la versión instalada: `a3-lean` contra `a3` en R, D y la K larga, 3 corridas por celda, con la regla de [design](design.md#la-regla-de-decisión). Pendiente en [verify](verify.md#pendiente-la-campaña).
-- [ ] **El valor por defecto:** si la regla elige `lean`, un commit propio cambia `DEFAULT_VARIANT`; si no, queda `full`.
+- [x] **La campaña**, paga, corrida el 2026-11-20: `a3-lean` contra `a3` en R, D y la K larga, 3 corridas por celda, con la regla de [design](design.md#la-regla-de-decisión). `lean` no pasó (T −9,2 %); `lean` sin la apertura (D11) pasó (T −19,3 %). Resultados en [verify](verify.md#la-campaña).
+- [x] **El valor por defecto:** la regla de D11 eligió `lean` sin la apertura, y `DEFAULT_VARIANT` pasó a `Lean` en su propio commit (`49b6a418`, CD7). Ver [verify](verify.md#d11-lean-sin-la-apertura).
