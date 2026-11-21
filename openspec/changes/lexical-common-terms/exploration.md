@@ -107,7 +107,7 @@ En `lexical` y `lexical_related` (30 casos cada una) la fila esperada ya estaba 
 | `rag-eval --real --diff` sobre `golden.json` (46) | **ningún caso se mueve** en R@1, R@5 ni R@10 (el canal léxico no se ve ahí; si se mueve alguno hay que explicarlo antes de seguir) |
 | `rag-eval --real --diff` sobre `golden-expanded.json` (154) y sobre el expandido de cruce | peor ≤ mejor y peor ≤ 2 en cada métrica; `lexical_related` `all_hit_rate` no baja de 0,70 |
 | Pares de idioma de `--diff` (`es>es`, `en>en`, `es>en`, `en>es`) | **ninguna fila de par pierde un caso**; `es>en` es la que más se mira (`config.yaml:21-24`) |
-| `--lexical-only --diff` sobre el expandido | mejoran al menos 6, empeoran a lo sumo 1 |
+| `--lexical-only --diff` sobre el expandido | por la ruta de recall, mejoran al menos 6 y empeoran a lo sumo 1; por la de costo (la puerta 0 pasó sólo por costo), ninguno empeora, aunque ninguno mejore |
 | `--agent-view` | `search_memory` no baja de 36/46 ni sube sus tokens medios (761,4, `config.yaml:28-30`) |
 | Costo | el tiempo del brazo `lexical` (`record_arm`, `search.rs:1269`) sobre una copia de un store real (`--background`) no sube, y baja si la puerta 0 pasó por costo |
 
