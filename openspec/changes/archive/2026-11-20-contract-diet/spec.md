@@ -1,6 +1,6 @@
 # contract-diet — Especificación (el bloque `lean`)
 
-Suma una cuarta variante del bloque del protocolo, `lean`, que `clawg setup claude-code --protocol lean` escribe con su sello, y el brazo del arnés que la mide contra `full`. `full` sigue siendo el valor por defecto y su texto no cambia. Las instrucciones del servidor, las descripciones de las herramientas, el daemon, los hooks y los datos guardados no cambian (CD6).
+Suma una cuarta variante del bloque del protocolo, `lean`, que `clawg setup claude-code --protocol lean` escribe con su sello, y el brazo del arnés que la mide contra `full`. `lean` es el valor por defecto (CD7, agregado después de D11), y `full` sigue elegible con `--protocol full` sin que su texto cambie. Las instrucciones del servidor, las descripciones de las herramientas, el daemon, los hooks y los datos guardados no cambian (CD6).
 
 ## Definiciones
 
