@@ -256,7 +256,7 @@ Un sello cuya variante este binario no conoce (la `lean` leída por un binario a
 
 ## CD7. `lean` es el valor por defecto
 
-`setup claude-code` sin `--protocol` MUST escribir `lean` sin `protocol=` en el sello cuando el bloque instalado no trae `protocol=`, y MUST mantener la variante elegida cuando lo trae (PB6). Un bloque `full` sin `protocol=` MUST leerse `stale`, y `setup` sin la opción MUST reescribirlo como `lean`. `--protocol full` MUST seguir eligiendo el entero. Este requisito reemplaza la frase de PB6 que fijaba `full` como la variante por defecto.
+`setup claude-code` sin `--protocol` MUST escribir `lean` sin `protocol=` en el sello cuando el bloque instalado no trae `protocol=`, y MUST mantener la variante elegida cuando lo trae (PB6). Un bloque `full` sin `protocol=` MUST leerse `stale` cuando su sello no tiene una versión posterior a la propia (también sin sello o con uno que no se lee), y `newer` cuando la tiene, como dice PB2 de [`specs/doctor`](../doctor/spec.md); en los dos casos `setup` sin la opción MUST reescribirlo como `lean`, porque el bloque difiere del planeado (R4). `--protocol full` MUST seguir eligiendo el entero. Este requisito reemplaza la frase de PB6 que fijaba `full` como la variante por defecto.
 
 #### Escenario: una máquina con el bloque entero de antes
 - GIVEN un `CLAUDE.md` con el bloque `full` sin `protocol=`

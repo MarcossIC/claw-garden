@@ -148,4 +148,4 @@ Lo que muestran los datos y no decide:
 
 Local, con la versión instalada.
 
-- **El bloque de una máquina real.** Con 0.92.0 instalada, en una máquina con el bloque entero de antes de `lean`: `clawg setup claude-code --profile prod --dry-run`, sin `--protocol`, tiene que decir `would update it (protocol=lean)` sobre ese bloque (con la preferencia `es`, `se actualizaría (protocol=lean)`). Después de correrlo sin `--dry-run`, `clawg doctor --profile prod` tiene que dar `protocol_block` `ok` `healthy`, y la primera sesión no trae el aviso del bloque.
+- **El bloque de una máquina real.** Con 0.92.0 instalada, en una máquina con el bloque entero de antes de `lean` y sin elección (su sello no trae `protocol=`): `clawg setup claude-code --profile prod --dry-run`, sin `--protocol`, tiene que decir `would update it (protocol=lean)` sobre ese bloque (con la preferencia `es`, `se actualizaría (protocol=lean)`). Después de correrlo sin `--dry-run`, `clawg doctor --profile prod` tiene que dar `protocol_block` `ok` `healthy`, y la primera sesión no trae el aviso del bloque.
