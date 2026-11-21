@@ -4,16 +4,16 @@ Verifica la clase (b), enfoque B1: la variante `lean`, su sello y el brazo `a3-l
 
 ## Qué se revisó
 
-- Los commits de la serie sobre `develop`: la propuesta (`docs(openspec): propose the lean protocol block for contract-diet`), `feat(mcp): write a lean protocol that keeps the opening and every rule`, `feat(setup): choose the lean protocol block with --protocol lean` y `feat(agent-eval): add the a3-lean arm with the lean protocol block`.
+- Los commits de la serie sobre `develop`: la propuesta (`docs(openspec): propose the lean protocol block for contract-diet`), `feat(mcp): write a lean protocol that keeps the opening and every rule`, `feat(setup): choose the lean protocol block with --protocol lean` y `feat(agent-eval): add the a3-lean arm with the lean protocol block`; después de D11, `fd32de60` (`lean` sin la apertura) y `49b6a418` (`lean` por defecto).
 - CI de Linux y Windows (`test (ubuntu-latest)` y `test (windows-latest)`, run 44716906999 del pull request a `main`): pasó sobre `a04e7001`, que lleva todo el código del cambio; los tres commits de después son docs de otras exploraciones.
 - Sobre el último, con `cargo clean --workspace` antes, en Linux con el embedder falso: `cargo test --locked --workspace`, `cargo clippy --locked --workspace --all-targets -- -D warnings` y `cargo clippy --locked -p clawg-cli -- -D warnings`. La suite pasa y los dos clippy no dan ningún hallazgo.
-- `git diff develop` no toca `protocol.md`, `protocol.es.md`, `agent_contract.json`, `agent_contract.es.json`, `crates/clawg-cli/src/daemon/`, `crates/clawg-cli/src/hook.rs` ni `crates/clawg-cli/src/doctor/` (CD6). `the_agent_contract_matches_its_file` y `the_spanish_agent_contract_matches_its_file` pasan sin `CLAWG_BLESS=1`.
+- `git diff develop` no toca `protocol.md`, `protocol.es.md`, `agent_contract.json`, `agent_contract.es.json`, `crates/clawg-cli/src/daemon/`, `crates/clawg-cli/src/hook.rs` ni `crates/clawg-cli/src/doctor/` (CD6); eso vale para la serie de antes de D11, y de los dos commits de después sólo `49b6a418` toca `hook.rs`, en un test que pasa a armar el bloque por defecto con `lean`. `the_agent_contract_matches_its_file` y `the_spanish_agent_contract_matches_its_file` pasan sin `CLAWG_BLESS=1`.
 
 ## Requisitos
 
 | Requisito | Tests | Estado |
 |---|---|---|
-| CD1, el texto de `lean` | `the_lean_protocol_keeps_the_head_of_the_full_one`, `the_lean_protocol_keeps_the_topic_key_rule_and_the_session_summary`, `the_lean_protocol_names_what_the_full_one_names`, `a_language_rewrites_both_rules_of_the_lean_protocol`, `the_lean_protocol_is_at_most_seventy_percent_of_the_full_one` (`protocol.rs`) | cumple. Con `lean` devolviendo el texto de `full`, el de tamaño fallaba por la aserción; los de igualdad son guardas contra la deriva de los dos textos |
+| CD1, el texto de `lean` | `the_lean_protocol_keeps_the_title_and_leaves_the_opening_to_the_servers_instructions`, `the_lean_protocol_keeps_the_topic_key_rule_and_the_session_summary`, `the_lean_protocol_and_the_servers_instructions_name_what_the_full_one_names`, `a_language_rewrites_the_save_rule_of_the_lean_protocol_and_the_server_says_the_other`, `the_lean_protocol_is_at_most_seventy_percent_of_the_full_one` (`protocol.rs`), con los nombres que tienen desde D11 (`fd32de60`) | cumple. Con `lean` devolviendo el texto de `full`, el de tamaño fallaba por la aserción; los de igualdad son guardas contra la deriva de los dos textos |
 | CD2, las pruebas del protocolo valen para `lean` | `every_protocol` con `lean` en `the_protocol_names_only_what_exists`; `the_protocol_says_where_a_key_is_shown`, `the_protocol_describes_the_session_summary`, `the_spanish_protocol_describes_the_session_summary` (`server.rs`); `the_spanish_protocol_has_the_sections_and_spans_of_the_english_one`, `the_protocol_says_which_preferences_open_every_session`, `the_protocol_says_where_a_call_without_a_project_goes` (`protocol.rs`) | cumple |
 | CD3, el bloque y su sello | `each_variant_is_its_block`, `the_protocol_option_writes_its_variant_and_a_run_without_it_keeps_it`, `a_new_version_with_the_same_text_rewrites_nothing`, `a_stamp_reads_its_version_and_its_choice` (`setup.rs`); `a_variant_is_named_by_its_option` (`protocol.rs`); `the_protocol_option_parses_and_excludes_local_remove_and_cursor` (`cli.rs`), que fallaba por el mensaje; `doctor_marks_an_old_block_stale_without_a_preference` (`tests/binary.rs`), con `--protocol lean` | cumple |
 | CD4, un sello con una variante desconocida | `a_stamp_with_an_unknown_variant_reads_as_stale` (`setup.rs`) | cumple, sin código nuevo: `Stamp::parse` ya daba `None` (`setup.rs:665`, el `?` sobre `Variant::parse`), así que un binario anterior lee `protocol=lean` como un sello ilegible, el bloque como `stale` y no `newer`, y su `setup` sin `--protocol` escribe `full` |
@@ -22,7 +22,7 @@ Verifica la clase (b), enfoque B1: la variante `lean`, su sello y el brazo `a3-l
 
 ## El tamaño
 
-Medido sobre los archivos, sin la línea del sello (unos 40 caracteres más en los dos bloques):
+Medido antes de D11, sobre `lean` con la apertura, y sobre los archivos, sin la línea del sello (unos 40 caracteres más en los dos bloques). Es historia: el `lean` que se aplicó no lleva la apertura, y su bloque pesa 5.144 bytes en inglés ([D11](#d11-lean-sin-la-apertura)).
 
 | | `full` | `lean` | Diferencia | `lean` / `full` |
 |---|---|---|---|---|
@@ -55,9 +55,9 @@ Cada regla del bloque `full` sigue en `lean` o en un texto que el agente lee: la
 
 ## Lo que se miró con cuidado
 
-- **La apertura es la de `full`**, por idioma y con la preferencia `en`: el test compara las cabezas y `opening`, así que las instrucciones del servidor, que salen de `text` (`server.rs:2081`), no pueden cambiar por `lean`.
-- **La regla del idioma con la preferencia `en`.** `text` reescribía `PROTOCOL` directamente; ahora la reescritura (`in_language`) toma el texto, y `lean` la aplica sobre su propio texto. `a_language_rewrites_both_rules_of_the_english_protocol` sigue igual, y `the_language_rules_occur_once_in_the_protocol` vale para `full`; para `lean`, `a_language_rewrites_both_rules_of_the_lean_protocol` exige `SAVE_RULE` una vez en `protocol.lean.md`.
-- **Finales de línea.** `lean` pasa los dos archivos a `\n`, como `short`; `the_lean_protocol_keeps_the_head_of_the_full_one` lo exige, y `freshness` compara sin mirarlos.
+- **`lean` no lleva la apertura**, en ningún idioma ni con la preferencia `en`: `the_lean_protocol_keeps_the_title_and_leaves_the_opening_to_the_servers_instructions` exige que su primera línea sea el título de `full`, que `opening(lean)` sea vacío y que el de `full` no lo sea, porque la apertura la mandan las instrucciones del servidor, que salen de `text` (`server.rs:2081`) y no cambian por `lean`. Antes de D11 la cabeza de `lean` era la de `full`, y el test comparaba las cabezas.
+- **La regla del idioma con la preferencia `en`.** `text` reescribía `PROTOCOL` directamente; ahora la reescritura (`in_language`) toma el texto, y `lean` la aplica sobre su propio texto. `a_language_rewrites_both_rules_of_the_english_protocol` sigue igual, y `the_language_rules_occur_once_in_the_protocol` vale para `full`; para `lean`, `a_language_rewrites_the_save_rule_of_the_lean_protocol_and_the_server_says_the_other` exige `SAVE_RULE` una vez en `protocol.lean.md`, su reescritura en el bloque, y las dos reglas en inglés en las instrucciones del servidor.
+- **Finales de línea.** `lean` pasa los dos archivos a `\n`, como `short`; `the_lean_protocol_keeps_the_title_and_leaves_the_opening_to_the_servers_instructions` lo exige, y `freshness` compara sin mirarlos.
 - **La sección de tipos nombra los siete tipos** aunque el `enum` ya los liste: `the_protocol_names_only_what_exists` pide que cada protocolo nombre cada herramienta y cada tipo, y la exploración contaba la lista entre lo que se podía sacar. Quedan como nombres, sin su definición.
 
 ## La campaña
@@ -98,7 +98,7 @@ Las métricas se contaron como en la campaña de protocol-block, y el mismo cál
 | T, mediana por sesión de los tokens de entrada | 207.796 | 188.734 | < 207.796 | cumple |
 | T contra el umbral de D5 | | 188.734 | ≤ 187.016 | **no cumple** |
 
-**`lean` no pasa.** El ahorro de T es del 9,2 %, contra el 10 % que pide D5 y el 10,7 % que estimaba la [propuesta](proposal.md). **El valor por defecto queda `full`**, y `lean` sigue elegible con `--protocol lean`.
+**`lean` no pasa.** El ahorro de T es del 9,2 %, contra el 10 % que pide D5 y el 10,7 % que estimaba la [propuesta](proposal.md). **Con esta campaña el valor por defecto quedaba `full`**, y `lean` elegible con `--protocol lean`; no es el resultado final: D11, abajo, pasó y dejó `lean` sin la apertura por defecto.
 
 Lo que muestran los datos y no decide:
 - `lean` no pierde ninguna conducta medida. Las seis condiciones de D6 se cumplen con margen o empatadas, y los dos brazos fallan la misma celda una vez.
