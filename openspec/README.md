@@ -12,6 +12,7 @@ exploration -> proposal -> spec (+ design si hace falta) -> tasks -> apply -> ve
 
 - **`exploration.md`**: el punto de partida. Tiene el problema verificado contra el código (con `ruta:línea`), los enfoques posibles y las decisiones abiertas.
 - **`proposal.md` / `spec.md` / `design.md` / `tasks.md`**: se escriben cuando le toca al cambio. El detalle es proporcional al cambio: un fix chico es una propuesta de una página más las tareas.
+- **`plan.md`**: un cambio puede llevar este único documento en lugar de la propuesta, la spec, el diseño y las tareas. En ese caso la spec del área se edita en el mismo cambio, sin una copia en su carpeta. Cuándo corresponde y qué secciones lleva está en `.claude/skills/change-workflow/SKILL.md`.
 - **`state.yaml`**: en qué fase está el cambio.
 - **Archivo**: cuando un cambio se cierra, pasa a `changes/archive/AAAA-MM-DD-<nombre>/`. Sus requisitos se consolidan en `specs/<dominio>/spec.md`, la fuente de verdad del comportamiento actual.
 - **Versión**: al archivar un cambio se sube el minor de `[workspace.package] version` en el `Cargo.toml` raíz (los crates la heredan), se corre `cargo update --workspace` para llevarla a `Cargo.lock` y se commitean los dos juntos como `chore: bump version to X.Y.Z`. Un fix suelto, fuera de openspec, sube el patch.
