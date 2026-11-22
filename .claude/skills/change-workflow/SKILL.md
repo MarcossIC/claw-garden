@@ -13,13 +13,13 @@ description: "Proportion. Use when starting, planning, implementing, reviewing o
 | Large | It touches stored data (schema, stored identifiers, statuses, the embedding contract), ranking or retrieval, or the pinned MCP contract; or more than one approach is reasonable; or where the change lives is not yet known | `plan.md` with its conditional sections | two reviewers |
 | Medium | Everything else | `plan.md` | one reviewer |
 
-A change folder that already holds a `proposal.md`, `spec.md` and `tasks.md` is implemented and reviewed from them as they are; nothing is rewritten into a plan.
+**Queue.** A change waits as an `exploration.md` and a `state.yaml` in its folder, in the order `openspec/ROADMAP.md` gives. When it is taken, its plan is written from the exploration, in the same folder. A change folder that already holds a `proposal.md`, `spec.md` and `tasks.md` is implemented and reviewed from them as they are; nothing is rewritten into a plan.
 
 **Done first.** Before any code, say what done is as checks a machine can run. One criterion states one thing: a criterion with "and" in it is two criteria. Each names the test or the command that proves it. Say also what must not change: nothing outside the named files or modules, and no existing test weakened or removed.
 
 **Small.** State done and the command that proves it. Write the failing test and run it to see it fail, then the code, then the tests of the files touched. Commit. There is no change folder, and the version takes a patch bump.
 
-**Plan.** A medium or large change has one document, `openspec/changes/<name>/plan.md`, written after reading the code it will touch: every claim about current behavior cites `path:line`. It follows in one file the rules `openspec/config.yaml` gives for proposals, specs, designs and tasks. Sections marked "sólo si" are left out when they do not apply. `state.yaml` records the phase as `plan`, `apply` or `verify`. Implementation starts once the plan is approved, and that approval is the only stop.
+**Plan.** A medium or large change has one document, `openspec/changes/<name>/plan.md`, written after reading the code it will touch: every claim about current behavior cites `path:line`. It follows the `plan` rules of `openspec/config.yaml`. Sections marked "sólo si" are left out when they do not apply. `state.yaml` records the phase as `plan`, `apply` or `verify`. Implementation starts once the plan is approved, and that approval is the only stop.
 
 ```markdown
 # <nombre> — Plan
