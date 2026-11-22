@@ -14,6 +14,7 @@ It holds only what every session needs: the rules, and where to look for the res
 | The suite, `testing` builds, CI and release workflows, eval tools (`rag-eval`, `revision-eval`, `load-eval`, `perf-bench`, `agent-eval`) and the daemon bench | `docs/reference/testing.md` |
 | Versioning, publishing and release keys | `docs/reference/release.md` |
 | Design documents | `docs/` |
+| How a change is sized, planned, implemented and reviewed | `.claude/skills/change-workflow/SKILL.md` |
 
 ## Workspace
 
