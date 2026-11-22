@@ -16,7 +16,8 @@ Answer in this order.
 2. **Scope.** Everything the diff changes that the plan does not ask for.
 3. **Tests.** Any test weakened, removed or ignored, and any new test that asserts nothing about the new behavior.
 4. **Repository rules.** Any rule of `.claude/CLAUDE.md` or of `openspec/config.yaml` the change breaks: stored data that could be lost or hidden, a missing test that seeds the previous version, a reference to a plan or a change in code, comments or test names.
-5. **Merge.** Last, setting the list aside: would you merge this as it is? If not, the one reason that matters most.
+5. **Left in view.** A defect in code the change touches or relies on, even when it is older than the change. Report it apart, marked as older than the change.
+6. **Merge.** Last, setting the list aside: would you merge this as it is? If not, the one reason that matters most.
 
 Do not comment on style, naming or structure that no written rule covers.
 
