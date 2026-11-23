@@ -1,0 +1,1 @@
+clawg: this session saved memories but no session summary yet. Before you finish, save one with `save_memory`, memory_type `session_summary` and its project as in any save, with these sections: Goal, Instructions, Discoveries, Accomplished, Next steps, Relevant files, Validation. Then end your turn. clawg asks this once per session.
