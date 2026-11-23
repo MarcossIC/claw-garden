@@ -336,6 +336,8 @@ Sin reglas, MUST NOT haber hallazgo `tool_rules`.
 
 Cuando el `settings.json` del usuario, o el `.claude/settings.local.json` de la carpeta actual, tiene el hook de `session-start` de este perfil y le faltan el de `PostToolUse` o el de `PostToolUseFailure` en un grupo que corre después de una llamada a Bash (sin matcher, con uno vacío o `*`, o con `Bash` entre sus alternativas, que en una lista de nombres se separan por `|` o `,` con espacios opcionales, como `Edit| Bash`; uno bajo otro matcher cuenta como faltante, como en R3 de [`specs/setup`](../setup/spec.md)), MUST sumar un hallazgo `tool_hooks` de severidad `info`, `reason_code` `not_installed`, con `clawg setup claude-code` (o con `--local`, para el archivo de la carpeta) como `safe_next_step`. Sin el hook de `session-start`, no hay hallazgo, porque ese perfil no corre clawg.
 
+Cuando uno de esos archivos tiene el hook de `session-start` de este perfil y le falta el de `Stop`, MUST sumar un hallazgo `stop_hook` de severidad `info`, `reason_code` `not_installed`, con el mismo `safe_next_step` que `tool_hooks` y `evidence` con `path` (`stop_hook`, `crates/clawg-cli/src/doctor/checks.rs`; `missing_stop_hook`, `crates/clawg-cli/src/setup.rs`): sin ese hook clawg no pide el resumen de la sesión ([`specs/hooks`](../hooks/spec.md), SS1). `tool_hooks` no nombra `Stop`. **Tests:** `a_settings_without_the_stop_hook_is_named`.
+
 Ninguno de los dos hallazgos cambia el código de salida, y `doctor` MUST NOT escribir el libro.
 
 #### Escenario: el `CLAUDE.md` que pide `eza`

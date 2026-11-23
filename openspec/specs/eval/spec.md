@@ -1966,7 +1966,7 @@ El brazo que mide `a3` sin los dos hooks de Bash que aprenden los programas ause
 
 ### RE9. El brazo `a3-notools`
 
-`agent-eval` MUST tener el brazo `a3-notools`: `a3` sin los grupos de `PostToolUse` y `PostToolUseFailure` de clawg (RE7), y todo lo demás igual a `a3`: el servidor, los otros tres hooks, el bloque del protocolo y la siembra. Los brazos con hooks toman los de `setup::plan` (`crates/clawg-eval/src/bin/agent-eval/arm.rs`), así que `a3` corre con los dos hooks de Bash desde RE7, y el `a3` que se midió antes de RE7 es `a3-notools`. La corrida en seco no corre los hooks del cliente, así que lo que el hook entrega lo prueban RE3 y RE6 contra el binario, no el arnés.
+`agent-eval` MUST tener el brazo `a3-notools`: `a3` sin los grupos de `PostToolUse` y `PostToolUseFailure` de clawg (RE7), y todo lo demás igual a `a3`: el servidor, los otros hooks (desde summary-on-stop, también `Stop`, que una sesión que guarda sigue un turno más para su resumen), el bloque del protocolo y la siembra. Los brazos con hooks toman los de `setup::plan` (`crates/clawg-eval/src/bin/agent-eval/arm.rs`), así que `a3` corre con los dos hooks de Bash desde RE7, y el `a3` que se midió antes de RE7 es `a3-notools`. La corrida en seco no corre los hooks del cliente, así que lo que el hook entrega lo prueban RE3 y RE6 contra el binario, no el arnés.
 
 ##### Escenario
 - GIVEN el plan de `a3` y el de `a3-notools` para una misma tarea

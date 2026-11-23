@@ -310,7 +310,7 @@ Una fila cuya `last_seen_at_ms` tiene más de `HOURS_KEPT_MS` (400 días) MUST b
 
 ## SU6. Las rutas del daemon
 
-Todas detrás del token, y todas contestan `204` sin cuerpo. Su lugar entre las rutas del daemon está en [`specs/daemon-access`](../daemon-access/spec.md), SU6.
+Todas detrás del token; contestan `204` sin cuerpo, salvo `POST /v1/sessions/summary`, que lee la fila abierta de una sesión y contesta `{"ask": bool}` ([`specs/hooks`](../hooks/spec.md), SS1). Su lugar entre las rutas del daemon está en [`specs/daemon-access`](../daemon-access/spec.md), SU6.
 
 - `POST /v1/sessions` MUST registrar la sesión vigente del agente y del proyecto, y además aceptar `event` (`start` o `prompt`), `source` y `client`, los tres opcionales. Es un evento de hook de esa sesión (SU2). Un `event` desconocido MUST contar como uno que no dice qué pasó.
 - `POST /v1/sessions/end` (`session_id`, `reason` opcional) MUST cerrar la fila abierta de ese id (SU3). No toma proyecto y no registra ninguno. Un `session_id` inválido es un 400, con la misma regla que `POST /v1/sessions`.
