@@ -53,10 +53,18 @@ pub struct DisputesQuery {
     /// it; absent, the whole store.
     #[serde(default)]
     pub project_id: Option<String>,
+    /// Lists the pairs waiting for the user, with the first line of each
+    /// side, instead of the pending ones.
+    #[serde(default)]
+    pub escalated: bool,
 }
 
 /// How many pending pairs `GET /v1/disputes` names.
 const OPEN_PAIRS_SHOWN: usize = 5;
+
+/// How many escalated pairs it names on request: each one is a question for
+/// the user, and ten with their texts stay near 10 KB.
+const ESCALATED_LISTED: usize = 10;
 
 
 /// The answer every verdict route gives a refused one.
@@ -100,14 +108,17 @@ pub(super) async fn judge_dispute(
         .map_err(resolve_error)
 }
 
-/// The pairs not judged yet, counted, with the oldest pending ones.
+/// The pairs not judged yet, counted, with the oldest pending ones, or the
+/// oldest escalated ones when asked.
 pub(super) async fn disputes(
     State(app): State<Arc<AppCtx>>,
     Query(q): Query<DisputesQuery>,
 ) -> ApiResult<Json<OpenPairs>> {
     let reader = named_reader(&app, q.agent_id.as_deref());
     let project_id = live_project(&app, q.project_id).await?;
-    open_pairs(&app.runtime.store, reader.as_ref(), project_id.as_deref(), Listed::Pending, OPEN_PAIRS_SHOWN)
+    let (listed, limit) =
+        if q.escalated { (Listed::Escalated, ESCALATED_LISTED) } else { (Listed::Pending, OPEN_PAIRS_SHOWN) };
+    open_pairs(&app.runtime.store, reader.as_ref(), project_id.as_deref(), listed, limit)
         .await
         .map(Json)
         .map_err(ApiError::internal)

@@ -2345,6 +2345,95 @@ async fn disputes_lists_the_pending_pairs_an_agent_reaches_in_a_project() {
     assert_eq!(hidden["pending"], 0, "{hidden}");
 }
 
+/// Saves one row per content for `agent-http`, in `project` when given, and
+/// returns their ids in order.
+async fn seed_rows(h: &Harness, contents: &[String], project: Option<&str>) -> Vec<i64> {
+    let mut ids = Vec::new();
+    for content in contents {
+        ids.push(save_id(h, json!({ "content": content, "agent_id": "agent-http", "project_id": project })).await);
+    }
+    ids
+}
+
+/// Leaves exactly these pairs in `memory_conflict`, as the detector would.
+async fn note_pairs(h: &Harness, pairs: Vec<(i64, i64, &'static str)>) {
+    h.ctx
+        .runtime
+        .store
+        .conn_for_test()
+        .call(move |c| -> rusqlite::Result<()> {
+            c.execute("DELETE FROM memory_conflict", [])?;
+            for (at, (new, old, state)) in pairs.into_iter().enumerate() {
+                c.execute(
+                    "INSERT INTO memory_conflict (new_id, old_id, distance, state, created_at) VALUES (?1, ?2, 0.3, ?3, ?4)",
+                    rusqlite::params![new, old, state, at as i64],
+                )?;
+            }
+            Ok(())
+        })
+        .await
+        .expect("note the pairs");
+}
+
+fn distinct_notes(n: usize) -> Vec<String> {
+    (0..n).map(|i| format!("Note {i}: the zone {i} runbook keeps step {i} first
+the rest of note {i}")).collect()
+}
+
+#[tokio::test]
+async fn disputes_list_ten_escalated_pairs_with_both_lines_on_request() {
+    let h = Harness::start().await;
+    let ids = seed_rows(&h, &distinct_notes(16), None).await;
+    let old = ids[0];
+    let mut pairs: Vec<(i64, i64, &'static str)> = ids[1..13].iter().map(|&new| (new, old, "escalated")).collect();
+    pairs.extend(ids[13..].iter().map(|&new| (new, old, "pending")));
+    note_pairs(&h, pairs).await;
+
+    let (status, body) = h.get_json("/v1/disputes?agent_id=agent-http&escalated=true").await;
+
+    assert_eq!(status, 200, "{body}");
+    assert_eq!((body["escalated"].as_i64(), body["pending"].as_i64()), (Some(12), Some(3)), "{body}");
+    let listed: Vec<i64> = body["pairs"].as_array().unwrap().iter().map(|p| p["new_id"].as_i64().unwrap()).collect();
+    assert_eq!(listed, ids[1..11].to_vec(), "the ten oldest escalated ones: {body}");
+    assert_eq!(body["pairs"][0]["new_line"], "Note 1: the zone 1 runbook keeps step 1 first", "{body}");
+    assert_eq!(body["pairs"][0]["old_line"], "Note 0: the zone 0 runbook keeps step 0 first", "{body}");
+}
+
+#[tokio::test]
+async fn disputes_without_the_flag_list_the_pending_pairs_as_before() {
+    let h = Harness::start().await;
+    let ids = seed_rows(&h, &distinct_notes(3), None).await;
+    note_pairs(&h, vec![(ids[1], ids[0], "escalated"), (ids[2], ids[0], "pending")]).await;
+
+    let (status, body) = h.get_json("/v1/disputes?agent_id=agent-http").await;
+
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body,
+        json!({ "pending": 1, "escalated": 1, "pairs": [
+            { "new_id": ids[2], "old_id": ids[0], "distance": 0.3, "created_at": 1,
+              "new_mark": "inferred", "old_mark": "inferred" }
+        ] })
+    );
+}
+
+#[tokio::test]
+async fn escalated_disputes_keep_the_reach_and_the_project() {
+    let h = Harness::start().await;
+    let here = seed_rows(&h, &distinct_notes(2), Some("p")).await;
+    let there = seed_rows(&h, &distinct_notes(2), Some("q")).await;
+    note_pairs(&h, vec![(here[1], here[0], "escalated"), (there[1], there[0], "escalated")]).await;
+
+    let (_, in_p) = h.get_json("/v1/disputes?agent_id=agent-other&escalated=true&project_id=p").await;
+    let listed: Vec<i64> = in_p["pairs"].as_array().unwrap().iter().map(|p| p["new_id"].as_i64().unwrap()).collect();
+    assert_eq!(listed, vec![here[1]], "only the project's: {in_p}");
+
+    write_policy(&h, HIDE_AUTHOR);
+    let (_, hidden) = h.get_json("/v1/disputes?agent_id=agent-other&escalated=true&project_id=p").await;
+    assert_eq!(hidden["pairs"], json!([]), "{hidden}");
+    assert_eq!(hidden["escalated"], 0, "{hidden}");
+}
+
 #[tokio::test]
 async fn resolve_rejects_the_same_row() {
     let h = Harness::start().await;
