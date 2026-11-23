@@ -385,7 +385,7 @@ async fn assemble(
     // cuts any of it: the cut stays pure, and a side whose hit it drops is
     // printed with its text instead of cited by an id that is not there.
     let conflicts = fetch_active_conflicts(store, reader, &shown).await.unwrap_or_else(|e| {
-        log::warn!("fetch_active_conflicts failed: {e}; CONFLICTS block omitted");
+        log::warn!("fetch_active_conflicts failed: {e}; the conflict block and the conflict marks are omitted");
         Vec::new()
     });
     // Every pair marks its printed sides, whether or not the block keeps it.
@@ -848,8 +848,9 @@ fn is_line_break(c: char) -> bool {
 }
 
 /// `[YYYY-MM-DD #id type] content`, with the origin of a preference the user
-/// did not state after the type, as ACTIVE CONFLICTS marks a side, and
-/// ` by <agent>` before the `]` when another agent saved it.
+/// did not state after the type, as ACTIVE CONFLICTS marks a side, the
+/// `conflict=` mark of a row in dispute, and ` by <agent>` before the `]`
+/// when another agent saved it.
 fn format_hit_line(hit: &RankedHit, reader: &str, mark: Option<&str>) -> String {
     let (y, m, d) = unix_millis_to_ymd(hit.created_at);
     let origin = hit.origin.map(|o| format!(" {o}")).unwrap_or_default();
@@ -1337,6 +1338,7 @@ async fn fetch_active_conflicts(
                  JOIN memory m_old
                    ON m_old.id IN (SELECT value FROM json_each(m_new.disputed_against))
                  WHERE m_new.status = 'disputed'
+                   AND json_valid(m_new.disputed_against)
                    AND m_new.deleted_at IS NULL
                    AND m_old.deleted_at IS NULL
                    AND (m_new.id IN (SELECT value FROM json_each(?1))
@@ -4101,6 +4103,22 @@ mod tests {
         assert!(conflicts.contains(&format!("NEW #{new}")), "{text}");
         assert!(text.contains(&format!("#{new} semantic_fact conflict=#{old}]")), "{text}");
         assert!(text.contains(&format!("#{old} semantic_fact conflict=#{new}]")), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_malformed_dispute_list_hides_no_other_pair() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let (old_id, new_id) = disputed_pair(&store, "agent-1", "semantic_fact", 8.0).await;
+        let (_, broken) = disputed_pair(&store, "agent-1", "semantic_fact", 8.0).await;
+        store
+            .conn
+            .call(move |c| c.execute("UPDATE memory SET disputed_against = 'not json' WHERE id = ?1", [broken]))
+            .await
+            .unwrap();
+
+        let others = other_sides(&store, &Reader::new("agent-1", Reach::Own), &[new_id, broken]).await.unwrap();
+
+        assert_eq!(others, HashMap::from([(new_id, vec![old_id])]));
     }
 
     #[tokio::test]
