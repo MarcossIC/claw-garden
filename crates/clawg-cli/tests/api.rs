@@ -5391,6 +5391,7 @@ async fn a_context_records_its_state_its_size_and_the_blocks_it_cut() {
     );
     assert_eq!(gauge_of(&h, "context.cut", &[("block", "recent"), ("state", "searched")]), None);
     assert_eq!(gauge_of(&h, "context.cut", &[("block", "long_term"), ("state", "searched")]), None);
+    assert_eq!(gauge_of(&h, "context.cut", &[("block", "long_term"), ("state", "recent")]), None);
 
     let run = h.ctx.runtime.metrics.run();
     let bytes = &run[&clawg_core::metrics::SeriesKey::new("context.prompt_bytes", &[])];
