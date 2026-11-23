@@ -15,7 +15,7 @@ use clawg_core::memory::language::{count_saves_in, count_saves_in_projects};
 use clawg_core::memory::merge::canonical;
 use clawg_core::memory::outbox::OutboxState;
 use clawg_core::memory::prompt_builder::{
-    build_memory_prompt, build_session_prompt, DEFAULT_BUDGET, MAX_BUDGET, PromptBlock, QueryTexts,
+    build_memory_prompt, build_session_prompt, DEFAULT_BUDGET, MAX_BUDGET, other_sides, PromptBlock, QueryTexts,
     Retrieval,
 };
 use clawg_core::memory::redact::SecretKind;
@@ -37,6 +37,7 @@ use clawg_core::metrics::{Recorder, Unit};
 use clawg_core::preferences::Lang;
 use clawg_core::runtime::{Accepted, AcceptError};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::oneshot;
 
@@ -980,6 +981,7 @@ pub(super) async fn search(
         hits = hits.into_iter().zip(shown_hits(&scored, ratio)).filter_map(|(h, shown)| shown.then_some(h)).collect();
     }
     app.runtime.access_tracker.record_hits(&hits);
+    mark_conflicts(&app, &caller, &mut hits).await;
 
     let withheld = found - hits.len();
     app.runtime.metrics.gauge("search.hits", &[], hits.len() as f64);
@@ -992,6 +994,20 @@ pub(super) async fn search(
         None => None,
     };
     Ok(Json(SearchBody { hits: hits.into_iter().map(Kinded::hit).collect(), withheld, other_language }))
+}
+
+/// Names on each hit the other sides of its escalated pairs, in one query
+/// over the hits returned. A failed lookup leaves the hits unmarked, as the
+/// context leaves out its conflict block: the search itself did not fail.
+async fn mark_conflicts(app: &AppCtx, reader: &Reader, hits: &mut [RankedHit]) {
+    let ids: Vec<i64> = hits.iter().map(|h| h.id).collect();
+    let mut others = other_sides(&app.runtime.store, reader, &ids).await.unwrap_or_else(|e| {
+        log::warn!("the conflicts of the hits did not read: {e}");
+        HashMap::new()
+    });
+    for hit in hits {
+        hit.conflicts_with = others.remove(&hit.id).unwrap_or_default();
+    }
 }
 
 /// The live projects a search reads: each of `project_ids` once, whatever

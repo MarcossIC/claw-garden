@@ -172,6 +172,11 @@ pub struct RankedHit {
     /// `None` for a stated preference and for every other row.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub origin: Option<&'static str>,
+    /// The other sides of each escalated pair the row is in, as the reader
+    /// reaches them; left out when it is in none, so an older bridge reads
+    /// the hit as before.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub conflicts_with: Vec<i64>,
 }
 
 /// Position `piece` (from 1) of a save stored as `pieces` rows.
@@ -580,6 +585,7 @@ async fn knn_one(
                     topic_key: r.topic_key,
                     project_id: r.project_id,
                     origin: r.origin,
+                    conflicts_with: Vec::new(),
                 })
                 .collect();
             // Sorted before the trim, not after: the widened window is cut
@@ -1147,6 +1153,7 @@ async fn score_lexical_candidates(
                 topic_key: r.topic_key,
                 project_id: r.project_id,
                 origin: r.origin,
+                conflicts_with: Vec::new(),
             });
         }
         Ok(hits)
@@ -1499,6 +1506,7 @@ mod tests {
             topic_key: None,
             project_id: None,
             origin: None,
+            conflicts_with: Vec::new(),
         };
         let h2 = RankedHit {
             id: 2,
@@ -1515,6 +1523,7 @@ mod tests {
             topic_key: None,
             project_id: None,
             origin: None,
+            conflicts_with: Vec::new(),
         };
         let mut hits = [h2, h1];
         hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
@@ -1542,6 +1551,7 @@ mod tests {
                 topic_key: None,
                 project_id: None,
                 origin: None,
+                conflicts_with: Vec::new(),
             }
         }
 
@@ -4726,6 +4736,7 @@ mod tests {
             topic_key: None,
             project_id: None,
             origin: None,
+            conflicts_with: Vec::new(),
         }
     }
 

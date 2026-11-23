@@ -1040,6 +1040,7 @@ async fn fetch_last_session(
                     project_id: row.get(8)?,
                     // A session summary, never a preference.
                     origin: None,
+                    conflicts_with: Vec::new(),
                 }));
             }
             Ok(None)
@@ -1133,6 +1134,7 @@ async fn fetch_recent_saves(
                     exact: false,
                     topic_key: row.get(7)?,
                     project_id: row.get(8)?,
+                    conflicts_with: Vec::new(),
                 })
             })?;
             rows.collect()
@@ -1520,6 +1522,7 @@ mod tests {
             topic_key: None,
             project_id: None,
             origin: None,
+            conflicts_with: Vec::new(),
         }
     }
 
@@ -2282,6 +2285,7 @@ mod tests {
             topic_key: None,
             project_id: None,
             origin: None,
+            conflicts_with: Vec::new(),
         };
 
         let hits = vec![make_hit(recent_ts), make_hit(recent_ts), make_hit(old_ts)];
@@ -2307,6 +2311,7 @@ mod tests {
             topic_key: None,
             project_id: None,
             origin: None,
+            conflicts_with: Vec::new(),
         };
         let now_ms: i64 = 1_700_000_000_000;
         let (recent, longterm) = bucket_by_recency(vec![hit], TimestampMs::from_unix_millis(now_ms));
@@ -2331,6 +2336,7 @@ mod tests {
             topic_key: None,
             project_id: None,
             origin: None,
+            conflicts_with: Vec::new(),
         };
         let now_ms: i64 = 1_700_000_000_000;
         let (recent, longterm) = bucket_by_recency(vec![hit], TimestampMs::from_unix_millis(now_ms));
@@ -2356,6 +2362,7 @@ mod tests {
             topic_key: None,
             project_id: None,
             origin: None,
+            conflicts_with: Vec::new(),
         };
         let (recent, longterm) = bucket_by_recency(vec![hit], TimestampMs::from_unix_millis(now_ms));
         assert_eq!(recent.len(), 1, "a future timestamp counts as recent rather than being clamped");
@@ -2738,10 +2745,10 @@ mod tests {
     async fn recent_longterm_split_by_7day_window() {
         let now_ms: i64 = 1_700_000_000_000;
         let recent = vec![
-            RankedHit { id: 1, content: "r".to_string(), memory_type: StoredType::read("chat_message"), tier: 2, status: StoredStatus::read("active"), score: 0.9, distance: 0.1, created_at: TimestampMs::from_unix_millis(now_ms - 86_400_000), agent_id: None, piece: None, exact: false, topic_key: None, project_id: None, origin: None },
+            RankedHit { id: 1, content: "r".to_string(), memory_type: StoredType::read("chat_message"), tier: 2, status: StoredStatus::read("active"), score: 0.9, distance: 0.1, created_at: TimestampMs::from_unix_millis(now_ms - 86_400_000), agent_id: None, piece: None, exact: false, topic_key: None, project_id: None, origin: None, conflicts_with: Vec::new() },
         ];
         let old = vec![
-            RankedHit { id: 2, content: "o".to_string(), memory_type: StoredType::read("chat_message"), tier: 2, status: StoredStatus::read("active"), score: 0.8, distance: 0.2, created_at: TimestampMs::from_unix_millis(now_ms - 8 * 86_400_000), agent_id: None, piece: None, exact: false, topic_key: None, project_id: None, origin: None },
+            RankedHit { id: 2, content: "o".to_string(), memory_type: StoredType::read("chat_message"), tier: 2, status: StoredStatus::read("active"), score: 0.8, distance: 0.2, created_at: TimestampMs::from_unix_millis(now_ms - 8 * 86_400_000), agent_id: None, piece: None, exact: false, topic_key: None, project_id: None, origin: None, conflicts_with: Vec::new() },
         ];
         let (r, l) = bucket_by_recency(recent.into_iter().chain(old).collect(), TimestampMs::from_unix_millis(now_ms));
         assert_eq!(r.len(), 1);
@@ -2752,8 +2759,8 @@ mod tests {
     async fn all_old_hits_go_to_longterm_only() {
         let now_ms: i64 = 1_700_000_000_000;
         let hits = vec![
-            RankedHit { id: 1, content: "a".to_string(), memory_type: StoredType::read("chat_message"), tier: 2, status: StoredStatus::read("active"), score: 0.9, distance: 0.1, created_at: TimestampMs::from_unix_millis(now_ms - 30 * 86_400_000), agent_id: None, piece: None, exact: false, topic_key: None, project_id: None, origin: None },
-            RankedHit { id: 2, content: "b".to_string(), memory_type: StoredType::read("chat_message"), tier: 2, status: StoredStatus::read("active"), score: 0.8, distance: 0.2, created_at: TimestampMs::from_unix_millis(now_ms - 20 * 86_400_000), agent_id: None, piece: None, exact: false, topic_key: None, project_id: None, origin: None },
+            RankedHit { id: 1, content: "a".to_string(), memory_type: StoredType::read("chat_message"), tier: 2, status: StoredStatus::read("active"), score: 0.9, distance: 0.1, created_at: TimestampMs::from_unix_millis(now_ms - 30 * 86_400_000), agent_id: None, piece: None, exact: false, topic_key: None, project_id: None, origin: None, conflicts_with: Vec::new() },
+            RankedHit { id: 2, content: "b".to_string(), memory_type: StoredType::read("chat_message"), tier: 2, status: StoredStatus::read("active"), score: 0.8, distance: 0.2, created_at: TimestampMs::from_unix_millis(now_ms - 20 * 86_400_000), agent_id: None, piece: None, exact: false, topic_key: None, project_id: None, origin: None, conflicts_with: Vec::new() },
         ];
         let (r, l) = bucket_by_recency(hits, TimestampMs::from_unix_millis(now_ms));
         assert_eq!(r.len(), 0);
@@ -2764,8 +2771,8 @@ mod tests {
     async fn all_recent_hits_go_to_recent_only() {
         let now_ms: i64 = 1_700_000_000_000;
         let hits = vec![
-            RankedHit { id: 1, content: "a".to_string(), memory_type: StoredType::read("chat_message"), tier: 2, status: StoredStatus::read("active"), score: 0.9, distance: 0.1, created_at: TimestampMs::from_unix_millis(now_ms - 86_400_000), agent_id: None, piece: None, exact: false, topic_key: None, project_id: None, origin: None },
-            RankedHit { id: 2, content: "b".to_string(), memory_type: StoredType::read("chat_message"), tier: 2, status: StoredStatus::read("active"), score: 0.8, distance: 0.2, created_at: TimestampMs::from_unix_millis(now_ms - 2 * 86_400_000), agent_id: None, piece: None, exact: false, topic_key: None, project_id: None, origin: None },
+            RankedHit { id: 1, content: "a".to_string(), memory_type: StoredType::read("chat_message"), tier: 2, status: StoredStatus::read("active"), score: 0.9, distance: 0.1, created_at: TimestampMs::from_unix_millis(now_ms - 86_400_000), agent_id: None, piece: None, exact: false, topic_key: None, project_id: None, origin: None, conflicts_with: Vec::new() },
+            RankedHit { id: 2, content: "b".to_string(), memory_type: StoredType::read("chat_message"), tier: 2, status: StoredStatus::read("active"), score: 0.8, distance: 0.2, created_at: TimestampMs::from_unix_millis(now_ms - 2 * 86_400_000), agent_id: None, piece: None, exact: false, topic_key: None, project_id: None, origin: None, conflicts_with: Vec::new() },
         ];
         let (r, l) = bucket_by_recency(hits, TimestampMs::from_unix_millis(now_ms));
         assert_eq!(r.len(), 2);

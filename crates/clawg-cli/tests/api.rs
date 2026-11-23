@@ -2434,6 +2434,71 @@ async fn escalated_disputes_keep_the_reach_and_the_project() {
     assert_eq!(hidden["escalated"], 0, "{hidden}");
 }
 
+/// The `conflicts_with` of each hit a search for the port returns, by id.
+async fn conflicts_by_hit(h: &Harness, agent: &str, limit: Option<usize>) -> Vec<(i64, Option<Value>)> {
+    let mut body = json!({ "query": "the API listens on port", "agent_id": agent });
+    if let Some(limit) = limit {
+        body["limit"] = json!(limit);
+    }
+    let (status, body) = h.post_json("/v1/search", body).await;
+    assert_eq!(status, 200, "{body}");
+    body["hits"]
+        .as_array()
+        .expect("hits")
+        .iter()
+        .map(|hit| (hit["id"].as_i64().unwrap(), hit.get("conflicts_with").cloned()))
+        .collect()
+}
+
+#[tokio::test]
+async fn a_search_names_the_other_side_on_both_hits_of_an_escalated_pair() {
+    let h = Harness::start().await;
+    let (old, new) = seed_dispute(&h).await;
+
+    let hits = conflicts_by_hit(&h, "agent-http", None).await;
+
+    assert!(hits.contains(&(new, Some(json!([old])))), "{hits:?}");
+    assert!(hits.contains(&(old, Some(json!([new])))), "{hits:?}");
+}
+
+#[tokio::test]
+async fn a_search_names_the_other_side_of_a_lone_hit() {
+    let h = Harness::start().await;
+    let (old, new) = seed_dispute(&h).await;
+
+    let hits = conflicts_by_hit(&h, "agent-http", Some(1)).await;
+
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    let (id, others) = &hits[0];
+    let other = if *id == new { old } else { new };
+    assert_eq!(others, &Some(json!([other])), "{hits:?}");
+}
+
+#[tokio::test]
+async fn a_search_names_no_pending_deleted_or_hidden_side() {
+    let h = Harness::start().await;
+    let (old, new) = seed_dispute(&h).await;
+    let release = format!("UPDATE memory SET status = 'active', disputed_against = NULL WHERE id = {new}");
+    h.ctx.runtime.store.conn_for_test().call(move |c| c.execute(&release, [])).await.expect("release");
+    note_pairs(&h, vec![(new, old, "pending")]).await;
+    assert!(conflicts_by_hit(&h, "agent-http", None).await.iter().all(|(_, c)| c.is_none()), "a pending pair");
+
+    let h = Harness::start().await;
+    let (old, _) = seed_dispute(&h).await;
+    let delete = format!("UPDATE memory SET deleted_at = 1 WHERE id = {old}");
+    h.ctx.runtime.store.conn_for_test().call(move |c| c.execute(&delete, [])).await.expect("delete");
+    assert!(conflicts_by_hit(&h, "agent-http", None).await.iter().all(|(_, c)| c.is_none()), "a deleted side");
+
+    let h = Harness::start().await;
+    let (_, new) = seed_dispute(&h).await;
+    let move_side = format!("UPDATE memory SET agent_id = 'agent-other' WHERE id = {new}");
+    h.ctx.runtime.store.conn_for_test().call(move |c| c.execute(&move_side, [])).await.expect("author");
+    write_policy(&h, HIDE_AUTHOR);
+    let hits = conflicts_by_hit(&h, "agent-other", None).await;
+    assert!(hits.iter().any(|(id, _)| *id == new), "the visible side is found: {hits:?}");
+    assert!(hits.iter().all(|(_, c)| c.is_none()), "a hidden side: {hits:?}");
+}
+
 #[tokio::test]
 async fn resolve_rejects_the_same_row() {
     let h = Harness::start().await;
