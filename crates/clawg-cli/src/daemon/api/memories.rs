@@ -394,7 +394,8 @@ pub struct ReplacedMemory {
 }
 
 /// An earlier `memory` row a save was found close to. `escalated` says the
-/// pair waits for the user in ACTIVE CONFLICTS; otherwise it waits for the
+/// pair waits for the user, marked `conflict=` where its rows are shown;
+/// otherwise it waits for the
 /// caller's own verdict.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct RelatedMemory {

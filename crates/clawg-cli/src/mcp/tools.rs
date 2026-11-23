@@ -276,8 +276,8 @@ pub fn format_resolution(lang: Lang, r: &Resolution) -> String {
     };
     let rows = format!("{}\n{}", line(&r.keep), line(&r.other));
     match (r.pair.as_deref(), lang) {
-        (Some("escalated"), Lang::En) => format!("{rows}\nthe pair waits for the user in ACTIVE CONFLICTS"),
-        (Some("escalated"), Lang::Es) => format!("{rows}\nel par espera a la persona en ACTIVE CONFLICTS"),
+        (Some("escalated"), Lang::En) => format!("{rows}\nthe pair waits for the user; list_memories with conflicts lists it"),
+        (Some("escalated"), Lang::Es) => format!("{rows}\nel par espera a la persona; list_memories con conflicts lo lista"),
         _ => rows,
     }
 }
@@ -288,8 +288,8 @@ pub fn format_open_pairs(lang: Lang, open: &OpenPairs) -> String {
     match (open.escalated, lang) {
         (0, Lang::En) => "conflict candidates: none open".to_string(),
         (0, Lang::Es) => "candidatos a conflicto: ninguno abierto".to_string(),
-        (n, Lang::En) => format!("conflict candidates: {n} waiting for the user in ACTIVE CONFLICTS"),
-        (n, Lang::Es) => format!("candidatos a conflicto: {n} esperando a la persona en ACTIVE CONFLICTS"),
+        (n, Lang::En) => format!("conflict candidates: {n} waiting for the user; list_memories with conflicts lists them"),
+        (n, Lang::Es) => format!("candidatos a conflicto: {n} esperando a la persona; list_memories con conflicts los lista"),
     }
 }
 
@@ -821,7 +821,7 @@ fn suggestion_reason(lang: Lang, reason: &str) -> String {
 
 /// One line per suggestion nobody answered that the project may be another
 /// one: `recall_context` and `session-start` show them until they are
-/// answered, as they show ACTIVE CONFLICTS.
+/// answered, as a context with a query shows ACTIVE CONFLICTS.
 pub(crate) fn suggestion_lines(lang: Lang, suggestions: &[ListedSuggestion]) -> Vec<String> {
     suggestions
         .iter()
@@ -2285,6 +2285,17 @@ mod tests {
         assert_eq!(out, "#9 active\n#4 superseded by #9");
     }
 
+    #[test]
+    fn a_pair_left_to_the_user_says_where_it_is_listed() {
+        let row = |id, status: &str| ResolvedRow { id, status: StoredStatus::read(status), superseded_by: None };
+        let waiting = Resolution { keep: row(9, "active"), other: row(4, "disputed"), pair: Some("escalated".into()) };
+        let en = format_resolution(Lang::En, &waiting);
+        assert_eq!(en, "#9 active\n#4 disputed\nthe pair waits for the user; list_memories with conflicts lists it");
+        let es = format_resolution(Lang::Es, &waiting);
+        assert!(es.ends_with("\nel par espera a la persona; list_memories con conflicts lo lista"), "{es}");
+        assert!(!en.contains("ACTIVE CONFLICTS") && !es.contains("ACTIVE CONFLICTS"));
+    }
+
     // ── format_context ──────────────────────────────────────────────────────
 
     #[test]
@@ -2504,10 +2515,10 @@ mod tests {
     fn format_status_ends_with_the_open_pairs() {
         let open = OpenPairs { pending: 2, escalated: 1, pairs: vec![open_pair(9, 4, None, None), open_pair(12, 4, None, None)] };
         let out = format_status(Lang::En, &health(), Profile::Dev, Path::new("/d"), "a", "from --agent", "shared: none", Some(&format_open_pairs(Lang::En, &open)), None);
-        assert!(out.ends_with("\nconflict candidates: 1 waiting for the user in ACTIVE CONFLICTS"), "out was: {out}");
+        assert!(out.ends_with("\nconflict candidates: 1 waiting for the user; list_memories with conflicts lists them"), "out was: {out}");
         assert_eq!(
             format_open_pairs(Lang::Es, &open),
-            "candidatos a conflicto: 1 esperando a la persona en ACTIVE CONFLICTS"
+            "candidatos a conflicto: 1 esperando a la persona; list_memories con conflicts los lista"
         );
         assert_eq!(format_open_pairs(Lang::En, &OpenPairs::default()), "conflict candidates: none open");
     }

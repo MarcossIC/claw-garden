@@ -508,7 +508,7 @@ pub struct SavedMemory {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct RelatedMemory {
     pub id: i64,
-    /// The pair waits for the user in ACTIVE CONFLICTS.
+    /// The pair waits for the user, who sees it marked `conflict=` or listed.
     pub escalated: bool,
     /// The first line of the earlier row.
     #[serde(default)]

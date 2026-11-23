@@ -442,6 +442,21 @@ mod tests {
     }
 
     #[test]
+    fn no_opening_waits_for_a_conflict_block_to_ask() {
+        for language in LANGUAGES {
+            let opening = opening(&text(language));
+            assert!(!opening.contains("ACTIVE CONFLICTS"), "{language:?}: {opening}");
+            assert!(opening.contains("`conflict=`"), "{language:?}: {opening}");
+            let ask = opening.split(". ").find(|s| s.contains("`conflict=`")).expect("the sentence on a disputed memory");
+            assert!(!ask.contains("`recall_context`"), "{language:?}: {ask}");
+        }
+        let en = opening(PROTOCOL);
+        assert!(en.contains("ask the user which memory holds; record only their answer"), "{en}");
+        let es = opening(PROTOCOL_ES);
+        assert!(es.contains("pregúntale a la persona qué memoria vale") && es.contains("sólo si la persona lo dijo"), "{es}");
+    }
+
+    #[test]
     fn the_lean_protocol_and_the_servers_instructions_name_what_the_full_one_names() {
         for language in LANGUAGES {
             let (full, lean) = (text(language), lean(language));

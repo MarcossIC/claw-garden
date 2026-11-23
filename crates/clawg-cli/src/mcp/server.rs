@@ -459,8 +459,8 @@ fn verdict_enum(schema: &mut schemars::Schema) {
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct ResolveConflictArgs {
-    /// One memory id of the pair, as shown by ACTIVE CONFLICTS or
-    /// `save_memory`. With supersedes it is the one that stays.
+    /// One memory id of the pair, as shown by a `conflict=` mark,
+    /// `list_memories` or `save_memory`. With supersedes it is the one that stays.
     pub keep: i64,
     /// The other memory id of the pair.
     pub other: i64,
@@ -2025,8 +2025,9 @@ impl ClawgMcp {
         name = "resolve_conflict",
         description = "Judge a pair of memories the detector found close to each other: one \
                        that `save_memory` names, when the new save replaces the old memory or \
-                       only the user can tell which holds, or one under ACTIVE CONFLICTS in \
-                       `recall_context`, once the user has said which holds. A preference or a \
+                       only the user can tell which holds, or one marked `conflict=` or listed \
+                       by `list_memories` with `conflicts`, once the user has said which holds. \
+                       A preference or a \
                        decision is superseded only on the user's word: judge it conflicts and \
                        ask, then call supersedes with user_answered and their answer in reason. \
                        Returns the status of both memories. Either side may be another agent's."
@@ -4206,7 +4207,7 @@ mod tests {
 
         note(newest, new, "escalated").await;
         let t = status().await;
-        assert!(t.ends_with("\nconflict candidates: 1 waiting for the user in ACTIVE CONFLICTS"), "{t}");
+        assert!(t.ends_with("\nconflict candidates: 1 waiting for the user; list_memories with conflicts lists them"), "{t}");
         assert!(!t.contains("resolve_conflict") && !t.contains("close to"), "{t}");
     }
 
@@ -4392,7 +4393,7 @@ mod tests {
             .expect("call");
         assert_eq!(
             text(&r),
-            format!("#{old} active\n#{new} disputed\nthe pair waits for the user in ACTIVE CONFLICTS")
+            format!("#{old} active\n#{new} disputed\nthe pair waits for the user; list_memories with conflicts lists it")
         );
         let r = b
             .resolve_conflict_impl(
@@ -6194,7 +6195,7 @@ mod tests {
         let several = status(folders(&[&alpha, &beta])).await;
 
         assert!(one.ends_with("\nconflict candidates: none open"), "the pair is of another project: {one}");
-        assert!(several.ends_with("\nconflict candidates: 1 waiting for the user in ACTIVE CONFLICTS"), "{several}");
+        assert!(several.ends_with("\nconflict candidates: 1 waiting for the user; list_memories with conflicts lists them"), "{several}");
     }
 
     #[tokio::test]

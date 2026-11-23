@@ -107,8 +107,8 @@ pub const DESCRIPTIONS: &[(&str, Option<&str>, &str)] = &[
         "resolve_conflict",
         None,
         "Juzga un par de memorias que el detector encontró cercanas: uno que nombra `save_memory`, cuando el \
-         save nuevo reemplaza a la memoria vieja o sólo la persona puede decir cuál vale, o uno bajo ACTIVE \
-         CONFLICTS en `recall_context`, una vez que la persona dijo cuál vale. Una preferencia o una decisión \
+         save nuevo reemplaza a la memoria vieja o sólo la persona puede decir cuál vale, o uno marcado \
+         `conflict=` o listado por `list_memories` con `conflicts`, una vez que la persona dijo cuál vale. Una preferencia o una decisión \
          sólo se reemplaza por palabra de la persona: júzgala conflicts y pregunta, y después llama con \
          supersedes, user_answered y su respuesta en reason. Devuelve el estado de las dos memorias. Cualquiera \
          de los lados puede ser de otro agente.",
@@ -116,8 +116,8 @@ pub const DESCRIPTIONS: &[(&str, Option<&str>, &str)] = &[
     (
         "resolve_conflict",
         Some("keep"),
-        "Un id de memoria del par, como lo muestran ACTIVE CONFLICTS o `save_memory`. Con supersedes es el \
-         que queda.",
+        "Un id de memoria del par, como lo muestran la marca `conflict=`, `list_memories` o `save_memory`. Con \
+         supersedes es el que queda.",
     ),
     ("resolve_conflict", Some("other"), "El otro id de memoria del par."),
     (
