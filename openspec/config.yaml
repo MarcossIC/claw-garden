@@ -36,6 +36,8 @@ context: |
   docs/eval/results/2026-10-17-real-rank-fusion-tip-expanded-agent-view.json (0.70). The ranking of identifier-related
   rows below the 10-hit limit is not addressed yet.
 
+# No OpenSpec CLI or schema reads these groups. They are read by .claude/skills/change-workflow/SKILL.md:
+# general always, plan when plan.md is written, apply while implementing, verify and archive when closing.
 rules:
   general:
     - Detail is proportional to the change. A small fix carries no plan, and a plan records a decision only when there is a real one with alternatives.
