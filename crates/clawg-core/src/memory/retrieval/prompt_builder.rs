@@ -4098,7 +4098,7 @@ mod tests {
 
         let conflicts = block(&text, SEP_CONFLICTS).unwrap_or_else(|| panic!("{text}"));
         assert!(conflicts.contains(CONFLICT_NOTE), "{text}");
-        assert!(conflicts.contains(&format!("NEW #{new}")) || conflicts.contains(&format!("NEW [")), "{text}");
+        assert!(conflicts.contains(&format!("NEW #{new}")), "{text}");
         assert!(text.contains(&format!("#{new} semantic_fact conflict=#{old}]")), "{text}");
         assert!(text.contains(&format!("#{old} semantic_fact conflict=#{new}]")), "{text}");
     }
