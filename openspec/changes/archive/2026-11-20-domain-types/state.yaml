@@ -1,0 +1,24 @@
+change: domain-types
+objective: "transversal"
+depends_on: [core-use-cases]  # archivado
+phase: archived
+release: "0.90.0"  # la tanda 1 (R1 a R6, aquí DT1 a DT6) salió en 0.90.0 con sus cuatro commits de código; las tandas 2 a 5 son cambios propios (tasks.md, «Tandas siguientes»)
+artifacts:
+  exploration: done  # el borrador del 2026-11-01; la tanda 1 es este cambio
+  proposal: done  # la tanda 1: el tipo y el estado de una memoria, de la base al cliente
+  spec: done  # R1 a R6, consolidados como DT1 a DT6 en specs/storage y specs/retrieval
+  design: done  # D1 a D7; D3 cierra la decisión abierta 1 de la exploración
+  tasks: done  # tareas 1 a 5; las tandas 2 a 5, cada una en un cambio propio
+  apply: done  # tareas 2 y 3; después dos correcciones, 6ac1108f y fe74b010 (verify.md, «Windows»)
+  verify: done  # Linux (verify.md); CI de Linux y Windows, run 44591210821 sobre d658c8a9; Windows en local con target-test (verify.md, «Windows»)
+  archive: done  # DT1, DT3, DT4 y DT6 en specs/storage; DT2 y DT5 en specs/retrieval; ningún requisito se deja sin consolidar
+decisions:
+  unknown_names: stored_other  # Stored<T> con Other(String) para lo leído; MemoryType y MemoryStatus estrictos para lo que entra (D1)
+  unknown_decisions: todays_path  # un nombre desconocido toma el camino del comodín de hoy (D2)
+  sql_literals: literal_and_test  # los literales quedan en el SQL; un test de convenciones los comprueba (D3)
+  filters: stored  # los filtros de tipo aceptan cualquier nombre; el de estado del daemon se valida con MemoryStatus (D4)
+  outbox_event: stored_type  # MemoryEvent::memory_type es Option<StoredType> (D5)
+  inputs: text  # la entrada de la CLI y del puente MCP sigue siendo texto que valida el daemon (D6)
+  eval_api: unchanged  # convierte en su borde (D6)
+updated: 2026-11-20
+main_spec: openspec/specs/storage/spec.md, openspec/specs/retrieval/spec.md

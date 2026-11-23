@@ -1,0 +1,1 @@
+clawg: esta sesión guardó memorias pero todavía ningún resumen de sesión. Antes de terminar, guarda uno con `save_memory`, memory_type `session_summary` y su proyecto como en cualquier save, con estas secciones: Objetivo, Instrucciones, Descubrimientos, Logrado, Próximos pasos, Archivos relevantes, Validación. Después termina tu turno. clawg lo pide una sola vez por sesión.

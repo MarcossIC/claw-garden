@@ -75,12 +75,16 @@ fn ranked_hit_serializes_to_json() {
         topic_key: None,
         project_id: None,
         origin: None,
+        conflicts_with: Vec::new(),
     };
     let json = serde_json::to_value(&hit).expect("RankedHit must be Serialize");
     assert_eq!(json["id"], 7);
     assert_eq!(json["memory_type"], "semantic_fact");
     assert!(json["created_at"].is_i64(), "created_at must serialize as a millisecond number");
     assert!(json.get("origin").is_none(), "a hit with no mark sends none: {json}");
+    assert!(json.get("conflicts_with").is_none(), "a hit in no escalated pair sends no list: {json}");
+    let disputed = RankedHit { conflicts_with: vec![3, 9], ..hit.clone() };
+    assert_eq!(serde_json::to_value(&disputed).unwrap()["conflicts_with"], serde_json::json!([3, 9]));
     let inferred = RankedHit { memory_type: StoredType::read("user_preference"), origin: Some("inferred"), ..hit };
     assert_eq!(serde_json::to_value(&inferred).unwrap()["origin"], "inferred");
 }

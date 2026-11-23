@@ -6,7 +6,7 @@
 //! Kept in memory only: after a restart a save carries no session until the
 //! next hook registers one, which beats carrying a stale one.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 /// The longest session id accepted, as for an `operation_id`.
@@ -64,6 +64,8 @@ pub struct SessionRegistry {
 struct Sessions {
     by_key: HashMap<(String, Option<String>), (String, u64)>,
     registered: u64,
+    /// The sessions already asked for their summary, by host session id.
+    asked: HashSet<String>,
 }
 
 impl SessionRegistry {
@@ -82,6 +84,12 @@ impl SessionRegistry {
     pub fn current(&self, agent_id: &str, project_id: Option<&str>) -> Option<String> {
         let key = (agent_id.to_string(), project_id.map(str::to_string));
         self.lock().by_key.get(&key).map(|(session, _)| session.clone())
+    }
+
+    /// Whether `session_id` is asked for its summary now: true the first
+    /// time, which marks it, and false from then on.
+    pub fn ask_summary_once(&self, session_id: &str) -> bool {
+        self.lock().asked.insert(session_id.to_string())
     }
 
     /// The sessions of `source`, merged into `target`, are `target`'s now: a
@@ -138,6 +146,14 @@ mod tests {
         for agent in ["a", "b", "c"] {
             assert_eq!(registry.current(agent, Some("source")), None, "{agent}");
         }
+    }
+
+    #[test]
+    fn a_session_is_asked_for_its_summary_once() {
+        let registry = SessionRegistry::default();
+        assert!(registry.ask_summary_once("s1"));
+        assert!(!registry.ask_summary_once("s1"));
+        assert!(registry.ask_summary_once("s2"), "each session once");
     }
 
     #[test]

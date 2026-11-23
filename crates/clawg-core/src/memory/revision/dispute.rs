@@ -2,7 +2,7 @@
 //!
 //! Every pair is a `memory_conflict` row. An escalated pair is also named in
 //! the newer row's `disputed_against`, which makes that row `disputed` and
-//! puts the pair in ACTIVE CONFLICTS. A verdict either supersedes one side
+//! has every row of the pair a prompt or a search shows marked `conflict=`. A verdict either supersedes one side
 //! (`superseded_by` points at the row that stays), keeps both, or escalates
 //! the pair; the first two drop each side from the other's
 //! `disputed_against`, so that list always names the disputes still open, and
@@ -480,7 +480,8 @@ pub async fn judge_pair(
         .map_err(failed_call(ClosedAs::During("judge_pair")))
 }
 
-/// A pair waiting for the agent's verdict.
+/// An open pair: one waiting for the agent's verdict, or, on an escalated
+/// listing, for the user's.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OpenPair {
     pub new_id: i64,
@@ -493,6 +494,12 @@ pub struct OpenPair {
     pub new_mark: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub old_mark: Option<String>,
+    /// The first line of each side, only on an escalated listing: the agent
+    /// puts both texts to the user without another call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_line: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_line: Option<String>,
 }
 
 /// The pairs not judged yet, among live rows.
@@ -500,8 +507,40 @@ pub struct OpenPair {
 pub struct OpenPairs {
     pub pending: i64,
     pub escalated: i64,
-    /// The oldest pending pairs, up to the limit asked for.
+    /// The oldest pairs of the state listed, up to the limit asked for.
     pub pairs: Vec<OpenPair>,
+}
+
+/// Which open pairs a listing returns; the counts cover both either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Listed {
+    /// The pairs waiting for the agent's verdict.
+    Pending,
+    /// The pairs waiting for the user, each with the first line of its sides.
+    Escalated,
+}
+
+impl Listed {
+    fn state(self) -> &'static str {
+        match self {
+            Listed::Pending => "pending",
+            Listed::Escalated => "escalated",
+        }
+    }
+}
+
+/// How many characters of a side's first line an escalated listing carries,
+/// the preview a listed or searched memory shows.
+const PAIR_LINE_LIMIT: usize = 500;
+
+/// The first line of `content` that holds text, cut to [`PAIR_LINE_LIMIT`].
+fn first_line(content: &str) -> String {
+    let line = content.lines().map(str::trim).find(|line| !line.is_empty()).unwrap_or_default();
+    if line.chars().count() <= PAIR_LINE_LIMIT {
+        return line.to_owned();
+    }
+    let kept: String = line.chars().take(PAIR_LINE_LIMIT).collect();
+    format!("{kept}…")
 }
 
 /// A pair counts while both rows are live, its newer row in the project
@@ -520,11 +559,12 @@ const OPEN_PAIR_FROM: &str = concat!(
 );
 
 /// Counts the open pairs `reader` reaches in `project_id` and lists the
-/// `limit` oldest pending ones.
+/// `limit` oldest of the state `listed` names.
 pub async fn open_pairs(
     store: &MemoryStore,
     reader: Option<&Reader>,
     project_id: Option<&str>,
+    listed: Listed,
     limit: usize,
 ) -> Result<OpenPairs, MemoryError> {
     let reach = reader_bind(reader);
@@ -542,9 +582,16 @@ pub async fn open_pairs(
             )?;
             let mut stmt = c.prepare(&format!(
                 "SELECT p.new_id, p.old_id, p.distance, p.created_at, n.source, n.created_by_type, \
-                 o.source, o.created_by_type {OPEN_PAIR_FROM} AND p.state = 'pending' \
-                 ORDER BY p.created_at, p.new_id, p.old_id LIMIT ?2"
+                 o.source, o.created_by_type, n.content, o.content {OPEN_PAIR_FROM} AND p.state = '{}' \
+                 ORDER BY p.created_at, p.new_id, p.old_id LIMIT ?2",
+                listed.state()
             ))?;
+            let line = |r: &rusqlite::Row<'_>, at: usize| -> rusqlite::Result<Option<String>> {
+                match listed {
+                    Listed::Pending => Ok(None),
+                    Listed::Escalated => Ok(Some(first_line(&r.get::<_, String>(at)?))),
+                }
+            };
             let side = |r: &rusqlite::Row<'_>, at: usize| -> rusqlite::Result<Option<String>> {
                 let (source, by): (String, String) = (r.get(at)?, r.get(at + 1)?);
                 Ok(mark(&source, &by).map(str::to_owned))
@@ -558,6 +605,8 @@ pub async fn open_pairs(
                         created_at: r.get(3)?,
                         new_mark: side(r, 4)?,
                         old_mark: side(r, 6)?,
+                        new_line: line(r, 8)?,
+                        old_line: line(r, 9)?,
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1368,7 +1417,7 @@ mod tests {
         note_pair(&store, gone, old, "pending").await;
         soft_delete(&store, gone).await;
 
-        let open = open_pairs(&store, Some(&reader("agent-d")), None, 5).await.unwrap();
+        let open = open_pairs(&store, Some(&reader("agent-d")), None, Listed::Pending, 5).await.unwrap();
 
         assert_eq!((open.pending, open.escalated), (1, 1));
         assert_eq!(open.pairs.iter().map(|p| (p.new_id, p.old_id)).collect::<Vec<_>>(), vec![(a, old)]);
@@ -1392,11 +1441,66 @@ mod tests {
             .unwrap();
 
         let another = reader("agent-x");
-        assert_eq!(open_pairs(&store, Some(&another), None, 5).await.unwrap().pending, 2, "another agent judges them too");
-        let in_p = open_pairs(&store, Some(&another), Some("p"), 5).await.unwrap();
+        assert_eq!(open_pairs(&store, Some(&another), None, Listed::Pending, 5).await.unwrap().pending, 2, "another agent judges them too");
+        let in_p = open_pairs(&store, Some(&another), Some("p"), Listed::Pending, 5).await.unwrap();
         assert_eq!(in_p.pairs.iter().map(|p| p.new_id).collect::<Vec<_>>(), vec![here], "only the project's");
         let hiding = Reader::new("agent-x", Reach::AllBut(vec!["agent-d".into()]));
-        assert_eq!(open_pairs(&store, Some(&hiding), None, 5).await.unwrap().pending, 0, "a pair it cannot read is not counted");
+        assert_eq!(open_pairs(&store, Some(&hiding), None, Listed::Pending, 5).await.unwrap().pending, 0, "a pair it cannot read is not counted");
+    }
+
+    #[tokio::test]
+    async fn escalated_pairs_list_the_oldest_with_the_first_line_of_each_side() {
+        let store = store().await;
+        let old = seed(&store, "use Postgres for the ledger\nbecause of the audit", "active", &[], 0).await;
+        let mut escalated = Vec::new();
+        for n in 1..=3 {
+            let new = seed(&store, &format!("the ledger moves to store {n}\nsecond line"), "disputed", &[old], n).await;
+            note_pair(&store, new, old, "escalated").await;
+            escalated.push(new);
+        }
+        let waiting = seed(&store, "a pending side", "active", &[], 4).await;
+        note_pair(&store, waiting, old, "pending").await;
+        let long = seed(&store, &format!("\n{}", "x".repeat(PAIR_LINE_LIMIT + 20)), "disputed", &[old], 5).await;
+        note_pair(&store, long, old, "escalated").await;
+
+        let open = open_pairs(&store, Some(&reader("agent-d")), None, Listed::Escalated, 3).await.unwrap();
+
+        assert_eq!((open.pending, open.escalated), (1, 4), "the counts do not change");
+        assert_eq!(open.pairs.iter().map(|p| p.new_id).collect::<Vec<_>>(), escalated, "the oldest, never a pending one");
+        let first = &open.pairs[0];
+        assert_eq!(first.new_line.as_deref(), Some("the ledger moves to store 1"));
+        assert_eq!(first.old_line.as_deref(), Some("use Postgres for the ledger"));
+
+        let all = open_pairs(&store, Some(&reader("agent-d")), None, Listed::Escalated, 10).await.unwrap();
+        let cut = all.pairs.iter().find(|p| p.new_id == long).unwrap().new_line.clone().unwrap();
+        assert_eq!(cut, format!("{}…", "x".repeat(PAIR_LINE_LIMIT)));
+
+        let pending = open_pairs(&store, Some(&reader("agent-d")), None, Listed::Pending, 5).await.unwrap();
+        assert_eq!(pending.pairs.iter().map(|p| p.new_id).collect::<Vec<_>>(), vec![waiting]);
+        assert_eq!((pending.pairs[0].new_line.as_deref(), pending.pairs[0].old_line.as_deref()), (None, None));
+    }
+
+    #[tokio::test]
+    async fn escalated_pairs_keep_the_reach_and_the_project() {
+        let store = store().await;
+        let old = seed(&store, "old", "active", &[], 0).await;
+        let here = seed(&store, "here", "disputed", &[old], 1).await;
+        let there = seed(&store, "there", "disputed", &[old], 2).await;
+        note_pair(&store, here, old, "escalated").await;
+        note_pair(&store, there, old, "escalated").await;
+        store
+            .conn
+            .call(move |c| {
+                c.execute("UPDATE memory SET project_id = 'p' WHERE id = ?1", [here])?;
+                c.execute("UPDATE memory SET project_id = 'q' WHERE id = ?1", [there])
+            })
+            .await
+            .unwrap();
+
+        let in_p = open_pairs(&store, Some(&reader("agent-x")), Some("p"), Listed::Escalated, 10).await.unwrap();
+        assert_eq!(in_p.pairs.iter().map(|p| p.new_id).collect::<Vec<_>>(), vec![here]);
+        let hiding = Reader::new("agent-x", Reach::AllBut(vec!["agent-d".into()]));
+        assert!(open_pairs(&store, Some(&hiding), None, Listed::Escalated, 10).await.unwrap().pairs.is_empty());
     }
 
     #[tokio::test]
@@ -1411,7 +1515,7 @@ mod tests {
             .unwrap();
         note_pair(&store, new, old, "pending").await;
 
-        let open = open_pairs(&store, Some(&reader("agent-d")), None, 5).await.unwrap();
+        let open = open_pairs(&store, Some(&reader("agent-d")), None, Listed::Pending, 5).await.unwrap();
 
         let pair = &open.pairs[0];
         assert_eq!((pair.new_mark.as_deref(), pair.old_mark.as_deref()), (Some("inferred"), None));

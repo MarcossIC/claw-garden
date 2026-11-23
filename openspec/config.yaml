@@ -1,5 +1,3 @@
-schema: spec-driven
-
 context: |
   Claw Garden: local-first memory for coding agents, in Rust.
   Workspace: crates/clawg-core (SQLite + sqlite-vec + FTS5, ONNX Runtime multilingual-e5-small,
@@ -38,32 +36,28 @@ context: |
   docs/eval/results/2026-10-17-real-rank-fusion-tip-expanded-agent-view.json (0.70). The ranking of identifier-related
   rows below the 10-hit limit is not addressed yet.
 
-strict_tdd: true
-
+# No OpenSpec CLI or schema reads these groups. They are read by .claude/skills/change-workflow/SKILL.md:
+# general always, plan when plan.md is written, apply while implementing, verify and archive when closing.
 rules:
   general:
-    - Detail is proportional to the change. A small fix is a one-page proposal plus tasks; design.md only when there is a real architectural decision with alternatives.
+    - Detail is proportional to the change. A small fix carries no plan, and a plan records a decision only when there is a real one with alternatives.
     - Every claim about current behavior cites code as path:line, verified in this repo. No claim from an outside source is copied without checking it against the code.
     - Code, comments, test names, error messages and commit messages never reference plans, phases, changes or specs.
     - Artifacts are written for whoever clones the repository. A step says what it needs to run (an OS, the real model, the gitignored golden set in docs/eval/, a data profile), not whose machine it runs on; a decision says what was chosen and why, not who chose it. No person's name, username or home path.
     - The user's database is the most important asset. No change may lose, hide or destroy stored memories. A new version either opens and serves the previous version's data, or refuses without touching it and with a documented way back.
     - Any change to the schema, stored identifiers (project_id, agent_id), statuses or the embedding contract ships with a test that seeds data at the previous version and proves it survives and stays reachable.
-  proposal:
+  plan:
     - State the problem with evidence, the objective it serves (1-5), scope and explicit non-scope.
     - Say how success is measured (a rag-eval metric with a pre-committed threshold, or a test that fails today).
+    - Write what done means as Given/When/Then scenarios with RFC 2119 keywords (MUST, SHALL, SHOULD, MAY). Each one maps to at least one test that fails before the change.
     - Any change to stored data (project_id, schema, statuses) includes migration and rollback.
-  specs:
-    - Use Given/When/Then scenarios and RFC 2119 keywords (MUST, SHALL, SHOULD, MAY).
-    - Each requirement maps to at least one test that fails before the change.
-  design:
-    - Record decisions with the alternatives considered and their tradeoffs.
+    - Record a decision with the alternatives considered and their tradeoffs.
+    - Each step is preceded by its failing test and maps to one atomic conventional commit, checked with the tests of the files it changes. The full suite and both clippy run once, on the last commit of the change, never on every commit.
+    - The spec of the area is edited in the same change.
+  apply:
     - Keep parsing and decision logic pure and separate from I/O (filesystem, port, database).
     - Any ranking or retrieval change is validated with rag-eval --diff against the baseline before it becomes the default.
     - No new dependency, visibility or abstraction without a real use.
-  tasks:
-    - Strict TDD - each implementation task is preceded by its failing test.
-    - Each task maps to one atomic conventional commit, checked with the tests of the files it changes. The full suite and both clippy run once, on the last commit of the change, never on every commit.
-  apply:
     - Run tests and clippy in target-test on Windows (cargo test --workspace --target-dir target-test), never in another target dir.
     - Before testing a new version run cargo clean --workspace --target-dir target-test; after rustup update or a dependency change, cargo clean --target-dir target-test. Delete any comparison build dir before the task ends.
     - No release builds, installs, or access to ~/.clawg or ~/.clawg-dev without explicit authorization.

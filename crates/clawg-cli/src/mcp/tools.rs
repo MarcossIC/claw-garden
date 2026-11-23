@@ -17,7 +17,7 @@
 use std::path::Path;
 
 use clawg_core::memory::dispute::{OpenPairs, Resolution, ResolvedRow};
-use clawg_core::memory::prompt_builder::{display_author, shared_note};
+use clawg_core::memory::prompt_builder::{conflict_mark, display_author, shared_note};
 use clawg_core::memory::provenance::mark;
 use clawg_core::memory::registry::{ListedSuggestion, Refusal, Resolution as ProjectResolution};
 use clawg_core::memory::sharing::{Reach, SharingError, SharingPolicy};
@@ -243,13 +243,14 @@ fn format_hits(lang: Lang, hits: &[Hit], reader: &str, save_projects: &[String])
             let piece = h.piece.map(|p| format!(" piece={}/{}", p.piece, p.pieces)).unwrap_or_default();
             let author = shared_author(h, reader);
             let by = author.map(|a| format!(" by {}", display_author(a))).unwrap_or_default();
+            let conflict = conflict_mark(&h.conflicts_with).map(|m| format!(" {m}")).unwrap_or_default();
             let topic = shown_key(h.topic_key.as_deref(), Some(&h.memory_type), &h.project_id, save_projects);
             let project = match &h.project_id {
                 Some(Some(project)) if save_projects.len() > 1 => format!(" project={}", display_project(project)),
                 _ => String::new(),
             };
             format!(
-                "{}. #{} [{}/{}/t{}{origin}{piece} score={:.2}{topic}{project}{by}] {}",
+                "{}. #{} [{}/{}/t{}{origin}{piece} score={:.2}{conflict}{topic}{project}{by}] {}",
                 i + 1,
                 h.id,
                 h.kind,
@@ -275,8 +276,8 @@ pub fn format_resolution(lang: Lang, r: &Resolution) -> String {
     };
     let rows = format!("{}\n{}", line(&r.keep), line(&r.other));
     match (r.pair.as_deref(), lang) {
-        (Some("escalated"), Lang::En) => format!("{rows}\nthe pair waits for the user in ACTIVE CONFLICTS"),
-        (Some("escalated"), Lang::Es) => format!("{rows}\nel par espera a la persona en ACTIVE CONFLICTS"),
+        (Some("escalated"), Lang::En) => format!("{rows}\nthe pair waits for the user; list_memories with conflicts lists it"),
+        (Some("escalated"), Lang::Es) => format!("{rows}\nel par espera a la persona; list_memories con conflicts lo lista"),
         _ => rows,
     }
 }
@@ -287,9 +288,48 @@ pub fn format_open_pairs(lang: Lang, open: &OpenPairs) -> String {
     match (open.escalated, lang) {
         (0, Lang::En) => "conflict candidates: none open".to_string(),
         (0, Lang::Es) => "candidatos a conflicto: ninguno abierto".to_string(),
-        (n, Lang::En) => format!("conflict candidates: {n} waiting for the user in ACTIVE CONFLICTS"),
-        (n, Lang::Es) => format!("candidatos a conflicto: {n} esperando a la persona en ACTIVE CONFLICTS"),
+        (n, Lang::En) => format!("conflict candidates: {n} waiting for the user; list_memories with conflicts lists them"),
+        (n, Lang::Es) => format!("candidatos a conflicto: {n} esperando a la persona; list_memories con conflicts los lista"),
     }
+}
+
+/// The pairs waiting for the user, as `list_memories` lists them on request:
+/// both sides of each with the id `resolve_conflict` takes, how many more
+/// wait, and a closing line that leaves the verdict to the user.
+pub fn format_escalated_pairs(lang: Lang, open: &OpenPairs) -> String {
+    if open.pairs.is_empty() {
+        return format_open_pairs(lang, &OpenPairs { escalated: 0, ..OpenPairs::default() });
+    }
+    let side = |label: &str, id: i64, mark: Option<&str>, line: Option<&str>| {
+        let mark = mark.map(|m| format!(" [{m}]")).unwrap_or_default();
+        format!("{label} #{id}{mark} {}", truncate_content(line.unwrap_or_default(), CONTENT_PREVIEW_LIMIT))
+    };
+    let mut blocks: Vec<String> = open
+        .pairs
+        .iter()
+        .map(|p| {
+            format!(
+                "{}\n{}",
+                side("NEW", p.new_id, p.new_mark.as_deref(), p.new_line.as_deref()),
+                side("OLD", p.old_id, p.old_mark.as_deref(), p.old_line.as_deref())
+            )
+        })
+        .collect();
+    let more = (open.escalated - open.pairs.len() as i64).max(0);
+    if more > 0 {
+        blocks.push(match lang {
+            Lang::En => format!("(+{more} more waiting, ask again once these are answered)"),
+            Lang::Es => format!("(+{more} más esperando; pídelos de nuevo cuando estos tengan respuesta)"),
+        });
+    }
+    blocks.push(
+        match lang {
+            Lang::En => "Ask the user which memory holds in each pair; record only their answer, with resolve_conflict, user_answered and their words in reason.",
+            Lang::Es => "Pregúntale a la persona qué memoria vale en cada par; registra sólo su respuesta, con resolve_conflict, user_answered y sus palabras en reason.",
+        }
+        .to_string(),
+    );
+    blocks.join("\n\n")
 }
 
 /// What `read_memory` tells the model: which piece it asked for and every
@@ -781,7 +821,7 @@ fn suggestion_reason(lang: Lang, reason: &str) -> String {
 
 /// One line per suggestion nobody answered that the project may be another
 /// one: `recall_context` and `session-start` show them until they are
-/// answered, as they show ACTIVE CONFLICTS.
+/// answered, as a context with a query shows ACTIVE CONFLICTS.
 pub(crate) fn suggestion_lines(lang: Lang, suggestions: &[ListedSuggestion]) -> Vec<String> {
     suggestions
         .iter()
@@ -1265,6 +1305,7 @@ mod tests {
             topic_key: None,
             project_id: None,
             origin: None,
+            conflicts_with: Vec::new(),
         }
     }
 
@@ -1732,6 +1773,19 @@ mod tests {
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines[0], "1. #9 [Memory/user_preference/t1 inferred piece=1/2 score=0.90] tabs");
         assert_eq!(lines[1], "2. #10 [Memory/user_preference/t1 score=0.80] spaces", "no mark, the line of before");
+    }
+
+    #[test]
+    fn format_hits_shows_the_conflict_of_a_hit() {
+        let mut disputed = hit(12, "Memory", "user_preference", 1, 0.83, "tabs");
+        disputed.conflicts_with = vec![9];
+        let mut many = hit(13, "Memory", "semantic_fact", 2, 0.5, "the port");
+        many.conflicts_with = vec![15, 4, 11, 9, 7];
+        let out = format_hits(Lang::En, &[disputed, many, hit(10, "Memory", "user_preference", 1, 0.8, "spaces")], "a", &[]);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[0], "1. #12 [Memory/user_preference/t1 score=0.83 conflict=#9] tabs");
+        assert_eq!(lines[1], "2. #13 [Memory/semantic_fact/t2 score=0.50 conflict=#4,#7,#9+2] the port");
+        assert_eq!(lines[2], "3. #10 [Memory/user_preference/t1 score=0.80] spaces", "no mark, the line of before");
     }
 
     /// A newline inside a memory would split one hit across two lines and make
@@ -2231,6 +2285,17 @@ mod tests {
         assert_eq!(out, "#9 active\n#4 superseded by #9");
     }
 
+    #[test]
+    fn a_pair_left_to_the_user_says_where_it_is_listed() {
+        let row = |id, status: &str| ResolvedRow { id, status: StoredStatus::read(status), superseded_by: None };
+        let waiting = Resolution { keep: row(9, "active"), other: row(4, "disputed"), pair: Some("escalated".into()) };
+        let en = format_resolution(Lang::En, &waiting);
+        assert_eq!(en, "#9 active\n#4 disputed\nthe pair waits for the user; list_memories with conflicts lists it");
+        let es = format_resolution(Lang::Es, &waiting);
+        assert!(es.ends_with("\nel par espera a la persona; list_memories con conflicts lo lista"), "{es}");
+        assert!(!en.contains("ACTIVE CONFLICTS") && !es.contains("ACTIVE CONFLICTS"));
+    }
+
     // ── format_context ──────────────────────────────────────────────────────
 
     #[test]
@@ -2396,6 +2461,8 @@ mod tests {
             created_at: 1,
             new_mark: new_mark.map(str::to_owned),
             old_mark: old_mark.map(str::to_owned),
+            new_line: None,
+            old_line: None,
         }
     }
 
@@ -2406,14 +2473,52 @@ mod tests {
         assert_eq!(format_open_pairs(Lang::Es, &open), "candidatos a conflicto: ninguno abierto");
     }
 
+    fn escalated_pair(new_id: i64, old_id: i64, new_mark: Option<&str>) -> OpenPair {
+        OpenPair {
+            new_line: Some(format!("the new side {new_id}")),
+            old_line: Some(format!("the old side {old_id}")),
+            ..open_pair(new_id, old_id, new_mark, None)
+        }
+    }
+
+    #[test]
+    fn the_escalated_pairs_show_both_sides_and_leave_the_verdict_to_the_user() {
+        let open = OpenPairs { pending: 3, escalated: 2, pairs: vec![escalated_pair(12, 9, Some("inferred")), escalated_pair(14, 9, None)] };
+        let out = format_escalated_pairs(Lang::En, &open);
+        assert_eq!(
+            out,
+            "NEW #12 [inferred] the new side 12\nOLD #9 the old side 9\n\n\
+             NEW #14 the new side 14\nOLD #9 the old side 9\n\n\
+             Ask the user which memory holds in each pair; record only their answer, with resolve_conflict, user_answered and their words in reason."
+        );
+        assert!(!out.contains("supersedes") && !out.contains("compatible"), "it judges no pair: {out}");
+        let es = format_escalated_pairs(Lang::Es, &open);
+        assert!(es.starts_with("NEW #12 [inferred] the new side 12\nOLD #9"), "{es}");
+        assert!(es.ends_with("registra sólo su respuesta, con resolve_conflict, user_answered y sus palabras en reason."), "{es}");
+    }
+
+    #[test]
+    fn the_escalated_pairs_count_the_ones_left_out() {
+        let open = OpenPairs { pending: 0, escalated: 12, pairs: (1..=10).map(|n| escalated_pair(100 + n, n, None)).collect() };
+        assert!(format_escalated_pairs(Lang::En, &open).contains("\n\n(+2 more waiting, ask again once these are answered)\n\n"));
+        assert!(format_escalated_pairs(Lang::Es, &open).contains("(+2 más esperando; pídelos de nuevo cuando estos tengan respuesta)"));
+    }
+
+    #[test]
+    fn no_escalated_pairs_say_none_open() {
+        let open = OpenPairs { pending: 4, escalated: 0, pairs: Vec::new() };
+        assert_eq!(format_escalated_pairs(Lang::En, &open), "conflict candidates: none open");
+        assert_eq!(format_escalated_pairs(Lang::Es, &open), "candidatos a conflicto: ninguno abierto");
+    }
+
     #[test]
     fn format_status_ends_with_the_open_pairs() {
         let open = OpenPairs { pending: 2, escalated: 1, pairs: vec![open_pair(9, 4, None, None), open_pair(12, 4, None, None)] };
         let out = format_status(Lang::En, &health(), Profile::Dev, Path::new("/d"), "a", "from --agent", "shared: none", Some(&format_open_pairs(Lang::En, &open)), None);
-        assert!(out.ends_with("\nconflict candidates: 1 waiting for the user in ACTIVE CONFLICTS"), "out was: {out}");
+        assert!(out.ends_with("\nconflict candidates: 1 waiting for the user; list_memories with conflicts lists them"), "out was: {out}");
         assert_eq!(
             format_open_pairs(Lang::Es, &open),
-            "candidatos a conflicto: 1 esperando a la persona en ACTIVE CONFLICTS"
+            "candidatos a conflicto: 1 esperando a la persona; list_memories con conflicts los lista"
         );
         assert_eq!(format_open_pairs(Lang::En, &OpenPairs::default()), "conflict candidates: none open");
     }

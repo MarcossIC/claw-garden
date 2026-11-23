@@ -1039,7 +1039,7 @@ mod tests {
 
     /// Disputes lived only in `disputed_against` before the pair table, so
     /// each id it names becomes an escalated pair with no distance, and every
-    /// row keeps its status and its list: what was in ACTIVE CONFLICTS stays.
+    /// row keeps its status and its list: a pair waiting for the user stays.
     #[tokio::test]
     async fn a_database_with_disputes_opens_with_escalated_pairs() {
         ensure_vec0_registered();

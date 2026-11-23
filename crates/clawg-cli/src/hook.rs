@@ -44,11 +44,30 @@ pub const SESSION_END_DEADLINE: Duration = Duration::from_secs(1);
 /// path of the agent's next request.
 pub const POST_TOOL_DEADLINE: Duration = Duration::from_millis(300);
 
+/// The most `stop` takes. What it asks the local daemon takes milliseconds,
+/// but on a loaded Windows machine starting the hook and reaching the daemon
+/// came to a second, and a stop that runs out of time asks for nothing; the
+/// hook is installed with five seconds.
+pub const STOP_DEADLINE: Duration = Duration::from_secs(3);
+
+/// What `stop` asks the agent, in each language the hook speaks.
+const SUMMARY_REQUEST: &str = include_str!("summary_request.md");
+const SUMMARY_REQUEST_ES: &str = include_str!("summary_request.es.md");
+
+/// The request for the session's summary in `lang`.
+fn summary_request(lang: Lang) -> &'static str {
+    match lang {
+        Lang::En => SUMMARY_REQUEST.trim_end(),
+        Lang::Es => SUMMARY_REQUEST_ES.trim_end(),
+    }
+}
+
 /// How long the hook of `event` may take.
 pub fn deadline_of(event: HookEvent) -> Duration {
     match event {
         HookEvent::SessionStart | HookEvent::UserPromptSubmit => HOOK_DEADLINE,
         HookEvent::SessionEnd => SESSION_END_DEADLINE,
+        HookEvent::Stop => STOP_DEADLINE,
         HookEvent::PostToolUse | HookEvent::PostToolUseFailure => POST_TOOL_DEADLINE,
     }
 }
@@ -114,6 +133,10 @@ pub struct HookInput {
     /// costs the hint and not the whole input.
     #[serde(default)]
     pub error: Option<serde_json::Value>,
+    /// At a stop, whether the agent already went on because a hook of the
+    /// stop asked it to.
+    #[serde(default)]
+    pub stop_hook_active: Option<bool>,
 }
 
 impl HookInput {
@@ -294,6 +317,7 @@ pub fn envelope(host: HookClient, event: HookEvent, text: &str) -> String {
         HookEvent::SessionEnd => "SessionEnd",
         HookEvent::PostToolUse => "PostToolUse",
         HookEvent::PostToolUseFailure => "PostToolUseFailure",
+        HookEvent::Stop => "Stop",
     };
     match host {
         HookClient::ClaudeCode => {
@@ -388,7 +412,11 @@ pub async fn respond_and_record(
     let end = tokio::time::Instant::now() + deadline;
     let to_answer = match event {
         HookEvent::SessionStart => deadline.saturating_sub(RECORD_RESERVE),
-        HookEvent::UserPromptSubmit | HookEvent::SessionEnd | HookEvent::PostToolUse | HookEvent::PostToolUseFailure => deadline,
+        HookEvent::UserPromptSubmit
+        | HookEvent::SessionEnd
+        | HookEvent::PostToolUse
+        | HookEvent::PostToolUseFailure
+        | HookEvent::Stop => deadline,
     };
     let (out, run) = respond_checking(event, host, agent, base_dir, input, to_answer, profile).await;
     if let Some(run) = run {
@@ -470,6 +498,9 @@ async fn respond_reading(
     if matches!(event, HookEvent::PostToolUse | HookEvent::PostToolUseFailure) {
         return (after_tool(event, host, base_dir, input, tokio::time::Instant::now() + deadline).await, None);
     }
+    if event == HookEvent::Stop {
+        return (ask_for_summary(host, base_dir, input, tokio::time::Instant::now() + deadline).await, None);
+    }
     let started = std::time::Instant::now();
     let at_ms = now_ms();
     let now = tokio::time::Instant::now();
@@ -514,7 +545,14 @@ async fn respond_reading(
             let lines = opening_lines(language, own.rules, own.notice);
             (!lines.is_empty()).then(|| lines.join("\n\n"))
         }),
-        (HookEvent::UserPromptSubmit | HookEvent::SessionEnd | HookEvent::PostToolUse | HookEvent::PostToolUseFailure, _) => answered,
+        (
+            HookEvent::UserPromptSubmit
+            | HookEvent::SessionEnd
+            | HookEvent::PostToolUse
+            | HookEvent::PostToolUseFailure
+            | HookEvent::Stop,
+            _,
+        ) => answered,
     };
     let printed = text.map(|t| envelope(host, event, &t));
     let run = (event == HookEvent::SessionStart).then(|| Run {
@@ -595,6 +633,40 @@ async fn end_session(host: HookClient, base_dir: &Path, input: impl AsyncRead + 
     let data_dir = base_dir.to_path_buf();
     let Some(client) = blocking(move || DaemonClient::from_data_dir(&data_dir)).await.flatten() else { return };
     let _ = client.end_session(session, input.reason.as_deref()).await;
+}
+
+/// What the end of a turn says: `{"decision": "block", "reason": …}`, which
+/// has Claude Code go on with the request for the session's summary, when the
+/// daemon says this session should save one now; nothing otherwise. Cursor,
+/// a hook installed for Claude Code that Cursor runs, a stop the agent
+/// already went on from (`stop_hook_active`), no daemon, an older one and no
+/// answer in time all let the agent finish. No folder is read and no project
+/// registered, so no model wakes up.
+async fn ask_for_summary(
+    host: HookClient,
+    base_dir: &Path,
+    input: impl AsyncRead + Unpin,
+    deadline: tokio::time::Instant,
+) -> Option<String> {
+    if host == HookClient::Cursor {
+        return None;
+    }
+    let raw = tokio::time::timeout_at(deadline, read_input(input)).await.ok().flatten()?;
+    let input = HookInput::parse(&raw)?;
+    if input.cursor_version.is_some() || input.stop_hook_active == Some(true) {
+        return None;
+    }
+    let session = input.session_id?;
+    let (data_dir, preferences_dir) = (base_dir.to_path_buf(), base_dir.to_path_buf());
+    let client = read_by(deadline, move || DaemonClient::from_data_dir(&data_dir)).await?;
+    let language = read_by(deadline, move || preferences::language_in(&preferences_dir)).await;
+    let ask = tokio::time::timeout_at(deadline, client.summary_due(&session)).await.ok()?.ok()?;
+    ask.then(|| stop_block(summary_request(language.unwrap_or(Lang::En))))
+}
+
+/// The answer to a stop that has the agent go on with `reason`.
+fn stop_block(reason: &str) -> String {
+    serde_json::json!({ "decision": "block", "reason": reason }).to_string()
 }
 
 /// What a call to a tool leaves and says: the ledger of missing programs is
@@ -686,12 +758,14 @@ async fn answer(
     let Some(project) = project_of(&client, &dir).await else { return (None, Outcome::ProjectRefused) };
     // Both events register: a daemon started since the session began learns
     // it at the next prompt. A refusal changes nothing the hook prints.
-    // `session-end` never gets here: `respond_reading` answers it first.
+    // `session-end` and `stop` never get here: `respond_reading` answers them first.
     let reported = match event {
         HookEvent::SessionStart => SessionEvent { event: "start", source: input.source.as_deref(), client: client_name(host) },
-        HookEvent::UserPromptSubmit | HookEvent::SessionEnd | HookEvent::PostToolUse | HookEvent::PostToolUseFailure => {
-            SessionEvent { event: "prompt", source: None, client: client_name(host) }
-        }
+        HookEvent::UserPromptSubmit
+        | HookEvent::SessionEnd
+        | HookEvent::PostToolUse
+        | HookEvent::PostToolUseFailure
+        | HookEvent::Stop => SessionEvent { event: "prompt", source: None, client: client_name(host) },
     };
     let register = async {
         if let Some(session) = input.session_id.as_deref() {
@@ -710,7 +784,9 @@ async fn answer(
             let outcome = if context.prompt.trim().is_empty() { Outcome::EmptyContext } else { Outcome::Injected };
             (session_start_text(&context, health.ok().as_ref(), compacted, language, own.notice, own.rules), outcome)
         }
-        HookEvent::SessionEnd | HookEvent::PostToolUse | HookEvent::PostToolUseFailure => (None, Outcome::EmptyContext),
+        HookEvent::SessionEnd | HookEvent::PostToolUse | HookEvent::PostToolUseFailure | HookEvent::Stop => {
+            (None, Outcome::EmptyContext)
+        }
         HookEvent::UserPromptSubmit => {
             let args = ListArgs {
                 kind: Some("memory".into()),
@@ -1004,6 +1080,132 @@ mod tests {
         assert!(ended.contains(&("s-claude", Some("clear"))) && ended.contains(&("s-cursor", Some("window_close"))), "{ended:?}");
         let after = std::fs::read_to_string(d.dir.path().join(crate::hook_log::FILE)).unwrap_or_default();
         assert_eq!(after, before, "only a session start leaves a line in the record");
+    }
+
+    /// Runs `stop` of Claude Code with `input` against the data directory `dir`.
+    async fn stop(dir: &Path, host: HookClient, input: serde_json::Value) -> Option<String> {
+        respond(HookEvent::Stop, host, "a", dir, input.to_string().as_bytes(), STOP_DEADLINE).await
+    }
+
+    /// A session of `d` opened by a session start, which then saved `types`.
+    async fn session_that_saved(d: &crate::client::tests::TestDaemon, session: &str, types: &[&'static str]) {
+        let repo = tempfile::tempdir().unwrap();
+        let start = serde_json::json!({ "cwd": repo.path(), "session_id": session, "source": "startup" });
+        respond(HookEvent::SessionStart, HookClient::ClaudeCode, "a", d.dir.path(), start.to_string().as_bytes(), HOOK_DEADLINE).await;
+        for memory_type in types {
+            d.metrics.sessions().activity(session, now_ms(), clawg_core::metrics::sessions::Activity::Save(memory_type));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stop_asks_for_the_summary_of_a_session_that_saved() {
+        let d = daemon_keeping_sessions().await;
+        session_that_saved(&d, "s-1", &["semantic_fact"]).await;
+
+        let out = stop(d.dir.path(), HookClient::ClaudeCode, serde_json::json!({ "session_id": "s-1", "stop_hook_active": false })).await;
+
+        let out: serde_json::Value = serde_json::from_str(&out.expect("the request")).unwrap();
+        assert_eq!(out, serde_json::json!({ "decision": "block", "reason": summary_request(Lang::En) }));
+    }
+
+    #[tokio::test]
+    async fn a_stop_asks_only_once() {
+        let d = daemon_keeping_sessions().await;
+        session_that_saved(&d, "s-1", &["semantic_fact"]).await;
+        let input = serde_json::json!({ "session_id": "s-1" });
+        assert!(stop(d.dir.path(), HookClient::ClaudeCode, input.clone()).await.is_some());
+        assert_eq!(stop(d.dir.path(), HookClient::ClaudeCode, input).await, None);
+    }
+
+    #[tokio::test]
+    async fn a_stop_speaks_the_preferred_language() {
+        let d = daemon_keeping_sessions().await;
+        session_that_saved(&d, "s-1", &["semantic_fact"]).await;
+        clawg_core::preferences::save(d.dir.path(), &clawg_core::preferences::Preferences { language: Some(Lang::Es) }).unwrap();
+        let out = stop(d.dir.path(), HookClient::ClaudeCode, serde_json::json!({ "session_id": "s-1" })).await.expect("the request");
+        let out: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(out["reason"], summary_request(Lang::Es));
+    }
+
+    #[tokio::test]
+    async fn a_stop_that_already_continued_lets_the_agent_finish() {
+        let dir = tempfile::tempdir().unwrap();
+        let got = broken_daemon(dir.path(), Some(axum::http::StatusCode::OK)).await;
+        let input = serde_json::json!({ "session_id": "s-1", "stop_hook_active": true });
+        assert_eq!(stop(dir.path(), HookClient::ClaudeCode, input).await, None);
+        assert_eq!(got.load(Ordering::SeqCst), 0, "the daemon is not asked");
+    }
+
+    #[tokio::test]
+    async fn a_stop_without_an_answer_lets_the_agent_finish() {
+        let empty = tempfile::tempdir().unwrap();
+        assert_eq!(stop(empty.path(), HookClient::ClaudeCode, serde_json::json!({ "session_id": "s-1" })).await, None, "no daemon");
+        assert_eq!(std::fs::read_dir(empty.path()).unwrap().count(), 0, "nothing is written");
+
+        let dir = tempfile::tempdir().unwrap();
+        let got = broken_daemon(dir.path(), Some(axum::http::StatusCode::NOT_FOUND)).await;
+        assert_eq!(stop(dir.path(), HookClient::ClaudeCode, serde_json::json!({ "session_id": "s-1" })).await, None, "an older daemon");
+        assert!(got.load(Ordering::SeqCst) > 0);
+        for input in [&b"not json"[..], b"", br#"{"stop_hook_active":false}"#] {
+            assert_eq!(respond(HookEvent::Stop, HookClient::ClaudeCode, "a", dir.path(), input, STOP_DEADLINE).await, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stop_against_a_silent_daemon_returns_by_its_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let got = broken_daemon(dir.path(), None).await;
+        let deadline = Duration::from_millis(300);
+        let started = std::time::Instant::now();
+        let input = br#"{"session_id":"s-1"}"#;
+        assert_eq!(respond(HookEvent::Stop, HookClient::ClaudeCode, "a", dir.path(), &input[..], deadline).await, None);
+        assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+        assert!(got.load(Ordering::SeqCst) > 0, "it waited for the daemon");
+        assert_eq!(deadline_of(HookEvent::Stop), STOP_DEADLINE);
+    }
+
+    #[tokio::test]
+    async fn a_stop_from_cursor_does_nothing() {
+        let d = daemon_keeping_sessions().await;
+        session_that_saved(&d, "s-1", &["semantic_fact"]).await;
+        assert_eq!(stop(d.dir.path(), HookClient::Cursor, serde_json::json!({ "session_id": "s-1" })).await, None);
+        let foreign = serde_json::json!({ "session_id": "s-1", "cursor_version": "3.28.0" });
+        assert_eq!(stop(d.dir.path(), HookClient::ClaudeCode, foreign).await, None);
+        assert!(stop(d.dir.path(), HookClient::ClaudeCode, serde_json::json!({ "session_id": "s-1" })).await.is_some(), "nothing was marked");
+    }
+
+    #[test]
+    fn the_summary_request_names_the_tool_and_the_type() {
+        for lang in [Lang::En, Lang::Es] {
+            let text = summary_request(lang);
+            assert!(text.contains("`save_memory`") && text.contains("`session_summary`"), "{text}");
+        }
+    }
+
+    /// The names of the sections of `## {heading}` in `protocol`.
+    fn summary_sections(protocol: &str, heading: &str) -> Vec<String> {
+        let protocol = protocol.replace("\r\n", "\n");
+        let section = protocol.split(&format!("## {heading}\n")).nth(1).expect("the section");
+        let section = section.split("\n## ").next().unwrap();
+        section.lines().filter_map(|l| l.strip_prefix("- ")?.split_once(':').map(|(name, _)| name.to_string())).collect()
+    }
+
+    #[test]
+    fn the_summary_request_names_the_sections_of_the_protocol() {
+        let cases = [
+            (Lang::En, crate::mcp::protocol::PROTOCOL, "Session summary"),
+            (Lang::En, include_str!("mcp/protocol.lean.md"), "Session summary"),
+            (Lang::Es, crate::mcp::protocol::PROTOCOL_ES, "Resumen de sesión"),
+            (Lang::Es, include_str!("mcp/protocol.lean.es.md"), "Resumen de sesión"),
+        ];
+        for (lang, protocol, heading) in cases {
+            let sections = summary_sections(protocol, heading);
+            assert_eq!(sections.len(), 7, "{sections:?}");
+            let text = summary_request(lang);
+            for name in sections {
+                assert!(text.contains(&name), "{lang:?}: {name} missing from {text}");
+            }
+        }
     }
 
     #[tokio::test]
@@ -1556,7 +1758,7 @@ mod tests {
 
     /// The block this binary, at 0.88.0, writes for `language`.
     fn written_block(language: Option<Lang>) -> String {
-        crate::setup::block("\n", language, crate::mcp::protocol::Variant::Full, crate::setup::Stamp { version: version("0.88.0"), choice: None })
+        crate::setup::block("\n", language, crate::mcp::protocol::Variant::Lean, crate::setup::Stamp { version: version("0.88.0"), choice: None })
     }
 
     #[test]

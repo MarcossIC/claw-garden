@@ -59,7 +59,7 @@ Un evento `chat`, `code_file` o `compaction` MUST sellarse como antes: por el ro
 ## P4. Los pares
 
 - `GET /v1/disputes` MUST traer la marca de cada lado de cada par pendiente que nombra (`new_mark`, `old_mark` de `OpenPair`, `crates/clawg-core/src/memory/revision/dispute.rs:485-496`).
-- `memory_status` MUST NOT listar pares ni su marca: dice sólo cuántos esperan a la persona en ACTIVE CONFLICTS ([`specs/mcp`](../mcp/spec.md), VR4), así que la marca no se imprime ahí. `GET /v1/disputes` la sigue trayendo, y el puente la lee sin imprimirla.
+- `memory_status` MUST NOT listar pares ni su marca: dice sólo cuántos esperan a la persona y que `list_memories` con `conflicts` los lista ([`specs/mcp`](../mcp/spec.md), VR4 y CO8), así que la marca no se imprime ahí. `GET /v1/disputes` la sigue trayendo, y el puente la lee sin imprimirla.
 - ACTIVE CONFLICTS MUST escribir la marca de cada lado que la tiene: en el rótulo cuando imprime su texto (`[AAAA-MM-DD #N disputed inferred] …`) y junto al id cuando lo cita (`format_conflict_block`, `crates/clawg-core/src/memory/retrieval/prompt_builder.rs:883`). No reordena: agrupa por la fila `disputed`, y reordenar rompería el grupo.
 - El origen MUST NOT cambiar el estado de un par ni el de sus filas, ni el orden de los pares listados.
 

@@ -971,6 +971,9 @@ pub enum HookEvent {
     PostToolUse,
     /// A tool call failed. The same as [`HookEvent::PostToolUse`].
     PostToolUseFailure,
+    /// The agent is about to end its turn: once per session, a session that
+    /// saved something worth a summary and none is asked for it.
+    Stop,
 }
 
 /// The clients whose hook input and output `clawg hook` speaks: Claude
@@ -1844,6 +1847,19 @@ mod tests {
                 agent: "cursor".into(),
                 client: HookClient::Cursor,
                 profile: ProfileArg { profile: None },
+            }
+        );
+    }
+
+    #[test]
+    fn hook_takes_the_stop_event() {
+        assert_eq!(
+            parse(&["clawg", "hook", "stop", "--agent", "claude-code", "--profile", "dev"]).command,
+            Command::Hook {
+                event: HookEvent::Stop,
+                agent: "claude-code".into(),
+                client: HookClient::ClaudeCode,
+                profile: ProfileArg { profile: Some("dev".into()) },
             }
         );
     }

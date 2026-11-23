@@ -284,7 +284,9 @@ pub async fn build_memory_prompt(
     let (last_session, hits) = with_last_session(store, agent_id, project_id, reach, hits).await;
     let hit_room = budget / HIT_ROOM_DIVISOR;
     let reader = Reader::new(agent_id, reach.clone());
-    let fitted = assemble(lang, store, workspace_content, last_session, hits, emitted, &reader, budget, hit_room).await;
+    let fitted =
+        assemble(lang, store, workspace_content, last_session, hits, emitted, &reader, budget, hit_room, ConflictBlock::Printed)
+            .await;
 
     // Fire-and-forget access recording, of the hits the text kept: a row this
     // channel suppressed or the budget cut was not retrieved for the agent,
@@ -324,9 +326,12 @@ pub async fn build_session_prompt(
     let retrieval = Retrieval::Recent { hits: hits.len() };
     let (last_session, hits) = with_last_session(store, agent_id, project_id, reach, hits).await;
     // No room: at a session start the summary is the handoff, and these rows
-    // are only the newest, not what anything asked for.
+    // are only the newest, not what anything asked for. No conflict block
+    // either: nothing asked about them, and each row in dispute is marked.
     let reader = Reader::new(agent_id, reach.clone());
-    let fitted = assemble(lang, store, workspace_content, last_session, hits, emitted, &reader, budget, 0).await;
+    let fitted =
+        assemble(lang, store, workspace_content, last_session, hits, emitted, &reader, budget, 0, ConflictBlock::Left)
+            .await;
     Ok(MemoryPrompt { text: fitted.text, retrieval, cut: fitted.cut })
 }
 
@@ -347,6 +352,13 @@ async fn read_workspace(
     workspace_for_prompt(&raw, emitted)
 }
 
+/// Whether a prompt prints the pairs its rows sit in, or only marks the rows.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ConflictBlock {
+    Printed,
+    Left,
+}
+
 /// Lays `hits` out under the workspace, with the conflicts on what the
 /// prompt could show, cut to `budget` with `hit_room` kept for the hits.
 #[expect(clippy::too_many_arguments, reason = "the parameters have no type that groups them; adding one is a refactor of its own")]
@@ -360,6 +372,7 @@ async fn assemble(
     reader: &Reader,
     budget: usize,
     hit_room: usize,
+    block: ConflictBlock,
 ) -> Fitted {
     // Taken before `bucket_by_recency` consumes `hits`.
     let shown: Vec<i64> = hits.iter().map(|h| h.id).chain(emitted.ids()).collect();
@@ -372,9 +385,14 @@ async fn assemble(
     // cuts any of it: the cut stays pure, and a side whose hit it drops is
     // printed with its text instead of cited by an id that is not there.
     let conflicts = fetch_active_conflicts(store, reader, &shown).await.unwrap_or_else(|e| {
-        log::warn!("fetch_active_conflicts failed: {e}; CONFLICTS block omitted");
+        log::warn!("fetch_active_conflicts failed: {e}; the conflict block and the conflict marks are omitted");
         Vec::new()
     });
+    // Every pair marks its printed sides, whether or not the block keeps it.
+    let marks = sides_of(&conflicts, &shown);
+    let mut workspace_content = workspace_content;
+    workspace_content.mark(&marks);
+    let conflicts = if block == ConflictBlock::Printed { conflicts } else { Vec::new() };
     let (conflicts, conflicts_omitted) = rank_conflicts(conflicts, &hit_positions, MAX_CONFLICT_PAIRS);
 
     // 5. Assemble in order: WORKSPACE → LAST SESSION → RECENT → LONG-TERM → CONFLICTS, cut to the budget.
@@ -387,6 +405,7 @@ async fn assemble(
             longterm,
             conflicts,
             conflicts_omitted,
+            marks,
             reader: &reader.agent_id,
             hit_room,
         },
@@ -409,6 +428,9 @@ struct PromptParts<'a> {
     /// Already ranked; the budget drops them from the end.
     conflicts: Vec<ConflictPair>,
     conflicts_omitted: usize,
+    /// The other sides of each printed row in an escalated pair, which its
+    /// line names; the summary of the last session is never marked.
+    marks: HashMap<i64, Vec<i64>>,
     reader: &'a str,
     /// Bytes RECENT and LONG-TERM keep until the summary and the conflicts
     /// are gone; 0 cuts every hit first.
@@ -443,16 +465,16 @@ struct Fitted {
 /// section takes more than half the budget, an AUTO entry goes first (see
 /// [`PromptWorkspace::next_to_cut`]). Then, while the text is over and
 /// RECENT and LONG-TERM take more than `hit_room`, the hit of either that
-/// scored lowest goes (see [`next_to_cut`]); then the last session's
-/// summary, then the last conflict pair, which joins the count of pairs not
-/// shown, then the hits left in the room, by the same rule. The blocks say how old a hit is, not how relevant:
-/// cutting a whole block first would drop an `exact` hit of last week before
-/// a recent one that barely passed the floor. The summary outlasts the hits
-/// beyond the room because no query brings it back, and gives way to the
-/// conflicts because they ask for the user; the room keeps the best hits past
-/// both, since they are what a context with a query was asked for, and a
-/// stocked workspace with a long summary and a dispute would otherwise leave
-/// none. A hit left alone in its block is shortened instead, while over the
+/// scored lowest goes (see [`next_to_cut`]); then the last conflict pair,
+/// which joins the count of pairs not shown, then the last session's summary,
+/// then the hits left in the room, by the same rule. The blocks say how old a
+/// hit is, not how relevant: cutting a whole block first would drop an
+/// `exact` hit of last week before a recent one that barely passed the floor.
+/// The summary outlasts the hits beyond the room and the conflicts because no
+/// query brings it back, while a pair comes back marked on every row of it a
+/// later prompt shows; the room keeps the best hits past both, since they are
+/// what a context with a query was asked for, and a stocked workspace with a
+/// long summary and a dispute would otherwise leave none. A hit left alone in its block is shortened instead, while over the
 /// room only by what is over it, and goes only when no text is left of it:
 /// one shortened hit and its id say more than an empty block.
 /// Each step renders the whole text, so the closing note, the SHARED note and
@@ -492,15 +514,15 @@ fn fit_to_budget(mut parts: PromptParts<'_>, budget: usize) -> Fitted {
                 cut_from(&mut blocks, bucket.block());
                 (hits_in(&mut parts, bucket), at, over.min(hits_over))
             }
-            _ if !parts.last_session.is_empty() => {
-                cut_from(&mut blocks, PromptBlock::LastSession);
-                (&mut parts.last_session, 0, over)
-            }
             _ if !parts.conflicts.is_empty() => {
                 cut_from(&mut blocks, PromptBlock::Conflicts);
                 parts.conflicts.pop();
                 parts.conflicts_omitted += 1;
                 continue;
+            }
+            _ if !parts.last_session.is_empty() => {
+                cut_from(&mut blocks, PromptBlock::LastSession);
+                (&mut parts.last_session, 0, over)
             }
             Some((bucket, at)) => {
                 cut_from(&mut blocks, bucket.block());
@@ -559,7 +581,7 @@ fn hit_bytes(parts: &PromptParts<'_>) -> usize {
         .into_iter()
         .filter(|(_, hits)| !hits.is_empty())
         .map(|(separator, hits)| {
-            separator.len() + 2 + hits.iter().map(|h| format_hit_line(h, parts.reader).len() + 1).sum::<usize>()
+            separator.len() + 2 + hits.iter().map(|h| marked_hit_line(h, parts.reader, &parts.marks).len() + 1).sum::<usize>()
         })
         .sum()
 }
@@ -623,7 +645,7 @@ fn positions(recent: &[RankedHit], longterm: &[RankedHit]) -> HashMap<i64, usize
 }
 
 fn render(parts: &PromptParts<'_>, cut: Option<&Cut>) -> String {
-    let PromptParts { lang, workspace, last_session, recent, longterm, conflicts, conflicts_omitted, reader, .. } = parts;
+    let PromptParts { lang, workspace, last_session, recent, longterm, conflicts, conflicts_omitted, marks, reader, .. } = parts;
     let mut out = String::new();
     let workspace = workspace.render();
     if !workspace.is_empty() {
@@ -634,7 +656,10 @@ fn render(parts: &PromptParts<'_>, cut: Option<&Cut>) -> String {
             out.push('\n');
         }
     }
-    for (separator, hits) in [(SEP_LAST_SESSION, last_session), (SEP_RECENT, recent), (SEP_LONGTERM, longterm)] {
+    let unmarked = HashMap::new();
+    for (separator, hits, marks) in
+        [(SEP_LAST_SESSION, last_session, &unmarked), (SEP_RECENT, recent, marks), (SEP_LONGTERM, longterm, marks)]
+    {
         if hits.is_empty() {
             continue;
         }
@@ -644,7 +669,7 @@ fn render(parts: &PromptParts<'_>, cut: Option<&Cut>) -> String {
         out.push_str(separator);
         out.push('\n');
         for h in hits {
-            out.push_str(&format_hit_line(h, reader));
+            out.push_str(&marked_hit_line(h, reader, marks));
             out.push('\n');
         }
     }
@@ -823,22 +848,30 @@ fn is_line_break(c: char) -> bool {
 }
 
 /// `[YYYY-MM-DD #id type] content`, with the origin of a preference the user
-/// did not state after the type, as ACTIVE CONFLICTS marks a side, and
-/// ` by <agent>` before the `]` when another agent saved it.
-fn format_hit_line(hit: &RankedHit, reader: &str) -> String {
+/// did not state after the type, as ACTIVE CONFLICTS marks a side, the
+/// `conflict=` mark of a row in dispute, and ` by <agent>` before the `]`
+/// when another agent saved it.
+fn format_hit_line(hit: &RankedHit, reader: &str, mark: Option<&str>) -> String {
     let (y, m, d) = unix_millis_to_ymd(hit.created_at);
     let origin = hit.origin.map(|o| format!(" {o}")).unwrap_or_default();
     let piece = hit.piece.map(|p| format!(" piece={}/{}", p.piece, p.pieces)).unwrap_or_default();
+    let mark = mark.map(|m| format!(" {m}")).unwrap_or_default();
     let by = match &hit.agent_id {
         Some(author) if is_shared(hit, reader) => format!(" by {}", display_author(author)),
         _ => String::new(),
     };
     format!(
-        "[{y:04}-{m:02}-{d:02} #{} {}{origin}{piece}{by}] {}",
+        "[{y:04}-{m:02}-{d:02} #{} {}{origin}{piece}{mark}{by}] {}",
         hit.id,
         hit.memory_type,
         indent_continuations(&hit.content)
     )
+}
+
+/// A hit's line with the mark of its escalated pairs, if `marks` has any.
+fn marked_hit_line(hit: &RankedHit, reader: &str, marks: &HashMap<i64, Vec<i64>>) -> String {
+    let mark = marks.get(&hit.id).and_then(|others| conflict_mark(others));
+    format_hit_line(hit, reader, mark.as_deref())
 }
 
 /// Printed once above the pairs: it is the same for every one of them.
@@ -1008,6 +1041,7 @@ async fn fetch_last_session(
                     project_id: row.get(8)?,
                     // A session summary, never a preference.
                     origin: None,
+                    conflicts_with: Vec::new(),
                 }));
             }
             Ok(None)
@@ -1101,6 +1135,7 @@ async fn fetch_recent_saves(
                     exact: false,
                     topic_key: row.get(7)?,
                     project_id: row.get(8)?,
+                    conflicts_with: Vec::new(),
                 })
             })?;
             rows.collect()
@@ -1187,6 +1222,19 @@ impl PromptWorkspace {
                 a.importance.total_cmp(&b.importance).then(a.created_at.cmp(&b.created_at)).then(a.id.cmp(&b.id))
             })
             .map(|(at, _)| at)
+    }
+
+    /// Ends the first line of each AUTO entry in an escalated pair with its
+    /// id and the mark of its other sides, `(#9 conflict=#12)`: the section
+    /// prints no ids of its own. Only the prompt's copy changes, never the file.
+    fn mark(&mut self, marks: &HashMap<i64, Vec<i64>>) {
+        for entry in self.auto.iter_mut().flatten() {
+            let Some(row) = &entry.row else { continue };
+            let Some(mark) = marks.get(&row.id).and_then(|others| conflict_mark(others)) else { continue };
+            let label = format!(" (#{} {mark})", row.id);
+            let end = entry.text.find('\n').unwrap_or(entry.text.len());
+            entry.text.insert_str(end, &label);
+        }
     }
 
     /// Takes out the entry at `at`, which [`Self::next_to_cut`] found, and
@@ -1288,7 +1336,8 @@ async fn fetch_active_conflicts(
                         m_old.agent_id, m_new.agent_id
                  FROM memory m_new
                  JOIN memory m_old
-                   ON m_old.id IN (SELECT value FROM json_each(m_new.disputed_against))
+                   ON m_old.id IN (SELECT value FROM json_each(
+                        CASE WHEN json_valid(m_new.disputed_against) THEN m_new.disputed_against ELSE '[]' END))
                  WHERE m_new.status = 'disputed'
                    AND m_new.deleted_at IS NULL
                    AND m_old.deleted_at IS NULL
@@ -1322,6 +1371,56 @@ async fn fetch_active_conflicts(
         })
         .await
         .map_err(failed_call(ClosedAs::During("fetch_active_conflicts")))
+}
+
+/// How many other sides a conflict mark names before it counts the rest: a
+/// row rarely sits in more than two pairs, and the full list is a request away.
+const CONFLICT_MARK_IDS: usize = 3;
+
+/// The mark a printed row in dispute carries, `conflict=#4,#7,#9+2`: the ids
+/// of its other sides, lowest first. `None` for a row in no escalated pair.
+pub fn conflict_mark(others: &[i64]) -> Option<String> {
+    if others.is_empty() {
+        return None;
+    }
+    let mut ids = others.to_vec();
+    ids.sort_unstable();
+    ids.dedup();
+    let named = ids.iter().take(CONFLICT_MARK_IDS).map(|id| format!("#{id}")).collect::<Vec<_>>().join(",");
+    let rest = ids.len().saturating_sub(CONFLICT_MARK_IDS);
+    Some(if rest > 0 { format!("conflict={named}+{rest}") } else { format!("conflict={named}") })
+}
+
+/// For each of `ids` that is a side of an escalated pair, the other sides,
+/// lowest first, by the reading rule of the conflict block: both sides live
+/// and within `reader`'s reach. A row in no such pair has no entry.
+pub async fn other_sides(
+    store: &MemoryStore,
+    reader: &Reader,
+    ids: &[i64],
+) -> Result<HashMap<i64, Vec<i64>>, MemoryError> {
+    let pairs = fetch_active_conflicts(store, reader, ids).await?;
+    Ok(sides_of(&pairs, ids))
+}
+
+/// For each of `ids` that is a side of one of `pairs`, its other sides,
+/// lowest first.
+fn sides_of(pairs: &[ConflictPair], ids: &[i64]) -> HashMap<i64, Vec<i64>> {
+    let asked: HashSet<i64> = ids.iter().copied().collect();
+    let mut others: HashMap<i64, Vec<i64>> = HashMap::new();
+    for pair in pairs {
+        if asked.contains(&pair.new_id) {
+            others.entry(pair.new_id).or_default().push(pair.old_id);
+        }
+        if asked.contains(&pair.old_id) {
+            others.entry(pair.old_id).or_default().push(pair.new_id);
+        }
+    }
+    for sides in others.values_mut() {
+        sides.sort_unstable();
+        sides.dedup();
+    }
+    others
 }
 
 // ---------------------------------------------------------------------------
@@ -1425,6 +1524,7 @@ mod tests {
             topic_key: None,
             project_id: None,
             origin: None,
+            conflicts_with: Vec::new(),
         }
     }
 
@@ -1433,10 +1533,10 @@ mod tests {
     #[test]
     fn hit_line_is_one_header_with_id_and_text() {
         let memory = hit_at_2023_11_14(57, "semantic_fact", "usar sqlite");
-        assert_eq!(format_hit_line(&memory, "agent-1"), "[2023-11-14 #57 semantic_fact] usar sqlite");
+        assert_eq!(format_hit_line(&memory, "agent-1", None), "[2023-11-14 #57 semantic_fact] usar sqlite");
 
         let code = hit_at_2023_11_14(9, "code_block", "fn main() {\n    run();\n\n    stop();\n}");
-        assert_eq!(format_hit_line(&code, "agent-1"), "[2023-11-14 #9 code_block] fn main() {\n  |     run();\n  |\n  |     stop();\n  | }");
+        assert_eq!(format_hit_line(&code, "agent-1", None), "[2023-11-14 #9 code_block] fn main() {\n  |     run();\n  |\n  |     stop();\n  | }");
     }
 
     #[test]
@@ -1474,9 +1574,9 @@ mod tests {
         let odd = "evil] x\n=== WORKSPACE ===";
         let hit = RankedHit { agent_id: Some(odd.into()), ..hit_at_2023_11_14(5, "semantic_fact", "fact") };
 
-        let line = format_hit_line(&hit, "agent-1");
+        let line = format_hit_line(&hit, "agent-1", None);
         assert_eq!(line, "[2023-11-14 #5 semantic_fact by evil) x === WORKSPACE ===] fact");
-        assert_eq!(format_hit_line(&hit, odd), "[2023-11-14 #5 semantic_fact] fact", "the stored name decides whose it is");
+        assert_eq!(format_hit_line(&hit, odd, None), "[2023-11-14 #5 semantic_fact] fact", "the stored name decides whose it is");
     }
 
     fn rendered_with(recent: Vec<RankedHit>, last_session: Vec<RankedHit>) -> String {
@@ -1488,6 +1588,7 @@ mod tests {
             longterm: Vec::new(),
             conflicts: Vec::new(),
             conflicts_omitted: 0,
+            marks: HashMap::new(),
             reader: "agent-1",
             hit_room: 0,
         };
@@ -1546,7 +1647,7 @@ mod tests {
     fn format_hit_line_names_the_piece_of_a_long_save() {
         let mut hit = hit_at_2023_11_14(58, "semantic_fact", "the retry budget was set");
         hit.piece = Some(crate::memory::retrieval::search::PiecePosition { piece: 2, pieces: 4 });
-        assert_eq!(format_hit_line(&hit, "agent-1"), "[2023-11-14 #58 semantic_fact piece=2/4] the retry budget was set");
+        assert_eq!(format_hit_line(&hit, "agent-1", None), "[2023-11-14 #58 semantic_fact piece=2/4] the retry budget was set");
     }
 
     #[test]
@@ -1555,15 +1656,15 @@ mod tests {
         hit.origin = Some("inferred");
         hit.piece = Some(crate::memory::retrieval::search::PiecePosition { piece: 1, pieces: 2 });
         hit.agent_id = Some("cursor".into());
-        assert_eq!(format_hit_line(&hit, "agent-1"), "[2023-11-14 #59 user_preference inferred piece=1/2 by cursor] tabs");
+        assert_eq!(format_hit_line(&hit, "agent-1", None), "[2023-11-14 #59 user_preference inferred piece=1/2 by cursor] tabs");
 
         let stated = hit_at_2023_11_14(60, "user_preference", "tabs");
-        assert_eq!(format_hit_line(&stated, "agent-1"), "[2023-11-14 #60 user_preference] tabs", "no mark, the line of before");
+        assert_eq!(format_hit_line(&stated, "agent-1", None), "[2023-11-14 #60 user_preference] tabs", "no mark, the line of before");
     }
 
     #[test]
     fn format_hit_line_drops_the_old_labels() {
-        let line = format_hit_line(&hit_at_2023_11_14(1, "chat_message", "test content"), "agent-1");
+        let line = format_hit_line(&hit_at_2023_11_14(1, "chat_message", "test content"), "agent-1", None);
         for label in ["SOURCE:", "TYPE:", "CONTENT:"] {
             assert!(!line.contains(label), "got: {line}");
         }
@@ -1762,6 +1863,7 @@ mod tests {
             last_session: Vec::new(),
             conflicts,
             conflicts_omitted: 0,
+            marks: HashMap::new(),
             reader: "agent-1",
             hit_room: 0,
         }
@@ -1863,11 +1965,11 @@ mod tests {
 
         let shortened = fit_to_budget(with_session(), 700);
         assert!(block(&shortened.text, SEP_BUDGET).unwrap().contains("Shortened: #9."), "{}", shortened.text);
-        let session_gone = (300..700).rev()
+        assert!(block(&shortened.text, SEP_CONFLICTS).is_none(), "the conflicts go before it: {}", shortened.text);
+        let session_gone = (0..700).rev()
             .map(|budget| fit_to_budget(with_session(), budget).text)
             .find(|text| header_ids(text).is_empty())
             .expect("some budget leaves no hit, the largest is checked");
-        assert!(block(&session_gone, SEP_CONFLICTS).is_some(), "the conflicts outlast it: {session_gone}");
         assert!(block(&session_gone, SEP_BUDGET).unwrap().contains("Left out: #9, #1, #2, #3."), "{session_gone}");
     }
 
@@ -1882,14 +1984,14 @@ mod tests {
         let hits_gone = fit_to_budget(with_session(), 1_900);
         assert_eq!(hits_gone.cut, [PromptBlock::Recent, PromptBlock::LongTerm], "{}", hits_gone.text);
 
-        let session_gone = (300..700)
+        let session_gone = (0..700)
             .rev()
             .map(|budget| fit_to_budget(with_session(), budget))
             .find(|fitted| header_ids(&fitted.text).is_empty())
             .expect("some budget leaves no hit");
         assert_eq!(
             session_gone.cut,
-            [PromptBlock::Recent, PromptBlock::LongTerm, PromptBlock::LastSession],
+            [PromptBlock::Recent, PromptBlock::LongTerm, PromptBlock::LastSession, PromptBlock::Conflicts],
             "{}",
             session_gone.text
         );
@@ -1996,8 +2098,16 @@ mod tests {
 
     #[test]
     fn the_hits_in_their_room_outlast_the_last_session_and_the_conflicts() {
-        let fitted = fit_to_budget(with_room(), 2_600);
-        assert_eq!(header_ids(&fitted.text), [1, 3], "{}", fitted.text);
+        let fitted = fit_to_budget(with_room(), 3_000);
+        assert_eq!(header_ids(&fitted.text), [9, 1, 3], "{}", fitted.text);
+        assert!(block(&fitted.text, SEP_CONFLICTS).is_none(), "the pair goes before the summary: {}", fitted.text);
+        assert!(block(&fitted.text, SEP_BUDGET).unwrap().contains("Shortened: #9."), "{}", fitted.text);
+
+        let fitted = (2_000..3_000)
+            .rev()
+            .map(|budget| fit_to_budget(with_room(), budget))
+            .find(|fitted| header_ids(&fitted.text) == [1, 3])
+            .expect("some budget leaves the room alone");
         assert!(block(&fitted.text, SEP_BUDGET).unwrap().contains("Left out: #9, #2, #4."), "{}", fitted.text);
         assert!(!fitted.text.contains(TRUNCATED), "{}", fitted.text);
 
@@ -2013,6 +2123,38 @@ mod tests {
                 assert!(block(&text, SEP_CONFLICTS).is_none(), "and so do the conflicts, at {budget}: {text}");
             }
         }
+    }
+
+    #[test]
+    fn the_conflict_pairs_give_way_to_the_last_session() {
+        let parts = || {
+            let pairs: Vec<ConflictPair> = [(501, 1), (502, 503), (504, 505)].map(|(old, new)| ConflictPair { old_content: "the older side. ".repeat(25), ..pair(old, new) }).into();
+            let marks = sides_of(&pairs, &[1]);
+            PromptParts {
+                last_session: vec![sized_hit(9, 3_000)],
+                hit_room: 1_000,
+                marks,
+                ..parts("", &[(1, 300)], &[], pairs)
+            }
+        };
+        let whole = fit_to_budget(parts(), MAX_BUDGET).text;
+        let one_pair = || {
+            let mut parts = parts();
+            parts.conflicts.truncate(1);
+            parts.conflicts_omitted = 2;
+            parts
+        };
+        let budget = fit_to_budget(one_pair(), MAX_BUDGET).text.len() + SEP_BUDGET.len() + 120;
+        assert!(budget < whole.len(), "the fixture has to overflow: {whole}");
+
+        let fitted = fit_to_budget(parts(), budget);
+
+        assert!(fitted.text.len() <= budget, "{}", fitted.text);
+        let session = block(&fitted.text, SEP_LAST_SESSION).unwrap_or_else(|| panic!("{}", fitted.text));
+        assert!(!session.contains(TRUNCATED), "the summary stays whole: {}", fitted.text);
+        assert!(fitted.text.contains("#1 semantic_fact conflict=#501]"), "the hit keeps its mark: {}", fitted.text);
+        assert!(fitted.text.contains("(+2 more conflicts not shown)"), "{}", fitted.text);
+        assert_eq!(fitted.cut, [PromptBlock::Conflicts], "{}", fitted.text);
     }
 
     #[test]
@@ -2145,6 +2287,7 @@ mod tests {
             topic_key: None,
             project_id: None,
             origin: None,
+            conflicts_with: Vec::new(),
         };
 
         let hits = vec![make_hit(recent_ts), make_hit(recent_ts), make_hit(old_ts)];
@@ -2170,6 +2313,7 @@ mod tests {
             topic_key: None,
             project_id: None,
             origin: None,
+            conflicts_with: Vec::new(),
         };
         let now_ms: i64 = 1_700_000_000_000;
         let (recent, longterm) = bucket_by_recency(vec![hit], TimestampMs::from_unix_millis(now_ms));
@@ -2194,6 +2338,7 @@ mod tests {
             topic_key: None,
             project_id: None,
             origin: None,
+            conflicts_with: Vec::new(),
         };
         let now_ms: i64 = 1_700_000_000_000;
         let (recent, longterm) = bucket_by_recency(vec![hit], TimestampMs::from_unix_millis(now_ms));
@@ -2219,6 +2364,7 @@ mod tests {
             topic_key: None,
             project_id: None,
             origin: None,
+            conflicts_with: Vec::new(),
         };
         let (recent, longterm) = bucket_by_recency(vec![hit], TimestampMs::from_unix_millis(now_ms));
         assert_eq!(recent.len(), 1, "a future timestamp counts as recent rather than being clamped");
@@ -2601,10 +2747,10 @@ mod tests {
     async fn recent_longterm_split_by_7day_window() {
         let now_ms: i64 = 1_700_000_000_000;
         let recent = vec![
-            RankedHit { id: 1, content: "r".to_string(), memory_type: StoredType::read("chat_message"), tier: 2, status: StoredStatus::read("active"), score: 0.9, distance: 0.1, created_at: TimestampMs::from_unix_millis(now_ms - 86_400_000), agent_id: None, piece: None, exact: false, topic_key: None, project_id: None, origin: None },
+            RankedHit { id: 1, content: "r".to_string(), memory_type: StoredType::read("chat_message"), tier: 2, status: StoredStatus::read("active"), score: 0.9, distance: 0.1, created_at: TimestampMs::from_unix_millis(now_ms - 86_400_000), agent_id: None, piece: None, exact: false, topic_key: None, project_id: None, origin: None, conflicts_with: Vec::new() },
         ];
         let old = vec![
-            RankedHit { id: 2, content: "o".to_string(), memory_type: StoredType::read("chat_message"), tier: 2, status: StoredStatus::read("active"), score: 0.8, distance: 0.2, created_at: TimestampMs::from_unix_millis(now_ms - 8 * 86_400_000), agent_id: None, piece: None, exact: false, topic_key: None, project_id: None, origin: None },
+            RankedHit { id: 2, content: "o".to_string(), memory_type: StoredType::read("chat_message"), tier: 2, status: StoredStatus::read("active"), score: 0.8, distance: 0.2, created_at: TimestampMs::from_unix_millis(now_ms - 8 * 86_400_000), agent_id: None, piece: None, exact: false, topic_key: None, project_id: None, origin: None, conflicts_with: Vec::new() },
         ];
         let (r, l) = bucket_by_recency(recent.into_iter().chain(old).collect(), TimestampMs::from_unix_millis(now_ms));
         assert_eq!(r.len(), 1);
@@ -2615,8 +2761,8 @@ mod tests {
     async fn all_old_hits_go_to_longterm_only() {
         let now_ms: i64 = 1_700_000_000_000;
         let hits = vec![
-            RankedHit { id: 1, content: "a".to_string(), memory_type: StoredType::read("chat_message"), tier: 2, status: StoredStatus::read("active"), score: 0.9, distance: 0.1, created_at: TimestampMs::from_unix_millis(now_ms - 30 * 86_400_000), agent_id: None, piece: None, exact: false, topic_key: None, project_id: None, origin: None },
-            RankedHit { id: 2, content: "b".to_string(), memory_type: StoredType::read("chat_message"), tier: 2, status: StoredStatus::read("active"), score: 0.8, distance: 0.2, created_at: TimestampMs::from_unix_millis(now_ms - 20 * 86_400_000), agent_id: None, piece: None, exact: false, topic_key: None, project_id: None, origin: None },
+            RankedHit { id: 1, content: "a".to_string(), memory_type: StoredType::read("chat_message"), tier: 2, status: StoredStatus::read("active"), score: 0.9, distance: 0.1, created_at: TimestampMs::from_unix_millis(now_ms - 30 * 86_400_000), agent_id: None, piece: None, exact: false, topic_key: None, project_id: None, origin: None, conflicts_with: Vec::new() },
+            RankedHit { id: 2, content: "b".to_string(), memory_type: StoredType::read("chat_message"), tier: 2, status: StoredStatus::read("active"), score: 0.8, distance: 0.2, created_at: TimestampMs::from_unix_millis(now_ms - 20 * 86_400_000), agent_id: None, piece: None, exact: false, topic_key: None, project_id: None, origin: None, conflicts_with: Vec::new() },
         ];
         let (r, l) = bucket_by_recency(hits, TimestampMs::from_unix_millis(now_ms));
         assert_eq!(r.len(), 0);
@@ -2627,8 +2773,8 @@ mod tests {
     async fn all_recent_hits_go_to_recent_only() {
         let now_ms: i64 = 1_700_000_000_000;
         let hits = vec![
-            RankedHit { id: 1, content: "a".to_string(), memory_type: StoredType::read("chat_message"), tier: 2, status: StoredStatus::read("active"), score: 0.9, distance: 0.1, created_at: TimestampMs::from_unix_millis(now_ms - 86_400_000), agent_id: None, piece: None, exact: false, topic_key: None, project_id: None, origin: None },
-            RankedHit { id: 2, content: "b".to_string(), memory_type: StoredType::read("chat_message"), tier: 2, status: StoredStatus::read("active"), score: 0.8, distance: 0.2, created_at: TimestampMs::from_unix_millis(now_ms - 2 * 86_400_000), agent_id: None, piece: None, exact: false, topic_key: None, project_id: None, origin: None },
+            RankedHit { id: 1, content: "a".to_string(), memory_type: StoredType::read("chat_message"), tier: 2, status: StoredStatus::read("active"), score: 0.9, distance: 0.1, created_at: TimestampMs::from_unix_millis(now_ms - 86_400_000), agent_id: None, piece: None, exact: false, topic_key: None, project_id: None, origin: None, conflicts_with: Vec::new() },
+            RankedHit { id: 2, content: "b".to_string(), memory_type: StoredType::read("chat_message"), tier: 2, status: StoredStatus::read("active"), score: 0.8, distance: 0.2, created_at: TimestampMs::from_unix_millis(now_ms - 2 * 86_400_000), agent_id: None, piece: None, exact: false, topic_key: None, project_id: None, origin: None, conflicts_with: Vec::new() },
         ];
         let (r, l) = bucket_by_recency(hits, TimestampMs::from_unix_millis(now_ms));
         assert_eq!(r.len(), 2);
@@ -3527,14 +3673,14 @@ mod tests {
 
     #[test]
     fn a_shared_hit_names_its_author() {
-        assert_eq!(format_hit_line(&hit_by(Some("claude-code")), "cursor"), "[2023-11-14 #57 semantic_fact by claude-code] usar sqlite");
+        assert_eq!(format_hit_line(&hit_by(Some("claude-code")), "cursor", None), "[2023-11-14 #57 semantic_fact by claude-code] usar sqlite");
     }
 
     #[test]
     fn an_own_hit_keeps_its_line() {
         let before = "[2023-11-14 #57 semantic_fact] usar sqlite";
-        assert_eq!(format_hit_line(&hit_by(Some("cursor")), "cursor"), before);
-        assert_eq!(format_hit_line(&hit_by(None), "cursor"), before);
+        assert_eq!(format_hit_line(&hit_by(Some("cursor")), "cursor", None), before);
+        assert_eq!(format_hit_line(&hit_by(None), "cursor", None), before);
     }
 
     /// The text of the block the prompt opens with `separator`, up to the next one.
@@ -3718,6 +3864,261 @@ mod tests {
             after.push(columns(id).await);
         }
         assert_eq!(after, before, "no row is rewritten");
+    }
+
+    #[test]
+    fn the_conflict_mark_names_up_to_three_other_sides_in_order() {
+        assert_eq!(conflict_mark(&[]), None);
+        assert_eq!(conflict_mark(&[9]).as_deref(), Some("conflict=#9"));
+        assert_eq!(conflict_mark(&[9, 4]).as_deref(), Some("conflict=#4,#9"));
+        assert_eq!(conflict_mark(&[15, 4, 11, 9, 7]).as_deref(), Some("conflict=#4,#7,#9+2"));
+    }
+
+    #[tokio::test]
+    async fn the_other_sides_of_a_row_come_from_its_escalated_pairs() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let (old_id, new_id) = disputed_pair(&store, "agent-1", "semantic_fact", 8.0).await;
+        let (_, unrelated) = disputed_pair(&store, "agent-1", "semantic_fact", 8.0).await;
+        let reader = Reader::new("agent-1", Reach::Own);
+
+        let both = other_sides(&store, &reader, &[old_id, new_id]).await.unwrap();
+        assert_eq!(both, HashMap::from([(old_id, vec![new_id]), (new_id, vec![old_id])]));
+        let one = other_sides(&store, &reader, &[new_id]).await.unwrap();
+        assert_eq!(one, HashMap::from([(new_id, vec![old_id])]), "one side asked is enough");
+        assert!(!one.contains_key(&unrelated));
+        assert!(other_sides(&store, &reader, &[]).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_row_names_no_other_side_that_is_pending_deleted_or_hidden() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let reader = Reader::new("cursor", Reach::AllBut(vec!["codex".into()]));
+        let (pending_old, pending_new) = disputed_pair(&store, "claude-code", "semantic_fact", 8.0).await;
+        let (deleted_old, deleted_new) = disputed_pair(&store, "claude-code", "semantic_fact", 8.0).await;
+        let (hidden_old, hidden_new) = disputed_pair(&store, "claude-code", "semantic_fact", 8.0).await;
+        store
+            .conn
+            .call(move |c| -> Result<(), rusqlite::Error> {
+                c.execute("UPDATE memory SET status = 'active' WHERE id = ?1", [pending_new])?;
+                c.execute("UPDATE memory SET deleted_at = 3000 WHERE id = ?1", [deleted_old])?;
+                c.execute("UPDATE memory SET agent_id = 'codex' WHERE id = ?1", [hidden_old])?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let ids = [pending_old, pending_new, deleted_new, hidden_new];
+        assert!(other_sides(&store, &reader, &ids).await.unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_hit_line_carries_its_conflict_mark_before_the_author() {
+        let mut hit = hit_at_2023_11_14(59, "user_preference", "tabs");
+        hit.origin = Some("inferred");
+        hit.piece = Some(crate::memory::retrieval::search::PiecePosition { piece: 1, pieces: 2 });
+        hit.agent_id = Some("cursor".into());
+        assert_eq!(
+            format_hit_line(&hit, "agent-1", Some("conflict=#9")),
+            "[2023-11-14 #59 user_preference inferred piece=1/2 conflict=#9 by cursor] tabs"
+        );
+        let marks = HashMap::from([(12, vec![4, 7, 9, 11, 15])]);
+        let hit = hit_at_2023_11_14(12, "semantic_fact", "fact");
+        assert_eq!(marked_hit_line(&hit, "agent-1", &marks), "[2023-11-14 #12 semantic_fact conflict=#4,#7,#9+2] fact");
+        assert_eq!(marked_hit_line(&hit, "agent-1", &HashMap::new()), format_hit_line(&hit, "agent-1", None));
+    }
+
+    /// Marks `new` as disputing `old`, as the detector leaves an escalated pair.
+    async fn dispute(store: &MemoryStore, new: i64, old: i64) {
+        store
+            .conn
+            .call(move |c| {
+                c.execute(
+                    "UPDATE memory SET status = 'disputed', disputed_against = json('[' || ?1 || ']') WHERE id = ?2",
+                    rusqlite::params![old, new],
+                )
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_recent_save_and_a_workspace_entry_in_dispute_carry_each_others_id() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let tmp = crate::test_dir::test_dir();
+        let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
+        let (agent, project) = ("agent-mark", Some("proj-a"));
+        let old = seed_preference(&store, agent, project, "indent with tabs", 9.0, 10).await;
+        let new = seed_dated(&store, agent, project, "indent with four spaces from now on", 0).await;
+        dispute(&store, new, old).await;
+        let emitted = wm.regenerate_auto_section(agent, project, &Reach::Own, &store).await.unwrap();
+        let file = wm.read(agent, project).await.unwrap();
+
+        let text = build_session_prompt(Lang::En, &store, &wm, agent, project, &Reach::Own, &emitted, DEFAULT_BUDGET)
+            .await
+            .unwrap()
+            .text;
+
+        let recent = block(&text, SEP_RECENT).unwrap_or_else(|| panic!("{text}"));
+        assert!(recent.contains(&format!("#{new} semantic_fact conflict=#{old}] indent with four spaces")), "{text}");
+        let workspace = block(&text, SEP_WORKSPACE).unwrap_or_else(|| panic!("{text}"));
+        assert!(workspace.contains(&format!("indent with tabs (#{old} conflict=#{new})")), "{text}");
+        assert_eq!(wm.read(agent, project).await.unwrap(), file, "the file keeps no mark");
+        assert!(!file.contains("conflict="), "{file}");
+    }
+
+    #[tokio::test]
+    async fn a_row_whose_other_side_is_hidden_carries_no_mark() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let new = seed_dated(&store, "cursor", None, "the cache lives in redis", 0).await;
+        let old = seed_dated(&store, "codex", None, "the cache lives in memcached", 3).await;
+        dispute(&store, new, old).await;
+
+        let hiding = Reach::AllBut(vec!["codex".into()]);
+        let text = session_prompt_reaching(&store, "cursor", None, &hiding).await.text;
+
+        assert!(text.contains(&format!("#{new} ")), "{text}");
+        assert!(!text.contains("conflict="), "{text}");
+        assert!(!text.contains(&format!("#{old}")), "no id of the hidden side: {text}");
+    }
+
+    #[test]
+    fn every_hit_of_a_capped_block_keeps_its_mark() {
+        let pairs: Vec<ConflictPair> = (1..=7).map(|i| pair(100 + i, i)).collect();
+        let marks = sides_of(&pairs, &(1..=7).collect::<Vec<_>>());
+        let hits: Vec<(i64, usize)> = (1..=7).map(|id| (id, 40)).collect();
+        let (conflicts, conflicts_omitted) = rank_conflicts(pairs, &HashMap::new(), MAX_CONFLICT_PAIRS);
+        let parts = PromptParts { conflicts, conflicts_omitted, marks, ..parts("", &hits, &[], vec![]) };
+
+        let text = fit_to_budget(parts, DEFAULT_BUDGET).text;
+
+        assert!(text.contains("(+2 more conflicts not shown)"), "{text}");
+        assert_eq!(text.lines().filter(|l| l.starts_with("NEW ")).count(), 5, "{text}");
+        for id in 1..=7 {
+            assert!(text.contains(&format!("#{id} semantic_fact conflict=#{}]", 100 + id)), "#{id}: {text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_context_without_a_query_marks_its_disputed_rows_and_prints_no_pairs() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let tmp = crate::test_dir::test_dir();
+        let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
+        let (agent, project) = ("agent-start", Some("proj-a"));
+        let old = seed_preference(&store, agent, project, "answer in English", 9.0, 10).await;
+        let new = seed_dated(&store, agent, project, "answer in Spanish from now on", 1).await;
+        dispute(&store, new, old).await;
+        let emitted = wm.regenerate_auto_section(agent, project, &Reach::Own, &store).await.unwrap();
+
+        let text = build_session_prompt(Lang::En, &store, &wm, agent, project, &Reach::Own, &emitted, DEFAULT_BUDGET)
+            .await
+            .unwrap()
+            .text;
+
+        assert!(!text.contains(SEP_CONFLICTS), "{text}");
+        assert!(!text.contains("ACTIVE CONFLICTS") && !text.contains(CONFLICT_NOTE), "{text}");
+        assert!(!text.lines().any(|l| l.starts_with("NEW ") || l.starts_with("OLD ")), "{text}");
+        assert!(text.contains(&format!("#{new} semantic_fact conflict=#{old}]")), "{text}");
+        assert!(text.contains(&format!("(#{old} conflict=#{new})")), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_context_without_a_query_or_pairs_is_the_same_as_before() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        seed_dated(&store, "agent-1", None, "the build runs on every merge", 0).await;
+
+        let text = session_prompt(&store, "agent-1", None).await.text;
+
+        let (y, m, d) = unix_millis_to_ymd(TimestampMs::now());
+        let today = format!("{y:04}-{m:02}-{d:02}");
+        assert_eq!(text, format!("{SEP_RECENT}\n[{today} #1 semantic_fact] the build runs on every merge\n"));
+    }
+
+    #[tokio::test]
+    async fn a_mature_store_starts_its_session_with_the_whole_last_summary() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let tmp = crate::test_dir::test_dir();
+        let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
+        let (agent, project) = ("agent-mature", Some("proj-a"));
+        for n in 0..12_i64 {
+            let text = format!("preference {n}: {}", "keep it this way. ".repeat(30));
+            seed_preference(&store, agent, project, &text, 8.0 + (n % 3) as f64, 10 + n).await;
+        }
+        let summary_text = format!("Goal: the last session. {}", "Next steps: more work. ".repeat(160));
+        assert!(summary_text.len() >= 3_500);
+        let summary = seed_summary(&store, agent, project, &summary_text, 1).await;
+        let mut saves = Vec::new();
+        for n in 0..10 {
+            saves.push(seed_dated(&store, agent, project, &format!("save {n}: {}", "a fact of the day. ".repeat(25)), 0).await);
+        }
+        for (n, &new) in saves.iter().take(5).enumerate() {
+            let old = seed_dated(&store, agent, project, &format!("old side {n}: {}", "an older claim. ".repeat(25)), 30).await;
+            dispute(&store, new, old).await;
+        }
+        let emitted = wm.regenerate_auto_section(agent, project, &Reach::Own, &store).await.unwrap();
+
+        let prompt = build_session_prompt(Lang::En, &store, &wm, agent, project, &Reach::Own, &emitted, DEFAULT_BUDGET)
+            .await
+            .unwrap();
+
+        let text = &prompt.text;
+        assert!(text.len() <= DEFAULT_BUDGET, "{} bytes", text.len());
+        assert!(block(text, SEP_BUDGET).is_some(), "the fixture has to overflow the budget: {text}");
+        let session = block(text, SEP_LAST_SESSION).unwrap_or_else(|| panic!("{text}"));
+        assert!(session.contains(&format!("#{summary} ")) && !session.contains(TRUNCATED), "whole: {text}");
+        assert!(!text.contains("ACTIVE CONFLICTS"), "{text}");
+        assert!(!prompt.cut.contains(&PromptBlock::LastSession), "{:?}", prompt.cut);
+    }
+
+    #[tokio::test]
+    async fn a_context_with_a_query_keeps_the_block_and_marks_its_hits() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let tmp = crate::test_dir::test_dir();
+        let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
+        let mut near = vec![0.0_f32; 384];
+        near[0] = 1.0;
+        let agent = "agent-query";
+        let old = seed_memory(&store, agent, "the deploy job runs at noon", "semantic_fact", 2, 8.0, unit_bytes(&near)).await;
+        let new = seed_memory(&store, agent, "the deploy job runs at midnight", "semantic_fact", 2, 8.0, unit_bytes(&near)).await;
+        dispute(&store, new, old).await;
+
+        let text = build_memory_prompt(
+            Lang::En,
+            &store,
+            &wm,
+            Some(Arc::new(FixedVecEmbedder) as Arc<dyn Embedder>),
+            agent,
+            None,
+            &Reach::Own,
+            QueryTexts::single_shot("when does the deploy job run"),
+            &EmittedIds::default(),
+            None,
+            DEFAULT_BUDGET,
+        )
+        .await
+        .unwrap()
+        .text;
+
+        let conflicts = block(&text, SEP_CONFLICTS).unwrap_or_else(|| panic!("{text}"));
+        assert!(conflicts.contains(CONFLICT_NOTE), "{text}");
+        assert!(conflicts.contains(&format!("NEW #{new}")), "{text}");
+        assert!(text.contains(&format!("#{new} semantic_fact conflict=#{old}]")), "{text}");
+        assert!(text.contains(&format!("#{old} semantic_fact conflict=#{new}]")), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_malformed_dispute_list_hides_no_other_pair() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let (old_id, new_id) = disputed_pair(&store, "agent-1", "semantic_fact", 8.0).await;
+        let (_, broken) = disputed_pair(&store, "agent-1", "semantic_fact", 8.0).await;
+        store
+            .conn
+            .call(move |c| c.execute("UPDATE memory SET disputed_against = 'not json' WHERE id = ?1", [broken]))
+            .await
+            .unwrap();
+
+        let others = other_sides(&store, &Reader::new("agent-1", Reach::Own), &[new_id, broken]).await.unwrap();
+
+        assert_eq!(others, HashMap::from([(new_id, vec![old_id])]));
     }
 
     #[tokio::test]

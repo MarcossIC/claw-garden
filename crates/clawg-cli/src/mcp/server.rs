@@ -54,7 +54,7 @@ use crate::mcp::schema;
 use crate::mcp::startup::{on_failure, ClientHandle, Next};
 use crate::mcp::tools::{
     format_docs, format_language, format_recall, format_resolution, format_rows, format_save, format_search, format_sharing,
-    format_answered, format_delete, format_open_pairs, format_refusal, format_restore, format_status, format_synthesis, format_update,
+    format_answered, format_delete, format_escalated_pairs, format_open_pairs, format_refusal, format_restore, format_status, format_synthesis, format_update,
     indexes_docs, kind_refusal, no_folder, no_project_named, resolve_project, several_folders, topic_key_warning,
 };
 
@@ -330,6 +330,10 @@ pub struct ListMemoriesArgs {
     /// How many rows to skip, for paging through a long list. Defaults to 0.
     #[serde(default)]
     pub offset: Option<u32>,
+    /// Lists the pairs of memories that wait for the user to say which holds,
+    /// with both texts, instead of rows.
+    #[serde(default)]
+    pub conflicts: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -455,8 +459,8 @@ fn verdict_enum(schema: &mut schemars::Schema) {
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct ResolveConflictArgs {
-    /// One memory id of the pair, as shown by ACTIVE CONFLICTS or
-    /// `save_memory`. With supersedes it is the one that stays.
+    /// One memory id of the pair, as shown by a `conflict=` mark,
+    /// `list_memories` or `save_memory`. With supersedes it is the one that stays.
     pub keep: i64,
     /// The other memory id of the pair.
     pub other: i64,
@@ -1401,6 +1405,20 @@ impl ClawgMcp {
         if let Some(refusal) = kind_refusal(self.speaks(), args.kind.as_deref()) {
             return Self::failed(refusal);
         }
+        if args.conflicts == Some(true) {
+            let filtered = args.agent.is_some()
+                || args.tier.is_some()
+                || args.memory_type.is_some()
+                || args.limit.is_some()
+                || args.offset.is_some();
+            if filtered {
+                return Self::failed(match self.speaks() {
+                    Lang::En => "`conflicts` lists pairs, not rows, so it does not combine with agent, tier, memory_type, limit or offset",
+                    Lang::Es => "`conflicts` lista pares, no filas, así que no se combina con agent, tier, memory_type, limit ni offset",
+                });
+            }
+            return self.escalated_pairs(agent_id).await;
+        }
         let args = &args;
         let result = self
             .call(|client| async move {
@@ -1421,6 +1439,39 @@ impl ClawgMcp {
             Ok(Ok(rows)) => Self::ok(format_rows(self.speaks(), &rows, agent_id)),
             Ok(Err(e)) => Self::failed(Self::explain(self.speaks(), &e)),
             Err(failure) => Ok(failure),
+        }
+    }
+
+    /// The pairs waiting for the user in the open project, or in every one
+    /// when the open folders lead to several or none, as `memory_status`
+    /// counts them.
+    async fn escalated_pairs(&self, agent_id: &str) -> Result<CallToolResult, rmcp::ErrorData> {
+        let result = self.call(|client| async move { client.health().await.map(|_| client) }).await;
+        let client = match result {
+            Ok(Ok(client)) => client,
+            Ok(Err(e)) => return Self::failed(Self::explain(self.speaks(), &e)),
+            Err(failure) => return Ok(failure),
+        };
+        let listed = match self.one_project(&client).await {
+            Ok(one) => {
+                let project = one.map(|(_, ids)| ids.project);
+                client.open_disputes(agent_id, project.as_deref(), true).await
+            }
+            Err(e) => Err(e),
+        };
+        match listed {
+            Ok(open) => Self::ok(format_escalated_pairs(self.speaks(), &open)),
+            Err(e) if e.is_refused_query() => Self::failed(match self.speaks() {
+                Lang::En => {
+                    "the running clawg daemon is older than this bridge and cannot list the pairs waiting for the user; \
+                     restart it with `clawg stop` and call the tool again"
+                }
+                Lang::Es => {
+                    "el daemon de clawg que corre es más viejo que este puente y no puede listar los pares que esperan a la persona; \
+                     reinícialo con `clawg stop` y vuelve a llamar a la herramienta"
+                }
+            }),
+            Err(e) => Self::failed(Self::explain(self.speaks(), &e)),
         }
     }
 
@@ -1776,7 +1827,7 @@ impl ClawgMcp {
                 let conflicts = match self.one_project(&client).await {
                     Ok(one) => {
                         let project = one.map(|(_, ids)| ids.project);
-                        client.open_disputes(&agent_id, project.as_deref()).await.map(|open| format_open_pairs(lang, &open)).ok()
+                        client.open_disputes(&agent_id, project.as_deref(), false).await.map(|open| format_open_pairs(lang, &open)).ok()
                     }
                     Err(_) => None,
                 };
@@ -1879,7 +1930,8 @@ impl ClawgMcp {
                        every memory you can read, yours and other agents'; `agent` lists one \
                        agent's only. Returns one line per memory: id, type, tier, importance, \
                        access count, status, `by <agent>` when another agent saved it, and a \
-                       truncated summary."
+                       truncated summary. With `conflicts`, it lists instead the pairs of \
+                       memories that wait for the user, with both texts."
     )]
     async fn list_memories(
         &self,
@@ -1973,8 +2025,9 @@ impl ClawgMcp {
         name = "resolve_conflict",
         description = "Judge a pair of memories the detector found close to each other: one \
                        that `save_memory` names, when the new save replaces the old memory or \
-                       only the user can tell which holds, or one under ACTIVE CONFLICTS in \
-                       `recall_context`, once the user has said which holds. A preference or a \
+                       only the user can tell which holds, or one marked `conflict=` or listed \
+                       by `list_memories` with `conflicts`, once the user has said which holds. \
+                       A preference or a \
                        decision is superseded only on the user's word: judge it conflicts and \
                        ask, then call supersedes with user_answered and their answer in reason. \
                        Returns the status of both memories. Either side may be another agent's."
@@ -2937,11 +2990,17 @@ mod tests {
             && span.split('_').all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_lowercase()))
     }
 
-    /// The full protocol and the lean one, without a preference and with each language.
+    /// The full protocol and the lean one, without a preference and with each
+    /// language: the lean one with the server's instructions, which carry the
+    /// opening it leaves out.
     fn every_protocol() -> Vec<String> {
         [None, Some(Lang::En), Some(Lang::Es)]
             .into_iter()
-            .flat_map(|l| [protocol::text(l).into_owned(), protocol::lean(l)])
+            .flat_map(|l| {
+                let full = protocol::text(l).into_owned();
+                let lean = format!("{}\n\n{}", protocol::opening(&full), protocol::lean(l));
+                [full, lean]
+            })
             .collect()
     }
 
@@ -2964,7 +3023,7 @@ mod tests {
     /// characters, and they are paid for in every session.
     #[test]
     fn the_instructions_fit_older_clients() {
-        for protocol in every_protocol() {
+        for protocol in [None, Some(Lang::En), Some(Lang::Es)].map(protocol::text) {
             let length = opening(&protocol).chars().count();
             assert!(length <= 2048, "the instructions are {length} characters: {}", opening(&protocol));
         }
@@ -3199,7 +3258,7 @@ mod tests {
             .map(String::as_str)
             .collect();
         properties.sort();
-        assert_eq!(properties, ["agent", "limit", "memory_type", "offset", "tier"]);
+        assert_eq!(properties, ["agent", "conflicts", "limit", "memory_type", "offset", "tier"]);
     }
 
     /// The model has to pick `memory_type` from the set the store recognises;
@@ -3721,6 +3780,7 @@ mod tests {
                 memory_type: None,
                 limit: None,
                 offset: None,
+                conflicts: None,
             })
             .await
             .expect("list");
@@ -4147,8 +4207,130 @@ mod tests {
 
         note(newest, new, "escalated").await;
         let t = status().await;
-        assert!(t.ends_with("\nconflict candidates: 1 waiting for the user in ACTIVE CONFLICTS"), "{t}");
+        assert!(t.ends_with("\nconflict candidates: 1 waiting for the user; list_memories with conflicts lists them"), "{t}");
         assert!(!t.contains("resolve_conflict") && !t.contains("close to"), "{t}");
+    }
+
+    async fn note_escalated(store: &clawg_core::memory::MemoryStore, new: i64, old: i64, state: &'static str) {
+        store
+            .conn_for_test()
+            .call(move |c| {
+                c.execute(
+                    "INSERT INTO memory_conflict (new_id, old_id, distance, state, created_at) VALUES (?1, ?2, 0.3, ?3, ?1)",
+                    rusqlite::params![new, old, state],
+                )
+            })
+            .await
+            .expect("note the pair");
+    }
+
+    fn conflicts_only() -> ListMemoriesArgs {
+        ListMemoriesArgs { conflicts: Some(true), ..list_all() }
+    }
+
+    #[tokio::test]
+    async fn list_memories_with_conflicts_lists_the_projects_pairs_that_wait_for_the_user() {
+        let (b, _d, store) = bridge_with_store(test_project()).await;
+        let mut ids = Vec::new();
+        for n in 0..8 {
+            ids.push(saved_id(&b, "agent-mcp", &format!("the zone {n} runbook starts with step {n}")).await);
+        }
+        note_escalated(&store, ids[1], ids[0], "escalated").await;
+        note_escalated(&store, ids[3], ids[2], "escalated").await;
+        note_escalated(&store, ids[5], ids[4], "escalated").await;
+        note_escalated(&store, ids[7], ids[6], "pending").await;
+        let elsewhere = format!("UPDATE memory SET project_id = 'another-project' WHERE id IN ({}, {})", ids[4], ids[5]);
+        store.conn_for_test().call(move |c| c.execute(&elsewhere, [])).await.expect("move the pair");
+
+        let out = text(&b.list_memories_impl("agent-mcp", conflicts_only()).await.expect("list"));
+
+        assert!(out.contains(&format!("NEW #{} [inferred] the zone 1 runbook starts with step 1\nOLD #{} [inferred] the zone 0", ids[1], ids[0])), "{out}");
+        assert!(out.contains(&format!("NEW #{} [inferred] the zone 3", ids[3])), "{out}");
+        assert!(!out.contains(&format!("#{}", ids[5])), "another project's pair: {out}");
+        assert!(!out.contains(&format!("#{}", ids[7])), "a pending pair: {out}");
+        assert!(out.ends_with("record only their answer, with resolve_conflict, user_answered and their words in reason."), "{out}");
+    }
+
+    #[tokio::test]
+    async fn list_memories_with_conflicts_says_none_open_without_pairs() {
+        let (b, _d) = bridge().await;
+        let out = text(&b.list_memories_impl("agent-mcp", conflicts_only()).await.expect("list"));
+        assert_eq!(out, "conflict candidates: none open");
+    }
+
+    #[tokio::test]
+    async fn list_memories_with_conflicts_lists_ten_and_counts_the_rest() {
+        let (b, _d, store) = bridge_with_store(test_project()).await;
+        let old = saved_id(&b, "agent-mcp", "the queue keeps every job for a week").await;
+        for n in 0..12 {
+            let new = saved_id(&b, "agent-mcp", &format!("claim {n}: the queue keeps jobs for {n} days")).await;
+            note_escalated(&store, new, old, "escalated").await;
+        }
+
+        let out = text(&b.list_memories_impl("agent-mcp", conflicts_only()).await.expect("list"));
+
+        assert_eq!(out.lines().filter(|l| l.starts_with("NEW #")).count(), 10, "{out}");
+        assert!(out.contains("(+2 more waiting, ask again once these are answered)"), "{out}");
+    }
+
+    /// A bridge without a project of its own, in front of `app`.
+    async fn bridge_in_front_of(app: axum::Router) -> (ClawgMcp, tempfile::TempDir) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr: SocketAddr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let dir = tempfile::tempdir().expect("tempdir");
+        let client = DaemonClient::new(format!("http://127.0.0.1:{}", addr.port()), "t", dir.path().to_path_buf());
+        (ClawgMcp::with_project(client, Profile::Dev, None), dir)
+    }
+
+    #[tokio::test]
+    async fn list_memories_refuses_conflicts_with_a_row_filter() {
+        let (stub, hits) = counting_stub(axum::http::StatusCode::OK);
+        let (refusing, _dir) = bridge_in_front_of(stub).await;
+        for args in [
+            ListMemoriesArgs { tier: Some(1), ..conflicts_only() },
+            ListMemoriesArgs { agent: Some("cursor".into()), ..conflicts_only() },
+            ListMemoriesArgs { memory_type: Some("user_preference".into()), ..conflicts_only() },
+            ListMemoriesArgs { limit: Some(5), ..conflicts_only() },
+            ListMemoriesArgs { offset: Some(5), ..conflicts_only() },
+        ] {
+            let r = refusing.list_memories_impl("agent-mcp", args).await.expect("the call itself succeeds");
+            assert!(is_error(&r), "{}", text(&r));
+            assert!(text(&r).contains("does not combine"), "{}", text(&r));
+        }
+        assert!(hits.lock().unwrap().is_empty(), "refused without calling the daemon: {:?}", hits.lock().unwrap());
+        let (b, _d) = bridge().await;
+        let rows = text(&b.list_memories_impl("agent-mcp", ListMemoriesArgs { conflicts: Some(false), ..list_all() }).await.expect("list"));
+        assert_eq!(rows, text(&b.list_memories_impl("agent-mcp", list_all()).await.expect("list")), "false lists rows as before");
+    }
+
+    #[tokio::test]
+    async fn list_memories_with_conflicts_asks_to_restart_a_daemon_that_predates_it() {
+        let older = axum::Router::new()
+            .route(
+                "/health",
+                axum::routing::get(|| async {
+                    axum::Json(serde_json::json!({
+                        "status": "ok", "version": env!("CARGO_PKG_VERSION"), "profile": "dev",
+                        "pid": 1, "embedder": "ready", "uptime_s": 0
+                    }))
+                }),
+            )
+            .route(
+                "/v1/disputes",
+                axum::routing::get(|| async {
+                    (axum::http::StatusCode::BAD_REQUEST, "Failed to deserialize query string: unknown field `escalated`")
+                }),
+            );
+        let (b, _dir) = bridge_in_front_of(older).await;
+
+        let r = b.list_memories_impl("agent-mcp", conflicts_only()).await.expect("the call itself succeeds");
+
+        assert!(is_error(&r), "{}", text(&r));
+        assert!(text(&r).contains("clawg stop"), "{}", text(&r));
+        assert!(!text(&r).contains("NEW #"), "{}", text(&r));
     }
 
     #[tokio::test]
@@ -4211,7 +4393,7 @@ mod tests {
             .expect("call");
         assert_eq!(
             text(&r),
-            format!("#{old} active\n#{new} disputed\nthe pair waits for the user in ACTIVE CONFLICTS")
+            format!("#{old} active\n#{new} disputed\nthe pair waits for the user; list_memories with conflicts lists it")
         );
         let r = b
             .resolve_conflict_impl(
@@ -4615,7 +4797,7 @@ mod tests {
     }
 
     fn list_all() -> ListMemoriesArgs {
-        ListMemoriesArgs { agent: None, kind: None, tier: None, memory_type: None, limit: None, offset: None }
+        ListMemoriesArgs { agent: None, kind: None, tier: None, memory_type: None, limit: None, offset: None, conflicts: None }
     }
 
     /// Takes every exclusion away.
@@ -5071,6 +5253,34 @@ mod tests {
         hide(&d, "cursor", "claude-code");
         let hidden = text(&b.search_memory_impl("cursor", search_args(content)).await.expect("search"));
         assert!(!hidden.contains(content), "hidden from cursor: {hidden}");
+    }
+
+    #[tokio::test]
+    async fn search_memory_marks_both_sides_of_an_escalated_pair() {
+        let mut store = None;
+        let (b, _d) = bridge_with(|runtime| {
+            store = Some(runtime.store.clone());
+            runtime
+        })
+        .await;
+        let store = store.expect("the runtime's store");
+        let old = saved_id(&b, "agent-mcp", "the cache expires after one hour").await;
+        let new = saved_id(&b, "agent-mcp", "the cache expires after one day").await;
+        store
+            .conn_for_test()
+            .call(move |c| {
+                c.execute(
+                    "UPDATE memory SET status = 'disputed', disputed_against = json('[' || ?1 || ']') WHERE id = ?2",
+                    rusqlite::params![old, new],
+                )
+            })
+            .await
+            .expect("escalate the pair");
+
+        let out = text(&b.search_memory_impl("agent-mcp", search_args("the cache expires after one day")).await.expect("search"));
+
+        let line = out.lines().find(|l| l.contains(&format!("#{new} [Memory/"))).unwrap_or_else(|| panic!("{out}"));
+        assert!(line.contains(&format!(" conflict=#{old}]")), "{out}");
     }
 
     #[tokio::test]
@@ -5985,7 +6195,7 @@ mod tests {
         let several = status(folders(&[&alpha, &beta])).await;
 
         assert!(one.ends_with("\nconflict candidates: none open"), "the pair is of another project: {one}");
-        assert!(several.ends_with("\nconflict candidates: 1 waiting for the user in ACTIVE CONFLICTS"), "{several}");
+        assert!(several.ends_with("\nconflict candidates: 1 waiting for the user; list_memories with conflicts lists them"), "{several}");
     }
 
     #[tokio::test]

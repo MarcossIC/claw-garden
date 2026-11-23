@@ -389,8 +389,9 @@ async fn fetch_auto_rows(
             //
             // Both queries drop superseded rows but keep disputed
             // ones: a disputed row ranks like an active one everywhere else,
-            // and the conflicts block reaches the prompt for every row this
-            // section emits, so the dispute is shown next to it.
+            // and the prompt marks each entry this section emits that sits in
+            // an escalated pair with `conflict=`, so the dispute is shown next
+            // to it.
             let mut stmt = c.prepare(AUTO_PREFERENCES_SQL)?;
             let user_prefs: Vec<MemoryLine> = readable(
                 stmt.query_map(rusqlite::params![reach, proj], map_memory)?,

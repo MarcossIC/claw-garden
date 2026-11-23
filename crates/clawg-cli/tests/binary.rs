@@ -982,6 +982,39 @@ async fn a_session_end_closes_the_session_and_what_follows_opens_another() {
 }
 
 #[tokio::test]
+async fn a_stop_hook_blocks_once_and_exits_0() {
+    let sandbox = Sandbox::new();
+    let root = sandbox.home.join("repo");
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    let daemon = sandbox.serve().await;
+    daemon.wait_until_ready().await;
+    // The root the hook registers is canonical; on Windows a temp dir under a
+    // short 8.3 name is not, and would be another project.
+    let resolved = clawg_core::memory::ProjectIdentity::resolve(&root).root;
+    let (status, registered) = daemon.post("/v1/projects", json!({ "root_path": resolved.to_string_lossy(), "assigned": true })).await;
+    assert_eq!(status, 200, "{registered}");
+    session_hook(&sandbox, "session-start", json!({ "session_id": "session-s", "cwd": root, "source": "startup" }));
+    let (status, body) = daemon
+        .post(
+            "/v1/memories",
+            json!({ "content": "the release job runs on tuesdays", "agent_id": "smoke", "project_id": registered["project_id"], "memory_type": "semantic_fact" }),
+        )
+        .await;
+    assert!(status == 201 || status == 202, "{body}");
+
+    let input = json!({ "session_id": "session-s", "stop_hook_active": false, "hook_event_name": "Stop" }).to_string();
+    let out = hook(&sandbox, &[&["stop"], &SMOKE_HOOK[..]].concat(), &input);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+    let answer: Value = serde_json::from_str(stdout_of(&out).trim()).expect("one JSON object");
+    assert_eq!(answer["decision"], "block", "{answer}");
+    assert!(answer["reason"].as_str().is_some_and(|r| r.contains("session_summary")), "{answer}");
+
+    let again = hook(&sandbox, &[&["stop"], &SMOKE_HOOK[..]].concat(), &input);
+    assert_eq!((again.status.code(), stdout_of(&again).as_str()), (Some(0), ""), "{}", stderr_of(&again));
+    stop(&sandbox, &daemon).await;
+}
+
+#[tokio::test]
 async fn a_debug_binary_refuses_prod_even_with_a_test_home() {
     let sandbox = Sandbox::new();
     let out = sandbox.run(&["status", "--profile", "prod"]);

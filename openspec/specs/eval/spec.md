@@ -24,6 +24,7 @@ Fuente de verdad del comportamiento actual de la evaluación de recuperación: e
 - [agent-eval-sessions](../../changes/archive/2026-11-17-agent-eval-sessions/proposal.md), archivado el 2026-11-17, que sale en 0.88.0 (AS1 a AS22, en «`agent-eval`: las sesiones, el relevo y los artefactos», al final de esta spec; AS1 reemplaza el orden del `MEMORY.md` de `a4` en MD3). La campaña que corrió con él está en su [verify](../../changes/archive/2026-11-17-agent-eval-sessions/verify.md#la-campaña).
 - [protocol-block](../../changes/archive/2026-11-17-protocol-block/proposal.md), archivado el 2026-11-17, que sale en 0.88.0 (sólo PB7, el brazo `a3-short`, en «`agent-eval`: el brazo `a3-short`», al final de esta spec). Sus otros requisitos están en [`specs/setup`](../setup/spec.md), [`specs/doctor`](../doctor/spec.md), [`specs/hooks`](../hooks/spec.md) y [`specs/preferences`](../preferences/spec.md).
 - [repeated-errors](../../changes/archive/2026-11-19-repeated-errors/proposal.md), archivado el 2026-11-19, que sale en 0.90.0 (sólo RE9, el brazo `a3-notools`, en «`agent-eval`: el brazo `a3-notools`», al final de esta spec). Sus otros requisitos están en [`specs/setup`](../setup/spec.md), [`specs/doctor`](../doctor/spec.md) y [`specs/hooks`](../hooks/spec.md).
+- [contract-diet](../../changes/archive/2026-11-20-contract-diet/proposal.md), archivado el 2026-11-20, sale en 0.92.0 (sólo CD5, el brazo `a3-full`, en «`agent-eval`: el brazo `a3-full`», después del brazo `a3-short`). Sus otros requisitos están en [`specs/setup`](../setup/spec.md) y [`specs/doctor`](../doctor/spec.md).
 
 ## Definiciones
 
@@ -1483,7 +1484,7 @@ Las categorías dicen qué mide la tarea: `K1` una preferencia de la persona, `K
 
 ### AE2. Los brazos
 
-`arm::plan` MUST decidir, sin tocar disco, los archivos, los comandos y las variables de una corrida bajo `a0`, `a2`, `a3`, `a3-eager`, `a4` o `b`. Toda corrida MUST tener su home y su `CLAUDE_CONFIG_DIR` propios, `--mcp-config` con `--strict-mcp-config` y salida `stream-json`. Los brazos con clawg MUST llevar el servidor que `setup::plan` registraría; `a3`, `a3-eager` y `b` además MUST llevar el `settings.json` y el `CLAUDE.md` que ese plan escribe, en el idioma de la corrida, y `preferences.json` cuando hay idioma. `a3-eager` MUST apagar la búsqueda de herramientas, `b` MUST quitar `search_memory`, `read_memory` y `list_memories`, `a3-short` es `a3` con el bloque corto del protocolo (PB7), y `a4` MUST llevar las mismas memorias en el `MEMORY.md` nativo, sin servidor. `a0` MUST no tener servidor, siembra ni memoria nativa. Una ruta de `clawg` relativa MUST rechazarse. Como en `-p` nada puede aprobar un permiso, todo brazo MUST correr con `--permission-mode acceptEdits` (ediciones aprobadas sólo dentro del directorio de trabajo) y negar `Bash`, y los brazos con clawg MUST permitir todas las herramientas de su servidor (`--allowedTools mcp__<servidor>`); `b` MUST negar sus tres herramientas de lectura en el mismo `--disallowedTools` que `Bash`.
+`arm::plan` MUST decidir, sin tocar disco, los archivos, los comandos y las variables de una corrida bajo `a0`, `a2`, `a3`, `a3-eager`, `a4` o `b`. Toda corrida MUST tener su home y su `CLAUDE_CONFIG_DIR` propios, `--mcp-config` con `--strict-mcp-config` y salida `stream-json`. Los brazos con clawg MUST llevar el servidor que `setup::plan` registraría; `a3`, `a3-eager` y `b` además MUST llevar el `settings.json` y el `CLAUDE.md` que ese plan escribe, en el idioma de la corrida, y `preferences.json` cuando hay idioma. `a3-eager` MUST apagar la búsqueda de herramientas, `b` MUST quitar `search_memory`, `read_memory` y `list_memories`, `a3-short` es `a3` con el bloque corto del protocolo (PB7), `a3-full` es `a3` con el bloque entero (CD5), y `a4` MUST llevar las mismas memorias en el `MEMORY.md` nativo, sin servidor. `a0` MUST no tener servidor, siembra ni memoria nativa. Una ruta de `clawg` relativa MUST rechazarse. Como en `-p` nada puede aprobar un permiso, todo brazo MUST correr con `--permission-mode acceptEdits` (ediciones aprobadas sólo dentro del directorio de trabajo) y negar `Bash`, y los brazos con clawg MUST permitir todas las herramientas de su servidor (`--allowedTools mcp__<servidor>`); `b` MUST negar sus tres herramientas de lectura en el mismo `--disallowedTools` que `Bash`.
 
 ##### Escenario: lo que instala setup
 - GIVEN una tarea con memorias y el idioma `es`
@@ -1931,11 +1932,11 @@ La causa (d) no tiene lugar en el resultado: una corrida paga con un comando que
 
 ## `agent-eval`: el brazo `a3-short`
 
-El brazo que mide el bloque corto del protocolo. Sus tests corren con la suite, como los de las secciones anteriores. Origen: [protocol-block](../../changes/archive/2026-11-17-protocol-block/proposal.md). Lo que se midió con él, 18 corridas sobre las tareas largas de la sección anterior, está en su [verify](../../changes/archive/2026-11-17-protocol-block/verify.md#la-campaña): `short` y `off` no pasan la regla D6, y el valor por defecto de `setup` sigue siendo `full`.
+El brazo que mide el bloque corto del protocolo. Sus tests corren con la suite, como los de las secciones anteriores. Origen: [protocol-block](../../changes/archive/2026-11-17-protocol-block/proposal.md). Lo que se midió con él, 18 corridas sobre las tareas largas de la sección anterior, está en su [verify](../../changes/archive/2026-11-17-protocol-block/verify.md#la-campaña): `short` y `off` no pasan la regla D6, y el valor por defecto de `setup` era `full` cuando se midió; `lean` lo reemplazó en 0.92.0 ([contract-diet](../../changes/archive/2026-11-20-contract-diet/verify.md#la-campaña)).
 
 ### PB7. El brazo `a3-short`
 
-`agent-eval` MUST tener el brazo `a3-short`: `a3` con el bloque `short` que planea `setup::plan` con `--protocol short`, y todo lo demás (servidor, hooks, daemon, memorias, argumentos del cliente) igual a `a3`. `a3` MUST seguir escribiendo el bloque `full` y `l0` ninguno.
+`agent-eval` MUST tener el brazo `a3-short`: `a3` con el bloque `short` que planea `setup::plan` con `--protocol short`, y todo lo demás (servidor, hooks, daemon, memorias, argumentos del cliente) igual a `a3`. `a3` MUST escribir el bloque por defecto, que es `lean` desde 0.92.0 (CD7), y `l0` ninguno.
 
 ##### Escenario
 - GIVEN una tarea con memorias
@@ -1944,13 +1945,28 @@ El brazo que mide el bloque corto del protocolo. Sus tests corren con la suite, 
 
 **Tests:** `a3_short_is_a3_with_the_short_block` (`crates/clawg-eval/src/bin/agent-eval/arm.rs`).
 
+## `agent-eval`: el brazo `a3-full`
+
+El brazo que mide el bloque entero del protocolo frente al `lean` que `a3` escribe por defecto. Sus tests corren con la suite, como los de las secciones anteriores. Origen: [contract-diet](../../changes/archive/2026-11-20-contract-diet/proposal.md). En la campaña de `lean` (18 corridas), `a3-full` era el `a3` de entonces, con el bloque entero; la campaña de `lean` sin la apertura (9 corridas) se midió contra él. Está en su [verify](../../changes/archive/2026-11-20-contract-diet/verify.md#la-campaña).
+
+### CD5. El brazo `a3-full`
+
+`agent-eval` MUST tener el brazo `a3-full`, junto a `a3-short` en `ARMS`: `a3` con el bloque que planea `setup::plan` con `--protocol full`, y todo lo demás (servidor, hooks, daemon, memorias, argumentos y variables del cliente) igual a `a3`. `a3` MUST escribir el bloque por defecto (CD7).
+
+##### Escenario
+- GIVEN una tarea con memorias
+- WHEN se planean `a3` y `a3-full`
+- THEN sus planes son iguales salvo el `CLAUDE.md`, que en `a3` es el bloque `lean` y en `a3-full` el entero con `protocol=full`
+
+**Tests:** `a3_full_is_a3_with_the_whole_block` y `a3_full_reads_and_prints_by_its_name` (`crates/clawg-eval/src/bin/agent-eval/arm.rs`), y el brazo en las listas de brazos con daemon, con `setup` y con bloque.
+
 ## `agent-eval`: el brazo `a3-notools`
 
 El brazo que mide `a3` sin los dos hooks de Bash que aprenden los programas ausentes. Sus tests corren con la suite, como los de las secciones anteriores. Origen: [repeated-errors](../../changes/archive/2026-11-19-repeated-errors/proposal.md). Lo que se midió con él está en su [verify](../../changes/archive/2026-11-19-repeated-errors/verify.md#la-campaña).
 
 ### RE9. El brazo `a3-notools`
 
-`agent-eval` MUST tener el brazo `a3-notools`: `a3` sin los grupos de `PostToolUse` y `PostToolUseFailure` de clawg (RE7), y todo lo demás igual a `a3`: el servidor, los otros tres hooks, el bloque del protocolo y la siembra. Los brazos con hooks toman los de `setup::plan` (`crates/clawg-eval/src/bin/agent-eval/arm.rs`), así que `a3` corre con los dos hooks de Bash desde RE7, y el `a3` que se midió antes de RE7 es `a3-notools`. La corrida en seco no corre los hooks del cliente, así que lo que el hook entrega lo prueban RE3 y RE6 contra el binario, no el arnés.
+`agent-eval` MUST tener el brazo `a3-notools`: `a3` sin los grupos de `PostToolUse` y `PostToolUseFailure` de clawg (RE7), y todo lo demás igual a `a3`: el servidor, los otros hooks (desde summary-on-stop, también `Stop`, que una sesión que guarda sigue un turno más para su resumen), el bloque del protocolo y la siembra. Los brazos con hooks toman los de `setup::plan` (`crates/clawg-eval/src/bin/agent-eval/arm.rs`), así que `a3` corre con los dos hooks de Bash desde RE7, y el `a3` que se midió antes de RE7 es `a3-notools`. La corrida en seco no corre los hooks del cliente, así que lo que el hook entrega lo prueban RE3 y RE6 contra el binario, no el arnés.
 
 ##### Escenario
 - GIVEN el plan de `a3` y el de `a3-notools` para una misma tarea

@@ -57,7 +57,7 @@ use projects::{
     projects, register, rename, resolve_projects,
 };
 use serde::{Deserialize, Serialize};
-use sessions::{count_tool_call, end_session, register_session};
+use sessions::{count_tool_call, end_session, register_session, summary};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -275,6 +275,7 @@ pub fn router(app: Arc<AppCtx>) -> Router {
         .route("/sessions", post(register_session))
         .route("/sessions/end", post(end_session))
         .route("/sessions/calls", post(count_tool_call))
+        .route("/sessions/summary", post(summary))
         .route(
             "/memories/{kind}/{id}",
             get(get_memory).patch(update_memory).delete(delete_memory),

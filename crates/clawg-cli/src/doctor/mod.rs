@@ -220,7 +220,9 @@ pub fn run(profile: Profile) -> Result<Report, DoctorError> {
     let rules = crate::tool_failures::rules(&crate::tool_failures::read(&data_dir), now, crate::tool_failures::on_path);
     let instructions = if rules.is_empty() { Vec::new() } else { instruction_files() };
     found.extend(checks::tool_rules(lang, &rules, &instructions, now));
-    found.extend(checks::tool_hooks(lang, &settings_files(), profile));
+    let settings = settings_files();
+    found.extend(checks::tool_hooks(lang, &settings, profile));
+    found.extend(checks::stop_hook(lang, &settings, profile));
 
     let summary = Summary::of(&found);
     Ok(Report {

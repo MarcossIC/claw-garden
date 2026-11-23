@@ -2345,6 +2345,212 @@ async fn disputes_lists_the_pending_pairs_an_agent_reaches_in_a_project() {
     assert_eq!(hidden["pending"], 0, "{hidden}");
 }
 
+/// Saves one row per content for `agent-http`, in `project` when given, and
+/// returns their ids in order.
+async fn seed_rows(h: &Harness, contents: &[String], project: Option<&str>) -> Vec<i64> {
+    let mut ids = Vec::new();
+    for content in contents {
+        ids.push(save_id(h, json!({ "content": content, "agent_id": "agent-http", "project_id": project })).await);
+    }
+    ids
+}
+
+/// Leaves exactly these pairs in `memory_conflict`, as the detector would.
+async fn note_pairs(h: &Harness, pairs: Vec<(i64, i64, &'static str)>) {
+    h.ctx
+        .runtime
+        .store
+        .conn_for_test()
+        .call(move |c| -> rusqlite::Result<()> {
+            c.execute("DELETE FROM memory_conflict", [])?;
+            for (at, (new, old, state)) in pairs.into_iter().enumerate() {
+                c.execute(
+                    "INSERT INTO memory_conflict (new_id, old_id, distance, state, created_at) VALUES (?1, ?2, 0.3, ?3, ?4)",
+                    rusqlite::params![new, old, state, at as i64],
+                )?;
+            }
+            Ok(())
+        })
+        .await
+        .expect("note the pairs");
+}
+
+fn distinct_notes(n: usize) -> Vec<String> {
+    (0..n).map(|i| format!("Note {i}: the zone {i} runbook keeps step {i} first
+the rest of note {i}")).collect()
+}
+
+#[tokio::test]
+async fn disputes_list_ten_escalated_pairs_with_both_lines_on_request() {
+    let h = Harness::start().await;
+    let ids = seed_rows(&h, &distinct_notes(16), None).await;
+    let old = ids[0];
+    let mut pairs: Vec<(i64, i64, &'static str)> = ids[1..13].iter().map(|&new| (new, old, "escalated")).collect();
+    pairs.extend(ids[13..].iter().map(|&new| (new, old, "pending")));
+    note_pairs(&h, pairs).await;
+
+    let (status, body) = h.get_json("/v1/disputes?agent_id=agent-http&escalated=true").await;
+
+    assert_eq!(status, 200, "{body}");
+    assert_eq!((body["escalated"].as_i64(), body["pending"].as_i64()), (Some(12), Some(3)), "{body}");
+    let listed: Vec<i64> = body["pairs"].as_array().unwrap().iter().map(|p| p["new_id"].as_i64().unwrap()).collect();
+    assert_eq!(listed, ids[1..11].to_vec(), "the ten oldest escalated ones: {body}");
+    assert_eq!(body["pairs"][0]["new_line"], "Note 1: the zone 1 runbook keeps step 1 first", "{body}");
+    assert_eq!(body["pairs"][0]["old_line"], "Note 0: the zone 0 runbook keeps step 0 first", "{body}");
+}
+
+#[tokio::test]
+async fn disputes_without_the_flag_list_the_pending_pairs_as_before() {
+    let h = Harness::start().await;
+    let ids = seed_rows(&h, &distinct_notes(3), None).await;
+    note_pairs(&h, vec![(ids[1], ids[0], "escalated"), (ids[2], ids[0], "pending")]).await;
+
+    let (status, body) = h.get_json("/v1/disputes?agent_id=agent-http").await;
+
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body,
+        json!({ "pending": 1, "escalated": 1, "pairs": [
+            { "new_id": ids[2], "old_id": ids[0], "distance": 0.3, "created_at": 1,
+              "new_mark": "inferred", "old_mark": "inferred" }
+        ] })
+    );
+}
+
+#[tokio::test]
+async fn escalated_disputes_keep_the_reach_and_the_project() {
+    let h = Harness::start().await;
+    let here = seed_rows(&h, &distinct_notes(2), Some("p")).await;
+    let there = seed_rows(&h, &distinct_notes(2), Some("q")).await;
+    note_pairs(&h, vec![(here[1], here[0], "escalated"), (there[1], there[0], "escalated")]).await;
+
+    let (_, in_p) = h.get_json("/v1/disputes?agent_id=agent-other&escalated=true&project_id=p").await;
+    let listed: Vec<i64> = in_p["pairs"].as_array().unwrap().iter().map(|p| p["new_id"].as_i64().unwrap()).collect();
+    assert_eq!(listed, vec![here[1]], "only the project's: {in_p}");
+
+    write_policy(&h, HIDE_AUTHOR);
+    let (_, hidden) = h.get_json("/v1/disputes?agent_id=agent-other&escalated=true&project_id=p").await;
+    assert_eq!(hidden["pairs"], json!([]), "{hidden}");
+    assert_eq!(hidden["escalated"], 0, "{hidden}");
+}
+
+/// The `conflicts_with` of each hit a search for the port returns, by id.
+async fn conflicts_by_hit(h: &Harness, agent: &str, limit: Option<usize>) -> Vec<(i64, Option<Value>)> {
+    let mut body = json!({ "query": "the API listens on port", "agent_id": agent });
+    if let Some(limit) = limit {
+        body["limit"] = json!(limit);
+    }
+    let (status, body) = h.post_json("/v1/search", body).await;
+    assert_eq!(status, 200, "{body}");
+    body["hits"]
+        .as_array()
+        .expect("hits")
+        .iter()
+        .map(|hit| (hit["id"].as_i64().unwrap(), hit.get("conflicts_with").cloned()))
+        .collect()
+}
+
+#[tokio::test]
+async fn a_search_names_the_other_side_on_both_hits_of_an_escalated_pair() {
+    let h = Harness::start().await;
+    let (old, new) = seed_dispute(&h).await;
+
+    let hits = conflicts_by_hit(&h, "agent-http", None).await;
+
+    assert!(hits.contains(&(new, Some(json!([old])))), "{hits:?}");
+    assert!(hits.contains(&(old, Some(json!([new])))), "{hits:?}");
+}
+
+#[tokio::test]
+async fn a_search_names_the_other_side_of_a_lone_hit() {
+    let h = Harness::start().await;
+    let (old, new) = seed_dispute(&h).await;
+
+    let hits = conflicts_by_hit(&h, "agent-http", Some(1)).await;
+
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    let (id, others) = &hits[0];
+    let other = if *id == new { old } else { new };
+    assert_eq!(others, &Some(json!([other])), "{hits:?}");
+}
+
+#[tokio::test]
+async fn a_search_names_no_pending_deleted_or_hidden_side() {
+    let h = Harness::start().await;
+    let (old, new) = seed_dispute(&h).await;
+    let release = format!("UPDATE memory SET status = 'active', disputed_against = NULL WHERE id = {new}");
+    h.ctx.runtime.store.conn_for_test().call(move |c| c.execute(&release, [])).await.expect("release");
+    note_pairs(&h, vec![(new, old, "pending")]).await;
+    assert!(conflicts_by_hit(&h, "agent-http", None).await.iter().all(|(_, c)| c.is_none()), "a pending pair");
+
+    let h = Harness::start().await;
+    let (old, _) = seed_dispute(&h).await;
+    let delete = format!("UPDATE memory SET deleted_at = 1 WHERE id = {old}");
+    h.ctx.runtime.store.conn_for_test().call(move |c| c.execute(&delete, [])).await.expect("delete");
+    assert!(conflicts_by_hit(&h, "agent-http", None).await.iter().all(|(_, c)| c.is_none()), "a deleted side");
+
+    let h = Harness::start().await;
+    let (_, new) = seed_dispute(&h).await;
+    let move_side = format!("UPDATE memory SET agent_id = 'agent-other' WHERE id = {new}");
+    h.ctx.runtime.store.conn_for_test().call(move |c| c.execute(&move_side, [])).await.expect("author");
+    write_policy(&h, HIDE_AUTHOR);
+    let hits = conflicts_by_hit(&h, "agent-other", None).await;
+    assert!(hits.iter().any(|(id, _)| *id == new), "the visible side is found: {hits:?}");
+    assert!(hits.iter().all(|(_, c)| c.is_none()), "a hidden side: {hits:?}");
+}
+
+/// Every row of `memory_conflict` and the dispute columns of `memory`, as
+/// text, to compare before and after.
+async fn dispute_state(h: &Harness) -> Vec<String> {
+    h.ctx
+        .runtime
+        .store
+        .conn_for_test()
+        .call(|c| -> rusqlite::Result<Vec<String>> {
+            let mut rows = Vec::new();
+            let mut pairs = c.prepare("SELECT new_id, old_id, state, distance, created_at FROM memory_conflict ORDER BY new_id, old_id")?;
+            for row in pairs.query_map([], |r| {
+                Ok(format!("pair {}-{} {} {:?} {}", r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?, r.get::<_, Option<f64>>(3)?, r.get::<_, i64>(4)?))
+            })? {
+                rows.push(row?);
+            }
+            let mut memories = c.prepare("SELECT id, status, disputed_against, deleted_at FROM memory ORDER BY id")?;
+            for row in memories.query_map([], |r| {
+                Ok(format!("row {} {} {:?} {:?}", r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?, r.get::<_, Option<i64>>(3)?))
+            })? {
+                rows.push(row?);
+            }
+            Ok(rows)
+        })
+        .await
+        .expect("read the dispute state")
+}
+
+#[tokio::test]
+async fn a_waiting_pair_keeps_its_state_while_the_context_marks_it() {
+    let h = Harness::start().await;
+    let (old, new) = seed_dispute(&h).await;
+    note_pairs(&h, vec![(new, old, "escalated")]).await;
+    let before = dispute_state(&h).await;
+
+    let (status, context) = h.post_json("/v1/context", json!({ "agent_id": "agent-http" })).await;
+    assert_eq!(status, 200, "{context}");
+    let prompt = context["prompt"].as_str().expect("prompt");
+    assert!(!prompt.contains("ACTIVE CONFLICTS"), "{prompt}");
+    let line_of = |id: i64| prompt.lines().find(|l| l.contains(&format!(" #{id} "))).unwrap_or_default();
+    assert!(line_of(new).contains(&format!(" conflict=#{old}]")), "{prompt}");
+    assert!(line_of(old).contains(&format!(" conflict=#{new}]")), "{prompt}");
+
+    let hits = conflicts_by_hit(&h, "agent-http", None).await;
+    assert!(hits.contains(&(new, Some(json!([old])))) && hits.contains(&(old, Some(json!([new])))), "both sides found and marked: {hits:?}");
+
+    let (status, listed) = h.get_json("/v1/disputes?agent_id=agent-http&escalated=true").await;
+    assert_eq!(status, 200, "{listed}");
+    assert_eq!((listed["pairs"][0]["new_id"].as_i64(), listed["pairs"][0]["old_id"].as_i64()), (Some(new), Some(old)), "{listed}");
+
+    assert_eq!(dispute_state(&h).await, before, "nothing was judged or moved");
+}
+
 #[tokio::test]
 async fn resolve_rejects_the_same_row() {
     let h = Harness::start().await;
@@ -5178,8 +5384,14 @@ async fn a_context_records_its_state_its_size_and_the_blocks_it_cut() {
 
     assert_eq!(gauge_of(&h, "context.retrieval_state", &[("state", "recent")]), Some((1, 1.0)));
     assert_eq!(gauge_of(&h, "context.retrieval_state", &[("state", "searched")]), Some((1, 1.0)));
-    assert_eq!(gauge_of(&h, "context.cut", &[("block", "recent")]), Some((1, 1.0)), "only the first context was cut");
-    assert_eq!(gauge_of(&h, "context.cut", &[("block", "long_term")]), None);
+    assert_eq!(
+        gauge_of(&h, "context.cut", &[("block", "recent"), ("state", "recent")]),
+        Some((1, 1.0)),
+        "only the first context was cut"
+    );
+    assert_eq!(gauge_of(&h, "context.cut", &[("block", "recent"), ("state", "searched")]), None);
+    assert_eq!(gauge_of(&h, "context.cut", &[("block", "long_term"), ("state", "searched")]), None);
+    assert_eq!(gauge_of(&h, "context.cut", &[("block", "long_term"), ("state", "recent")]), None);
 
     let run = h.ctx.runtime.metrics.run();
     let bytes = &run[&clawg_core::metrics::SeriesKey::new("context.prompt_bytes", &[])];
@@ -5529,6 +5741,8 @@ const PROJECT_INPUTS: &[(&str, &str, Option<&str>)] = &[
     // A session's own id finds its row.
     ("POST", "/sessions/end", None),
     ("POST", "/sessions/calls", Some("body.project_id")),
+    // A session's own id finds the counts of its row.
+    ("POST", "/sessions/summary", None),
     ("GET", "/memories/{kind}/{id}", None),
     ("PATCH", "/memories/{kind}/{id}", Some("body.project_id")),
     ("DELETE", "/memories/{kind}/{id}", None),
@@ -6685,6 +6899,55 @@ async fn a_hook_event_opens_the_row_of_its_session_and_counts() {
     hook_event(&h, json!({ "agent_id": "x", "session_id": "s-3", "event": "prompt" })).await;
     let other = &session_rows(&h, "s-3")[0];
     assert_eq!((other.client.as_str(), other.project_id.as_deref(), other.prompts), ("other", None, 1));
+}
+
+async fn asks_for_summary(h: &Harness, session_id: &str) -> bool {
+    let (status, body) = h.post_json("/v1/sessions/summary", json!({ "session_id": session_id })).await;
+    assert_eq!(status, 200, "{body}");
+    body["ask"].as_bool().expect("ask")
+}
+
+/// Opens `session_id` for `agent-http` in project `p`, as the hook of a
+/// prompt does, so that the saves that follow are counted for it.
+async fn in_session(h: &Harness, session_id: &str) {
+    hook_event(h, json!({ "agent_id": "agent-http", "project_id": "p", "session_id": session_id, "event": "prompt" })).await;
+}
+
+async fn save_typed(h: &Harness, content: &str, memory_type: &str) {
+    save_id(h, json!({ "content": content, "agent_id": "agent-http", "project_id": "p", "memory_type": memory_type })).await;
+}
+
+#[tokio::test]
+async fn a_session_is_asked_for_its_summary_after_its_first_save() {
+    let h = keeping_sessions().await;
+    in_session(&h, "s-1").await;
+    assert!(!asks_for_summary(&h, "s-1").await, "a turn that saved nothing");
+    save_typed(&h, "the release job runs on tuesdays", "semantic_fact").await;
+    assert!(asks_for_summary(&h, "s-1").await, "the turn after the first save");
+    assert!(!asks_for_summary(&h, "s-1").await, "only once");
+
+    in_session(&h, "s-2").await;
+    save_typed(&h, "the linter crashed on a missing config", "tool_error").await;
+    assert!(!asks_for_summary(&h, "s-2").await, "only a failure");
+    save_typed(&h, "the linter reads its config from the repo root", "semantic_fact").await;
+    assert!(asks_for_summary(&h, "s-2").await);
+}
+
+#[tokio::test]
+async fn the_summary_question_answers_no_for_an_unknown_session() {
+    let h = keeping_sessions().await;
+    assert!(!asks_for_summary(&h, "never-seen").await);
+    let (status, _) = h.post_json("/v1/sessions/summary", json!({ "session_id": "has space" })).await;
+    assert_eq!(status, 400);
+}
+
+#[tokio::test]
+async fn the_summary_question_leaves_the_model_unloaded() {
+    let h = Harness::start_unloaded(false).await;
+    h.ctx.runtime.metrics.set_writing(true);
+    in_session(&h, "s-1").await;
+    assert!(!asks_for_summary(&h, "s-1").await);
+    assert_eq!(h.reloads.load(Ordering::SeqCst), 0, "the question loads no model");
 }
 
 #[tokio::test]

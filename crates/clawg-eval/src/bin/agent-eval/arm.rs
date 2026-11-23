@@ -28,9 +28,9 @@ pub enum Arm {
     /// A3 with the short protocol block `clawg setup claude-code --protocol
     /// short` writes.
     A3Short,
-    /// A3 with the lean protocol block `clawg setup claude-code --protocol
-    /// lean` writes.
-    A3Lean,
+    /// A3 with the whole protocol block `clawg setup claude-code --protocol
+    /// full` writes, the default before the lean one.
+    A3Full,
     /// A3 without the `PostToolUse` and `PostToolUseFailure` hooks that `setup`
     /// installs for `Bash`: what a3 was before they existed.
     A3NoTools,
@@ -85,7 +85,7 @@ impl Shape {
 }
 
 pub const ARMS: [Arm; 12] =
-    [Arm::A0, Arm::A2, Arm::A3, Arm::A3Eager, Arm::A3Short, Arm::A3Lean, Arm::A3NoTools, Arm::A4, Arm::B, Arm::L0, Arm::L1, Arm::L2];
+    [Arm::A0, Arm::A2, Arm::A3, Arm::A3Eager, Arm::A3Short, Arm::A3Full, Arm::A3NoTools, Arm::A4, Arm::B, Arm::L0, Arm::L1, Arm::L2];
 
 /// The events of the hooks `setup` installs for the tools the agent calls, which
 /// arm `a3-notools` does not have.
@@ -116,7 +116,7 @@ impl Arm {
             Arm::A3 => "a3",
             Arm::A3Eager => "a3-eager",
             Arm::A3Short => "a3-short",
-            Arm::A3Lean => "a3-lean",
+            Arm::A3Full => "a3-full",
             Arm::A3NoTools => "a3-notools",
             Arm::A4 => "a4",
             Arm::B => "b",
@@ -128,17 +128,17 @@ impl Arm {
 
     /// Whether a run of this arm starts clawg: its daemon, its bridge, its hooks.
     pub fn has_clawg(self) -> bool {
-        matches!(self, Arm::A2 | Arm::A3 | Arm::A3Eager | Arm::A3Short | Arm::A3Lean | Arm::A3NoTools | Arm::B | Arm::L0 | Arm::L1 | Arm::L2)
+        matches!(self, Arm::A2 | Arm::A3 | Arm::A3Eager | Arm::A3Short | Arm::A3Full | Arm::A3NoTools | Arm::B | Arm::L0 | Arm::L1 | Arm::L2)
     }
 
     /// Whether the arm has the hooks `setup` writes in `settings.json`.
     fn has_setup(self) -> bool {
-        matches!(self, Arm::A3 | Arm::A3Eager | Arm::A3Short | Arm::A3Lean | Arm::A3NoTools | Arm::B | Arm::L0 | Arm::L1 | Arm::L2)
+        matches!(self, Arm::A3 | Arm::A3Eager | Arm::A3Short | Arm::A3Full | Arm::A3NoTools | Arm::B | Arm::L0 | Arm::L1 | Arm::L2)
     }
 
     /// Whether the arm has the protocol block `setup` writes in `CLAUDE.md`.
     fn has_protocol(self) -> bool {
-        matches!(self, Arm::A3 | Arm::A3Eager | Arm::A3Short | Arm::A3Lean | Arm::A3NoTools | Arm::B)
+        matches!(self, Arm::A3 | Arm::A3Eager | Arm::A3Short | Arm::A3Full | Arm::A3NoTools | Arm::B)
     }
 
     /// Whether the arm delivers the seeded rules and, if it does, whether
@@ -320,7 +320,7 @@ pub fn plan(task: &Task, arm: Arm, layout: &Layout, options: &Options) -> Result
             version: setup::own_version()?,
             protocol: match arm {
                 Arm::A3Short => Some(Variant::Short),
-                Arm::A3Lean => Some(Variant::Lean),
+                Arm::A3Full => Some(Variant::Full),
                 _ => None,
             },
         };
@@ -573,7 +573,7 @@ mod tests {
         assert!(with(by_glob.clone(), Arm::L2).is_ok(), "l2 delivers the rules with globs by file, so nothing goes at startup");
         assert!(matches!(with(by_glob, Arm::L1), Err(ArmError::StartupTooLong { .. })));
 
-        for arm in [Arm::A3, Arm::A3Short, Arm::A3Lean, Arm::A4, Arm::L0] {
+        for arm in [Arm::A3, Arm::A3Short, Arm::A3Full, Arm::A4, Arm::L0] {
             assert!(with(rules(300, "{}"), arm).is_ok(), "{arm:?} has no startup hook of the harness");
         }
     }
@@ -595,8 +595,10 @@ mod tests {
         let own = setup::own_version().unwrap();
         let a3 = plan(&task(true), Arm::A3, &layout(), &options(None)).unwrap();
         let short = plan(&task(true), Arm::A3Short, &layout(), &options(None)).unwrap();
-        let full_block = file(&a3, "CLAUDE.md").unwrap();
-        assert!(full_block.contains(&format!("<!-- clawg {own} -->")) && full_block.contains("## How to write a save"), "a3 keeps the whole block");
+        let a3_block = file(&a3, "CLAUDE.md").unwrap();
+        assert!(a3_block.contains(&format!("<!-- clawg {own} -->")) && a3_block.contains("## How to write a save"), "a3 keeps every section");
+        let full = plan(&task(true), Arm::A3Full, &layout(), &options(None)).unwrap();
+        let full_block = file(&full, "CLAUDE.md").unwrap();
         let block = file(&short, "CLAUDE.md").unwrap();
         assert!(block.contains(&format!("<!-- clawg {own} protocol=short -->")), "{block}");
         assert!(block.contains("## Session summary") && block.contains("## After a compaction"), "{block}");
@@ -616,37 +618,39 @@ mod tests {
     }
 
     #[test]
-    fn a3_lean_is_a3_with_the_lean_block() {
+    fn a3_full_is_a3_with_the_whole_block() {
+        use clawg_cli::mcp::protocol;
         let own = setup::own_version().unwrap();
         let a3 = plan(&task(true), Arm::A3, &layout(), &options(None)).unwrap();
-        let lean = plan(&task(true), Arm::A3Lean, &layout(), &options(None)).unwrap();
-        let full_block = file(&a3, "CLAUDE.md").unwrap();
-        let block = file(&lean, "CLAUDE.md").unwrap();
-        assert!(block.contains(&format!("<!-- clawg {own} protocol=lean -->")), "{block}");
-        assert!(block.contains("## How to write a save") && block.contains("## Session summary"), "{block}");
-        assert!(block.contains("gets a `topic_key`, a\n  short stable name such as `storage/engine`"), "the key's rule stays whole: {block}");
-        assert!(block.len() < full_block.len() && block.len() > full_block.len() / 2, "{} of {} bytes", block.len(), full_block.len());
+        let full = plan(&task(true), Arm::A3Full, &layout(), &options(None)).unwrap();
+        let a3_block = file(&a3, "CLAUDE.md").unwrap();
+        let block = file(&full, "CLAUDE.md").unwrap();
+        assert!(block.contains(&format!("<!-- clawg {own} protocol=full -->")), "{block}");
+        assert!(block.contains(protocol::text(None).replace("\r\n", "\n").trim_end()), "the whole protocol: {block}");
+        assert!(a3_block.contains(protocol::lean(None).trim_end()), "a3 has the lean block, the default: {a3_block}");
+        assert!(a3_block.len() * 10 <= block.len() * 7, "{} of {} bytes", a3_block.len(), block.len());
 
         let without_block = |plan: &RunPlan| RunPlan {
             arm: String::new(),
             files: plan.files.iter().filter(|(path, _)| !path.ends_with("CLAUDE.md")).cloned().collect(),
             ..plan.clone()
         };
-        assert_eq!(without_block(&lean), without_block(&a3), "everything but the block is a3's");
-        assert_eq!(lean.arm, "a3-lean");
+        assert_eq!(without_block(&full), without_block(&a3), "everything but the block is a3's");
+        assert_eq!(full.arm, "a3-full");
 
-        let spanish = plan(&task(true), Arm::A3Lean, &layout(), &options(Some(Lang::Es))).unwrap();
+        let spanish = plan(&task(true), Arm::A3Full, &layout(), &options(Some(Lang::Es))).unwrap();
         let block = file(&spanish, "CLAUDE.md").unwrap();
-        assert!(block.contains("## Cómo escribir un save") && block.contains("protocol=lean"), "{block}");
+        assert!(block.contains(protocol::text(Some(Lang::Es)).replace("\r\n", "\n").trim_end()) && block.contains("protocol=full"), "{block}");
     }
 
     #[test]
-    fn a3_lean_reads_and_prints_by_its_name() {
-        assert_eq!(Arm::parse("a3-lean"), Some(Arm::A3Lean));
-        assert_eq!(Arm::A3Lean.as_str(), "a3-lean");
+    fn a3_full_reads_and_prints_by_its_name() {
+        assert_eq!(Arm::parse("a3-full"), Some(Arm::A3Full));
+        assert_eq!(Arm::A3Full.as_str(), "a3-full");
+        assert_eq!(Arm::parse("a3-lean"), None, "lean is a3's own block");
         let order: Vec<&str> = ARMS.iter().map(|a| a.as_str()).collect();
         let at = |name: &str| order.iter().position(|a| *a == name);
-        assert_eq!(at("a3-lean"), at("a3-short").map(|i| i + 1), "beside a3-short: {order:?}");
+        assert_eq!(at("a3-full"), at("a3-short").map(|i| i + 1), "beside a3-short: {order:?}");
     }
 
     #[test]
@@ -703,7 +707,7 @@ mod tests {
             assert!(plan.files.iter().any(|(p, _)| *p == layout().config_dir().join("settings.json")), "{}", arm.as_str());
             let settings = settings(&plan);
             assert_eq!(settings["hooks"]["InstructionsLoaded"], logged, "{}", arm.as_str());
-            let with_setup = matches!(arm, Arm::A3 | Arm::A3Eager | Arm::A3Short | Arm::A3Lean | Arm::A3NoTools | Arm::B | Arm::L0 | Arm::L1 | Arm::L2);
+            let with_setup = matches!(arm, Arm::A3 | Arm::A3Eager | Arm::A3Short | Arm::A3Full | Arm::A3NoTools | Arm::B | Arm::L0 | Arm::L1 | Arm::L2);
             assert_eq!(settings["hooks"]["UserPromptSubmit"].is_array(), with_setup, "setup's hooks stay: {}", arm.as_str());
         }
     }
@@ -841,7 +845,7 @@ mod tests {
     #[test]
     fn the_arms_with_clawg_start_a_daemon_of_the_run_on_an_ephemeral_port() {
         let with_daemon: Vec<Arm> = ARMS.into_iter().filter(|arm| plan(&task(true), *arm, &layout(), &options(None)).unwrap().daemon.is_some()).collect();
-        assert_eq!(with_daemon, [Arm::A2, Arm::A3, Arm::A3Eager, Arm::A3Short, Arm::A3Lean, Arm::A3NoTools, Arm::B, Arm::L0, Arm::L1, Arm::L2]);
+        assert_eq!(with_daemon, [Arm::A2, Arm::A3, Arm::A3Eager, Arm::A3Short, Arm::A3Full, Arm::A3NoTools, Arm::B, Arm::L0, Arm::L1, Arm::L2]);
 
         let plan = plan(&task(true), Arm::A3, &layout(), &options(None)).unwrap();
         let daemon = plan.daemon.unwrap();

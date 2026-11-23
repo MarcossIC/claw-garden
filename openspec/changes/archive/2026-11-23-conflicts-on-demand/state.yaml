@@ -1,0 +1,15 @@
+change: conflicts-on-demand
+objective: "1"
+depends_on: []  # se coordina con session-lifecycle (99) y memory-links (134), sin esperarlos
+phase: archive
+artifacts:
+  exploration: done
+  proposal: done  # A2, B1, C1, P1, D5 nada en el arranque, D6 las dos vías, y context.cut con state
+  spec: done  # CO1 a CO13: contexto sin consulta sin bloque, marca conflict=#N, orden del presupuesto, search y list_memories con conflicts, textos, context.cut con state
+  design: skipped  # las alternativas y su costo están en la exploración; la propuesta las cierra
+  tasks: done  # 15 tareas: 14 de implementación en la nube (Linux, embedder falso) y la verificación; la medición con el perfil real queda aparte, después de publicar
+  apply: done
+  verify: done  # dos revisores, dos rondas, WARNINGS
+  archive: done
+updated: 2026-11-23
+main_spec: openspec/specs/retrieval/spec.md, openspec/specs/disputes/spec.md, openspec/specs/mcp/spec.md, openspec/specs/hooks/spec.md, openspec/specs/metrics/spec.md

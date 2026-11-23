@@ -53,12 +53,13 @@ const HOOK_TIMEOUT_SECS: u64 = 5;
 /// The client lifecycle events `clawg hook` answers, as the client names
 /// them and as `clawg hook` takes them, with the matcher of the group that
 /// holds each one's hook: none runs it for everything.
-const HOOK_EVENTS: [(&str, &str, Option<&str>); 5] = [
+const HOOK_EVENTS: [(&str, &str, Option<&str>); 6] = [
     ("SessionStart", "session-start", Some(SESSION_START_MATCHER)),
     ("UserPromptSubmit", "user-prompt-submit", None),
     ("SessionEnd", "session-end", None),
     ("PostToolUse", "post-tool-use", Some(SHELL_TOOL_MATCHER)),
     ("PostToolUseFailure", "post-tool-use-failure", Some(SHELL_TOOL_MATCHER)),
+    ("Stop", "stop", None),
 ];
 
 /// Copies of each file kept in `backups/setup`, the newest.
@@ -491,6 +492,22 @@ pub(crate) fn missing_tool_hooks(text: &str, profile: Profile) -> Vec<&'static s
         .collect()
 }
 
+/// Whether `text`, a `settings.json` that runs clawg at session start for
+/// `profile`, lacks the hook of `Stop`: an install from before it, which never
+/// asks for the session's summary. A file without the session-start hook, or
+/// that is not settings, lacks nothing.
+pub(crate) fn missing_stop_hook(text: &str, profile: Profile) -> bool {
+    let Ok(Value::Object(settings)) = serde_json::from_str::<Value>(text) else { return false };
+    let has = |event: &str, arg: &str| {
+        settings
+            .get("hooks")
+            .and_then(|hooks| hooks.get(event))
+            .and_then(Value::as_array)
+            .is_some_and(|groups| hooks_run_for(groups, None).any(|hook| is_clawg_hook(hook, arg, profile)))
+    };
+    has("SessionStart", "session-start") && !has("Stop", "stop")
+}
+
 /// Whether a command's words run `clawg hook <event_arg>` for `profile`. One
 /// without `--profile` belongs to no profile.
 fn runs_clawg_hook(words: &[String], event_arg: &str, profile: Profile) -> bool {
@@ -712,8 +729,10 @@ impl Stamp {
     }
 }
 
-/// What the block holds when the person chose no variant: the whole protocol.
-const DEFAULT_VARIANT: Variant = Variant::Full;
+/// What the block holds when the person chose no variant: the lean protocol,
+/// which kept every behaviour of the whole one in agent-eval at a tenth less
+/// context per session.
+const DEFAULT_VARIANT: Variant = Variant::Lean;
 
 /// The protocol for `language` as `variant` has it ([`protocol::text`],
 /// [`protocol::short`] or nothing) between its markers, with `stamp` after the
@@ -1419,7 +1438,7 @@ mod tests {
 
     /// The block as this binary writes it, in a file with LF line endings.
     fn installed_block(language: Option<Lang>) -> String {
-        block("\n", language, Variant::Full, Stamp { version: v("0.88.0"), choice: None })
+        block("\n", language, DEFAULT_VARIANT, Stamp { version: v("0.88.0"), choice: None })
     }
 
     fn written(step: &FileStep) -> &str {
@@ -1476,7 +1495,7 @@ mod tests {
             plan.server.add_args(),
             ["mcp", "add", "--scope", "user", "clawg-dev", "--", exe().to_str().unwrap(), "mcp", "--profile", "dev", "--agent", "claude-code"]
         );
-        assert_eq!(plan.hooks.added, ["SessionStart", "UserPromptSubmit", "SessionEnd", "PostToolUse", "PostToolUseFailure"]);
+        assert_eq!(plan.hooks.added, ["SessionStart", "UserPromptSubmit", "SessionEnd", "PostToolUse", "PostToolUseFailure", "Stop"]);
         let settings: Value = serde_json::from_str(written(&plan.settings)).unwrap();
         assert_eq!(
             settings,
@@ -1485,7 +1504,8 @@ mod tests {
                 "UserPromptSubmit": [{ "hooks": [hook("user-prompt-submit")] }],
                 "SessionEnd": [{ "hooks": [hook("session-end")] }],
                 "PostToolUse": [{ "matcher": "Bash", "hooks": [hook("post-tool-use")] }],
-                "PostToolUseFailure": [{ "matcher": "Bash", "hooks": [hook("post-tool-use-failure")] }]
+                "PostToolUseFailure": [{ "matcher": "Bash", "hooks": [hook("post-tool-use-failure")] }],
+                "Stop": [{ "hooks": [hook("stop")] }]
             }})
         );
         assert_eq!(plan.block, BlockStep::Added);
@@ -1545,11 +1565,11 @@ mod tests {
     #[test]
     fn a_block_is_current_stale_or_newer() {
         let own = v("0.88.0");
-        let older = block("\n", None, Variant::Full, Stamp { version: v("0.87.0"), choice: None });
+        let older = block("\n", None, DEFAULT_VARIANT, Stamp { version: v("0.87.0"), choice: None });
         assert_eq!(freshness(&older, None, own), Freshness::Current, "the same text of another version");
         assert_eq!(freshness(&older.replace('\n', "\r\n"), None, own), Freshness::Current, "the same text with CRLF");
         assert_eq!(freshness(&older, Some(Lang::Es), own), Freshness::Stale, "the other language is other text");
-        let spanish = block("\n", Some(Lang::Es), Variant::Full, Stamp { version: own, choice: None });
+        let spanish = block("\n", Some(Lang::Es), DEFAULT_VARIANT, Stamp { version: own, choice: None });
         assert_eq!(freshness(&spanish, Some(Lang::Es), own), Freshness::Current);
 
         let before_stamps = format!(
@@ -1570,8 +1590,9 @@ mod tests {
         let own = v("0.88.0");
         let stamp = |choice| Stamp { version: own, choice };
         for language in [None, Some(Lang::Es)] {
-            let full = block("\n", language, Variant::Full, stamp(None));
-            assert_eq!(full, installed_block(language));
+            let default = block("\n", language, DEFAULT_VARIANT, stamp(None));
+            assert_eq!(default, installed_block(language));
+            let full = block("\n", language, Variant::Full, stamp(Some(Variant::Full)));
             assert!(full.contains(protocol::text(language).replace("\r\n", "\n").trim_end()), "the whole protocol");
 
             let short = block("\n", language, Variant::Short, stamp(Some(Variant::Short)));
@@ -1589,7 +1610,7 @@ mod tests {
             let off = block("\n", language, Variant::Off, stamp(Some(Variant::Off)));
             assert_eq!(off, format!("{BEGIN_MARKER}\n<!-- clawg 0.88.0 protocol=off -->\n{END_MARKER}"));
 
-            for (text, choice) in [(&full, None), (&short, Some(Variant::Short)), (&lean, Some(Variant::Lean)), (&off, Some(Variant::Off))] {
+            for (text, choice) in [(&default, None), (&full, Some(Variant::Full)), (&short, Some(Variant::Short)), (&lean, Some(Variant::Lean)), (&off, Some(Variant::Off))] {
                 assert_eq!(freshness(text, language, own), Freshness::Current, "{choice:?} is what its own stamp asks for");
                 assert_eq!(read_stamp(text), Some(stamp(choice)));
             }
@@ -1612,7 +1633,7 @@ mod tests {
         assert_eq!(read_stamp(&later), None, "its stamp reads as none");
         assert_eq!(freshness(&later, None, own), Freshness::Stale, "stale, not newer: the version is never read");
         let plan_ = plan(&asking_for(None, &later), Mode::Install).unwrap();
-        assert_eq!((plan_.block, plan_.variant), (BlockStep::Rewritten, Some(Variant::Full)), "setup writes the default over it");
+        assert_eq!((plan_.block, plan_.variant), (BlockStep::Rewritten, Some(Variant::Lean)), "setup writes the default over it");
     }
 
     fn asking_for(protocol: Option<Variant>, instructions: &str) -> State {
@@ -1638,11 +1659,11 @@ mod tests {
         }
 
         let from_short = mine(&block("\n", None, Variant::Short, Stamp { version: v("0.88.0"), choice: Some(Variant::Short) }));
-        let back = plan(&asking_for(Some(Variant::Full), &from_short), Mode::Install).unwrap();
-        assert!(written(&back.instructions).contains("<!-- clawg 0.88.0 protocol=full -->"), "a chosen variant is written even when it is the default");
+        let back = plan(&asking_for(Some(Variant::Lean), &from_short), Mode::Install).unwrap();
+        assert!(written(&back.instructions).contains("<!-- clawg 0.88.0 protocol=lean -->"), "a chosen variant is written even when it is the default");
 
         let none = plan(&asking_for(None, &before_stamps), Mode::Install).unwrap();
-        assert_eq!((none.block, none.variant), (BlockStep::Unchanged, Some(Variant::Full)), "no choice, the default");
+        assert_eq!((none.block, none.variant), (BlockStep::Rewritten, Some(Variant::Lean)), "no choice: the default, over the whole block of before");
 
         let fresh = plan(&State { protocol: Some(Variant::Short), ..state(None, None, None) }, Mode::Install).unwrap();
         assert!(written(&fresh.instructions).starts_with(&format!("{BEGIN_MARKER}\n<!-- clawg 0.88.0 protocol=short -->\n# Claw Garden memory protocol\n")));
@@ -1652,7 +1673,7 @@ mod tests {
         let (text, _) = report(&plan(&s, Mode::Install).unwrap(), &s, None);
         assert!(text.contains("would update it (protocol=short)"), "{text}");
         let (text, _) = report(&plan(&state(None, None, Some(&before_stamps)), Mode::Install).unwrap(), &state(None, None, None), None);
-        assert!(text.contains("up to date (protocol=full)"), "{text}");
+        assert!(text.contains("would update it (protocol=lean)"), "{text}");
     }
 
     #[test]
@@ -1660,12 +1681,12 @@ mod tests {
         for (choice, requested) in
             [(None, None), (Some(Variant::Short), None), (Some(Variant::Short), Some(Variant::Short)), (Some(Variant::Lean), None), (Some(Variant::Off), None)]
         {
-            let variant = choice.unwrap_or(Variant::Full);
+            let variant = choice.unwrap_or(DEFAULT_VARIANT);
             let older = block("\n", None, variant, Stamp { version: v("0.87.0"), choice });
             let plan_ = plan(&asking_for(requested, &older), Mode::Install).unwrap();
             assert_eq!((plan_.block, &plan_.instructions), (BlockStep::Unchanged, &FileStep::Unchanged), "{choice:?} {requested:?}");
         }
-        let crlf = block("\r\n", None, Variant::Full, Stamp { version: v("0.87.0"), choice: None }) + "\r\n";
+        let crlf = block("\r\n", None, DEFAULT_VARIANT, Stamp { version: v("0.87.0"), choice: None }) + "\r\n";
         assert_eq!(plan(&asking_for(None, &crlf), Mode::Install).unwrap().block, BlockStep::Unchanged);
     }
 
@@ -1708,7 +1729,7 @@ mod tests {
         let keys: Vec<&String> = value.as_object().unwrap().keys().collect();
         assert_eq!(keys, ["theme", "hooks", "model"]);
         let events: Vec<&String> = value["hooks"].as_object().unwrap().keys().collect();
-        assert_eq!(events, ["UserPromptSubmit", "PreToolUse", "SessionStart", "SessionEnd", "PostToolUse", "PostToolUseFailure"]);
+        assert_eq!(events, ["UserPromptSubmit", "PreToolUse", "SessionStart", "SessionEnd", "PostToolUse", "PostToolUseFailure", "Stop"]);
         let prompt = value["hooks"]["UserPromptSubmit"].as_array().unwrap();
         assert_eq!(prompt[0]["hooks"][0]["command"], "~/bin/remind.sh");
         assert_eq!(prompt[1]["hooks"][0], hook("user-prompt-submit"));
@@ -1720,14 +1741,14 @@ mod tests {
         let settings = r#"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"\"/old dir/clawg\" hook session-start --agent other --profile dev"}]}]}}"#;
         let plan = plan(&state(None, Some(settings), None), Mode::Install).unwrap();
         assert_eq!(plan.hooks.conflicts, [("SessionStart", "\"/old dir/clawg\" hook session-start --agent other --profile dev".to_string())]);
-        assert_eq!(plan.hooks.added, ["UserPromptSubmit", "SessionEnd", "PostToolUse", "PostToolUseFailure"]);
+        assert_eq!(plan.hooks.added, ["UserPromptSubmit", "SessionEnd", "PostToolUse", "PostToolUseFailure", "Stop"]);
         let value: Value = serde_json::from_str(written(&plan.settings)).unwrap();
         assert_eq!(value["hooks"]["SessionStart"].as_array().unwrap().len(), 1, "the conflicting hook is not replaced");
 
         let ended = shell_hook("/old/clawg hook session-end --agent other --profile dev");
         let ended = super::plan(&state(None, Some(&settings_with(&[("SessionEnd", ended)])), None), Mode::Install).unwrap();
         assert_eq!(ended.hooks.conflicts, [("SessionEnd", "/old/clawg hook session-end --agent other --profile dev".to_string())]);
-        assert_eq!(ended.hooks.added, ["SessionStart", "UserPromptSubmit", "PostToolUse", "PostToolUseFailure"]);
+        assert_eq!(ended.hooks.added, ["SessionStart", "UserPromptSubmit", "PostToolUse", "PostToolUseFailure", "Stop"]);
 
         let moved = serde_json::json!({ "type": "command", "command": "/old/clawg",
             "args": ["hook", "session-start", "--agent", "claude-code", "--profile", "dev"] });
@@ -1767,7 +1788,7 @@ mod tests {
         .to_string();
         let first = plan(&state(None, Some(&settings), None), Mode::Install).unwrap();
         assert_eq!(first.hooks.migrated, ["SessionStart", "UserPromptSubmit", "SessionEnd"]);
-        assert_eq!(first.hooks.added, ["PostToolUse", "PostToolUseFailure"], "the hooks of a later version are added, not migrated");
+        assert_eq!(first.hooks.added, ["PostToolUse", "PostToolUseFailure", "Stop"], "the hooks of a later version are added, not migrated");
         assert!(first.hooks.conflicts.is_empty(), "{:?}", first.hooks);
         let value: Value = serde_json::from_str(written(&first.settings)).unwrap();
         assert_eq!(
@@ -1777,7 +1798,8 @@ mod tests {
                 "UserPromptSubmit": [{ "hooks": [hook("user-prompt-submit")] }, { "hooks": [{ "type": "command", "command": "guard" }] }],
                 "SessionEnd": [{ "hooks": [hook("session-end")] }],
                 "PostToolUse": [{ "matcher": "Bash", "hooks": [hook("post-tool-use")] }],
-                "PostToolUseFailure": [{ "matcher": "Bash", "hooks": [hook("post-tool-use-failure")] }]
+                "PostToolUseFailure": [{ "matcher": "Bash", "hooks": [hook("post-tool-use-failure")] }],
+                "Stop": [{ "hooks": [hook("stop")] }]
             }})
         );
         let s = state(None, Some(&settings), None);
@@ -1786,7 +1808,7 @@ mod tests {
         assert!(text.contains("would migrate SessionStart, UserPromptSubmit, SessionEnd to run without a shell"), "{text}");
 
         let second = plan(&state(None, after(Some(&settings), &first.settings).as_deref(), None), Mode::Install).unwrap();
-        assert_eq!(second.hooks.unchanged, ["SessionStart", "UserPromptSubmit", "SessionEnd", "PostToolUse", "PostToolUseFailure"]);
+        assert_eq!(second.hooks.unchanged, ["SessionStart", "UserPromptSubmit", "SessionEnd", "PostToolUse", "PostToolUseFailure", "Stop"]);
         assert_eq!(second.settings, FileStep::Unchanged);
 
         let both = settings_with(&[
@@ -1795,7 +1817,7 @@ mod tests {
         ]);
         let plan = plan(&state(None, Some(&both), None), Mode::Install).unwrap();
         assert_eq!(plan.hooks.migrated, ["SessionStart"]);
-        assert_eq!(plan.hooks.added, ["UserPromptSubmit", "SessionEnd", "PostToolUse", "PostToolUseFailure"]);
+        assert_eq!(plan.hooks.added, ["UserPromptSubmit", "SessionEnd", "PostToolUse", "PostToolUseFailure", "Stop"]);
         let value: Value = serde_json::from_str(written(&plan.settings)).unwrap();
         assert_eq!(value["hooks"]["SessionStart"], serde_json::json!([{ "hooks": [hook("session-start")] }]), "it would run twice");
     }
@@ -1839,7 +1861,7 @@ mod tests {
         let prod = "clawg hook session-start --agent claude-code --profile prod";
         let settings = format!(r#"{{"hooks":{{"SessionStart":[{{"hooks":[{{"type":"command","command":"{prod}"}}]}}]}}}}"#);
         let plan_ = plan(&state(None, Some(&settings), None), Mode::Install).unwrap();
-        assert_eq!(plan_.hooks.added, ["SessionStart", "UserPromptSubmit", "SessionEnd", "PostToolUse", "PostToolUseFailure"]);
+        assert_eq!(plan_.hooks.added, ["SessionStart", "UserPromptSubmit", "SessionEnd", "PostToolUse", "PostToolUseFailure", "Stop"]);
         let removing = plan(&state(None, Some(&settings), None), Mode::Remove).unwrap();
         assert_eq!(removing.settings, FileStep::Unchanged, "the prod hook stays");
     }
@@ -1850,7 +1872,7 @@ mod tests {
         let plan_ = plan(&spanish, Mode::Install).unwrap();
         let text = written(&plan_.instructions);
         assert!(text.contains("# Protocolo de memoria de Claw Garden"), "{text}");
-        assert!(text.contains("Responde a la persona en español salvo que escriba en otro idioma"), "{text}");
+        assert!(text.contains("Escríbela en español, y busca en español también."), "{text}");
         assert_eq!(text, format!("{}\n", installed_block(Some(Lang::Es))));
         assert_ne!(installed_block(Some(Lang::Es)), installed_block(None));
     }
@@ -1864,7 +1886,7 @@ mod tests {
         assert_eq!(code, 0);
         for needed in [
             "servidor mcp clawg-dev: se registraría (claude mcp add --scope user clawg-dev -- ",
-            ": se agregarían SessionStart, UserPromptSubmit, SessionEnd, PostToolUse, PostToolUseFailure",
+            ": se agregarían SessionStart, UserPromptSubmit, SessionEnd, PostToolUse, PostToolUseFailure, Stop",
             "protocolo de memoria en ",
             ": se actualizaría",
         ] {
@@ -1880,7 +1902,7 @@ mod tests {
         assert_eq!(code, 1, "the manual command is not done");
         for needed in [
             "servidor mcp clawg-dev: claude no está en el PATH; regístralo con:\n  claude mcp add --scope user clawg-dev -- ",
-            ": agregados SessionStart, UserPromptSubmit, SessionEnd, PostToolUse, PostToolUseFailure",
+            ": agregados SessionStart, UserPromptSubmit, SessionEnd, PostToolUse, PostToolUseFailure, Stop",
             ": actualizado",
             "archivo anterior copiado a /b/settings.json.1",
             "copia más vieja borrada: /b/settings.json.0",
@@ -1963,7 +1985,7 @@ mod tests {
         );
         let second = plan(&s, Mode::Install).unwrap();
         assert_eq!(second.server_step, ServerStep::Unchanged);
-        assert_eq!(second.hooks.unchanged, ["SessionStart", "UserPromptSubmit", "SessionEnd", "PostToolUse", "PostToolUseFailure"]);
+        assert_eq!(second.hooks.unchanged, ["SessionStart", "UserPromptSubmit", "SessionEnd", "PostToolUse", "PostToolUseFailure", "Stop"]);
         assert_eq!((&second.settings, &second.instructions), (&FileStep::Unchanged, &FileStep::Unchanged));
         let (text, code) = report(&second, &s, Some(&Applied { server: ServerOutcome::NotRun, backups: vec![], pruned: vec![], failures: vec![] }));
         assert_eq!(code, 0);
@@ -1983,7 +2005,7 @@ mod tests {
         );
         let s = state(Some(&planned_server_json()), Some(&earlier), None);
         let plan = plan(&s, Mode::Install).unwrap();
-        assert_eq!(plan.hooks.added, ["SessionEnd", "PostToolUse", "PostToolUseFailure"]);
+        assert_eq!(plan.hooks.added, ["SessionEnd", "PostToolUse", "PostToolUseFailure", "Stop"]);
         assert_eq!(plan.hooks.unchanged, ["SessionStart", "UserPromptSubmit"]);
         assert!(plan.hooks.migrated.is_empty() && plan.hooks.conflicts.is_empty(), "{:?}", plan.hooks);
 
@@ -1996,7 +2018,7 @@ mod tests {
 
         let (report, code) = report(&plan, &s, None);
         assert_eq!(code, 0, "{report}");
-        assert!(report.contains("would add SessionEnd, PostToolUse, PostToolUseFailure; SessionStart, UserPromptSubmit already there"), "{report}");
+        assert!(report.contains("would add SessionEnd, PostToolUse, PostToolUseFailure, Stop; SessionStart, UserPromptSubmit already there"), "{report}");
     }
 
     #[test]
@@ -2013,7 +2035,7 @@ mod tests {
         );
         let s = state(Some(&planned_server_json()), Some(&earlier), None);
         let plan = plan(&s, Mode::Install).unwrap();
-        assert_eq!(plan.hooks.added, ["PostToolUse", "PostToolUseFailure"]);
+        assert_eq!(plan.hooks.added, ["PostToolUse", "PostToolUseFailure", "Stop"]);
         assert_eq!(plan.hooks.unchanged, ["SessionStart", "UserPromptSubmit", "SessionEnd"]);
         assert!(plan.hooks.migrated.is_empty() && plan.hooks.conflicts.is_empty(), "{:?}", plan.hooks);
 
@@ -2024,7 +2046,7 @@ mod tests {
 
         let (report, code) = report(&plan, &s, None);
         assert_eq!(code, 0, "{report}");
-        assert!(report.contains("would add PostToolUse, PostToolUseFailure; SessionStart, UserPromptSubmit, SessionEnd already there"), "{report}");
+        assert!(report.contains("would add PostToolUse, PostToolUseFailure, Stop; SessionStart, UserPromptSubmit, SessionEnd already there"), "{report}");
     }
 
     #[test]
@@ -2035,7 +2057,8 @@ mod tests {
                 "UserPromptSubmit": [{ "hooks": [hook("user-prompt-submit")] }],
                 "SessionEnd": [{ "hooks": [hook("session-end")] }],
                 "PostToolUse": tool_groups.clone(),
-                "PostToolUseFailure": tool_groups
+                "PostToolUseFailure": tool_groups,
+                "Stop": [{ "hooks": [hook("stop")] }]
             }})
             .to_string();
             let plan = plan(&state(None, Some(&settings), None), Mode::Install).unwrap();
@@ -2045,7 +2068,7 @@ mod tests {
 
         let (elsewhere, missing) = with(serde_json::json!([{ "matcher": "Edit", "hooks": [hook("post-tool-use"), hook("post-tool-use-failure")] }]));
         assert_eq!(elsewhere.hooks.added, ["PostToolUse", "PostToolUseFailure"], "{:?}", elsewhere.hooks);
-        assert_eq!(elsewhere.hooks.unchanged, ["SessionStart", "UserPromptSubmit", "SessionEnd"], "a session-start hook counts under any matcher");
+        assert_eq!(elsewhere.hooks.unchanged, ["SessionStart", "UserPromptSubmit", "SessionEnd", "Stop"], "a session-start hook counts under any matcher");
         assert!(elsewhere.hooks.conflicts.is_empty(), "{:?}", elsewhere.hooks);
         assert_eq!(missing, ["PostToolUse", "PostToolUseFailure"]);
         let value: Value = serde_json::from_str(written(&elsewhere.settings)).unwrap();
@@ -2115,11 +2138,12 @@ mod tests {
         let settings = serde_json::json!({ "hooks": {
             "SessionStart": [{ "matcher": "startup|resume|clear|compact", "hooks": [hook("session-start")] }],
             "PostToolUse": [{ "matcher": "Bash", "hooks": [hook("post-tool-use")] }, { "matcher": "Edit", "hooks": [foreign.clone()] }],
-            "PostToolUseFailure": [{ "matcher": "Bash", "hooks": [hook("post-tool-use-failure")] }]
+            "PostToolUseFailure": [{ "matcher": "Bash", "hooks": [hook("post-tool-use-failure")] }],
+            "Stop": [{ "hooks": [hook("stop")] }]
         }})
         .to_string();
         let plan = plan(&state(None, Some(&settings), None), Mode::Remove).unwrap();
-        assert_eq!(plan.hooks.removed, ["SessionStart", "PostToolUse", "PostToolUseFailure"]);
+        assert_eq!(plan.hooks.removed, ["SessionStart", "PostToolUse", "PostToolUseFailure", "Stop"]);
         let value: Value = serde_json::from_str(written(&plan.settings)).unwrap();
         assert_eq!(value, serde_json::json!({ "hooks": { "PostToolUse": [{ "matcher": "Edit", "hooks": [foreign] }] } }));
     }
@@ -2135,7 +2159,7 @@ mod tests {
         let (text, code) = run_in(s, Mode::Install, true, Some(Path::new("/nonexistent/claude")), dir.path(), 0).unwrap();
         assert_eq!(code, 0);
         assert!(text.contains("would register it"), "{text}");
-        assert!(text.contains("would add SessionStart, UserPromptSubmit, SessionEnd, PostToolUse, PostToolUseFailure"), "{text}");
+        assert!(text.contains("would add SessionStart, UserPromptSubmit, SessionEnd, PostToolUse, PostToolUseFailure, Stop"), "{text}");
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 
@@ -2165,7 +2189,7 @@ mod tests {
             );
             let removed = plan(&s, Mode::Remove).unwrap();
             assert_eq!(removed.server_step, ServerStep::Remove);
-            assert_eq!(removed.hooks.removed, ["SessionStart", "UserPromptSubmit", "SessionEnd", "PostToolUse", "PostToolUseFailure"]);
+            assert_eq!(removed.hooks.removed, ["SessionStart", "UserPromptSubmit", "SessionEnd", "PostToolUse", "PostToolUseFailure", "Stop"]);
             let settings_back = after(s.settings.text.as_deref(), &removed.settings);
             let expected_settings = match settings {
                 None | Some("{}") => Some("{}\n".to_string()),

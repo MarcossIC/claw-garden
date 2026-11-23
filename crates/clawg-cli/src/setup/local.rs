@@ -257,7 +257,8 @@ mod tests {
             "UserPromptSubmit": [{ "hooks": [hook("user-prompt-submit")] }],
             "SessionEnd": [{ "hooks": [hook("session-end")] }],
             "PostToolUse": [{ "matcher": "Bash", "hooks": [hook("post-tool-use")] }],
-            "PostToolUseFailure": [{ "matcher": "Bash", "hooks": [hook("post-tool-use-failure")] }]
+            "PostToolUseFailure": [{ "matcher": "Bash", "hooks": [hook("post-tool-use-failure")] }],
+            "Stop": [{ "hooks": [hook("stop")] }]
         }})
     }
 
@@ -281,7 +282,7 @@ mod tests {
     #[test]
     fn local_hooks_go_in_the_folder_settings_alone() {
         let plan = plan(&state(None), Mode::Install).unwrap();
-        assert_eq!(plan.hooks.added, ["SessionStart", "UserPromptSubmit", "SessionEnd", "PostToolUse", "PostToolUseFailure"]);
+        assert_eq!(plan.hooks.added, ["SessionStart", "UserPromptSubmit", "SessionEnd", "PostToolUse", "PostToolUseFailure", "Stop"]);
         assert_eq!(written(&plan.settings), installed());
 
         let dir = tempfile::tempdir().unwrap();
@@ -305,11 +306,11 @@ mod tests {
         let FileStep::Write(text) = &first.settings else { panic!("{:?}", first.settings) };
         let again = state(Some(text));
         let second = plan(&again, Mode::Install).unwrap();
-        assert_eq!(second.hooks.unchanged, ["SessionStart", "UserPromptSubmit", "SessionEnd", "PostToolUse", "PostToolUseFailure"]);
+        assert_eq!(second.hooks.unchanged, ["SessionStart", "UserPromptSubmit", "SessionEnd", "PostToolUse", "PostToolUseFailure", "Stop"]);
         assert_eq!(second.settings, FileStep::Unchanged);
         let (text, code) = report(&second, &again, Some(&nothing_written()));
         assert_eq!(code, 0, "{text}");
-        assert!(text.contains("SessionStart, UserPromptSubmit, SessionEnd, PostToolUse, PostToolUseFailure already there"), "{text}");
+        assert!(text.contains("SessionStart, UserPromptSubmit, SessionEnd, PostToolUse, PostToolUseFailure, Stop already there"), "{text}");
         assert!(!text.contains("Open a new"), "{text}");
     }
 
@@ -320,11 +321,11 @@ mod tests {
         let s = state(Some(&earlier.to_string()));
         let plan = plan(&s, Mode::Install).unwrap();
         assert_eq!(plan.hooks.added, ["SessionEnd"]);
-        assert_eq!(plan.hooks.unchanged, ["SessionStart", "UserPromptSubmit", "PostToolUse", "PostToolUseFailure"]);
+        assert_eq!(plan.hooks.unchanged, ["SessionStart", "UserPromptSubmit", "PostToolUse", "PostToolUseFailure", "Stop"]);
         assert_eq!(written(&plan.settings), installed());
         let (text, code) = report(&plan, &s, None);
         assert_eq!(code, 0, "{text}");
-        assert!(text.contains("would add SessionEnd; SessionStart, UserPromptSubmit, PostToolUse, PostToolUseFailure already there"), "{text}");
+        assert!(text.contains("would add SessionEnd; SessionStart, UserPromptSubmit, PostToolUse, PostToolUseFailure, Stop already there"), "{text}");
     }
 
     #[test]
@@ -335,7 +336,7 @@ mod tests {
         let s = state(Some(&moved));
         let plan = plan(&s, Mode::Install).unwrap();
         assert_eq!(plan.hooks.conflicts.len(), 1, "{:?}", plan.hooks);
-        assert_eq!(plan.hooks.added, ["UserPromptSubmit", "SessionEnd", "PostToolUse", "PostToolUseFailure"]);
+        assert_eq!(plan.hooks.added, ["UserPromptSubmit", "SessionEnd", "PostToolUse", "PostToolUseFailure", "Stop"]);
         let value = written(&plan.settings);
         assert_eq!(value["hooks"]["SessionStart"].as_array().unwrap().len(), 1, "the conflicting hook is not replaced");
         let (text, code) = report(&plan, &s, None);
@@ -348,7 +349,7 @@ mod tests {
     fn remove_deletes_a_file_left_with_nothing() {
         let s = state(Some(&installed().to_string()));
         let plan = plan(&s, Mode::Remove).unwrap();
-        assert_eq!(plan.hooks.removed, ["SessionStart", "UserPromptSubmit", "SessionEnd", "PostToolUse", "PostToolUseFailure"]);
+        assert_eq!(plan.hooks.removed, ["SessionStart", "UserPromptSubmit", "SessionEnd", "PostToolUse", "PostToolUseFailure", "Stop"]);
         assert_eq!(plan.settings, FileStep::Delete);
         let (text, code) = report(&plan, &s, None);
         assert_eq!(code, 0, "{text}");
