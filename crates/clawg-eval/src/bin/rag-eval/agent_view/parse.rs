@@ -121,7 +121,7 @@ fn bullet_segments(section: &str) -> Vec<String> {
     let mut open = false;
     for line in section.lines().skip(1) {
         if let Some(bullet) = line.strip_prefix("- ") {
-            segments.push(vec![bullet]);
+            segments.push(vec![without_entry_mark(bullet)]);
             open = true;
         } else if line.starts_with("## ") || line.starts_with("<!-- ") {
             open = false;
@@ -151,13 +151,23 @@ fn joined(segments: Vec<Vec<&str>>) -> Vec<String> {
         .collect()
 }
 
+/// The first line of an AUTO entry without the `(#id conflict=#…)` the
+/// prompt adds to an entry in dispute, which the row's own text does not hold.
+fn without_entry_mark(first_line: &str) -> &str {
+    match first_line.rsplit_once(" (#") {
+        Some((before, mark)) if mark.ends_with(')') && mark.contains(" conflict=#") => before,
+        _ => first_line,
+    }
+}
+
 /// The text after a hit header, `[YYYY-MM-DD #id type] `, where the type is
 /// one word and may be absent, a preference the user did not state adds its
-/// origin after it, a piece of a long save adds `piece={k}/{n}` and a row
-/// another agent saved ends with `by {author}`.
+/// origin after it, a piece of a long save adds `piece={k}/{n}`, a row in
+/// dispute adds `conflict=#…` and a row another agent saved ends with
+/// `by {author}`.
 fn hit_text(line: &str) -> Option<&str> {
     let (header, text) = line.strip_prefix('[')?.split_once("] ")?;
-    let header = without_origin(without_piece(without_author(header)));
+    let header = without_origin(without_piece(without_conflict(without_author(header))));
     let (date, rest) = header.split_once(" #")?;
     let id = rest.split_once(' ').map_or(rest, |(id, kind)| {
         if kind.is_empty() || kind.contains(' ') { "" } else { id }
@@ -184,6 +194,14 @@ const ORIGINS: [&str; 3] = ["conclusion", "imported", "inferred"];
 fn without_origin(header: &str) -> &str {
     match header.rsplit_once(' ') {
         Some((before, origin)) if ORIGINS.contains(&origin) => before,
+        _ => header,
+    }
+}
+
+/// `header` without a trailing ` conflict=#…` mark, or as it came.
+fn without_conflict(header: &str) -> &str {
+    match header.rsplit_once(' ') {
+        Some((before, mark)) if mark.starts_with("conflict=#") => before,
         _ => header,
     }
 }
@@ -399,6 +417,19 @@ mod tests {
     fn a_hit_may_open_with_a_dash() {
         let text = "=== RECENT CONTEXT (Last 7 Days) ===\n[2026-08-10 #2 chat_message] notes:\n  | - first point\n  | - second point\n";
         assert_eq!(context_segments(text), vec!["notes:\n- first point\n- second point".to_string()]);
+    }
+
+    #[test]
+    fn a_hit_and_an_entry_in_dispute_are_read_without_their_mark() {
+        let text = "=== WORKSPACE ===\n- indent with tabs (#9 conflict=#12)\n\n=== RECENT CONTEXT (Last 7 Days) ===\n\
+                    [2026-11-20 #12 semantic_fact conflict=#9] indent with spaces\n\
+                    [2026-11-20 #13 user_preference inferred piece=1/2 conflict=#4,#7,#9+2 by cursor] the port is 9090\n";
+        assert_eq!(
+            context_segments(text),
+            vec!["indent with tabs".to_string(), "indent with spaces".to_string(), "the port is 9090".to_string()]
+        );
+        let line = "1. #12 [Memory/user_preference/t1 score=0.83 conflict=#9] tabs";
+        assert_eq!(parse_search_output(line).unwrap()[0].score, 0.83);
     }
 
     #[test]
