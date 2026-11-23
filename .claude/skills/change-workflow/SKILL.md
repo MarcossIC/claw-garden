@@ -19,7 +19,16 @@ description: "Proportion. Use when starting, planning, implementing, reviewing o
 
 **Small.** State done and the command that proves it. Write the failing test and run it to see it fail, then the code, then the tests of the files touched. Commit. There is no change folder, and the version takes a patch bump.
 
-**Plan.** A medium or large change has one document, `openspec/changes/<name>/plan.md`, written after reading the code it will touch: every claim about current behavior cites `path:line`. It follows the `plan` rules of `openspec/config.yaml`. Sections marked "sólo si" are left out when they do not apply. `state.yaml` records the phase as `plan`, `apply` or `verify`. Implementation starts once the plan is approved, and that approval is the only stop.
+**Plan.** A medium or large change has one document, `openspec/changes/<name>/plan.md`, written after reading the code it will touch: every claim about current behavior cites `path:line`. It follows the `plan` rules of `openspec/config.yaml`. Sections marked "sólo si" are left out when they do not apply. `state.yaml` records the phase as `plan`, `apply` or `verify`. Implementation starts once the plan is approved. With the person in the conversation, they approve it, and that approval is the only stop. In autonomous work the plan review approves it, and the session goes on without waiting.
+
+**Autonomous work.** A session works autonomously when it runs in the background (`claude --bg`, a scheduled task, a cloud session), when another session launched it to orchestrate, or when the person said to carry on alone. An autonomous session never waits for an answer: it finishes the work, or leaves it closed and explained.
+
+- The plan review approves the plan. Once `plan.md` is written, launch the `change-reviewer` agent in plan mode with the path of the plan and the original request, quoted: once for a medium change, twice in parallel for a large one, neither run seeing the other's report. Findings are handled as under **Review**. When a round returns `CLEAN` or `WARNINGS`, the plan is approved: note it under `Registro` and implement it.
+- What would need a question is decided by the narrowest reading of the request and noted under `Registro` with its reason. Nothing the request does not name is added to settle a doubt.
+- When a third round, of the plan or of the change, still has findings, stop fixing and do not wait: leave the work committed on its branch, unmerged, with the open findings under `Verificación`, and end with them in the final answer.
+- What truly needs the person (deleting or migrating stored data that cannot be rebuilt, a release, touching the real data profiles, permissions or credentials) is not done: implement the rest and end by saying what was left out and why.
+- Whoever orchestrates writes no stops into the request. The request of an autonomous session says it works autonomously by this skill, and never says "stop to show me the plan": a stop written into the request is honoured, and another session cannot lift it.
+- The final answer says what was approved and in how many rounds, the commits and the branch, what was decided without asking, and what is left to check by hand.
 
 ```markdown
 # <nombre> — Plan
@@ -62,7 +71,7 @@ Qué se corrió y qué devolvió, los hallazgos de la revisión y lo pendiente e
 
 **Closing checks.** The full suite and both clippy runs go once, on the last commit. A result is reported from the output of the command that produced it.
 
-**Review.** After the closing checks, launch the `change-reviewer` agent with the path of the plan and the range of commits: once for a medium change, twice in parallel for a large one, neither run seeing the other's report. The reviewer reports and never edits; the implementer fixes. With two reviewers, a finding both report is fixed, and a finding only one reports is checked against the code before acting on it. A second round reviews only what changed since the first. When a third round still has findings, stop fixing and put the approach back in front of the person. A critical finding blocks archiving.
+**Review.** After the closing checks, launch the `change-reviewer` agent with the path of the plan and the range of commits: once for a medium change, twice in parallel for a large one, neither run seeing the other's report. The reviewer reports and never edits; the implementer fixes. With two reviewers, a finding both report is fixed, and a finding only one reports is checked against the code before acting on it. A second round reviews only what changed since the first. When a third round still has findings, stop fixing and put the approach back in front of the person, or, in autonomous work, close as **Autonomous work** says. A critical finding blocks archiving.
 
 **Verification and archive.** Write under `Verificación` what ran and what it returned, each review finding with what was done about it, and what only a local run can check. Then archive as `openspec/README.md` describes.
 
