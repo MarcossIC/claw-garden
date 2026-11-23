@@ -1121,7 +1121,7 @@ fn record_context(metrics: &Recorder, retrieval: &RetrievalState, prompt_bytes: 
     metrics.gauge("context.retrieval_state", &[("state", retrieval.name())], 1.0);
     metrics.observe("context.prompt_bytes", Unit::Bytes, &[], prompt_bytes as u64);
     for block in cut {
-        metrics.gauge("context.cut", &[("block", block.as_str())], 1.0);
+        metrics.gauge("context.cut", &[("block", block.as_str()), ("state", retrieval.name())], 1.0);
     }
 }
 

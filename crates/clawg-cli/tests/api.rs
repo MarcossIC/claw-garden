@@ -5178,8 +5178,13 @@ async fn a_context_records_its_state_its_size_and_the_blocks_it_cut() {
 
     assert_eq!(gauge_of(&h, "context.retrieval_state", &[("state", "recent")]), Some((1, 1.0)));
     assert_eq!(gauge_of(&h, "context.retrieval_state", &[("state", "searched")]), Some((1, 1.0)));
-    assert_eq!(gauge_of(&h, "context.cut", &[("block", "recent")]), Some((1, 1.0)), "only the first context was cut");
-    assert_eq!(gauge_of(&h, "context.cut", &[("block", "long_term")]), None);
+    assert_eq!(
+        gauge_of(&h, "context.cut", &[("block", "recent"), ("state", "recent")]),
+        Some((1, 1.0)),
+        "only the first context was cut"
+    );
+    assert_eq!(gauge_of(&h, "context.cut", &[("block", "recent"), ("state", "searched")]), None);
+    assert_eq!(gauge_of(&h, "context.cut", &[("block", "long_term"), ("state", "searched")]), None);
 
     let run = h.ctx.runtime.metrics.run();
     let bytes = &run[&clawg_core::metrics::SeriesKey::new("context.prompt_bytes", &[])];
