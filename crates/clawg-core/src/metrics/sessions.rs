@@ -387,6 +387,23 @@ impl SessionLog {
         self.changed.notify_one();
     }
 
+    /// The accepted saves of the open row of `session_id`, by memory type;
+    /// `None` when it has no open row or the log is off.
+    pub fn saves(&self, session_id: &str) -> Option<BTreeMap<String, u64>> {
+        if !self.enabled() {
+            return None;
+        }
+        let state = self.lock();
+        let row = &state.open.get(session_id)?.row;
+        Some(
+            row.counts
+                .iter()
+                .filter(|((kind, _), _)| *kind == CountKind::Save)
+                .map(|((_, name), count)| (name.clone(), *count))
+                .collect(),
+        )
+    }
+
     /// Waits for a change that must reach the file before the minute turns.
     pub async fn changed(&self) {
         self.changed.notified().await;
@@ -431,6 +448,26 @@ mod tests {
 
     fn rows_of(log: &SessionLog, session_id: &str) -> Vec<SessionRow> {
         log.take().rows.into_iter().filter(|row| row.session_id == session_id).collect()
+    }
+
+    #[test]
+    fn the_saves_of_an_open_session_are_read_by_type() {
+        let log = log();
+        assert_eq!(log.saves("s"), None, "no row yet");
+        log.hook(who("s", Some("p")), T, HookEvent::Start("startup"));
+        assert_eq!(log.saves("s"), Some(BTreeMap::new()));
+        log.activity("s", T + MINUTE, Activity::Save("semantic_fact"));
+        log.activity("s", T + 2 * MINUTE, Activity::Save("semantic_fact"));
+        log.activity("s", T + 3 * MINUTE, Activity::Save("tool_error"));
+        log.activity("s", T + 3 * MINUTE, Activity::Call { tool: "search_memory", failed: false });
+        let saves = log.saves("s").expect("an open row");
+        assert_eq!(saves, BTreeMap::from([("semantic_fact".to_string(), 2), ("tool_error".to_string(), 1)]));
+
+        log.end("s", T + 4 * MINUTE, "logout");
+        assert_eq!(log.saves("s"), None, "a closed row is not read");
+        let off = SessionLog::default();
+        off.hook(who("s", None), T, HookEvent::Start("startup"));
+        assert_eq!(off.saves("s"), None, "the log is off");
     }
 
     #[test]
