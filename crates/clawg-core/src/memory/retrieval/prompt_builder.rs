@@ -1324,6 +1324,50 @@ async fn fetch_active_conflicts(
         .map_err(failed_call(ClosedAs::During("fetch_active_conflicts")))
 }
 
+/// How many other sides a conflict mark names before it counts the rest: a
+/// row rarely sits in more than two pairs, and the full list is a request away.
+const CONFLICT_MARK_IDS: usize = 3;
+
+/// The mark a printed row in dispute carries, `conflict=#4,#7,#9+2`: the ids
+/// of its other sides, lowest first. `None` for a row in no escalated pair.
+pub fn conflict_mark(others: &[i64]) -> Option<String> {
+    if others.is_empty() {
+        return None;
+    }
+    let mut ids = others.to_vec();
+    ids.sort_unstable();
+    ids.dedup();
+    let named = ids.iter().take(CONFLICT_MARK_IDS).map(|id| format!("#{id}")).collect::<Vec<_>>().join(",");
+    let rest = ids.len().saturating_sub(CONFLICT_MARK_IDS);
+    Some(if rest > 0 { format!("conflict={named}+{rest}") } else { format!("conflict={named}") })
+}
+
+/// For each of `ids` that is a side of an escalated pair, the other sides,
+/// lowest first, by the reading rule of the conflict block: both sides live
+/// and within `reader`'s reach. A row in no such pair has no entry.
+pub async fn other_sides(
+    store: &MemoryStore,
+    reader: &Reader,
+    ids: &[i64],
+) -> Result<HashMap<i64, Vec<i64>>, MemoryError> {
+    let pairs = fetch_active_conflicts(store, reader, ids).await?;
+    let asked: HashSet<i64> = ids.iter().copied().collect();
+    let mut others: HashMap<i64, Vec<i64>> = HashMap::new();
+    for pair in pairs {
+        if asked.contains(&pair.new_id) {
+            others.entry(pair.new_id).or_default().push(pair.old_id);
+        }
+        if asked.contains(&pair.old_id) {
+            others.entry(pair.old_id).or_default().push(pair.new_id);
+        }
+    }
+    for sides in others.values_mut() {
+        sides.sort_unstable();
+        sides.dedup();
+    }
+    Ok(others)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -3718,6 +3762,51 @@ mod tests {
             after.push(columns(id).await);
         }
         assert_eq!(after, before, "no row is rewritten");
+    }
+
+    #[test]
+    fn the_conflict_mark_names_up_to_three_other_sides_in_order() {
+        assert_eq!(conflict_mark(&[]), None);
+        assert_eq!(conflict_mark(&[9]).as_deref(), Some("conflict=#9"));
+        assert_eq!(conflict_mark(&[9, 4]).as_deref(), Some("conflict=#4,#9"));
+        assert_eq!(conflict_mark(&[15, 4, 11, 9, 7]).as_deref(), Some("conflict=#4,#7,#9+2"));
+    }
+
+    #[tokio::test]
+    async fn the_other_sides_of_a_row_come_from_its_escalated_pairs() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let (old_id, new_id) = disputed_pair(&store, "agent-1", "semantic_fact", 8.0).await;
+        let (_, unrelated) = disputed_pair(&store, "agent-1", "semantic_fact", 8.0).await;
+        let reader = Reader::new("agent-1", Reach::Own);
+
+        let both = other_sides(&store, &reader, &[old_id, new_id]).await.unwrap();
+        assert_eq!(both, HashMap::from([(old_id, vec![new_id]), (new_id, vec![old_id])]));
+        let one = other_sides(&store, &reader, &[new_id]).await.unwrap();
+        assert_eq!(one, HashMap::from([(new_id, vec![old_id])]), "one side asked is enough");
+        assert!(!one.contains_key(&unrelated));
+        assert!(other_sides(&store, &reader, &[]).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_row_names_no_other_side_that_is_pending_deleted_or_hidden() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let reader = Reader::new("cursor", Reach::AllBut(vec!["codex".into()]));
+        let (pending_old, pending_new) = disputed_pair(&store, "claude-code", "semantic_fact", 8.0).await;
+        let (deleted_old, deleted_new) = disputed_pair(&store, "claude-code", "semantic_fact", 8.0).await;
+        let (hidden_old, hidden_new) = disputed_pair(&store, "claude-code", "semantic_fact", 8.0).await;
+        store
+            .conn
+            .call(move |c| -> Result<(), rusqlite::Error> {
+                c.execute("UPDATE memory SET status = 'active' WHERE id = ?1", [pending_new])?;
+                c.execute("UPDATE memory SET deleted_at = 3000 WHERE id = ?1", [deleted_old])?;
+                c.execute("UPDATE memory SET agent_id = 'codex' WHERE id = ?1", [hidden_old])?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let ids = [pending_old, pending_new, deleted_new, hidden_new];
+        assert!(other_sides(&store, &reader, &ids).await.unwrap().is_empty());
     }
 
     #[tokio::test]
