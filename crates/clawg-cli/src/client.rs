@@ -2775,15 +2775,15 @@ pub(crate) mod tests {
     async fn a_daemon_that_predates_the_escalated_listing_refuses_its_query() {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
-        #[expect(dead_code, reason = "the fields are only read to refuse what is not among them")]
         struct OlderQuery {
             agent_id: Option<String>,
             project_id: Option<String>,
         }
         let app = axum::Router::new().route(
             "/v1/disputes",
-            axum::routing::get(|_: axum::extract::Query<OlderQuery>| async {
-                axum::Json(serde_json::json!({ "pending": 1, "escalated": 0, "pairs": [] }))
+            axum::routing::get(|axum::extract::Query(asked): axum::extract::Query<OlderQuery>| async move {
+                let named = [asked.agent_id, asked.project_id].into_iter().flatten().count();
+                axum::Json(serde_json::json!({ "pending": named, "escalated": 0, "pairs": [] }))
             }),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
