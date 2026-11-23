@@ -25,6 +25,7 @@ Fuente de verdad del comportamiento actual de la recuperación: el corte relativ
 - [preference-model](../../changes/archive/2026-11-06-preference-model/proposal.md), archivado el 2026-11-06, que salió en 0.77.0 (PM1, PM2, PM3, PM5 y PM7 de esa spec, con esos nombres; las tres definiciones de las preferencias, y lo que cambian en «Hits de otros agentes», «Línea de hit en `recall_context`», «El parser de `rag-eval --agent-view`» y «Fuera de esta spec»). Dónde se muestra la marca y el sello de un save que repite una fila están en [`specs/provenance`](../provenance/spec.md), PM5 y PM9; `all_projects`, el protocolo y la clave de una preferencia sin proyecto, en [`specs/mcp`](../mcp/spec.md), PM4, PM6 y PM8.
 - [bridge-project-identity](../../changes/archive/2026-11-07-bridge-project-identity/proposal.md), archivado el 2026-11-07, que salió en 0.78.0 (sólo BI6 de esa spec, con ese nombre). De qué carpetas sale el grupo y cómo lo muestra el puente está en [`specs/mcp`](../mcp/spec.md), BI1 a BI5.
 - [retire-legacy-kinds](../../changes/archive/2026-11-07-retire-legacy-kinds/proposal.md), archivado el 2026-11-07, que sale en 0.79.0 (RL4 de esa spec, que se llama R4 allí: un solo KNN sobre `memory`, sin brazos por tabla; lo demás de RL4 está en [`specs/storage`](../storage/spec.md)). Los requisitos de ese cambio se numeran R1 a R10 allí y RL1 a RL10 acá, para no chocar con los ids de cada spec.
+- [conflicts-on-demand](../../changes/archive/2026-11-23-conflicts-on-demand/proposal.md), archivado el 2026-11-23, que sale en 0.93.0 (CO1 a CO6 de esa spec, con esos nombres, después de «Orden y tope de los conflictos»; el orden nuevo de «El prompt cumple el presupuesto»).
 - [domain-types](../../changes/archive/2026-11-20-domain-types/proposal.md), archivado el 2026-11-20, que sale en 0.90.0 (sus R2 y R5, que aquí son DT2 y DT5, al final de la spec): una fila de `memory_type` o de `status` que este código no conoce sigue apareciendo en la búsqueda, el listado y el outbox donde aparecía, y los filtros y la API de tipo y estado siguen como estaban. Lo que se lee y se escribe, y las decisiones sobre el tipo, están en [`specs/storage`](../storage/spec.md) (DT1, DT3, DT4 y DT6), y las definiciones de «Nombre conocido» y «Nombre desconocido» también.
 
 ## Definiciones
@@ -447,6 +448,125 @@ Tras ordenar, el bloque MUST conservar los primeros 5 pares (`MAX_CONFLICT_PAIRS
 
 **Test:** `conflict_pairs_rank_by_best_hit_position_workspace_only_last`, `conflict_pair_order_ignores_input_order` y `conflict_block_keeps_five_pairs_and_counts_the_rest` en `prompt_builder.rs`.
 
+## CO1. El contexto sin consulta no trae ACTIVE CONFLICTS
+
+`build_session_prompt` MUST NOT imprimir el bloque `=== ACTIVE CONFLICTS (review needed) ===` ni su NOTE: lee los pares de lo que muestra sólo para marcar sus filas (CO2), con la consulta de `fetch_active_conflicts`, aunque una fila de RECENT o de AUTO sea un lado de un par (hoy los pide con los ids de RECENT y de AUTO, `prompt_builder.rs:365` y `:374`). Sigue llevando el workspace, LAST SESSION y RECENT, y las filas en disputa que imprime llevan la marca de CO2. El arranque MUST NOT decir cuántos pares esperan ni pedir que se pregunte por ellos: quien los quiere los pide (CO8). Vale para todo cliente que pida el contexto sin consulta, `clawg hook session-start` de Claude Code y de Cursor incluidos.
+
+#### Escenario: una fila reciente y una preferencia en disputa
+- GIVEN un par escalado cuyo lado nuevo es un save de ayer y cuyo lado viejo es una preferencia que la sección AUTO imprime
+- WHEN se pide el contexto sin consulta
+- THEN el prompt no contiene `ACTIVE CONFLICTS`, ni `NEW `, ni `OLD `, ni la NOTE
+- AND las dos filas llevan la marca de CO2
+
+#### Escenario: sin pares
+- GIVEN un store sin pares escalados
+- WHEN se pide el contexto sin consulta
+- THEN el prompt es byte a byte el de antes
+
+**Tests (hoy fallan):** en `prompt_builder.rs` (mod tests, con el store), uno por escenario; el segundo guarda que lo no marcado no cambia. `e2e_full_4_block_output` sigue pasando: arma con consulta.
+
+## CO2. Cada fila en disputa que el prompt imprime lleva `conflict=#N`
+
+Con o sin consulta, una fila mostrada que es un lado de un par escalado MUST llevar la marca con el id del otro lado, y el otro lado MUST llevar la suya con el primero. La consulta y el alcance son los de `fetch_active_conflicts` (misma regla de lectura: un lado que el lector no alcanza no se nombra, ni como otro lado de un par que sí alcanza).
+
+- **Un hit** (`format_hit_line`, `prompt_builder.rs:828`): la marca va dentro del encabezado, después del tipo, de la marca de origen y de `piece=`, y antes de ` by <autor>`: `[2026-11-20 #12 user_preference conflict=#9] texto`.
+- **Una entrada de la sección AUTO**, que no imprime su id: `(#12 conflict=#9)` al final de su primera línea, con el id de la propia entrada. Sólo en el prompt: `workspace.md` MUST NOT cambiar.
+- La marca no depende del tope de pares del bloque (`MAX_CONFLICT_PAIRS`, `prompt_builder.rs:57`): una fila de un par que el bloque no imprime, o que el presupuesto sacó (CO3), sigue marcada.
+- Una fila sin pares escalados MUST imprimirse byte a byte como hoy. LAST SESSION no se marca. Una fila nueva cuyo `disputed_against` no es JSON válido no forma par, y MUST NOT apagar la marca ni el bloque de los demás (`a_malformed_dispute_list_hides_no_other_pair`).
+- La marca no cambia el orden, el score ni el presupuesto de nadie: sólo suma sus bytes al texto que `fit_to_budget` mide.
+
+El comentario de `crates/clawg-core/src/memory/retrieval/workspace.rs:390-393` MUST dar la razón nueva de que la sección AUTO conserve las filas `disputed`: la marca avisa de la disputa junto a cada una, y ya no el bloque. No tiene test: es un comentario, y `verify` lo mira en el diff.
+
+#### Escenario: un hit y una entrada del workspace
+- GIVEN el par (old 9, new 12), con 12 en RECENT y 9 en la sección AUTO
+- WHEN se arma el prompt
+- THEN la línea de 12 es `[<fecha> #12 <tipo> conflict=#9] <texto>`
+- AND la entrada de 9 termina su primera línea con `(#9 conflict=#12)`
+- AND `workspace.md` es el mismo archivo que sin la marca
+
+#### Escenario: un lado fuera del alcance
+- GIVEN un par cuyo otro lado es de un agente que `sharing.json` le oculta al lector
+- WHEN se arma el prompt
+- THEN la fila visible no lleva marca y ningún id del lado oculto aparece
+
+#### Escenario: más de tres
+- GIVEN una fila nueva que disputa a cinco filas (ids 4, 7, 9, 11 y 15)
+- WHEN se imprime como hit
+- THEN su encabezado lleva `conflict=#4,#7,#9+2`
+
+#### Escenario: el bloque con tope
+- GIVEN siete pares escalados con un lado en RECENT, y una consulta
+- WHEN se arma el prompt
+- THEN el bloque imprime cinco pares y `(+2 more conflicts not shown)`, y los siete hits llevan su marca
+
+**Tests (hoy fallan):** en `prompt_builder.rs` (mod tests): la línea de un hit, la de una entrada de AUTO, el lado oculto (junto a `a_conflict_side_cannot_open_a_new_or_old_line` y los de alcance de `fetch_active_conflicts`), el tope de tres y el bloque con tope (junto a `conflict_block_keeps_five_pairs_and_counts_the_rest`); en `workspace.rs`, que `workspace.md` no lleva la marca. Los de línea sin marca que hoy pasan (`format_hit_line_drops_the_old_labels`, `hit_line_is_one_header_with_id_and_text`) guardan la regla byte a byte.
+
+## CO3. Con consulta, el presupuesto corta los pares antes que LAST SESSION
+
+`fit_to_budget` (`prompt_builder.rs:468-540`) MUST quitar, de a uno y midiendo el texto entero después de cada paso (como hoy), en este orden: las entradas de AUTO que pasan de la mitad del presupuesto (SC2), los hits que pasan de la reserva, **los pares desde el último**, **LAST SESSION**, los hits que quedan y las entradas de AUTO que queden. Hoy LAST SESSION sale antes que los pares (`:495-504`). Un lado cuyo hit se cortó sigue imprimiéndose con su texto en el bloque (`render`, `:657`; `format_conflict_block`, `:893-901`), y la marca CO2 queda en los hits que no se cortaron. La reserva (un cuarto del presupuesto con consulta, 0 sin ella) y SC5 no cambian. Sin consulta no hay pares, así que su orden es el de antes: AUTO sobre la mitad, todos los saves, LAST SESSION y el resto de AUTO.
+
+Un texto que entra entero MUST seguir siendo byte a byte el que se arma sin presupuesto, y `context.cut` MUST seguir contando `conflicts` por cada paso que quitó un par (`PromptBlock::Conflicts`).
+
+#### Escenario: la reserva
+- GIVEN cuatro hits de 1.000 bytes, un resumen de LAST SESSION y un par, y una reserva en la que caben dos hits
+- WHEN el presupuesto alcanza quitando los dos hits de menor score
+- THEN se van esos dos, y LAST SESSION y el par quedan enteros
+- AND con un presupuesto que no alcanza para eso, el par se va antes que LAST SESSION, y LAST SESSION antes que los dos hits de la reserva
+
+#### Escenario: los pares ceden al resumen
+- GIVEN una consulta, un resumen de 3.000 bytes, un hit y tres pares, y un presupuesto en el que no entra todo
+- WHEN se cortan los pares y con eso el texto entra
+- THEN LAST SESSION queda entero, el hit sigue marcado y el bloque cuenta los pares que se fueron en `(+N more conflicts not shown)`
+
+**Tests (hoy fallan):** cambian `the_hits_in_their_room_outlast_the_last_session_and_the_conflicts` y `conflicts_go_after_every_hit` (`prompt_builder.rs`), y el escenario «la reserva» de [`specs/retrieval`](../retrieval/spec.md#el-prompt-cumple-el-presupuesto); es nuevo uno del segundo escenario. `the_last_session_block_gives_way_after_the_hits` sigue (sin pares).
+
+## CO4. El arranque trae entero el resumen de la sesión anterior
+
+Un contexto sin consulta con un workspace, un resumen largo y saves recientes que no entran juntos MUST traer LAST SESSION entero mientras lo que sobra pueda cortarse de la sección AUTO (sobre la mitad del presupuesto, SC2) y de RECENT. Sólo se acorta cuando lo que escribió la persona o lo que no se puede cortar pasa solo el presupuesto (SC5). Es el criterio del piloto «al abrir una sesión, el contexto trae entero el resumen de la sesión anterior» ([ROADMAP](../../ROADMAP.md#piloto-una-semana-de-trabajo-real-no-una-noche)): hoy falla porque el texto de los lados de los pares pasa al bloque cuando se corta su hit y, con él, `fit_to_budget` llega a LAST SESSION antes que a los pares (`prompt_builder.rs:495-504`).
+
+#### Escenario: un store maduro al empezar la sesión
+- GIVEN un workspace con la sección AUTO llena, un resumen de sesión de 3.500 bytes, diez saves recientes y cinco pares escalados con un lado entre ellos, que no entran juntos en 8.000 bytes
+- WHEN se pide el contexto sin consulta
+- THEN el prompt trae el resumen entero bajo LAST SESSION, cabe en el presupuesto y no contiene `ACTIVE CONFLICTS`
+- AND `context.cut` no registra `last_session`
+
+**Tests (hoy fallan):** en `prompt_builder.rs` (mod tests, con el store), junto a `a_context_without_a_query_keeps_the_last_session_over_its_saves` y `a_stocked_workspace_leaves_room_for_the_last_session`; con pares, que ésos no tienen.
+
+## CO5. `POST /v1/search` manda el otro lado de cada hit
+
+Cada hit de `memory` que `POST /v1/search` devuelve MUST llevar `conflicts_with`, la lista de los ids del otro lado de cada par escalado en que está, con la regla de lectura de `fetch_active_conflicts` (los dos lados vivos y alcanzables por el lector). MUST omitirse cuando es vacía, como `origin` (PM5 de [`specs/retrieval`](../retrieval/spec.md)), así que un puente anterior lee la respuesta como siempre. Se calcula con una consulta por búsqueda, sobre los ids de los hits que devuelve. MUST NOT nombrar un par `pending`, un par con un lado `deleted_at`, ni un lado que el lector no alcanza. La búsqueda no cambia: ni el ranking, ni el score, ni lo que `search.found` mide.
+
+#### Escenario: los dos lados
+- GIVEN el par escalado (old 1, new 2), y una búsqueda que devuelve las dos filas
+- WHEN responde `POST /v1/search`
+- THEN el hit de 2 trae `conflicts_with: [1]` y el de 1 trae `conflicts_with: [2]`
+
+#### Escenario: lo que no cuenta
+- GIVEN un par pendiente (no escalado), un par escalado con un lado borrado y otro con un lado de un agente oculto
+- WHEN la búsqueda devuelve esas filas
+- THEN ningún hit lleva `conflicts_with`, y el cuerpo de cada hit es el de antes
+
+#### Escenario: un solo lado devuelto
+- GIVEN el par (old 1, new 2) y una búsqueda cuyos hits no traen a 1
+- WHEN responde
+- THEN el hit de 2 trae `conflicts_with: [1]`
+
+**Tests (hoy fallan):** en `crates/clawg-cli/tests/api.rs`, uno por escenario; `ranked_hit_serializes_to_json` (`crates/clawg-core/tests/public_api.rs`) guarda que el campo se omite vacío.
+
+## CO6. `search_memory` muestra ` conflict=#N`
+
+El `Hit` del puente MUST leer `conflicts_with` con `#[serde(default)]` (`crates/clawg-cli/src/client.rs:212`): un daemon anterior no lo manda y el hit lo toma como vacío. `format_hits` (`crates/clawg-cli/src/mcp/tools.rs:232-267`) MUST mostrar la marca de las Definiciones justo después de `score=` y antes de `topic=`, `project=` y ` by`: `N. #id [Memory/user_preference/t1 score=0.83 conflict=#9] texto`. Un hit sin `conflicts_with` MUST imprimirse byte a byte como hoy, y la marca no cambia qué hits se muestran ni su orden.
+
+#### Escenario: un hit en disputa
+- GIVEN un hit con `conflicts_with: [9]` y score 0,83
+- THEN su línea es `1. #12 [Memory/user_preference/t1 score=0.83 conflict=#9] <texto>`
+
+#### Escenario: un daemon anterior
+- GIVEN una respuesta de `/v1/search` sin `conflicts_with`
+- THEN `search_memory` muestra la línea de hoy
+
+**Tests (hoy fallan):** en `tools.rs` (mod tests), junto a `format_hits_shows_the_origin_of_a_preference`; en `client.rs`, junto a `a_hit_from_an_old_daemon_has_no_origin`; en `server.rs`, `search_memory` contra un daemon de prueba que marca.
+
 ## Workspace en el prompt
 
 El workspace entregado al modelo (`workspace_for_prompt`, `prompt_builder.rs:1225`) MUST NOT contener `<!-- `, ni sección USER vacía, ni un encabezado `## ` de la sección AUTO sin bullets debajo. El contenido no vacío de USER MUST conservarse tal cual lo escribió el usuario, encabezados incluidos, sin marcadores y sin líneas en blanco al principio ni al final: la poda de encabezados sólo mira la sección AUTO, que es la que genera `render_rows` (`workspace.rs:591`). Un archivo sin `AUTO_START` MUST entregarse entero; uno con AUTO pero sin `AUTO-END` se toma como AUTO hasta el final, y el texto antes de `AUTO-START` se entrega. Si no queda nada, no se emite la sección WORKSPACE. El archivo en disco MUST ser byte a byte idéntico antes y después de un recall.
@@ -616,9 +736,9 @@ LAST SESSION y RECENT corren en cada `POST /v1/context` y en cada `clawg hook se
 
 ## El prompt cumple el presupuesto
 
-`build_memory_prompt` y `build_session_prompt` reciben el presupuesto del contexto y arman el texto con `fit_to_budget` (`prompt_builder.rs:482`), una función pura sobre el workspace, el último resumen, los hits candidatos, los pares ya ordenados y la reserva de los hits (`PromptParts::hit_room`). Si el texto entero entra, MUST ser byte a byte el que se arma sin presupuesto. Si no entra, MUST quitar de a uno, midiendo otra vez el texto entero después de cada paso, hasta que entre (`:491-553`): primero las entradas conocidas de la sección AUTO mientras haya algo esperando y sus bytes pasen de la mitad del presupuesto ([SC2](#sc2-la-sección-auto-cede-lo-que-pasa-de-la-mitad)), después los hits de RECENT y LONG-TERM mientras esos dos bloques ocupen más bytes que la reserva (su separador, sus líneas con el margen y la línea en blanco que los abre; `hit_bytes`, `:571`), después el resumen de LAST SESSION, después los pares de conflictos desde el último, después los hits que quedan, y por último las entradas conocidas que queden ([SC3](#sc3-sin-nada-esperando-auto-usa-todo-el-presupuesto)). Entre los hits va primero el de menor score, sea del bloque que sea, y un hit exacto sólo cuando no queda ningún otro (`next_to_cut`, `prompt_builder.rs:608`); un empate se resuelve desde el final de LONG-TERM y después desde el final de RECENT, así que un contexto sin consulta, cuyos hits valen 0, se sigue cortando desde su save más viejo. Los bloques dicen la edad de un hit y no su relevancia: cortar un bloque entero primero quitaba un hit exacto de la semana pasada antes que uno de RECENT que apenas pasó el piso, y la búsqueda nunca corta un exacto ([«Definiciones»](#definiciones), corte relativo). El resumen queda por encima de los hits que pasan de la reserva porque ninguna consulta lo trae de vuelta, y cede ante los conflictos porque esos piden una pregunta al usuario. El texto MUST NOT superar el presupuesto salvo en el caso de [SC5](#sc5-lo-que-escribió-la-persona-no-se-corta).
+`build_memory_prompt` y `build_session_prompt` reciben el presupuesto del contexto y arman el texto con `fit_to_budget` (`prompt_builder.rs:482`), una función pura sobre el workspace, el último resumen, los hits candidatos, los pares ya ordenados y la reserva de los hits (`PromptParts::hit_room`). Si el texto entero entra, MUST ser byte a byte el que se arma sin presupuesto. Si no entra, MUST quitar de a uno, midiendo otra vez el texto entero después de cada paso, hasta que entre (`:491-553`): primero las entradas conocidas de la sección AUTO mientras haya algo esperando y sus bytes pasen de la mitad del presupuesto ([SC2](#sc2-la-sección-auto-cede-lo-que-pasa-de-la-mitad)), después los hits de RECENT y LONG-TERM mientras esos dos bloques ocupen más bytes que la reserva (su separador, sus líneas con el margen y la línea en blanco que los abre; `hit_bytes`, `:571`), después los pares de conflictos desde el último, después el resumen de LAST SESSION, después los hits que quedan, y por último las entradas conocidas que queden ([SC3](#sc3-sin-nada-esperando-auto-usa-todo-el-presupuesto)). Entre los hits va primero el de menor score, sea del bloque que sea, y un hit exacto sólo cuando no queda ningún otro (`next_to_cut`, `prompt_builder.rs:608`); un empate se resuelve desde el final de LONG-TERM y después desde el final de RECENT, así que un contexto sin consulta, cuyos hits valen 0, se sigue cortando desde su save más viejo. Los bloques dicen la edad de un hit y no su relevancia: cortar un bloque entero primero quitaba un hit exacto de la semana pasada antes que uno de RECENT que apenas pasó el piso, y la búsqueda nunca corta un exacto ([«Definiciones»](#definiciones), corte relativo). El resumen queda por encima de los hits que pasan de la reserva porque ninguna consulta lo trae de vuelta, y cede ante los conflictos porque esos piden una pregunta al usuario. El texto MUST NOT superar el presupuesto salvo en el caso de [SC5](#sc5-lo-que-escribió-la-persona-no-se-corta).
 
-La reserva MUST ser un cuarto del presupuesto en un contexto con consulta (`HIT_ROOM_DIVISOR`, `prompt_builder.rs:69`; `build_memory_prompt`, `:294`) y 0 en el contexto sin consulta (`build_session_prompt`, `:338`), cuyo orden, después de lo que cede la sección AUTO, es todos los hits, LAST SESSION y los conflictos. Con la reserva, los mejores hits sobreviven al resumen y a los conflictos, que son lo que un contexto con consulta pidió: en un store maduro, un workspace cerca del tope del AUTO, un resumen largo y un par en disputa se comían el presupuesto default, y el recorte sacaba todos los hits, los de la consulta incluidos (un `recall_context` real con 19.134 bytes de contexto entero, y `revision-eval chains --real --background`). Con el default la reserva es de 2.000 bytes. `AUTO_BYTE_CAP` (6.000 bytes, `crates/clawg-core/src/memory/retrieval/workspace.rs:19-20`) sólo recorta los skills y las decisiones al escribir el archivo (`render_auto_section`, `:517`): las preferencias no tienen tope, y por eso, mientras algo espera, la sección AUTO cede lo que pasa de la mitad del presupuesto. Sin consulta no hay reserva: al iniciar una sesión LAST SESSION es el traspaso, y RECENT son los saves más nuevos, no la respuesta a una pregunta.
+La reserva MUST ser un cuarto del presupuesto en un contexto con consulta (`HIT_ROOM_DIVISOR`, `prompt_builder.rs:69`; `build_memory_prompt`, `:294`) y 0 en el contexto sin consulta (`build_session_prompt`, `:338`), cuyo orden, después de lo que cede la sección AUTO, es todos los hits y LAST SESSION: ese contexto no trae pares ([CO1](#co1-el-contexto-sin-consulta-no-trae-active-conflicts)). Con la reserva, los mejores hits sobreviven al resumen y a los conflictos, que son lo que un contexto con consulta pidió: en un store maduro, un workspace cerca del tope del AUTO, un resumen largo y un par en disputa se comían el presupuesto default, y el recorte sacaba todos los hits, los de la consulta incluidos (un `recall_context` real con 19.134 bytes de contexto entero, y `revision-eval chains --real --background`). Con el default la reserva es de 2.000 bytes. `AUTO_BYTE_CAP` (6.000 bytes, `crates/clawg-core/src/memory/retrieval/workspace.rs:19-20`) sólo recorta los skills y las decisiones al escribir el archivo (`render_auto_section`, `:517`): las preferencias no tienen tope, y por eso, mientras algo espera, la sección AUTO cede lo que pasa de la mitad del presupuesto. Sin consulta no hay reserva: al iniciar una sesión LAST SESSION es el traspaso, y RECENT son los saves más nuevos, no la respuesta a una pregunta.
 
 Del workspace sólo se cortan entradas conocidas de la sección AUTO, nunca [lo que escribió la persona](#sc5-lo-que-escribió-la-persona-no-se-corta). Cada fila que la sección imprimió es una que la búsqueda salteó (`EmittedIds`), así que, una vez cortada, el bloque `BUDGET` es su único canal: por eso se nombra por id. Medir el texto entero en cada paso cuenta la nota `SHARED`, el bloque `BUDGET`, el texto que gana un conflicto cuando se va su hit y el margen de cada línea de continuación (4 bytes por línea, `  | `).
 
@@ -643,7 +763,7 @@ Del workspace sólo se cortan entradas conocidas de la sección AUTO, nunca [lo 
 - GIVEN cuatro hits de 1.000 bytes, un resumen de LAST SESSION y un par, y una reserva en la que caben dos hits
 - WHEN quitar los dos hits de menor score alcanza
 - THEN se van esos dos, y LAST SESSION y el par quedan enteros
-- AND con un presupuesto que no alcanza para eso, LAST SESSION y el par se van antes que los dos hits de la reserva
+- AND con un presupuesto que no alcanza para eso, el par se va antes que LAST SESSION, y LAST SESSION antes que los dos hits de la reserva
 
 #### Escenario: inicio de sesión en un store maduro
 - GIVEN un workspace, un resumen de sesión y saves recientes que no entran juntos

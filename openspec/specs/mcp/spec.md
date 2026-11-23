@@ -28,6 +28,7 @@ Fuente de verdad del comportamiento actual del puente `clawg mcp`: cómo abre un
 - [bridge-project-identity](../../changes/archive/2026-11-07-bridge-project-identity/proposal.md), archivado el 2026-11-07, que salió en 0.78.0 (BI1 a BI5 y BI7 a BI10 de esa spec, con esos nombres, sus definiciones, `project=` entre los marcadores, y lo que cambian en «Los conflictos en las herramientas», «La clave de tema en las herramientas», PM4 y PM8). La búsqueda de un grupo en el core y en `POST /v1/search` está en [`specs/retrieval`](../retrieval/spec.md), BI6.
 - [retire-legacy-kinds](../../changes/archive/2026-11-07-retire-legacy-kinds/proposal.md), archivado el 2026-11-07, que sale en 0.79.0 (RL5 a RL7, al final de esta spec: la API y la CLI que un puente anterior usa, y las herramientas sin `kind`; el texto de la explicación de un kind retirado está en RL7). Los requisitos de ese cambio se numeran R1 a R10 allí y RL1 a RL10 acá, para no chocar con los ids de cada spec. Las specs de la API y de la CLI no existen aparte: RL5 y RL6 viven acá porque son lo que el puente, y los clientes que lo usan, reciben.
 - [verdict-on-replace](../../changes/archive/2026-11-12-verdict-on-replace/proposal.md), archivado el 2026-11-12, que sale en 0.85.0 (VR2 a VR5: la respuesta de `restore_memory`, la frase del protocolo sobre las cercanas, la línea de conflictos de `memory_status` y las descripciones de `resolve_conflict` y `restore_memory`, en «Los conflictos en las herramientas», «Borrar y restaurar en las herramientas», «La apertura lleva los hábitos que más rinden» y «Las instrucciones caben en 2.048 caracteres»). VR1, la línea de la respuesta del save, está en [`specs/disputes`](../disputes/spec.md). Los requisitos de ese cambio se numeran R1 a R6 allí y VR1 a VR5 acá; el R6, que lista lo que no cambia, no se consolida.
+- [conflicts-on-demand](../../changes/archive/2026-11-23-conflicts-on-demand/proposal.md), archivado el 2026-11-23, que sale en 0.93.0 (CO8 a CO10 de esa spec, con esos nombres, después de «Los conflictos en las herramientas»; VR3 y VR4 con su texto nuevo).
 
 ## Definiciones
 
@@ -316,9 +317,85 @@ Qué es un par, cuándo escala y qué hace cada veredicto está en [`specs/dispu
 - `resolve_conflict` MUST tomar `keep`, `other`, `verdict`, `reason` y `user_answered` (`ResolveConflictArgs`, `crates/clawg-cli/src/mcp/server.rs:445`), y ya no `keep_both`. `user_answered` es booleano y opcional, y su descripción dice que va sólo cuando el usuario dijo cuál vale, con su respuesta en `reason`, y que reemplazar una `user_preference` o una `architectural_decision` lo pide. La descripción de la herramienta (`server.rs:1961-1968`) MUST decir que el agente juzga un par que nombra `save_memory` cuando el save nuevo reemplaza a la memoria vieja o cuando sólo el usuario puede decir cuál vale, y uno bajo ACTIVE CONFLICTS de `recall_context` una vez que el usuario dijo cuál vale, y MUST NOT nombrar `memory_status` como fuente de pares para juzgar (VR5). MUST decir además que una preferencia o una decisión se reemplaza sólo con la palabra del usuario: juzgarla `conflicts`, preguntar y llamar `supersedes` con `user_answered` y su respuesta en `reason`. La descripción de `keep` MUST decir que su id es el que muestran ACTIVE CONFLICTS o `save_memory`, y no `memory_status`, que no muestra ids. Las demás descripciones del schema no cambian: la herramienta acepta los cuatro veredictos. Sin la declaración, el `409` del daemon llega como error con el texto que la pide ([`specs/disputes`](../disputes/spec.md) R3).
 - `update_memory` MUST tomar `user_answered` igual, para sacarle el tipo a una preferencia o a una decisión ([`specs/update`](../update/spec.md) R5). `verdict` MUST declarar en el schema el `enum` de los cuatro veredictos de `Verdict::ALL` (`verdict_enum`, `server.rs:439`). Al deserializar sigue siendo una cadena libre, así que un valor desconocido llega al daemon y vuelve como un error que lista los cuatro. Contra un daemon anterior a `/v1/disputes/judge`, MUST pedir que se lo reinicie con `clawg stop` (`server.rs:1587-1598`).
 - `save_memory` MUST sumar la línea `close to earlier memories: …` cuando el save tiene candidatas (`related_text`, `server.rs:391`), y lo que esa línea pide al agente es VR1 de [`specs/disputes`](../disputes/spec.md): llamar a `resolve_conflict` sólo si el save reemplaza una de las nombradas.
-- **VR4.** `memory_status` MUST sumar una línea de conflictos que diga sólo cuántos pares esperan a la persona (`format_open_pairs`, `crates/clawg-cli/src/mcp/tools.rs:285`; `memory_status_impl`, `server.rs:1746`): sin pares escalados, `conflict candidates: none open` (`candidatos a conflicto: ninguno abierto`), haya o no pares pendientes; con `n` escalados, `conflict candidates: n waiting for the user in ACTIVE CONFLICTS` (`candidatos a conflicto: n esperando a la persona en ACTIVE CONFLICTS`). El alcance es el de los pares escalados que el agente alcanza en el proyecto abierto, o en todos con varios o ninguno ([BI8](#bi8-memory_status-y-read_memory)) (`GET /v1/disputes` con `agent_id` y `project_id`), de cualquier autor. MUST NOT contar los pares pendientes, listar ninguno ni decir cómo juzgarlos: el agente juzga un par cuando un save lo nombra (VR1), no desde una lista. Contra un daemon sin `GET /v1/disputes` MUST omitir la línea, y no fallar (`server.rs:1764-1770`). El puente lee la respuesta con el tipo que el daemon serializa (`OpenPairs`, de `clawg-core`) y de él imprime sólo `escalated`; la marca de cada lado sigue en `GET /v1/disputes` y en ACTIVE CONFLICTS ([`specs/provenance`](../provenance/spec.md), P4).
+- **VR4.** `memory_status` MUST sumar una línea de conflictos que diga sólo cuántos pares esperan a la persona (`format_open_pairs`, `crates/clawg-cli/src/mcp/tools.rs:285`; `memory_status_impl`, `server.rs:1746`): sin pares escalados, `conflict candidates: none open` (`candidatos a conflicto: ninguno abierto`), haya o no pares pendientes; con `n` escalados, `conflict candidates: n waiting for the user; list_memories with conflicts lists them` (`candidatos a conflicto: n esperando a la persona; list_memories con conflicts los lista`, CO10). El alcance es el de los pares escalados que el agente alcanza en el proyecto abierto, o en todos con varios o ninguno ([BI8](#bi8-memory_status-y-read_memory)) (`GET /v1/disputes` con `agent_id` y `project_id`), de cualquier autor. MUST NOT contar los pares pendientes, listar ninguno ni decir cómo juzgarlos: el agente juzga un par cuando un save lo nombra (VR1), no desde una lista. Contra un daemon sin `GET /v1/disputes` MUST omitir la línea, y no fallar (`server.rs:1764-1770`). El puente lee la respuesta con el tipo que el daemon serializa (`OpenPairs`, de `clawg-core`) y de él imprime sólo `escalated`; la marca de cada lado sigue en `GET /v1/disputes` y en ACTIVE CONFLICTS ([`specs/provenance`](../provenance/spec.md), P4).
 
 **Tests:** `resolve_conflict_reports_the_outcome`, `resolve_conflict_against_an_older_daemon_asks_for_a_restart`, `resolve_conflict_sends_the_users_answer`, `update_memory_sends_the_users_answer`, `save_outcome_text_names_related_memories` y `memory_status_counts_only_the_pairs_that_wait_for_the_user` (`server.rs`); `pending_pairs_are_not_put_to_the_agent` y `format_status_ends_with_the_open_pairs` (`tools.rs`). El schema lo fija también `the_agent_contract_matches_its_file` ([`specs/quality`](../quality/spec.md)).
+
+## CO8. `list_memories` con `conflicts` lista los pares que esperan a la persona
+
+`ListMemoriesArgs` (`crates/clawg-cli/src/mcp/server.rs:313-333`) MUST aceptar `conflicts`, un booleano opcional. Con `conflicts: true`, `list_memories` MUST listar, en lugar de filas, los pares escalados del proyecto abierto cuando las carpetas abiertas llevan a uno, y los de todos cuando llevan a varios o a ninguno (la regla de `memory_status`, [BI8](../mcp/spec.md#bi8-memory_status-y-read_memory); `one_project`, `server.rs:664`), con `GET /v1/disputes?escalated=true` (CO7). La salida MUST:
+
+- traer, por cada par, `NEW #N` con la primera línea de la fila nueva y `OLD #M` con la de la vieja, cada lado con su marca de origen cuando la tiene (P4 de [`specs/provenance`](../provenance/spec.md)), los ids que recibe `resolve_conflict`;
+- decir cuántos de los pares escalados quedan sin listar cuando `escalated` pasa de los que trae el daemon (`(+N more waiting, ask again once these are answered)`; en español, su equivalente);
+- terminar con una línea que pida preguntarle a la persona por cada par y registrar sólo su respuesta con `resolve_conflict`, `user_answered` y sus palabras en `reason`, sin juzgar ninguno por cuenta propia;
+- decir `conflict candidates: none open` (`candidatos a conflicto: ninguno abierto`) y nada más cuando no hay ninguno.
+
+Con `conflicts: true` junto a `agent`, `tier`, `memory_type`, `limit` u `offset`, que son filtros de filas, MUST negarse sin llamar al daemon y decir que `conflicts` no se combina con ellos. Contra un daemon que rechaza `escalated` (CO7), MUST decir que se reinicie el daemon con `clawg stop` y MUST NOT mostrar los pendientes como si fueran escalados, como `resolve_conflict` contra un daemon sin `/v1/disputes/judge` (`server.rs:1599`). Sin `conflicts`, o con `conflicts: false`, `list_memories` MUST ser el de hoy.
+
+La descripción de `conflicts` MUST ser de una oración que diga que lista los pares de memorias que esperan a la persona, con los dos textos, en lugar de filas, y la de `list_memories` MUST nombrarlo en una frase. Pesa unos 150 caracteres por idioma y los paga sólo quien carga `list_memories`.
+
+#### Escenario: los pares del proyecto
+- GIVEN dos pares escalados en el proyecto abierto, uno en otro proyecto y uno pendiente
+- WHEN el agente llama a `list_memories` con `conflicts: true`
+- THEN lista los dos del proyecto, cada uno con `NEW #N <línea>` y `OLD #M <línea>`, y termina con la línea que pide preguntar
+- AND no lista el de otro proyecto ni el pendiente
+
+#### Escenario: sin pares
+- GIVEN un proyecto sin pares escalados
+- WHEN se llama con `conflicts: true`
+- THEN la respuesta es `conflict candidates: none open`
+
+#### Escenario: más de diez
+- GIVEN doce pares escalados
+- WHEN se llama con `conflicts: true`
+- THEN lista diez y dice que quedan dos
+
+#### Escenario: con un filtro de filas
+- GIVEN `conflicts: true` y `tier: 1`
+- WHEN se llama
+- THEN se niega sin llamar al daemon
+
+#### Escenario: un daemon anterior
+- GIVEN un daemon que rechaza `escalated=true`
+- WHEN se llama con `conflicts: true`
+- THEN la respuesta pide `clawg stop` y no lista nada
+
+**Tests (hoy fallan):** en `server.rs` (mod tests), uno por escenario, junto a `memory_status_counts_only_the_pairs_that_wait_for_the_user`; en `tools.rs`, el formato (junto a `format_status_ends_with_the_open_pairs`) y que la línea final no juzga ningún par (como `pending_pairs_are_not_put_to_the_agent` para VR4); `the_agent_contract_matches_its_file` y su versión en español (CO9). `list_memories` sin `conflicts`: los existentes, sin cambio.
+
+## CO9. La apertura pide preguntar por una marca, no por el bloque
+
+La frase de ACTIVE CONFLICTS de las instrucciones del servidor (`crates/clawg-cli/src/mcp/protocol.md:28-30` y `protocol.es.md:27-29`) MUST dejar de depender de que `recall_context` liste el bloque, y MUST pedir, en las dos lenguas, que se le pregunte a la persona cuál memoria vale cuando una respuesta depende de una memoria marcada `conflict=`, o cuando la persona pide revisar los conflictos, y que se registre con `resolve_conflict`, `user_answered` y sus palabras en `reason`. MUST conservar «ask the user which memory holds» y «pregúntale a la persona qué memoria vale» (`the_instructions_carry_the_saving_habits` y su versión en español), y MUST NOT nombrar `list_memories`: en inglés no entra. En inglés MUST medir 205 caracteres o menos (la que reemplaza mide 204), y las tres aperturas (sin preferencia, `en` y `es`) MUST seguir en 2.048 caracteres o menos (`the_instructions_fit_older_clients`, `server.rs`; hoy con `en` miden 2.047). MUST conservar también la guarda de la frase vieja («set it only when the user said so», «sólo si la persona lo dijo»): que se registre sólo la respuesta de la persona. El `409` del daemon para una fila protegida ([`specs/disputes`](../disputes/spec.md), R3) no la reemplaza, porque sólo frena un veredicto sin `user_answered`, y la descripción de `user_answered` sólo llega cuando el agente ya cargó `resolve_conflict`. Cabe en los 205: «When an answer rests on a `conflict=` memory or the user asks for conflicts, ask the user which memory holds; record only their answer, with `resolve_conflict`, `user_answered` and their words in `reason`.» mide 205. En español la frase conserva «sólo si la persona lo dijo». La otra mitad de VR3, la de los saves con cercanas, no cambia. La frase siguiente, la de `synthesize`, cambió su sujeto: «When it says» se refería a `recall_context`, que esta frase ya no nombra, y pasó a «When told» («Cuando se te diga»), que cabe en el largo.
+
+El español y el inglés MUST nombrar lo mismo entre comillas invertidas (`protocol.rs:270-280` y `:444-454`); `conflict=` no cuenta como nombre (`is_name`, `server.rs:2935-2938`). `protocol.lean*.md` no lleva la apertura y no cambia. El bloque `full` instalado queda `stale` (PB4 de [`specs/hooks`](../hooks/spec.md)) hasta correr `clawg setup claude-code`; `lean`, `short` y `off` siguen `current`.
+
+#### Escenario: la frase
+- GIVEN la apertura en inglés y en español
+- THEN dice ``marked `conflict=` `` (o su equivalente) y la condición de pedir la revisión, y conserva la frase de «qué memoria vale»
+- AND dice que se registra sólo la respuesta de la persona («record only their answer», «sólo si la persona lo dijo»)
+- AND no dice `ACTIVE CONFLICTS` ni `lists`/`liste` aplicado a `recall_context`
+
+#### Escenario: el largo
+- GIVEN las tres variantes
+- THEN la frase en inglés mide 205 caracteres o menos y ninguna apertura pasa de 2.048
+
+**Tests (hoy fallan):** `the_instructions_fit_older_clients` y `the_instructions_carry_the_saving_habits` (y su versión en español) en `server.rs`, con el texto nuevo; en `protocol.rs`, que ninguna apertura nombra `ACTIVE CONFLICTS` ni depende de `recall_context` para preguntar, y que `lean` sigue igual. Los contratos (`crates/clawg-cli/src/mcp/agent_contract.json` y `agent_contract.es.json`) se regeneran con `CLAWG_BLESS=1 cargo test -p clawg-cli the_agent_contract_matches_its_file` y `... the_spanish_agent_contract_matches_its_file`; el diff se revisa: MUST ser sólo la frase de las instrucciones, las descripciones de `resolve_conflict` y de su `keep`, y la de `list_memories` con su parámetro nuevo.
+
+## CO10. `resolve_conflict` y las líneas de `memory_status` dicen dónde se ven los pares
+
+- La descripción de `resolve_conflict` (`crates/clawg-cli/src/mcp/server.rs:1973-1981`; en español, `tools_es.rs`) MUST decir que juzga un par que nombra `save_memory`, o uno marcado `conflict=` o listado por `list_memories` con `conflicts`, una vez que la persona dijo cuál vale, en lugar de «one under ACTIVE CONFLICTS in `recall_context`», y MUST NOT nombrar `memory_status` como fuente de pares (VR5). Lo demás de la descripción no cambia. La de `keep` (`server.rs:458`) MUST decir que su id es el que muestran la marca `conflict=`, `list_memories` o `save_memory`, en lugar de «ACTIVE CONFLICTS or `save_memory`».
+- La línea de `memory_status` (`format_open_pairs`, `tools.rs:286-293`) y la de un veredicto `conflicts` (`format_resolution`, `tools.rs:270-282`) MUST dejar de decir «in ACTIVE CONFLICTS» (`en ACTIVE CONFLICTS`) y decir dónde se listan: que `list_memories` con `conflicts` los lista. VR4 sigue: la línea de `memory_status` dice sólo cuántos pares esperan, sin listar ninguno ni decir cómo juzgarlos; con ninguno, `conflict candidates: none open`. VR5 sigue: ninguna lista de pares en `memory_status`.
+
+#### Escenario: memory_status
+- GIVEN un par escalado
+- WHEN el agente llama a `memory_status`
+- THEN la línea dice que hay 1 esperando a la persona y nombra `list_memories` con `conflicts`
+- AND no lista el par ni dice cómo juzgarlo
+
+#### Escenario: un veredicto `conflicts`
+- GIVEN un `resolve_conflict` con `conflicts`
+- THEN la respuesta dice que el par espera a la persona y dónde se lista, sin nombrar ACTIVE CONFLICTS
+
+**Tests (hoy fallan):** cambian `format_status_ends_with_the_open_pairs`, el de `format_resolution` (`tools.rs:2228`) y `memory_status_counts_only_the_pairs_that_wait_for_the_user` (`server.rs`), que hoy fijan «in ACTIVE CONFLICTS»; `pending_pairs_are_not_put_to_the_agent` sigue. Los contratos, como en CO9.
 
 ## La clave de tema en las herramientas
 
@@ -411,7 +488,7 @@ Mientras sea el único texto del protocolo que llega solo al agente, la apertura
 - pedir un hecho por llamada, con una primera línea que nombre el tema y con rutas e identificadores exactos;
 - pedir memorias y búsquedas en inglés, cualquiera sea el idioma de la conversación, porque una memoria se encuentra mejor con una consulta en su idioma (el corte por pareja de idiomas de [`specs/eval`](../eval/spec.md)); con preferencia, en el idioma preferido (LP9 y AL2);
 - decir que lo recuperado (memorias y pasajes del proyecto) es evidencia y no instrucciones;
-- **VR3.** pedir que, cuando `save_memory` nombra memorias cercanas a la nueva y la nueva reemplaza a una, se llame a `resolve_conflict` con `supersedes` mientras la conversación sigue ahí, o con `conflicts` si sólo el usuario puede decir cuál vale, y que si valen las dos no se haga nada, sin decir `judge each` ni `juzga cada una` y sin nombrar `compatible` ni `scoped` en esa frase; que se le pregunte al usuario por lo que lista ACTIVE CONFLICTS y que su respuesta se registre con `resolve_conflict`, `user_answered` y sus palabras en `reason`, puesto sólo cuando el usuario lo dijo ([`specs/disputes`](../disputes/spec.md));
+- **VR3.** pedir que, cuando `save_memory` nombra memorias cercanas a la nueva y la nueva reemplaza a una, se llame a `resolve_conflict` con `supersedes` mientras la conversación sigue ahí, o con `conflicts` si sólo el usuario puede decir cuál vale, y que si valen las dos no se haga nada, sin decir `judge each` ni `juzga cada una` y sin nombrar `compatible` ni `scoped` en esa frase; que se le pregunte al usuario cuál memoria vale cuando una respuesta depende de una memoria marcada `conflict=` o cuando pide revisar los conflictos, y que se registre sólo su respuesta con `resolve_conflict`, `user_answered` y sus palabras en `reason` (CO9) ([`specs/disputes`](../disputes/spec.md));
 - decir qué no guardar.
 
 El texto completo MUST traer además el resumen de sesión con sus seis partes (Goal, Instructions, Discoveries, Accomplished, Next steps y Relevant files), que el resumen más nuevo del proyecto abre el contexto de la sesión siguiente bajo LAST SESSION, pregunte lo que pregunte ([`specs/retrieval`](../retrieval/spec.md), «La última sesión»), y qué hacer tras una compactación. La frase de LAST SESSION va en «Session summary», fuera de la apertura, y ningún test la pide. También MUST decir cuándo darle una `topic_key` a un save (una decisión o una preferencia que puede cambiar, con un nombre corto y estable como `storage/engine`) y que una versión nueva se guarda bajo la clave que muestran `search_memory` y `read_memory`, nunca bajo una nueva. Esa oración va en «How to write a save», fuera de la apertura, así que las instrucciones y su largo no cambian; no tiene un test que la pida, y `the_protocol_names_only_what_exists` comprueba que `topic_key` sea una propiedad del schema.

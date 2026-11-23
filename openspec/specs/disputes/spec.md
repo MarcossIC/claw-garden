@@ -10,6 +10,7 @@ Fuente de verdad del comportamiento actual de los pares que encuentra el detecto
 - [protected-verdicts](../../changes/archive/2026-10-20-protected-verdicts/proposal.md), archivado el 2026-10-20 (la guarda de las filas protegidas y la declaración en R3, y lo que cambia en `conflicts`, R6 y «Datos de la versión anterior»).
 - [agent-authorship](../../changes/archive/2026-10-22-agent-authorship/proposal.md), archivado el 2026-10-22: el detector compara con el alcance del que guarda, y los pares se juzgan y se cuentan por lector y proyecto (R6, «Umbral y banda del detector»).
 - [verdict-on-replace](../../changes/archive/2026-11-12-verdict-on-replace/proposal.md), archivado el 2026-11-12, que sale en 0.85.0 (VR1, en «Las candidatas en la respuesta del save», y lo que cambia en R6 y en la apertura del protocolo). Los requisitos de ese cambio se numeran R1 a R6 allí y VR1 a VR5 acá, para no chocar con los ids de cada spec; VR2 a VR5 viven en [`specs/mcp`](../mcp/spec.md).
+- [conflicts-on-demand](../../changes/archive/2026-11-23-conflicts-on-demand/proposal.md), archivado el 2026-11-23, que sale en 0.93.0 (CO7 de esa spec, con ese nombre, después de R6).
 - [save-pairs](../../changes/archive/2026-11-17-save-pairs/proposal.md), archivado el 2026-11-17, que sale en 0.88.0 (el detector anota un solo par por save también en un save reanudado, en «El detector anota candidatas», y la lista de tests de R6). El enlace de las piezas que falla está en [`specs/pieces`](../pieces/spec.md), R3, y lo que retoma un replay en [`specs/storage`](../storage/spec.md).
 
 ## Definiciones
@@ -135,7 +136,7 @@ Juzgar un par enlazado con `compatible` o `scoped` MUST sacar a cada fila del `d
 
 ## `conflicts`: el usuario decide
 
-Juzgar un par enlazado con `conflicts` MUST hacer que la fila más nueva nombre a la más vieja en `disputed_against` y quede `disputed`, y dejar el par `escalated`: pasa a ACTIVE CONFLICTS. Es el veredicto del agente que no está seguro, y el primer paso para reemplazar una fila protegida: después el agente le pregunta al usuario y registra su respuesta con la declaración (R3). Juzgar `conflicts` no abre la guarda.
+Juzgar un par enlazado con `conflicts` MUST hacer que la fila más nueva nombre a la más vieja en `disputed_against` y quede `disputed`, y dejar el par `escalated`: espera a la persona, marcado `conflict=` donde se muestran sus filas y listado a pedido (CO7; [`specs/retrieval`](../retrieval/spec.md), CO2). Es el veredicto del agente que no está seguro, y el primer paso para reemplazar una fila protegida: después el agente le pregunta al usuario y registra su respuesta con la declaración (R3). Juzgar `conflicts` no abre la guarda.
 
 **Test:** `conflicts_escalates_a_pending_pair` en `dispute.rs`.
 
@@ -287,6 +288,32 @@ La NOTE de ACTIVE CONFLICTS (una vez por bloque; [`specs/retrieval`](../retrieva
 - THEN el texto dice que N queda y O queda reemplazada por N, y `list_memories` lo muestra
 
 **Test:** `resolve_supersedes_the_other_row`, `resolve_rejects_the_same_row`, `resolve_unknown_row_is_not_found`, `resolve_rows_without_a_dispute_conflict`, `judge_records_a_verdict`, `judge_refuses_scoped_without_reason`, `resolve_with_keep_both_still_works`, `disputes_lists_the_pending_pairs_an_agent_reaches_in_a_project` y `a_protected_verdict_without_the_answer_is_a_409` en `crates/clawg-cli/tests/api.rs`; `resolve_conflict_reports_the_outcome`, `resolve_conflict_against_an_older_daemon_asks_for_a_restart`, `resolve_conflict_sends_the_users_answer`, `a_long_save_is_judged_through_the_first_id_it_answers` (el primer id de `saved #…` juzga el par que la línea `close to earlier memories` nombra, aunque lo tenga otra pieza, R3), `memory_status_counts_only_the_pairs_that_wait_for_the_user`, `another_agent_resolves_a_conflict_unless_hidden`, `the_instructions_carry_the_saving_habits` y el conteo de herramientas en `crates/clawg-cli/src/mcp/server.rs`; `the_conflict_note_names_the_tool` y `the_conflict_note_does_not_claim_a_contradiction` en `crates/clawg-core/src/memory/retrieval/prompt_builder.rs`.
+
+## CO7. `GET /v1/disputes` lista los escalados a pedido
+
+`GET /v1/disputes` MUST aceptar `escalated=true`, un booleano. Con él, `pairs` MUST traer los pares **escalados** en lugar de los pendientes (`open_pairs` filtra hoy `p.state = 'pending'`, `dispute.rs:545`): los más viejos primero, con el orden de ahora (`p.created_at, p.new_id, p.old_id`), hasta **10** pares (`ESCALATED_LISTED`, nombre propuesto; los pendientes siguen en 5, `OPEN_PAIRS_SHOWN`, `crates/clawg-cli/src/daemon/api/disputes.rs:59`). Cada par MUST traer, además de lo que trae un par pendiente (ids, distancia, fecha y marca de origen de cada lado), la primera línea con texto de cada lado, sin los espacios de sus bordes (`new_line` y `old_line`), cortada a los 500 caracteres de la vista previa de `list_memories` y `search_memory` (`CONTENT_PREVIEW_LIMIT`, `crates/clawg-cli/src/mcp/tools.rs:41`). Los conteos `pending` y `escalated`, el alcance (el lector, y el proyecto de la fila nueva como la búsqueda) y los predicados de filas vivas no cambian; sin el parámetro, la respuesta MUST ser la de hoy, byte a byte.
+
+El tope es 10, no 5 ni todos. El bloque de ACTIVE CONFLICTS llega sin que nadie lo pida y por eso cuesta 5; esta lista se pide y puede ser más larga, pero cada par exige que el agente le pregunte a la persona, y diez pares con sus textos caben en unos 10 KB como máximo. En este repositorio hay más de 16: el pedido siguiente trae los demás, porque un par que la persona contesta sale de la lista, y el conteo `escalated` dice cuántos quedan.
+
+El parámetro MUST declararse en `DisputesQuery`, que rechaza lo que no conoce (`deny_unknown_fields`, `disputes.rs:46-48`): un daemon anterior responde un error de consulta, y es lo que lee CO8.
+
+#### Escenario: diez de doce
+- GIVEN doce pares escalados y tres pendientes del lector
+- WHEN `GET /v1/disputes?escalated=true`
+- THEN `escalated` es 12, `pending` es 3, `pairs` trae diez pares escalados, los más viejos, y ninguno pendiente
+- AND cada par trae `new_line` y `old_line`
+
+#### Escenario: sin el parámetro
+- GIVEN los mismos pares
+- WHEN `GET /v1/disputes`
+- THEN `pairs` trae los pendientes de siempre, sin `new_line` ni `old_line`
+
+#### Escenario: alcance
+- GIVEN un par escalado cuyo lado viejo es de un agente que `sharing.json` le oculta al lector, y uno de otro proyecto
+- WHEN `GET /v1/disputes?escalated=true&project_id=P`
+- THEN no trae ninguno de los dos
+
+**Tests (hoy fallan):** en `crates/clawg-core/src/memory/revision/dispute.rs` (mod tests), el listado de escalados con su tope y su orden, junto a los de `open_pairs`; en `crates/clawg-cli/tests/api.rs`, los tres escenarios.
 
 ## R7. El workspace no muestra filas reemplazadas
 

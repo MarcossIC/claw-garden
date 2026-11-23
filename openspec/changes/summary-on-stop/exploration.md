@@ -2,7 +2,7 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| 1, y el criterio de la etapa «la mayoría de las sesiones que guardan dejan su resumen» | M: un hook nuevo, una consulta al daemon y `setup`; no toca `memory.db` | —; se coordina con [conflicts-on-demand](../conflicts-on-demand/proposal.md) (141), que hace que el resumen llegue entero al arranque, y con [session-lifecycle](../session-lifecycle/exploration.md) (99), dormido, que ve el mismo problema con sesiones en paralelo | exploración |
+| 1, y el criterio de la etapa «la mayoría de las sesiones que guardan dejan su resumen» | M: un hook nuevo, una consulta al daemon y `setup`; no toca `memory.db` | —; se coordina con [conflicts-on-demand](../archive/2026-11-23-conflicts-on-demand/proposal.md) (141), que hace que el resumen llegue entero al arranque, y con [session-lifecycle](../session-lifecycle/exploration.md) (99), dormido, que ve el mismo problema con sesiones en paralelo | exploración |
 
 ## Problema
 
