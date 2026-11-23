@@ -3257,7 +3257,7 @@ mod tests {
             .map(String::as_str)
             .collect();
         properties.sort();
-        assert_eq!(properties, ["agent", "limit", "memory_type", "offset", "tier"]);
+        assert_eq!(properties, ["agent", "conflicts", "limit", "memory_type", "offset", "tier"]);
     }
 
     /// The model has to pick `memory_type` from the set the store recognises;
