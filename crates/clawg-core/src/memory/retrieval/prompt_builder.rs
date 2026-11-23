@@ -375,6 +375,10 @@ async fn assemble(
         log::warn!("fetch_active_conflicts failed: {e}; CONFLICTS block omitted");
         Vec::new()
     });
+    // Every pair marks its printed sides, whether or not the block keeps it.
+    let marks = sides_of(&conflicts, &shown);
+    let mut workspace_content = workspace_content;
+    workspace_content.mark(&marks);
     let (conflicts, conflicts_omitted) = rank_conflicts(conflicts, &hit_positions, MAX_CONFLICT_PAIRS);
 
     // 5. Assemble in order: WORKSPACE → LAST SESSION → RECENT → LONG-TERM → CONFLICTS, cut to the budget.
@@ -387,6 +391,7 @@ async fn assemble(
             longterm,
             conflicts,
             conflicts_omitted,
+            marks,
             reader: &reader.agent_id,
             hit_room,
         },
@@ -409,6 +414,9 @@ struct PromptParts<'a> {
     /// Already ranked; the budget drops them from the end.
     conflicts: Vec<ConflictPair>,
     conflicts_omitted: usize,
+    /// The other sides of each printed row in an escalated pair, which its
+    /// line names; the summary of the last session is never marked.
+    marks: HashMap<i64, Vec<i64>>,
     reader: &'a str,
     /// Bytes RECENT and LONG-TERM keep until the summary and the conflicts
     /// are gone; 0 cuts every hit first.
@@ -559,7 +567,7 @@ fn hit_bytes(parts: &PromptParts<'_>) -> usize {
         .into_iter()
         .filter(|(_, hits)| !hits.is_empty())
         .map(|(separator, hits)| {
-            separator.len() + 2 + hits.iter().map(|h| format_hit_line(h, parts.reader).len() + 1).sum::<usize>()
+            separator.len() + 2 + hits.iter().map(|h| marked_hit_line(h, parts.reader, &parts.marks).len() + 1).sum::<usize>()
         })
         .sum()
 }
@@ -623,7 +631,7 @@ fn positions(recent: &[RankedHit], longterm: &[RankedHit]) -> HashMap<i64, usize
 }
 
 fn render(parts: &PromptParts<'_>, cut: Option<&Cut>) -> String {
-    let PromptParts { lang, workspace, last_session, recent, longterm, conflicts, conflicts_omitted, reader, .. } = parts;
+    let PromptParts { lang, workspace, last_session, recent, longterm, conflicts, conflicts_omitted, marks, reader, .. } = parts;
     let mut out = String::new();
     let workspace = workspace.render();
     if !workspace.is_empty() {
@@ -634,7 +642,10 @@ fn render(parts: &PromptParts<'_>, cut: Option<&Cut>) -> String {
             out.push('\n');
         }
     }
-    for (separator, hits) in [(SEP_LAST_SESSION, last_session), (SEP_RECENT, recent), (SEP_LONGTERM, longterm)] {
+    let unmarked = HashMap::new();
+    for (separator, hits, marks) in
+        [(SEP_LAST_SESSION, last_session, &unmarked), (SEP_RECENT, recent, marks), (SEP_LONGTERM, longterm, marks)]
+    {
         if hits.is_empty() {
             continue;
         }
@@ -644,7 +655,7 @@ fn render(parts: &PromptParts<'_>, cut: Option<&Cut>) -> String {
         out.push_str(separator);
         out.push('\n');
         for h in hits {
-            out.push_str(&format_hit_line(h, reader));
+            out.push_str(&marked_hit_line(h, reader, marks));
             out.push('\n');
         }
     }
@@ -825,20 +836,27 @@ fn is_line_break(c: char) -> bool {
 /// `[YYYY-MM-DD #id type] content`, with the origin of a preference the user
 /// did not state after the type, as ACTIVE CONFLICTS marks a side, and
 /// ` by <agent>` before the `]` when another agent saved it.
-fn format_hit_line(hit: &RankedHit, reader: &str) -> String {
+fn format_hit_line(hit: &RankedHit, reader: &str, mark: Option<&str>) -> String {
     let (y, m, d) = unix_millis_to_ymd(hit.created_at);
     let origin = hit.origin.map(|o| format!(" {o}")).unwrap_or_default();
     let piece = hit.piece.map(|p| format!(" piece={}/{}", p.piece, p.pieces)).unwrap_or_default();
+    let mark = mark.map(|m| format!(" {m}")).unwrap_or_default();
     let by = match &hit.agent_id {
         Some(author) if is_shared(hit, reader) => format!(" by {}", display_author(author)),
         _ => String::new(),
     };
     format!(
-        "[{y:04}-{m:02}-{d:02} #{} {}{origin}{piece}{by}] {}",
+        "[{y:04}-{m:02}-{d:02} #{} {}{origin}{piece}{mark}{by}] {}",
         hit.id,
         hit.memory_type,
         indent_continuations(&hit.content)
     )
+}
+
+/// A hit's line with the mark of its escalated pairs, if `marks` has any.
+fn marked_hit_line(hit: &RankedHit, reader: &str, marks: &HashMap<i64, Vec<i64>>) -> String {
+    let mark = marks.get(&hit.id).and_then(|others| conflict_mark(others));
+    format_hit_line(hit, reader, mark.as_deref())
 }
 
 /// Printed once above the pairs: it is the same for every one of them.
@@ -1189,6 +1207,19 @@ impl PromptWorkspace {
             .map(|(at, _)| at)
     }
 
+    /// Ends the first line of each AUTO entry in an escalated pair with its
+    /// id and the mark of its other sides, `(#9 conflict=#12)`: the section
+    /// prints no ids of its own. Only the prompt's copy changes, never the file.
+    fn mark(&mut self, marks: &HashMap<i64, Vec<i64>>) {
+        for entry in self.auto.iter_mut().flatten() {
+            let Some(row) = &entry.row else { continue };
+            let Some(mark) = marks.get(&row.id).and_then(|others| conflict_mark(others)) else { continue };
+            let label = format!(" (#{} {mark})", row.id);
+            let end = entry.text.find('\n').unwrap_or(entry.text.len());
+            entry.text.insert_str(end, &label);
+        }
+    }
+
     /// Takes out the entry at `at`, which [`Self::next_to_cut`] found, and
     /// names its row.
     fn take(&mut self, at: usize) -> Option<i64> {
@@ -1351,6 +1382,12 @@ pub async fn other_sides(
     ids: &[i64],
 ) -> Result<HashMap<i64, Vec<i64>>, MemoryError> {
     let pairs = fetch_active_conflicts(store, reader, ids).await?;
+    Ok(sides_of(&pairs, ids))
+}
+
+/// For each of `ids` that is a side of one of `pairs`, its other sides,
+/// lowest first.
+fn sides_of(pairs: &[ConflictPair], ids: &[i64]) -> HashMap<i64, Vec<i64>> {
     let asked: HashSet<i64> = ids.iter().copied().collect();
     let mut others: HashMap<i64, Vec<i64>> = HashMap::new();
     for pair in pairs {
@@ -1365,7 +1402,7 @@ pub async fn other_sides(
         sides.sort_unstable();
         sides.dedup();
     }
-    Ok(others)
+    others
 }
 
 // ---------------------------------------------------------------------------
@@ -1477,10 +1514,10 @@ mod tests {
     #[test]
     fn hit_line_is_one_header_with_id_and_text() {
         let memory = hit_at_2023_11_14(57, "semantic_fact", "usar sqlite");
-        assert_eq!(format_hit_line(&memory, "agent-1"), "[2023-11-14 #57 semantic_fact] usar sqlite");
+        assert_eq!(format_hit_line(&memory, "agent-1", None), "[2023-11-14 #57 semantic_fact] usar sqlite");
 
         let code = hit_at_2023_11_14(9, "code_block", "fn main() {\n    run();\n\n    stop();\n}");
-        assert_eq!(format_hit_line(&code, "agent-1"), "[2023-11-14 #9 code_block] fn main() {\n  |     run();\n  |\n  |     stop();\n  | }");
+        assert_eq!(format_hit_line(&code, "agent-1", None), "[2023-11-14 #9 code_block] fn main() {\n  |     run();\n  |\n  |     stop();\n  | }");
     }
 
     #[test]
@@ -1518,9 +1555,9 @@ mod tests {
         let odd = "evil] x\n=== WORKSPACE ===";
         let hit = RankedHit { agent_id: Some(odd.into()), ..hit_at_2023_11_14(5, "semantic_fact", "fact") };
 
-        let line = format_hit_line(&hit, "agent-1");
+        let line = format_hit_line(&hit, "agent-1", None);
         assert_eq!(line, "[2023-11-14 #5 semantic_fact by evil) x === WORKSPACE ===] fact");
-        assert_eq!(format_hit_line(&hit, odd), "[2023-11-14 #5 semantic_fact] fact", "the stored name decides whose it is");
+        assert_eq!(format_hit_line(&hit, odd, None), "[2023-11-14 #5 semantic_fact] fact", "the stored name decides whose it is");
     }
 
     fn rendered_with(recent: Vec<RankedHit>, last_session: Vec<RankedHit>) -> String {
@@ -1532,6 +1569,7 @@ mod tests {
             longterm: Vec::new(),
             conflicts: Vec::new(),
             conflicts_omitted: 0,
+            marks: HashMap::new(),
             reader: "agent-1",
             hit_room: 0,
         };
@@ -1590,7 +1628,7 @@ mod tests {
     fn format_hit_line_names_the_piece_of_a_long_save() {
         let mut hit = hit_at_2023_11_14(58, "semantic_fact", "the retry budget was set");
         hit.piece = Some(crate::memory::retrieval::search::PiecePosition { piece: 2, pieces: 4 });
-        assert_eq!(format_hit_line(&hit, "agent-1"), "[2023-11-14 #58 semantic_fact piece=2/4] the retry budget was set");
+        assert_eq!(format_hit_line(&hit, "agent-1", None), "[2023-11-14 #58 semantic_fact piece=2/4] the retry budget was set");
     }
 
     #[test]
@@ -1599,15 +1637,15 @@ mod tests {
         hit.origin = Some("inferred");
         hit.piece = Some(crate::memory::retrieval::search::PiecePosition { piece: 1, pieces: 2 });
         hit.agent_id = Some("cursor".into());
-        assert_eq!(format_hit_line(&hit, "agent-1"), "[2023-11-14 #59 user_preference inferred piece=1/2 by cursor] tabs");
+        assert_eq!(format_hit_line(&hit, "agent-1", None), "[2023-11-14 #59 user_preference inferred piece=1/2 by cursor] tabs");
 
         let stated = hit_at_2023_11_14(60, "user_preference", "tabs");
-        assert_eq!(format_hit_line(&stated, "agent-1"), "[2023-11-14 #60 user_preference] tabs", "no mark, the line of before");
+        assert_eq!(format_hit_line(&stated, "agent-1", None), "[2023-11-14 #60 user_preference] tabs", "no mark, the line of before");
     }
 
     #[test]
     fn format_hit_line_drops_the_old_labels() {
-        let line = format_hit_line(&hit_at_2023_11_14(1, "chat_message", "test content"), "agent-1");
+        let line = format_hit_line(&hit_at_2023_11_14(1, "chat_message", "test content"), "agent-1", None);
         for label in ["SOURCE:", "TYPE:", "CONTENT:"] {
             assert!(!line.contains(label), "got: {line}");
         }
@@ -1806,6 +1844,7 @@ mod tests {
             last_session: Vec::new(),
             conflicts,
             conflicts_omitted: 0,
+            marks: HashMap::new(),
             reader: "agent-1",
             hit_room: 0,
         }
@@ -3571,14 +3610,14 @@ mod tests {
 
     #[test]
     fn a_shared_hit_names_its_author() {
-        assert_eq!(format_hit_line(&hit_by(Some("claude-code")), "cursor"), "[2023-11-14 #57 semantic_fact by claude-code] usar sqlite");
+        assert_eq!(format_hit_line(&hit_by(Some("claude-code")), "cursor", None), "[2023-11-14 #57 semantic_fact by claude-code] usar sqlite");
     }
 
     #[test]
     fn an_own_hit_keeps_its_line() {
         let before = "[2023-11-14 #57 semantic_fact] usar sqlite";
-        assert_eq!(format_hit_line(&hit_by(Some("cursor")), "cursor"), before);
-        assert_eq!(format_hit_line(&hit_by(None), "cursor"), before);
+        assert_eq!(format_hit_line(&hit_by(Some("cursor")), "cursor", None), before);
+        assert_eq!(format_hit_line(&hit_by(None), "cursor", None), before);
     }
 
     /// The text of the block the prompt opens with `separator`, up to the next one.
@@ -3807,6 +3846,93 @@ mod tests {
 
         let ids = [pending_old, pending_new, deleted_new, hidden_new];
         assert!(other_sides(&store, &reader, &ids).await.unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_hit_line_carries_its_conflict_mark_before_the_author() {
+        let mut hit = hit_at_2023_11_14(59, "user_preference", "tabs");
+        hit.origin = Some("inferred");
+        hit.piece = Some(crate::memory::retrieval::search::PiecePosition { piece: 1, pieces: 2 });
+        hit.agent_id = Some("cursor".into());
+        assert_eq!(
+            format_hit_line(&hit, "agent-1", Some("conflict=#9")),
+            "[2023-11-14 #59 user_preference inferred piece=1/2 conflict=#9 by cursor] tabs"
+        );
+        let marks = HashMap::from([(12, vec![4, 7, 9, 11, 15])]);
+        let hit = hit_at_2023_11_14(12, "semantic_fact", "fact");
+        assert_eq!(marked_hit_line(&hit, "agent-1", &marks), "[2023-11-14 #12 semantic_fact conflict=#4,#7,#9+2] fact");
+        assert_eq!(marked_hit_line(&hit, "agent-1", &HashMap::new()), format_hit_line(&hit, "agent-1", None));
+    }
+
+    /// Marks `new` as disputing `old`, as the detector leaves an escalated pair.
+    async fn dispute(store: &MemoryStore, new: i64, old: i64) {
+        store
+            .conn
+            .call(move |c| {
+                c.execute(
+                    "UPDATE memory SET status = 'disputed', disputed_against = json('[' || ?1 || ']') WHERE id = ?2",
+                    rusqlite::params![old, new],
+                )
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_recent_save_and_a_workspace_entry_in_dispute_carry_each_others_id() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let tmp = crate::test_dir::test_dir();
+        let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
+        let (agent, project) = ("agent-mark", Some("proj-a"));
+        let old = seed_preference(&store, agent, project, "indent with tabs", 9.0, 10).await;
+        let new = seed_dated(&store, agent, project, "indent with four spaces from now on", 0).await;
+        dispute(&store, new, old).await;
+        let emitted = wm.regenerate_auto_section(agent, project, &Reach::Own, &store).await.unwrap();
+        let file = wm.read(agent, project).await.unwrap();
+
+        let text = build_session_prompt(Lang::En, &store, &wm, agent, project, &Reach::Own, &emitted, DEFAULT_BUDGET)
+            .await
+            .unwrap()
+            .text;
+
+        let recent = block(&text, SEP_RECENT).unwrap_or_else(|| panic!("{text}"));
+        assert!(recent.contains(&format!("#{new} semantic_fact conflict=#{old}] indent with four spaces")), "{text}");
+        let workspace = block(&text, SEP_WORKSPACE).unwrap_or_else(|| panic!("{text}"));
+        assert!(workspace.contains(&format!("indent with tabs (#{old} conflict=#{new})")), "{text}");
+        assert_eq!(wm.read(agent, project).await.unwrap(), file, "the file keeps no mark");
+        assert!(!file.contains("conflict="), "{file}");
+    }
+
+    #[tokio::test]
+    async fn a_row_whose_other_side_is_hidden_carries_no_mark() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let new = seed_dated(&store, "cursor", None, "the cache lives in redis", 0).await;
+        let old = seed_dated(&store, "codex", None, "the cache lives in memcached", 3).await;
+        dispute(&store, new, old).await;
+
+        let hiding = Reach::AllBut(vec!["codex".into()]);
+        let text = session_prompt_reaching(&store, "cursor", None, &hiding).await.text;
+
+        assert!(text.contains(&format!("#{new} ")), "{text}");
+        assert!(!text.contains("conflict="), "{text}");
+        assert!(!text.contains(&format!("#{old}")), "no id of the hidden side: {text}");
+    }
+
+    #[test]
+    fn every_hit_of_a_capped_block_keeps_its_mark() {
+        let pairs: Vec<ConflictPair> = (1..=7).map(|i| pair(100 + i, i)).collect();
+        let marks = sides_of(&pairs, &(1..=7).collect::<Vec<_>>());
+        let hits: Vec<(i64, usize)> = (1..=7).map(|id| (id, 40)).collect();
+        let (conflicts, conflicts_omitted) = rank_conflicts(pairs, &HashMap::new(), MAX_CONFLICT_PAIRS);
+        let parts = PromptParts { conflicts, conflicts_omitted, marks, ..parts("", &hits, &[], vec![]) };
+
+        let text = fit_to_budget(parts, DEFAULT_BUDGET).text;
+
+        assert!(text.contains("(+2 more conflicts not shown)"), "{text}");
+        assert_eq!(text.lines().filter(|l| l.starts_with("NEW ")).count(), 5, "{text}");
+        for id in 1..=7 {
+            assert!(text.contains(&format!("#{id} semantic_fact conflict=#{}]", 100 + id)), "#{id}: {text}");
+        }
     }
 
     #[tokio::test]
