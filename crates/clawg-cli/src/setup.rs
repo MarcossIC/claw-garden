@@ -1886,7 +1886,7 @@ mod tests {
         assert_eq!(code, 0);
         for needed in [
             "servidor mcp clawg-dev: se registraría (claude mcp add --scope user clawg-dev -- ",
-            ": se agregarían SessionStart, UserPromptSubmit, SessionEnd, PostToolUse, PostToolUseFailure",
+            ": se agregarían SessionStart, UserPromptSubmit, SessionEnd, PostToolUse, PostToolUseFailure, Stop",
             "protocolo de memoria en ",
             ": se actualizaría",
         ] {
@@ -1902,7 +1902,7 @@ mod tests {
         assert_eq!(code, 1, "the manual command is not done");
         for needed in [
             "servidor mcp clawg-dev: claude no está en el PATH; regístralo con:\n  claude mcp add --scope user clawg-dev -- ",
-            ": agregados SessionStart, UserPromptSubmit, SessionEnd, PostToolUse, PostToolUseFailure",
+            ": agregados SessionStart, UserPromptSubmit, SessionEnd, PostToolUse, PostToolUseFailure, Stop",
             ": actualizado",
             "archivo anterior copiado a /b/settings.json.1",
             "copia más vieja borrada: /b/settings.json.0",
@@ -2159,7 +2159,7 @@ mod tests {
         let (text, code) = run_in(s, Mode::Install, true, Some(Path::new("/nonexistent/claude")), dir.path(), 0).unwrap();
         assert_eq!(code, 0);
         assert!(text.contains("would register it"), "{text}");
-        assert!(text.contains("would add SessionStart, UserPromptSubmit, SessionEnd, PostToolUse, PostToolUseFailure"), "{text}");
+        assert!(text.contains("would add SessionStart, UserPromptSubmit, SessionEnd, PostToolUse, PostToolUseFailure, Stop"), "{text}");
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 
