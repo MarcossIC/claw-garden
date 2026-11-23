@@ -1309,6 +1309,22 @@ impl DaemonClient {
         check_status(&answer)
     }
 
+    /// Whether the agent of `session_id` should be asked now for its
+    /// session's summary; the daemon says yes once per session. A daemon
+    /// without the route answers a bare 404, which is no.
+    pub async fn summary_due(&self, session_id: &str) -> Result<bool, ClientError> {
+        #[derive(Deserialize)]
+        struct Body {
+            ask: bool,
+        }
+        let body = serde_json::json!({ "session_id": session_id });
+        match self.send(Call::new(reqwest::Method::POST, "/v1/sessions/summary").json(&body)?).await {
+            Ok(answer) if answer.status == reqwest::StatusCode::NOT_FOUND => Ok(false),
+            Ok(answer) => Ok(read_response::<Body>(answer)?.ask),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Tells the daemon that `tool` ran for `agent_id` in the session of
     /// `project_id`, and whether it failed.
     pub async fn report_call(&self, agent_id: &str, project_id: Option<&str>, tool: &str, failed: bool) -> Result<(), ClientError> {
@@ -2794,6 +2810,20 @@ pub(crate) mod tests {
         assert!(refused.is_refused_query(), "{refused:?}");
         let pending = client.open_disputes("agent-1", None, false).await.expect("the call of before still works");
         assert_eq!(pending.pending, 1);
+    }
+
+    #[tokio::test]
+    async fn a_daemon_answers_whether_a_session_should_save_its_summary() {
+        let d = start_daemon().await;
+        publish(&d);
+        let c = DaemonClient::from_data_dir(d.dir.path()).expect("client");
+        assert!(!c.summary_due("s-1").await.expect("a daemon that knows the route"), "a session it never saw");
+
+        let app = axum::Router::new().route("/health", axum::routing::get(|| async { "ok" }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let older = DaemonClient::new(format!("http://{}", listener.local_addr().unwrap()), "token", std::env::temp_dir());
+        tokio::spawn(async move { axum::serve(listener, app).await.expect("serve") });
+        assert!(!older.summary_due("s-1").await.expect("a daemon without the route is no"));
     }
 
     #[tokio::test]
