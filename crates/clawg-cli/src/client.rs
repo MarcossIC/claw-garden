@@ -1319,7 +1319,7 @@ impl DaemonClient {
         }
         let body = serde_json::json!({ "session_id": session_id });
         match self.send(Call::new(reqwest::Method::POST, "/v1/sessions/summary").json(&body)?).await {
-            Ok(answer) if answer.status == reqwest::StatusCode::NOT_FOUND => Ok(false),
+            Ok(answer) if route_missing(answer.status, &answer.body) => Ok(false),
             Ok(answer) => Ok(read_response::<Body>(answer)?.ask),
             Err(e) => Err(e),
         }

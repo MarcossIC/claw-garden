@@ -53,7 +53,7 @@ const SUMMARY_REQUEST: &str = include_str!("summary_request.md");
 const SUMMARY_REQUEST_ES: &str = include_str!("summary_request.es.md");
 
 /// The request for the session's summary in `lang`.
-pub fn summary_request(lang: Lang) -> &'static str {
+fn summary_request(lang: Lang) -> &'static str {
     match lang {
         Lang::En => SUMMARY_REQUEST.trim_end(),
         Lang::Es => SUMMARY_REQUEST_ES.trim_end(),
@@ -663,7 +663,7 @@ async fn ask_for_summary(
 }
 
 /// The answer to a stop that has the agent go on with `reason`.
-pub fn stop_block(reason: &str) -> String {
+fn stop_block(reason: &str) -> String {
     serde_json::json!({ "decision": "block", "reason": reason }).to_string()
 }
 
