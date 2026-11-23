@@ -2,7 +2,15 @@
 
 Qué sigue y en qué orden. Es el único lugar que ordena lo pendiente: [README.md](README.md) es el mapa de lo que existe y cada cambio guarda su detalle en su carpeta. Lo terminado sale de acá.
 
-**La meta de esta etapa:** clawg es la única memoria de los clientes de agentes de uso diario, Claude Code y Cursor, en todos los proyectos. Lo que no acerca esa meta espera, aunque sea buena idea.
+**La etapa anterior está cumplida:** clawg es la única memoria de Claude Code desde el corte de Engram del 2026-11-20 (abajo), y Cursor tuvo 0 sesiones en el piloto.
+
+**La meta de esta etapa:** clawg funciona bien todos los días, en todos los proyectos, sin funciones nuevas. Se cumple con dos semanas seguidas de uso normal en las que:
+
+- el resumen de la sesión anterior llega entero en al menos 95 de cada 100 contextos de arranque (en el piloto, 116 de 250, por `context.cut`);
+- `clawg doctor` no da errores y `ingest.failed` queda en 0;
+- más de la mitad de las sesiones que guardan algo dejan su `session_summary` (hoy, 27 de 122, por `clawg metrics sessions`).
+
+Lo que no acerca esa meta no se abre, aunque sea buena idea: va a [ideas.md](ideas.md). **Como mucho dos cambios abiertos a la vez**, sin contar los dormidos. Los cambios que no servían a esta meta se cerraron sin código el 2026-11-22 (abajo).
 
 ## Cómo se ordena
 
@@ -39,6 +47,7 @@ Se publica lo anterior y se instalan los hooks de Claude Code en un repositorio 
 
 **Lo que sigue:** [conflicts-on-demand](changes/conflicts-on-demand/proposal.md) (141). Va antes que todo lo pendiente porque arregla un criterio del piloto que hoy falla: al abrir una sesión, el presupuesto corta LAST SESSION antes que ACTIVE CONFLICTS, y en 12 días del piloto `context.cut` cortó el resumen en 134 de 250 contextos. Saca el bloque del contexto sin consulta, marca en cada fila que muestra con qué otra está en disputa, deja el bloque en `recall_context` con consulta cortándolo antes que el resumen, y suma a `list_memories` la lista de los pares que esperan a la persona. Va en la nube: son el armado del contexto, el puente y sus textos, que se prueban en Linux con el embedder falso, y no toca `memory.db`. Queda en local, después de publicar, medir el corte en el perfil real con `context.cut` separado por `state`, con el umbral de su propuesta.
 
+
 [session-usage](changes/archive/2026-11-11-session-usage/proposal.md) (121), partes A, B, C y D, archivado el 2026-11-11, sale en 0.81.0 ([verify](changes/archive/2026-11-11-session-usage/verify.md)). Va ahora y no después del corte porque mide: lo que entre en una versión al empezar la semana deja contadas las sesiones del piloto. El conteo dice cuántas sesiones buscan, cuántas guardan, cuántas cierran con resumen y cuántas compactan, el dato que agent-eval y la parte B de session-lifecycle esperan para decidir. No toca `memory.db`, así que subir una versión durante el piloto no arriesga las memorias. La parte D entra en la misma versión: quien ya corrió `setup` lo corre otra vez para tener el hook de cierre. Lo que sólo se ve con los clientes del piloto pasó al párrafo del piloto. [store-boundary](changes/archive/2026-11-12-store-boundary/proposal.md) (104) se implementó en la nube durante el piloto, cuando session-usage, el otro cambio que tocaba `crates/clawg-cli/src/daemon/api.rs`, ya estaba en `develop`. Su PR entró a `develop` el 2026-11-12 y el cambio está archivado ese día, y sale en 0.84.0 ([verify](changes/archive/2026-11-12-store-boundary/verify.md)).
 
 [verdict-on-replace](changes/archive/2026-11-12-verdict-on-replace/proposal.md) (128) se hizo en la nube: son textos del puente y sus tests, y no toca `memory.db`. Abarató cada sesión que guarda: sacó el pedido al modelo que sólo juzgaba pares `compatible`. Está archivado el 2026-11-12 y sale en 0.85.0 ([verify](changes/archive/2026-11-12-verdict-on-replace/verify.md)). Lo que sólo se ve con uso real, cuántos pedidos siguen juzgando y cuántos reemplazos se detectan, queda por medir en local sobre los transcripts de las semanas siguientes, después de correr `clawg setup` otra vez en cada cliente ([pendiente](changes/archive/2026-11-12-verdict-on-replace/verify.md#pendiente-en-prod)).
@@ -64,35 +73,30 @@ La reimportación del historial se hizo el 2026-11-08, antes del piloto ([histor
 
 Queda abierto un paso: decidir si clawg necesita capturar en `Stop` y `SubagentStop`, donde hoy no instala hooks. Para `Stop` hay una forma que no es la puerta descartada: pedir el `session_summary` una sola vez por sesión, sólo si esa conversación guardó sin resumen, y dejar terminar ([ideas.md](ideas.md#mejoras-propuestas)). El conteo de session-usage ya da el dato: sólo 27 de las 122 sesiones con prompts guardaron un `session_summary`.
 
-## Sube sólo si el piloto lo pide
+## Dormidos: suben sólo si aparece su problema
+
+Nadie los relee hasta que pase lo que los despierta.
 
 | Cambio | Sube si |
 |---|---|
+| [tokenizer-footprint](changes/tokenizer-footprint/exploration.md) | La RAM del daemon molesta en uso real |
+| [embedder-bakeoff](changes/embedder-bakeoff/exploration.md) | Aparece un modelo de embeddings candidato a reemplazar el actual |
+| [model-reembed](changes/model-reembed/exploration.md) | Un modelo candidato pasa el umbral de embedder-bakeoff |
 | [knn-prefilter](changes/knn-prefilter/proposal.md) | Las búsquedas en un proyecto chico traen poco o nada que sí está guardado. La fracción de filas ajenas es lo que decide la pérdida |
 | [read-connections](changes/read-connections/exploration.md) | Un hook vence sus 3 s detrás de una operación larga y el arranque queda sin contexto |
 | [session-lifecycle](changes/session-lifecycle/exploration.md) | Dos sesiones en paralelo del mismo proyecto reciben el traspaso de la otra |
 | [topic-key-warning](changes/topic-key-warning/proposal.md) | No sube: se cierra cuando aparezcan casos reales que verifiquen su criterio |
 
-## Después del corte (no bloquean)
+## Cerrados sin código el 2026-11-22
 
-**Arquitectura, en este orden, porque cada paso abarata el siguiente:** store-boundary (archivado el 2026-11-12, sale en 0.84.0), memory-module-layout (archivado el 2026-11-13, sale en 0.87.0), core-use-cases (archivado el 2026-11-19, sale en 0.89.0) y domain-types (archivado el 2026-11-20, salió en 0.90.0), ya hechos, y la cadena sigue con storage-read-side, storage-write-side, y después search-index-ports y storage-ports, que tienen puerta: sin un candidato o una pregunta concreta, cierran sin código.
+Sus exploraciones quedan en `changes/archive/2026-11-22-<nombre>/`, con su fila en el [índice del archivo](changes/archive/README.md) y el motivo en su `state.yaml`. Se reabre uno desde ahí si su problema aparece.
 
-**Modelo y memoria del proceso:** tokenizer-footprint, embedder-bakeoff y model-reembed, que sólo sube si un modelo candidato pasa su umbral.
-
-**Instalación y distribución:** [claude-code-plugin](changes/claude-code-plugin/exploration.md), que decide si servidor y hooks se distribuyen como plugin de Claude Code y si el bloque de protocolo de `CLAUDE.md` sobra. Acerca la meta, pero el piloto corre con `--local`: sube si instalar a mano en el segundo repositorio resulta engorroso.
-
-**Calidad de lo guardado:** memory-anchors, y una política de olvido para `memory`, que hoy no existe y todavía no tiene cambio. [save-pairs](changes/archive/2026-11-17-save-pairs/proposal.md) (130) cerró los dos casos en que el primer id de un save largo todavía daba 409: un save reanudado que se emparejaba dos veces y un cierre fallido que nombraba pares sin enlazar. Está archivado el 2026-11-17 y sale en 0.88.0. [memory-links](changes/memory-links/exploration.md) (134) pregunta qué aporta un `session_summary` que no aporten las memorias sueltas, y si una red de memorias enlazadas trae algo que la búsqueda no trae. Sus dos puertas se miden en local, sin créditos (un export del store real y el golden de `docs/eval/`), y ninguna escribe código antes de abrirse. [stale-conclusions](changes/stale-conclusions/exploration.md) (140) pregunta si una conclusión con las fuentes vivas debe marcarse como atrasada cuando después se guardaron memorias sobre lo mismo. Espera a que un store real tenga conclusiones para revisar, y su puerta sale del mismo export que memory-links. [synthesis-groups](changes/synthesis-groups/exploration.md) (138) mira el otro extremo de la misma lista: agrupa por cercanía las memorias que ninguna conclusión cubre, para que el agente escriba una conclusión por grupo. Su puerta usa como golden las conclusiones que ya existen, con el mismo export y la misma medida de cercanía que stale-conclusions.
-
-**Calidad de la búsqueda, un cambio de ranking por vez:** [lexical-stemming](changes/lexical-stemming/exploration.md) (139) suma raíces del español y del inglés al índice léxico. Su censo y su `--lexical-only` se corren hoy, sin código. La medición de punta a punta espera a [memory-score-fusion](changes/memory-score-fusion/exploration.md) (136), porque hoy una palabra común sólo propone candidatos y casi no mueve el orden. Tampoco se mide junto con [lexical-common-terms](changes/lexical-common-terms/exploration.md) (137), que también cambia qué candidatos propone el canal. El orden entre esos dos: primero las puertas 0 de los dos, que no cambian el producto; después lexical-common-terms, medido solo; y después memory-score-fusion, que mide en una sola puerta sus dos brazos (la suma con el BM25 normalizado y el bono por posición, los dos sólo en consultas con identificador). Su primera versión no depende de lexical-common-terms. Ampliarla a consultas sin identificador sí.
-
-**Organización de los proyectos:** [project-groups](changes/project-groups/exploration.md) (123), que agrupa proyectos en un árbol para guardar y leer a nivel de grupo. Agrega una columna a `project`, así que va después del corte, cuando los datos ya se tocaron.
-
-**Índice del proyecto, con prioridad baja:** [docs-index-status](changes/archive/2026-11-12-docs-index-status/proposal.md) (124) muestra qué indexa el daemon en segundo plano y cuánto le falta; archivado el 2026-11-12, sale en 0.83.0. [project-concept-map](changes/project-concept-map/exploration.md) (125) pregunta si vale registrar un mapa de conceptos y relaciones del proyecto, y empieza por una puerta en local, sin código. [project-architecture-map](changes/project-architecture-map/exploration.md) (126), el mapa visual y de arquitectura, espera a esa puerta. [docs-query-language](changes/docs-query-language/exploration.md) (135) pregunta si `search_project` falla cuando la pregunta y el pasaje están en idiomas distintos. Su puerta es gratis y en local (el golden de docs partido por idioma y preguntas pareadas sobre un repositorio en inglés). Ninguno de los cuatro acerca la meta de esta etapa.
-
-**Costo por sesión:** [session-tokens](changes/session-tokens/exploration.md) (122) va en local, después de session-usage, y sólo si se quiere el costo de cada proyecto. Para saber si clawg ahorra alcanza agent-eval, que compara la misma tarea con y sin clawg.
+- **Mejorar el orden de la búsqueda:** lexical-common-terms (137), lexical-stemming (139), memory-score-fusion (136) y docs-query-language (135). Se reabren si el piloto muestra búsquedas que no encuentran lo guardado.
+- **Reorganizar el código sin cambiar lo que hace clawg:** storage-read-side (108), storage-write-side (109), search-index-ports (110) y storage-ports (111). La cadena de arquitectura ya hecha (store-boundary, memory-module-layout, core-use-cases y domain-types) queda como está.
+- **Funciones o mediciones que la meta no pide:** memory-anchors (98), memory-links (134), project-groups (123), project-concept-map (125), project-architecture-map (126), synthesis-groups (138), stale-conclusions (140), session-tokens (122) y claude-code-plugin (120).
 
 ## Cómo se mantiene
 
 - Al cerrar una noche, lo hecho sale de acá y lo que se cruzó se anota en la exploración de su cambio.
-- Un cambio nuevo entra en una etapa o abajo de todo, nunca en un lugar sin razón. Si no acerca la meta, va a «Después del corte».
+- Un cambio nuevo entra sólo si acerca la meta y hay lugar bajo el tope de dos abiertos. Si no, la idea va a [ideas.md](ideas.md) y no abre carpeta.
 - Los prompts de cada noche no viven acá: son notas personales que apuntan a estos cambios.

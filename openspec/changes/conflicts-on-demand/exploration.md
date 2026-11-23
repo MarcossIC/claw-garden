@@ -2,7 +2,7 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| 1, y el criterio del piloto «al abrir una sesión, el contexto trae entero el resumen de la sesión anterior» | M, por partes; ninguna toca `memory.db` | —; se coordina con [session-lifecycle](../session-lifecycle/exploration.md) (99) y [memory-links](../memory-links/exploration.md) (134), que miran el mismo traspaso, y sigue la regla de la apertura de [contract-diet](../archive/2026-11-20-contract-diet/proposal.md) (133, archivado) | exploración |
+| 1, y el criterio del piloto «al abrir una sesión, el contexto trae entero el resumen de la sesión anterior» | M, por partes; ninguna toca `memory.db` | —; se coordina con [session-lifecycle](../session-lifecycle/exploration.md) (99) y [memory-links](../archive/2026-11-22-memory-links/exploration.md) (134), que miran el mismo traspaso, y sigue la regla de la apertura de [contract-diet](../archive/2026-11-20-contract-diet/proposal.md) (133, archivado) | exploración |
 
 **Tesis:** ACTIVE CONFLICTS llega a cada inicio de sesión aunque nada de la sesión dependa de esas memorias, y le gana el presupuesto a LAST SESSION, que es el traspaso. Un conflicto sirve cuando una respuesta depende de una de las memorias en disputa, y eso lo sabe una búsqueda, no el arranque. La propuesta: el contexto sin consulta no trae el bloque; cada fila en disputa que clawg muestra (en el arranque, en `recall_context` y en `search_memory`) dice con qué otra fila está en disputa, con una marca de pocos bytes; `recall_context` con consulta conserva el bloque, pero el bloque cede antes que LAST SESSION; y `list_memories` lista, cuando la persona lo pide, todos los pares que la esperan.
 

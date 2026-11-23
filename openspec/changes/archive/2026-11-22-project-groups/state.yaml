@@ -1,0 +1,14 @@
+change: project-groups
+objective: 2
+depends_on: []
+phase: closed  # cerrado sin código el 2026-11-22: suma una función o una medición que la meta de la etapa no pide
+artifacts:
+  exploration: draft
+  proposal: pending
+  spec: pending
+  design: pending
+  tasks: pending
+  apply: pending
+  verify: pending
+  archive: done  # sin código, por la meta de la etapa del ROADMAP del 2026-11-22
+updated: 2026-11-22

@@ -32,7 +32,7 @@ Fuente: https://code.claude.com/docs/en/hooks, salvo donde se nombra otra págin
 | Fin | `SessionEnd` con `reason`: `clear` (`/clear`), `resume` (cambiar de sesión con `/resume` interactivo), `logout`, `prompt_input_exit` (salir con el prompt a la vista) y `other`. El presupuesto de 1,5 s rige al salir, en `/clear` y al cambiar con `/resume`. No puede bloquear. La página no dice que corra si se cierra la ventana de la terminal, si el proceso muere o si se apaga el equipo | `sessionEnd`, sin respuesta que se use, con `reason` (`completed`, `aborted`, `error`, `window_close`, `user_close`), `duration_ms` y `final_status` |
 | PID del cliente | No lo da: ninguna variable de entorno del hook lo trae. Se puede sacar subiendo por los procesos padre desde el hook, con una consola en el medio | — |
 | Cada llamada a una herramienta MCP | `PostToolUse` con matcher `mcp__clawg__.*`: `session_id`, `tool_name` y `duration_ms` | `afterMCPExecution`: `tool_name`, `mcp_server_name` y `duration` |
-| Tokens | No hay en ningún hook. Ver [session-tokens](../../session-tokens/exploration.md) (122) | No hay |
+| Tokens | No hay en ningún hook. Ver [session-tokens](../2026-11-22-session-tokens/exploration.md) (122) | No hay |
 
 ## Partes
 
@@ -53,7 +53,7 @@ Es una fila por sesión del cliente:
 
 **El fin.** Es el del hook de cierre cuando llega (parte D). Si no llega (la ventana de la terminal cerrada, sin verificar; un proceso que muere; el equipo que se apaga), el fin es `last_seen_at`, y la sesión se da por cerrada después de 6 horas sin actividad, con `end_reason` `idle`. Para eso no hace falta un proceso que revise: alcanza con mirar `last_seen_at` cuando llega el próximo evento del mismo id y cuando se arma el reporte. Una sesión cerrada no se reabre: si después llega actividad con el mismo id (un `resume`, o la misma ventana retomada a la mañana), empieza una fila nueva. Un reinicio del daemon no cierra nada: si el mismo id vuelve antes de las 6 horas, sigue la misma fila. El registro en memoria de hoy no puede hacerlo.
 
-**La atribución de una llamada** usa el mismo registro que ya sella los saves: la sesión vigente de su agente y proyecto en ese momento (`api.rs:1445`). Tiene el mismo límite, con dos sesiones en paralelo del mismo agente y proyecto. Lo arregla la parte A de 99, que pone el checkout en la clave, y entonces se arregla para los saves y para las llamadas a la vez. Lo exacto sería `PostToolUse`, con el id en cada llamada, pero es un proceso más por cada llamada a clawg y otro nombre de herramienta si clawg se distribuye como plugin (`mcp__plugin_clawg_clawg__*`, [claude-code-plugin](../../claude-code-plugin/exploration.md)). Queda como alternativa si la medición muestra que las sesiones en paralelo pesan.
+**La atribución de una llamada** usa el mismo registro que ya sella los saves: la sesión vigente de su agente y proyecto en ese momento (`api.rs:1445`). Tiene el mismo límite, con dos sesiones en paralelo del mismo agente y proyecto. Lo arregla la parte A de 99, que pone el checkout en la clave, y entonces se arregla para los saves y para las llamadas a la vez. Lo exacto sería `PostToolUse`, con el id en cada llamada, pero es un proceso más por cada llamada a clawg y otro nombre de herramienta si clawg se distribuye como plugin (`mcp__plugin_clawg_clawg__*`, [claude-code-plugin](../2026-11-22-claude-code-plugin/exploration.md)). Queda como alternativa si la medición muestra que las sesiones en paralelo pesan.
 
 **Dónde vive.**
 
@@ -124,7 +124,7 @@ Instalar `SessionEnd` en Claude Code y `sessionEnd` en Cursor para escribir `end
 
 ## Fuera de alcance
 
-- Tokens y costo: [session-tokens](../../session-tokens/exploration.md) (122).
+- Tokens y costo: [session-tokens](../2026-11-22-session-tokens/exploration.md) (122).
 - Mandar algo fuera de la máquina.
 - Una página o tablero: el JSON del reporte alcanza para armarla después.
 - Separar los subagentes de su sesión: comparten el puente, y sus llamadas cuentan para la sesión principal.
