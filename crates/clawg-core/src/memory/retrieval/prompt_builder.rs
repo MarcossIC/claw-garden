@@ -1336,9 +1336,9 @@ async fn fetch_active_conflicts(
                         m_old.agent_id, m_new.agent_id
                  FROM memory m_new
                  JOIN memory m_old
-                   ON m_old.id IN (SELECT value FROM json_each(m_new.disputed_against))
+                   ON m_old.id IN (SELECT value FROM json_each(
+                        CASE WHEN json_valid(m_new.disputed_against) THEN m_new.disputed_against ELSE '[]' END))
                  WHERE m_new.status = 'disputed'
-                   AND json_valid(m_new.disputed_against)
                    AND m_new.deleted_at IS NULL
                    AND m_old.deleted_at IS NULL
                    AND (m_new.id IN (SELECT value FROM json_each(?1))
