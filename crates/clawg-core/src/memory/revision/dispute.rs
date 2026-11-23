@@ -2,7 +2,7 @@
 //!
 //! Every pair is a `memory_conflict` row. An escalated pair is also named in
 //! the newer row's `disputed_against`, which makes that row `disputed` and
-//! puts the pair in ACTIVE CONFLICTS. A verdict either supersedes one side
+//! has every row of the pair a prompt or a search shows marked `conflict=`. A verdict either supersedes one side
 //! (`superseded_by` points at the row that stays), keeps both, or escalates
 //! the pair; the first two drop each side from the other's
 //! `disputed_against`, so that list always names the disputes still open, and
@@ -480,7 +480,8 @@ pub async fn judge_pair(
         .map_err(failed_call(ClosedAs::During("judge_pair")))
 }
 
-/// A pair waiting for the agent's verdict.
+/// An open pair: one waiting for the agent's verdict, or, on an escalated
+/// listing, for the user's.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OpenPair {
     pub new_id: i64,
@@ -530,10 +531,11 @@ impl Listed {
 
 /// How many characters of a side's first line an escalated listing carries,
 /// the preview a listed or searched memory shows.
-pub const PAIR_LINE_LIMIT: usize = 500;
+const PAIR_LINE_LIMIT: usize = 500;
 
+/// The first line of `content` that holds text, cut to [`PAIR_LINE_LIMIT`].
 fn first_line(content: &str) -> String {
-    let line = content.lines().next().unwrap_or_default();
+    let line = content.lines().map(str::trim).find(|line| !line.is_empty()).unwrap_or_default();
     if line.chars().count() <= PAIR_LINE_LIMIT {
         return line.to_owned();
     }
@@ -1458,7 +1460,7 @@ mod tests {
         }
         let waiting = seed(&store, "a pending side", "active", &[], 4).await;
         note_pair(&store, waiting, old, "pending").await;
-        let long = seed(&store, &"x".repeat(PAIR_LINE_LIMIT + 20), "disputed", &[old], 5).await;
+        let long = seed(&store, &format!("\n{}", "x".repeat(PAIR_LINE_LIMIT + 20)), "disputed", &[old], 5).await;
         note_pair(&store, long, old, "escalated").await;
 
         let open = open_pairs(&store, Some(&reader("agent-d")), None, Listed::Escalated, 3).await.unwrap();
