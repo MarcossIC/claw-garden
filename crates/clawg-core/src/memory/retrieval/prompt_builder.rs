@@ -451,16 +451,16 @@ struct Fitted {
 /// section takes more than half the budget, an AUTO entry goes first (see
 /// [`PromptWorkspace::next_to_cut`]). Then, while the text is over and
 /// RECENT and LONG-TERM take more than `hit_room`, the hit of either that
-/// scored lowest goes (see [`next_to_cut`]); then the last session's
-/// summary, then the last conflict pair, which joins the count of pairs not
-/// shown, then the hits left in the room, by the same rule. The blocks say how old a hit is, not how relevant:
-/// cutting a whole block first would drop an `exact` hit of last week before
-/// a recent one that barely passed the floor. The summary outlasts the hits
-/// beyond the room because no query brings it back, and gives way to the
-/// conflicts because they ask for the user; the room keeps the best hits past
-/// both, since they are what a context with a query was asked for, and a
-/// stocked workspace with a long summary and a dispute would otherwise leave
-/// none. A hit left alone in its block is shortened instead, while over the
+/// scored lowest goes (see [`next_to_cut`]); then the last conflict pair,
+/// which joins the count of pairs not shown, then the last session's summary,
+/// then the hits left in the room, by the same rule. The blocks say how old a
+/// hit is, not how relevant: cutting a whole block first would drop an
+/// `exact` hit of last week before a recent one that barely passed the floor.
+/// The summary outlasts the hits beyond the room and the conflicts because no
+/// query brings it back, while a pair comes back marked on every row of it a
+/// later prompt shows; the room keeps the best hits past both, since they are
+/// what a context with a query was asked for, and a stocked workspace with a
+/// long summary and a dispute would otherwise leave none. A hit left alone in its block is shortened instead, while over the
 /// room only by what is over it, and goes only when no text is left of it:
 /// one shortened hit and its id say more than an empty block.
 /// Each step renders the whole text, so the closing note, the SHARED note and
@@ -500,15 +500,15 @@ fn fit_to_budget(mut parts: PromptParts<'_>, budget: usize) -> Fitted {
                 cut_from(&mut blocks, bucket.block());
                 (hits_in(&mut parts, bucket), at, over.min(hits_over))
             }
-            _ if !parts.last_session.is_empty() => {
-                cut_from(&mut blocks, PromptBlock::LastSession);
-                (&mut parts.last_session, 0, over)
-            }
             _ if !parts.conflicts.is_empty() => {
                 cut_from(&mut blocks, PromptBlock::Conflicts);
                 parts.conflicts.pop();
                 parts.conflicts_omitted += 1;
                 continue;
+            }
+            _ if !parts.last_session.is_empty() => {
+                cut_from(&mut blocks, PromptBlock::LastSession);
+                (&mut parts.last_session, 0, over)
             }
             Some((bucket, at)) => {
                 cut_from(&mut blocks, bucket.block());
@@ -1946,11 +1946,11 @@ mod tests {
 
         let shortened = fit_to_budget(with_session(), 700);
         assert!(block(&shortened.text, SEP_BUDGET).unwrap().contains("Shortened: #9."), "{}", shortened.text);
-        let session_gone = (300..700).rev()
+        assert!(block(&shortened.text, SEP_CONFLICTS).is_none(), "the conflicts go before it: {}", shortened.text);
+        let session_gone = (0..700).rev()
             .map(|budget| fit_to_budget(with_session(), budget).text)
             .find(|text| header_ids(text).is_empty())
             .expect("some budget leaves no hit, the largest is checked");
-        assert!(block(&session_gone, SEP_CONFLICTS).is_some(), "the conflicts outlast it: {session_gone}");
         assert!(block(&session_gone, SEP_BUDGET).unwrap().contains("Left out: #9, #1, #2, #3."), "{session_gone}");
     }
 
@@ -1965,14 +1965,14 @@ mod tests {
         let hits_gone = fit_to_budget(with_session(), 1_900);
         assert_eq!(hits_gone.cut, [PromptBlock::Recent, PromptBlock::LongTerm], "{}", hits_gone.text);
 
-        let session_gone = (300..700)
+        let session_gone = (0..700)
             .rev()
             .map(|budget| fit_to_budget(with_session(), budget))
             .find(|fitted| header_ids(&fitted.text).is_empty())
             .expect("some budget leaves no hit");
         assert_eq!(
             session_gone.cut,
-            [PromptBlock::Recent, PromptBlock::LongTerm, PromptBlock::LastSession],
+            [PromptBlock::Recent, PromptBlock::LongTerm, PromptBlock::LastSession, PromptBlock::Conflicts],
             "{}",
             session_gone.text
         );
@@ -2079,8 +2079,16 @@ mod tests {
 
     #[test]
     fn the_hits_in_their_room_outlast_the_last_session_and_the_conflicts() {
-        let fitted = fit_to_budget(with_room(), 2_600);
-        assert_eq!(header_ids(&fitted.text), [1, 3], "{}", fitted.text);
+        let fitted = fit_to_budget(with_room(), 3_000);
+        assert_eq!(header_ids(&fitted.text), [9, 1, 3], "{}", fitted.text);
+        assert!(block(&fitted.text, SEP_CONFLICTS).is_none(), "the pair goes before the summary: {}", fitted.text);
+        assert!(block(&fitted.text, SEP_BUDGET).unwrap().contains("Shortened: #9."), "{}", fitted.text);
+
+        let fitted = (2_000..3_000)
+            .rev()
+            .map(|budget| fit_to_budget(with_room(), budget))
+            .find(|fitted| header_ids(&fitted.text) == [1, 3])
+            .expect("some budget leaves the room alone");
         assert!(block(&fitted.text, SEP_BUDGET).unwrap().contains("Left out: #9, #2, #4."), "{}", fitted.text);
         assert!(!fitted.text.contains(TRUNCATED), "{}", fitted.text);
 
@@ -2096,6 +2104,38 @@ mod tests {
                 assert!(block(&text, SEP_CONFLICTS).is_none(), "and so do the conflicts, at {budget}: {text}");
             }
         }
+    }
+
+    #[test]
+    fn the_conflict_pairs_give_way_to_the_last_session() {
+        let parts = || {
+            let pairs: Vec<ConflictPair> = [(501, 1), (502, 503), (504, 505)].map(|(old, new)| ConflictPair { old_content: "the older side. ".repeat(25), ..pair(old, new) }).into();
+            let marks = sides_of(&pairs, &[1]);
+            PromptParts {
+                last_session: vec![sized_hit(9, 3_000)],
+                hit_room: 1_000,
+                marks,
+                ..parts("", &[(1, 300)], &[], pairs)
+            }
+        };
+        let whole = fit_to_budget(parts(), MAX_BUDGET).text;
+        let one_pair = || {
+            let mut parts = parts();
+            parts.conflicts.truncate(1);
+            parts.conflicts_omitted = 2;
+            parts
+        };
+        let budget = fit_to_budget(one_pair(), MAX_BUDGET).text.len() + SEP_BUDGET.len() + 120;
+        assert!(budget < whole.len(), "the fixture has to overflow: {whole}");
+
+        let fitted = fit_to_budget(parts(), budget);
+
+        assert!(fitted.text.len() <= budget, "{}", fitted.text);
+        let session = block(&fitted.text, SEP_LAST_SESSION).unwrap_or_else(|| panic!("{}", fitted.text));
+        assert!(!session.contains(TRUNCATED), "the summary stays whole: {}", fitted.text);
+        assert!(fitted.text.contains("#1 semantic_fact conflict=#501]"), "the hit keeps its mark: {}", fitted.text);
+        assert!(fitted.text.contains("(+2 more conflicts not shown)"), "{}", fitted.text);
+        assert_eq!(fitted.cut, [PromptBlock::Conflicts], "{}", fitted.text);
     }
 
     #[test]
