@@ -5740,6 +5740,8 @@ const PROJECT_INPUTS: &[(&str, &str, Option<&str>)] = &[
     // A session's own id finds its row.
     ("POST", "/sessions/end", None),
     ("POST", "/sessions/calls", Some("body.project_id")),
+    // A session's own id finds the counts of its row.
+    ("POST", "/sessions/summary", None),
     ("GET", "/memories/{kind}/{id}", None),
     ("PATCH", "/memories/{kind}/{id}", Some("body.project_id")),
     ("DELETE", "/memories/{kind}/{id}", None),
@@ -6896,6 +6898,55 @@ async fn a_hook_event_opens_the_row_of_its_session_and_counts() {
     hook_event(&h, json!({ "agent_id": "x", "session_id": "s-3", "event": "prompt" })).await;
     let other = &session_rows(&h, "s-3")[0];
     assert_eq!((other.client.as_str(), other.project_id.as_deref(), other.prompts), ("other", None, 1));
+}
+
+async fn asks_for_summary(h: &Harness, session_id: &str) -> bool {
+    let (status, body) = h.post_json("/v1/sessions/summary", json!({ "session_id": session_id })).await;
+    assert_eq!(status, 200, "{body}");
+    body["ask"].as_bool().expect("ask")
+}
+
+/// Opens `session_id` for `agent-http` in project `p`, as the hook of a
+/// prompt does, so that the saves that follow are counted for it.
+async fn in_session(h: &Harness, session_id: &str) {
+    hook_event(h, json!({ "agent_id": "agent-http", "project_id": "p", "session_id": session_id, "event": "prompt" })).await;
+}
+
+async fn save_typed(h: &Harness, content: &str, memory_type: &str) {
+    save_id(h, json!({ "content": content, "agent_id": "agent-http", "project_id": "p", "memory_type": memory_type })).await;
+}
+
+#[tokio::test]
+async fn a_session_is_asked_for_its_summary_after_its_first_save() {
+    let h = keeping_sessions().await;
+    in_session(&h, "s-1").await;
+    assert!(!asks_for_summary(&h, "s-1").await, "a turn that saved nothing");
+    save_typed(&h, "the release job runs on tuesdays", "semantic_fact").await;
+    assert!(asks_for_summary(&h, "s-1").await, "the turn after the first save");
+    assert!(!asks_for_summary(&h, "s-1").await, "only once");
+
+    in_session(&h, "s-2").await;
+    save_typed(&h, "the linter crashed on a missing config", "tool_error").await;
+    assert!(!asks_for_summary(&h, "s-2").await, "only a failure");
+    save_typed(&h, "the linter reads its config from the repo root", "semantic_fact").await;
+    assert!(asks_for_summary(&h, "s-2").await);
+}
+
+#[tokio::test]
+async fn the_summary_question_answers_no_for_an_unknown_session() {
+    let h = keeping_sessions().await;
+    assert!(!asks_for_summary(&h, "never-seen").await);
+    let (status, _) = h.post_json("/v1/sessions/summary", json!({ "session_id": "has space" })).await;
+    assert_eq!(status, 400);
+}
+
+#[tokio::test]
+async fn the_summary_question_leaves_the_model_unloaded() {
+    let h = Harness::start_unloaded(false).await;
+    h.ctx.runtime.metrics.set_writing(true);
+    in_session(&h, "s-1").await;
+    assert!(!asks_for_summary(&h, "s-1").await);
+    assert_eq!(h.reloads.load(Ordering::SeqCst), 0, "the question loads no model");
 }
 
 #[tokio::test]
