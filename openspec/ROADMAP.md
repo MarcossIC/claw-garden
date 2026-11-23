@@ -45,7 +45,7 @@ Se publica lo anterior y se instalan los hooks de Claude Code en un repositorio 
 
 ## En la nube mientras corre el piloto
 
-**Lo que sigue:** [summary-on-stop](changes/summary-on-stop/exploration.md) (142). Cuando el agente va a terminar y esa sesión guardó algo sin `session_summary`, clawg se lo pide una sola vez y lo deja terminar. Sirve al mismo criterio de la meta que [conflicts-on-demand](changes/archive/2026-11-23-conflicts-on-demand/proposal.md) (141, archivado): aquél hace que el resumen llegue entero, y este que se escriba. Va en la nube: es un hook, una lectura del daemon y `setup`, que se prueban en Linux con el embedder falso, y no toca `memory.db`. Queda en local, después de publicar, correr `clawg setup claude-code` otra vez y leer en `clawg metrics sessions` cuántas sesiones dejan resumen.
+**Hecho:** [summary-on-stop](changes/archive/2026-11-23-summary-on-stop/plan.md) (142), archivado el 2026-11-23: cuando el agente de Claude Code termina un turno de una sesión que guardó algo sin `session_summary`, clawg se lo pide una sola vez y lo deja terminar. Queda en local, después de publicar, correr `clawg setup claude-code` otra vez y leer en `clawg metrics sessions` cuántas sesiones dejan resumen.
 
 [session-usage](changes/archive/2026-11-11-session-usage/proposal.md) (121), partes A, B, C y D, archivado el 2026-11-11, sale en 0.81.0 ([verify](changes/archive/2026-11-11-session-usage/verify.md)). Va ahora y no después del corte porque mide: lo que entre en una versión al empezar la semana deja contadas las sesiones del piloto. El conteo dice cuántas sesiones buscan, cuántas guardan, cuántas cierran con resumen y cuántas compactan, el dato que agent-eval y la parte B de session-lifecycle esperan para decidir. No toca `memory.db`, así que subir una versión durante el piloto no arriesga las memorias. La parte D entra en la misma versión: quien ya corrió `setup` lo corre otra vez para tener el hook de cierre. Lo que sólo se ve con los clientes del piloto pasó al párrafo del piloto. [store-boundary](changes/archive/2026-11-12-store-boundary/proposal.md) (104) se implementó en la nube durante el piloto, cuando session-usage, el otro cambio que tocaba `crates/clawg-cli/src/daemon/api.rs`, ya estaba en `develop`. Su PR entró a `develop` el 2026-11-12 y el cambio está archivado ese día, y sale en 0.84.0 ([verify](changes/archive/2026-11-12-store-boundary/verify.md)).
 
@@ -70,7 +70,7 @@ La reimportación del historial se hizo el 2026-11-08, antes del piloto ([histor
 - **Engram no queda de respaldo:** sin escrituras, dos semanas instalado no guardarían nada que clawg no tenga, y la vuelta atrás de lo que está en clawg son sus propias copias (`pre-import`, `pre-undo`) y `clawg import --undo`.
 - **Cursor no se toca:** tuvo 0 sesiones en el piloto, así que ni `clawg setup cursor` ni sacarle el servidor de Engram tienen nada que medir.
 
-El paso que quedaba abierto, capturar en `Stop`, se decidió el 2026-11-22: lo hace [summary-on-stop](changes/summary-on-stop/exploration.md) (142), arriba. `SubagentStop` sigue sin hook.
+El paso que quedaba abierto, capturar en `Stop`, se decidió el 2026-11-22: lo hace [summary-on-stop](changes/archive/2026-11-23-summary-on-stop/exploration.md) (142), arriba. `SubagentStop` sigue sin hook.
 
 ## Dormidos: suben sólo si aparece su problema
 

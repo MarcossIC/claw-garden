@@ -2,11 +2,11 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| 1, y el criterio de la etapa «la mayoría de las sesiones que guardan dejan su resumen» | M: un hook nuevo, una consulta al daemon y `setup`; no toca `memory.db` | —; se coordina con [conflicts-on-demand](../archive/2026-11-23-conflicts-on-demand/proposal.md) (141), que hace que el resumen llegue entero al arranque, y con [session-lifecycle](../session-lifecycle/exploration.md) (99), dormido, que ve el mismo problema con sesiones en paralelo | exploración |
+| 1, y el criterio de la etapa «la mayoría de las sesiones que guardan dejan su resumen» | M: un hook nuevo, una consulta al daemon y `setup`; no toca `memory.db` | —; se coordina con [conflicts-on-demand](../2026-11-23-conflicts-on-demand/proposal.md) (141), que hace que el resumen llegue entero al arranque, y con [session-lifecycle](../../session-lifecycle/exploration.md) (99), dormido, que ve el mismo problema con sesiones en paralelo | exploración |
 
 ## Problema
 
-La sesión siguiente arranca sabiendo dónde quedó la anterior sólo si la anterior guardó un `session_summary`, y eso depende de que el agente se acuerde. El conteo de [session-usage](../archive/2026-11-11-session-usage/proposal.md) (121) dice que sólo 27 de las 122 sesiones con prompts guardaron uno. conflicts-on-demand arregla que el resumen se corte al llegar; este cambio arregla que no se escriba.
+La sesión siguiente arranca sabiendo dónde quedó la anterior sólo si la anterior guardó un `session_summary`, y eso depende de que el agente se acuerde. El conteo de [session-usage](../2026-11-11-session-usage/proposal.md) (121) dice que sólo 27 de las 122 sesiones con prompts guardaron uno. conflicts-on-demand arregla que el resumen se corte al llegar; este cambio arregla que no se escriba.
 
 Ningún hook de clawg corre cuando el agente termina un turno: `clawg hook` contesta `SessionStart`, `UserPromptSubmit`, `SessionEnd`, `PostToolUse` y `PostToolUseFailure` (`crates/clawg-cli/src/cli.rs:962-974`), y `setup` instala esos cinco (`crates/clawg-cli/src/setup.rs:59`, `crates/clawg-cli/src/setup/local.rs:258-260`). `SessionEnd` llega tarde para esto: el agente ya no puede escribir.
 

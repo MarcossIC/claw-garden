@@ -34,7 +34,6 @@ La tabla tiene sólo lo que todavía no está en `changes/archive/`. Las filas d
 | 91 | [tokenizer-footprint](changes/tokenizer-footprint/exploration.md) | transversal | M–L | 92 (archivado); se coordina con 62 y 17 | exploración (borrador); con el modelo suelto, el piso del daemon es casi todo el tokenizer. Un paso 0 sin sesión de ONNX mide de qué está hecho |
 | 97 | [embedder-bakeoff](changes/embedder-bakeoff/exploration.md) | medición (1, 3) | M, por puertas | — para memorias; el golden y los resultados de 20 y la memo de 94, archivados, para docs; alimenta a 17 | exploración; decide midiendo si conviene dejar `multilingual-e5-small`, contra dos candidatos de granite de 384 dimensiones, con el umbral fijado antes |
 | 99 | [session-lifecycle](changes/session-lifecycle/exploration.md) | 1 y 4 | M, por partes | el paso 1 de 98 para la parte A; 96 mide B, C y D | exploración; el traspaso entre sesiones se rompe con sesiones en paralelo en worktrees del mismo proyecto. Parte A: traspaso por checkout; B a D: aviso antes de compactar, `compact_summary`, `SubagentStart` |
-| 142 | [summary-on-stop](changes/summary-on-stop/exploration.md) | 1, y el criterio de la etapa sobre los resúmenes | M; no toca `memory.db` | —; se coordina con 141 y 99 | exploración; un hook `Stop` que, si la sesión guardó algo sin `session_summary`, se lo pide al agente una sola vez y lo deja terminar. Sólo 27 de 122 sesiones con prompts guardaron uno |
 
 Objetivos del producto:
 

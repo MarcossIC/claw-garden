@@ -1,11 +1,11 @@
 change: summary-on-stop
 objective: "1"
 depends_on: []  # se coordina con conflicts-on-demand (141) y session-lifecycle (99), sin esperarlos
-phase: apply
+phase: archive
 artifacts:
   exploration: done
   plan: done  # aprobado por la revisión de plan en la ronda 2
-  apply: pending
-  verify: pending
-  archive: pending
+  apply: done
+  verify: done  # un revisor, dos rondas, WARNINGS
+  archive: done
 updated: 2026-11-23

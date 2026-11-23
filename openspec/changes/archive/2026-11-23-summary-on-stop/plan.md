@@ -101,10 +101,21 @@ Si la respuesta del daemon llega después del plazo, la sesión queda marcada si
 
 - 2026-11-23: las cuatro decisiones las cerró la persona en la conversación (una vez por sesión; sin `tool_error` ni `session_summary`; sólo Claude Code; texto propuesto por el plan y fijado en un archivo). Pidió trabajar el pedido hasta terminarlo, así que el plan lo aprueba la revisión de plan, como en el trabajo autónomo.
 - 2026-11-23, revisión de plan, ronda 1: BLOCKED. Se arregló: el texto de los dos pedidos, entero (C1); la marca se toma sólo cuando corresponde pedir, con H5 y H6 (C2); `doctor` tiene una función y un hallazgo propios para `Stop` y `tool_hooks` queda igual (C3, H19); `agent-eval` en el alcance (W1); la lista de archivos (W2); la cifra con `ROADMAP.md:11` (W3); las citas de `memories.rs` (W4); criterios de una afirmación, con test (W5); el resumen con un hecho y el save sin tipo (W6); el modelo descargado (W7); la vuelta atrás, el plazo y los huecos aceptados.
+- 2026-11-23, implementación (`90e23465` a `9e9ac233`): los pasos 1 a 7, un commit cada uno. Desvíos: H15 a H17 los prueban tests que ya existían y ahora fijan `Stop` en la lista de eventos (`an_empty_state_plans_the_server_the_hooks_and_the_block` y `a_second_run_changes_nothing` en `setup.rs`, `local_hooks_go_in_the_folder_settings_alone` en `setup/local.rs`, `remove_after_setup_gives_back_the_files`), en lugar de tres tests con nombre nuevo; los fixtures de una instalación completa suman `Stop`, así que los tests de «agrega sólo lo que falta» siguen agregando sólo eso. El pedido en español también se prueba (`a_stop_speaks_the_preferred_language`).
 - 2026-11-23, revisión de plan, ronda 2: WARNINGS, plan aprobado. Se arregló en el plan: H19 deja fuera los `added` de `setup.rs:2050` y `:2059`, que suman `Stop` (W1); `specs/eval` y `testing.md` en la lista y en el paso 7 (W2); la lista completa de tests de lista exacta (W3); el orden de la vuelta atrás y su cita.
 
 ## Verificación
 
-Pendiente.
+Qué corrió, sobre `084f84d6`:
+
+- `cargo test --workspace --no-fail-fast --target-dir target-test`: los 25 binarios de test en verde.
+- `cargo clippy --workspace --all-targets --target-dir target-test -- -D warnings`: limpio después de `084f84d6`. Desde `78fe7f4a` hasta ese commit el módulo de tests de `daemon/api/sessions.rs` quedaba antes de `sessions_follow` y `clippy::items_after_test_module` fallaba; el historial no se reescribe.
+- Después de la revisión (`14e4bbba`, `4d5dcf2c`, `8c48cb09`): clippy limpio otra vez, y los tests de `setup`, `stop` y `summary`.
+
+Revisión, un revisor:
+
+- Ronda 1: BLOCKED. Tres asserts de `setup.rs` (el informe en seco y los dos del informe en español) no fijaban `Stop`; se arreglaron (`14e4bbba`). También: R3 de `specs/hooks` admitía que `stop` imprimiera sin daemon, y no lo hace (se quitó); `commands.md` no describía `stop` (se agregó); `summary_request` y `stop_block` eran públicas sin uso fuera de `hook.rs` (privadas); `summary_due` tomaba cualquier 404 como un daemon anterior (ahora `route_missing`).
+- Ronda 2: WARNINGS, sin defectos de código; se arreglaron una coma doble en R3 de `specs/hooks` y el sujeto de una frase de `commands.md` (`5681aa82`).
+- Quedan anotados, sin cambio: el conjunto de sesiones ya pedidas no se limpia en `session-end`, así que una sesión que Claude Code reanuda con el mismo `session_id` no recibe un segundo pedido (es la regla de una vez por sesión); `SessionLog::saves` no cierra antes una fila de más de 6 h sin eventos, cosa que en la práctica hace el `user-prompt-submit` del turno; `the_summary_question_leaves_the_model_unloaded` recorre sólo el camino que contesta no.
 
 En local, después de publicar y con la versión instalada (perfil real, con autorización): correr `clawg setup claude-code` para que se instale `Stop`, y medir con `clawg metrics sessions` la fracción de sesiones que guardan algo y dejan su resumen, frente a 27 de 122.
