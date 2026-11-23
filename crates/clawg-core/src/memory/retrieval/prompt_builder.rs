@@ -284,7 +284,9 @@ pub async fn build_memory_prompt(
     let (last_session, hits) = with_last_session(store, agent_id, project_id, reach, hits).await;
     let hit_room = budget / HIT_ROOM_DIVISOR;
     let reader = Reader::new(agent_id, reach.clone());
-    let fitted = assemble(lang, store, workspace_content, last_session, hits, emitted, &reader, budget, hit_room).await;
+    let fitted =
+        assemble(lang, store, workspace_content, last_session, hits, emitted, &reader, budget, hit_room, ConflictBlock::Printed)
+            .await;
 
     // Fire-and-forget access recording, of the hits the text kept: a row this
     // channel suppressed or the budget cut was not retrieved for the agent,
@@ -324,9 +326,12 @@ pub async fn build_session_prompt(
     let retrieval = Retrieval::Recent { hits: hits.len() };
     let (last_session, hits) = with_last_session(store, agent_id, project_id, reach, hits).await;
     // No room: at a session start the summary is the handoff, and these rows
-    // are only the newest, not what anything asked for.
+    // are only the newest, not what anything asked for. No conflict block
+    // either: nothing asked about them, and each row in dispute is marked.
     let reader = Reader::new(agent_id, reach.clone());
-    let fitted = assemble(lang, store, workspace_content, last_session, hits, emitted, &reader, budget, 0).await;
+    let fitted =
+        assemble(lang, store, workspace_content, last_session, hits, emitted, &reader, budget, 0, ConflictBlock::Left)
+            .await;
     Ok(MemoryPrompt { text: fitted.text, retrieval, cut: fitted.cut })
 }
 
@@ -347,6 +352,13 @@ async fn read_workspace(
     workspace_for_prompt(&raw, emitted)
 }
 
+/// Whether a prompt prints the pairs its rows sit in, or only marks the rows.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ConflictBlock {
+    Printed,
+    Left,
+}
+
 /// Lays `hits` out under the workspace, with the conflicts on what the
 /// prompt could show, cut to `budget` with `hit_room` kept for the hits.
 #[expect(clippy::too_many_arguments, reason = "the parameters have no type that groups them; adding one is a refactor of its own")]
@@ -360,6 +372,7 @@ async fn assemble(
     reader: &Reader,
     budget: usize,
     hit_room: usize,
+    block: ConflictBlock,
 ) -> Fitted {
     // Taken before `bucket_by_recency` consumes `hits`.
     let shown: Vec<i64> = hits.iter().map(|h| h.id).chain(emitted.ids()).collect();
@@ -379,6 +392,7 @@ async fn assemble(
     let marks = sides_of(&conflicts, &shown);
     let mut workspace_content = workspace_content;
     workspace_content.mark(&marks);
+    let conflicts = if block == ConflictBlock::Printed { conflicts } else { Vec::new() };
     let (conflicts, conflicts_omitted) = rank_conflicts(conflicts, &hit_positions, MAX_CONFLICT_PAIRS);
 
     // 5. Assemble in order: WORKSPACE → LAST SESSION → RECENT → LONG-TERM → CONFLICTS, cut to the budget.
@@ -3973,6 +3987,113 @@ mod tests {
         for id in 1..=7 {
             assert!(text.contains(&format!("#{id} semantic_fact conflict=#{}]", 100 + id)), "#{id}: {text}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_context_without_a_query_marks_its_disputed_rows_and_prints_no_pairs() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let tmp = crate::test_dir::test_dir();
+        let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
+        let (agent, project) = ("agent-start", Some("proj-a"));
+        let old = seed_preference(&store, agent, project, "answer in English", 9.0, 10).await;
+        let new = seed_dated(&store, agent, project, "answer in Spanish from now on", 1).await;
+        dispute(&store, new, old).await;
+        let emitted = wm.regenerate_auto_section(agent, project, &Reach::Own, &store).await.unwrap();
+
+        let text = build_session_prompt(Lang::En, &store, &wm, agent, project, &Reach::Own, &emitted, DEFAULT_BUDGET)
+            .await
+            .unwrap()
+            .text;
+
+        assert!(!text.contains(SEP_CONFLICTS), "{text}");
+        assert!(!text.contains("ACTIVE CONFLICTS") && !text.contains(CONFLICT_NOTE), "{text}");
+        assert!(!text.lines().any(|l| l.starts_with("NEW ") || l.starts_with("OLD ")), "{text}");
+        assert!(text.contains(&format!("#{new} semantic_fact conflict=#{old}]")), "{text}");
+        assert!(text.contains(&format!("(#{old} conflict=#{new})")), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_context_without_a_query_or_pairs_is_the_same_as_before() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        seed_dated(&store, "agent-1", None, "the build runs on every merge", 0).await;
+
+        let text = session_prompt(&store, "agent-1", None).await.text;
+
+        let (y, m, d) = unix_millis_to_ymd(TimestampMs::now());
+        let today = format!("{y:04}-{m:02}-{d:02}");
+        assert_eq!(text, format!("{SEP_RECENT}\n[{today} #1 semantic_fact] the build runs on every merge\n"));
+    }
+
+    #[tokio::test]
+    async fn a_mature_store_starts_its_session_with_the_whole_last_summary() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let tmp = crate::test_dir::test_dir();
+        let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
+        let (agent, project) = ("agent-mature", Some("proj-a"));
+        for n in 0..12_i64 {
+            let text = format!("preference {n}: {}", "keep it this way. ".repeat(30));
+            seed_preference(&store, agent, project, &text, 8.0 + (n % 3) as f64, 10 + n).await;
+        }
+        let summary_text = format!("Goal: the last session. {}", "Next steps: more work. ".repeat(160));
+        assert!(summary_text.len() >= 3_500);
+        let summary = seed_summary(&store, agent, project, &summary_text, 1).await;
+        let mut saves = Vec::new();
+        for n in 0..10 {
+            saves.push(seed_dated(&store, agent, project, &format!("save {n}: {}", "a fact of the day. ".repeat(25)), 0).await);
+        }
+        for (n, &new) in saves.iter().take(5).enumerate() {
+            let old = seed_dated(&store, agent, project, &format!("old side {n}: {}", "an older claim. ".repeat(25)), 30).await;
+            dispute(&store, new, old).await;
+        }
+        let emitted = wm.regenerate_auto_section(agent, project, &Reach::Own, &store).await.unwrap();
+
+        let prompt = build_session_prompt(Lang::En, &store, &wm, agent, project, &Reach::Own, &emitted, DEFAULT_BUDGET)
+            .await
+            .unwrap();
+
+        let text = &prompt.text;
+        assert!(text.len() <= DEFAULT_BUDGET, "{} bytes", text.len());
+        assert!(block(text, SEP_BUDGET).is_some(), "the fixture has to overflow the budget: {text}");
+        let session = block(text, SEP_LAST_SESSION).unwrap_or_else(|| panic!("{text}"));
+        assert!(session.contains(&format!("#{summary} ")) && !session.contains(TRUNCATED), "whole: {text}");
+        assert!(!text.contains("ACTIVE CONFLICTS"), "{text}");
+        assert!(!prompt.cut.contains(&PromptBlock::LastSession), "{:?}", prompt.cut);
+    }
+
+    #[tokio::test]
+    async fn a_context_with_a_query_keeps_the_block_and_marks_its_hits() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let tmp = crate::test_dir::test_dir();
+        let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
+        let mut near = vec![0.0_f32; 384];
+        near[0] = 1.0;
+        let agent = "agent-query";
+        let old = seed_memory(&store, agent, "the deploy job runs at noon", "semantic_fact", 2, 8.0, unit_bytes(&near)).await;
+        let new = seed_memory(&store, agent, "the deploy job runs at midnight", "semantic_fact", 2, 8.0, unit_bytes(&near)).await;
+        dispute(&store, new, old).await;
+
+        let text = build_memory_prompt(
+            Lang::En,
+            &store,
+            &wm,
+            Some(Arc::new(FixedVecEmbedder) as Arc<dyn Embedder>),
+            agent,
+            None,
+            &Reach::Own,
+            QueryTexts::single_shot("when does the deploy job run"),
+            &EmittedIds::default(),
+            None,
+            DEFAULT_BUDGET,
+        )
+        .await
+        .unwrap()
+        .text;
+
+        let conflicts = block(&text, SEP_CONFLICTS).unwrap_or_else(|| panic!("{text}"));
+        assert!(conflicts.contains(CONFLICT_NOTE), "{text}");
+        assert!(conflicts.contains(&format!("NEW #{new}")) || conflicts.contains(&format!("NEW [")), "{text}");
+        assert!(text.contains(&format!("#{new} semantic_fact conflict=#{old}]")), "{text}");
+        assert!(text.contains(&format!("#{old} semantic_fact conflict=#{new}]")), "{text}");
     }
 
     #[tokio::test]
