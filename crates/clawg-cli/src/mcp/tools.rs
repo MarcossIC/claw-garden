@@ -17,7 +17,7 @@
 use std::path::Path;
 
 use clawg_core::memory::dispute::{OpenPairs, Resolution, ResolvedRow};
-use clawg_core::memory::prompt_builder::{display_author, shared_note};
+use clawg_core::memory::prompt_builder::{conflict_mark, display_author, shared_note};
 use clawg_core::memory::provenance::mark;
 use clawg_core::memory::registry::{ListedSuggestion, Refusal, Resolution as ProjectResolution};
 use clawg_core::memory::sharing::{Reach, SharingError, SharingPolicy};
@@ -243,13 +243,14 @@ fn format_hits(lang: Lang, hits: &[Hit], reader: &str, save_projects: &[String])
             let piece = h.piece.map(|p| format!(" piece={}/{}", p.piece, p.pieces)).unwrap_or_default();
             let author = shared_author(h, reader);
             let by = author.map(|a| format!(" by {}", display_author(a))).unwrap_or_default();
+            let conflict = conflict_mark(&h.conflicts_with).map(|m| format!(" {m}")).unwrap_or_default();
             let topic = shown_key(h.topic_key.as_deref(), Some(&h.memory_type), &h.project_id, save_projects);
             let project = match &h.project_id {
                 Some(Some(project)) if save_projects.len() > 1 => format!(" project={}", display_project(project)),
                 _ => String::new(),
             };
             format!(
-                "{}. #{} [{}/{}/t{}{origin}{piece} score={:.2}{topic}{project}{by}] {}",
+                "{}. #{} [{}/{}/t{}{origin}{piece} score={:.2}{conflict}{topic}{project}{by}] {}",
                 i + 1,
                 h.id,
                 h.kind,
@@ -1265,6 +1266,7 @@ mod tests {
             topic_key: None,
             project_id: None,
             origin: None,
+            conflicts_with: Vec::new(),
         }
     }
 
@@ -1732,6 +1734,19 @@ mod tests {
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines[0], "1. #9 [Memory/user_preference/t1 inferred piece=1/2 score=0.90] tabs");
         assert_eq!(lines[1], "2. #10 [Memory/user_preference/t1 score=0.80] spaces", "no mark, the line of before");
+    }
+
+    #[test]
+    fn format_hits_shows_the_conflict_of_a_hit() {
+        let mut disputed = hit(12, "Memory", "user_preference", 1, 0.83, "tabs");
+        disputed.conflicts_with = vec![9];
+        let mut many = hit(13, "Memory", "semantic_fact", 2, 0.5, "the port");
+        many.conflicts_with = vec![15, 4, 11, 9, 7];
+        let out = format_hits(Lang::En, &[disputed, many, hit(10, "Memory", "user_preference", 1, 0.8, "spaces")], "a", &[]);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[0], "1. #12 [Memory/user_preference/t1 score=0.83 conflict=#9] tabs");
+        assert_eq!(lines[1], "2. #13 [Memory/semantic_fact/t2 score=0.50 conflict=#4,#7,#9+2] the port");
+        assert_eq!(lines[2], "3. #10 [Memory/user_preference/t1 score=0.80] spaces", "no mark, the line of before");
     }
 
     /// A newline inside a memory would split one hit across two lines and make

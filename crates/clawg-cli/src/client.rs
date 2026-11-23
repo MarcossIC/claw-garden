@@ -243,6 +243,10 @@ pub struct Hit {
     /// send it, and the hit is shown without a mark.
     #[serde(default)]
     pub origin: Option<String>,
+    /// The other sides of the escalated pairs the row is in. A daemon that
+    /// predates the field does not send it, and the hit is shown unmarked.
+    #[serde(default)]
+    pub conflicts_with: Vec<i64>,
 }
 
 /// A field a daemon sends even when it is `null`, read so that `None` means
@@ -3158,6 +3162,21 @@ pub(crate) mod tests {
         });
         let hit: Hit = serde_json::from_value(new).expect("the new shape parses");
         assert_eq!(hit.origin.as_deref(), Some("inferred"));
+    }
+
+    #[test]
+    fn a_hit_from_a_daemon_without_conflicts_has_none() {
+        let old = serde_json::json!({
+            "id": 3, "kind": "Memory", "content": "x", "memory_type": "user_preference", "tier": 1, "score": 0.5
+        });
+        let hit: Hit = serde_json::from_value(old).expect("old shape still parses");
+        assert!(hit.conflicts_with.is_empty());
+        let new = serde_json::json!({
+            "id": 3, "kind": "Memory", "content": "x", "memory_type": "user_preference", "tier": 1, "score": 0.5,
+            "conflicts_with": [9]
+        });
+        let hit: Hit = serde_json::from_value(new).expect("the new shape parses");
+        assert_eq!(hit.conflicts_with, [9]);
     }
 
     #[test]

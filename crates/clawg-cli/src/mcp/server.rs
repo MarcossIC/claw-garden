@@ -5080,6 +5080,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn search_memory_marks_both_sides_of_an_escalated_pair() {
+        let mut store = None;
+        let (b, _d) = bridge_with(|runtime| {
+            store = Some(runtime.store.clone());
+            runtime
+        })
+        .await;
+        let store = store.expect("the runtime's store");
+        let old = saved_id(&b, "agent-mcp", "the cache expires after one hour").await;
+        let new = saved_id(&b, "agent-mcp", "the cache expires after one day").await;
+        store
+            .conn_for_test()
+            .call(move |c| {
+                c.execute(
+                    "UPDATE memory SET status = 'disputed', disputed_against = json('[' || ?1 || ']') WHERE id = ?2",
+                    rusqlite::params![old, new],
+                )
+            })
+            .await
+            .expect("escalate the pair");
+
+        let out = text(&b.search_memory_impl("agent-mcp", search_args("the cache expires after one day")).await.expect("search"));
+
+        let line = out.lines().find(|l| l.contains(&format!("#{new} [Memory/"))).unwrap_or_else(|| panic!("{out}"));
+        assert!(line.contains(&format!(" conflict=#{old}]")), "{out}");
+    }
+
+    #[tokio::test]
     async fn recall_context_passes_its_budget() {
         let (b, _d) = bridge().await;
         let content = "the release script tags every crate before it publishes. ".repeat(10);
