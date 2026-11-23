@@ -44,9 +44,11 @@ pub const SESSION_END_DEADLINE: Duration = Duration::from_secs(1);
 /// path of the agent's next request.
 pub const POST_TOOL_DEADLINE: Duration = Duration::from_millis(300);
 
-/// The most `stop` takes: it runs at the end of every turn, and what it asks
-/// the local daemon takes milliseconds.
-pub const STOP_DEADLINE: Duration = Duration::from_secs(1);
+/// The most `stop` takes. What it asks the local daemon takes milliseconds,
+/// but on a loaded Windows machine starting the hook and reaching the daemon
+/// came to a second, and a stop that runs out of time asks for nothing; the
+/// hook is installed with five seconds.
+pub const STOP_DEADLINE: Duration = Duration::from_secs(3);
 
 /// What `stop` asks the agent, in each language the hook speaks.
 const SUMMARY_REQUEST: &str = include_str!("summary_request.md");
