@@ -492,6 +492,22 @@ pub(crate) fn missing_tool_hooks(text: &str, profile: Profile) -> Vec<&'static s
         .collect()
 }
 
+/// Whether `text`, a `settings.json` that runs clawg at session start for
+/// `profile`, lacks the hook of `Stop`: an install from before it, which never
+/// asks for the session's summary. A file without the session-start hook, or
+/// that is not settings, lacks nothing.
+pub(crate) fn missing_stop_hook(text: &str, profile: Profile) -> bool {
+    let Ok(Value::Object(settings)) = serde_json::from_str::<Value>(text) else { return false };
+    let has = |event: &str, arg: &str| {
+        settings
+            .get("hooks")
+            .and_then(|hooks| hooks.get(event))
+            .and_then(Value::as_array)
+            .is_some_and(|groups| hooks_run_for(groups, None).any(|hook| is_clawg_hook(hook, arg, profile)))
+    };
+    has("SessionStart", "session-start") && !has("Stop", "stop")
+}
+
 /// Whether a command's words run `clawg hook <event_arg>` for `profile`. One
 /// without `--profile` belongs to no profile.
 fn runs_clawg_hook(words: &[String], event_arg: &str, profile: Profile) -> bool {

@@ -1208,6 +1208,33 @@ pub fn tool_hooks(lang: Lang, files: &[SettingsFile], profile: Profile) -> Vec<F
         .collect()
 }
 
+/// Each of `files` that runs clawg at session start for `profile` and lacks the
+/// hook of `Stop`: an install from before it never asks the agent for the
+/// session's summary. Always `info`; the next step is the setup that adds it.
+pub fn stop_hook(lang: Lang, files: &[SettingsFile], profile: Profile) -> Vec<Finding> {
+    files
+        .iter()
+        .filter(|file| crate::setup::missing_stop_hook(&file.text, profile))
+        .map(|file| {
+            let step = with_profile(if file.local { "clawg setup claude-code --local" } else { "clawg setup claude-code" }, profile);
+            let path = file.path.display();
+            let message = match lang {
+                Lang::En => format!(
+                    "{path} runs clawg when a session starts but has no hook for Stop: clawg does not ask the agent for the \
+                     session's summary until `{step}` adds it"
+                ),
+                Lang::Es => format!(
+                    "{path} corre clawg al empezar una sesión pero no tiene el hook de Stop: clawg no le pide al agente el \
+                     resumen de la sesión hasta que `{step}` lo agregue"
+                ),
+            };
+            Finding::new("stop_hook", Severity::Info, "not_installed", message)
+                .step(step)
+                .evidence(json!({ "path": file.path }))
+        })
+        .collect()
+}
+
 /// How long ago, in words, for a clock that may have gone back.
 fn age(lang: Lang, elapsed_ms: i64) -> String {
     let minutes = elapsed_ms.max(0) / 60_000;
@@ -2253,6 +2280,29 @@ mod tests {
         let no_session_start = settings_of(json!({ "UserPromptSubmit": [{ "hooks": [clawg_hook("user-prompt-submit", "dev")] }] }));
         for quiet in [complete, other_profile, no_session_start, "not json".to_string(), "{}".to_string()] {
             assert_eq!(tool_hooks(L, &[settings("s.json", false, quiet.clone())], P), [], "{quiet}");
+        }
+    }
+
+    #[test]
+    fn a_settings_without_the_stop_hook_is_named() {
+        let old = settings_of(json!({ "SessionStart": [{ "hooks": [clawg_hook("session-start", "dev")] }] }));
+        let found = stop_hook(L, &[settings("/home/u/.claude/settings.json", false, old.clone())], P);
+        assert_eq!(kinds(&found), [("stop_hook", Severity::Info, "not_installed")]);
+        assert_eq!(found[0].safe_next_step.as_deref(), Some("clawg setup claude-code --profile dev"));
+        assert!(found[0].message.contains("/home/u/.claude/settings.json") && found[0].message.contains("Stop"), "{}", found[0].message);
+        assert_eq!(found[0].evidence, json!({ "path": "/home/u/.claude/settings.json" }));
+        let local = stop_hook(L, &[settings("/work/app/.claude/settings.local.json", true, old.clone())], P);
+        assert_eq!(local[0].safe_next_step.as_deref(), Some("clawg setup claude-code --local --profile dev"));
+        let es = stop_hook(Lang::Es, &[settings("s.json", false, old)], P);
+        assert!(es[0].message.contains("no tiene el hook de Stop"), "{}", es[0].message);
+
+        let complete = settings_of(json!({
+            "SessionStart": [{ "hooks": [clawg_hook("session-start", "dev")] }],
+            "Stop": [{ "hooks": [clawg_hook("stop", "dev")] }]
+        }));
+        let other_profile = settings_of(json!({ "SessionStart": [{ "hooks": [clawg_hook("session-start", "prod")] }] }));
+        for quiet in [complete, other_profile, "not json".to_string(), "{}".to_string()] {
+            assert_eq!(stop_hook(L, &[settings("s.json", false, quiet.clone())], P), [], "{quiet}");
         }
     }
 }
