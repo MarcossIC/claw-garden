@@ -103,6 +103,12 @@ impl ClientError {
     pub fn means_daemon_gone(&self) -> bool {
         matches!(self, ClientError::NotRunning | ClientError::Unauthorized | ClientError::Daemon { status: 404, .. })
     }
+
+    /// The daemon refused the query string of a call: one that predates a
+    /// parameter the call sends rejects it as unknown.
+    pub fn is_refused_query(&self) -> bool {
+        matches!(self, ClientError::Daemon { status: 400, .. })
+    }
 }
 
 /// The parts of a daemon error body beyond its `error` code, kept so a caller
@@ -1496,11 +1502,22 @@ impl DaemonClient {
         read_response(self.send(Call::new(reqwest::Method::POST, "/v1/disputes/judge").json(&body)?).await?)
     }
 
-    /// The open pairs `agent` reaches, in `project_id` when one is given. A
-    /// daemon that predates the pair table answers a bare 404.
-    pub async fn open_disputes(&self, agent: &str, project_id: Option<&str>) -> Result<OpenPairs, ClientError> {
+    /// The open pairs `agent` reaches, in `project_id` when one is given: the
+    /// oldest pending ones, or with `escalated` the oldest waiting for the
+    /// user, with the first line of each side. A daemon that predates the
+    /// pair table answers a bare 404, and one that predates `escalated`
+    /// refuses the query ([`ClientError::is_refused_query`]).
+    pub async fn open_disputes(
+        &self,
+        agent: &str,
+        project_id: Option<&str>,
+        escalated: bool,
+    ) -> Result<OpenPairs, ClientError> {
         let mut query = vec![("agent_id", agent)];
         query.extend(project_id.map(|p| ("project_id", p)));
+        if escalated {
+            query.push(("escalated", "true"));
+        }
         let call = Call::new(reqwest::Method::GET, "/v1/disputes").query(query);
         read_response(self.send(call).await?)
     }
@@ -2742,6 +2759,41 @@ pub(crate) mod tests {
             }
             other => panic!("expected a daemon error, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn the_escalated_pairs_come_from_a_daemon_that_lists_them() {
+        let d = start_daemon().await;
+        publish(&d);
+        let c = DaemonClient::from_data_dir(d.dir.path()).expect("client");
+
+        let open = c.open_disputes("agent-1", None, true).await.expect("a daemon that knows the parameter");
+        assert_eq!((open.escalated, open.pairs.len()), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn a_daemon_that_predates_the_escalated_listing_refuses_its_query() {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        #[expect(dead_code, reason = "the fields are only read to refuse what is not among them")]
+        struct OlderQuery {
+            agent_id: Option<String>,
+            project_id: Option<String>,
+        }
+        let app = axum::Router::new().route(
+            "/v1/disputes",
+            axum::routing::get(|_: axum::extract::Query<OlderQuery>| async {
+                axum::Json(serde_json::json!({ "pending": 1, "escalated": 0, "pairs": [] }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let client = DaemonClient::new(format!("http://{}", listener.local_addr().unwrap()), "token", std::env::temp_dir());
+        tokio::spawn(async move { axum::serve(listener, app).await.expect("serve") });
+
+        let refused = client.open_disputes("agent-1", None, true).await.expect_err("the parameter is unknown to it");
+        assert!(refused.is_refused_query(), "{refused:?}");
+        let pending = client.open_disputes("agent-1", None, false).await.expect("the call of before still works");
+        assert_eq!(pending.pending, 1);
     }
 
     #[tokio::test]

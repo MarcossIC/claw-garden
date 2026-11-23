@@ -1776,7 +1776,7 @@ impl ClawgMcp {
                 let conflicts = match self.one_project(&client).await {
                     Ok(one) => {
                         let project = one.map(|(_, ids)| ids.project);
-                        client.open_disputes(&agent_id, project.as_deref()).await.map(|open| format_open_pairs(lang, &open)).ok()
+                        client.open_disputes(&agent_id, project.as_deref(), false).await.map(|open| format_open_pairs(lang, &open)).ok()
                     }
                     Err(_) => None,
                 };

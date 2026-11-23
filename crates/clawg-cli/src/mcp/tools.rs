@@ -293,6 +293,45 @@ pub fn format_open_pairs(lang: Lang, open: &OpenPairs) -> String {
     }
 }
 
+/// The pairs waiting for the user, as `list_memories` lists them on request:
+/// both sides of each with the id `resolve_conflict` takes, how many more
+/// wait, and a closing line that leaves the verdict to the user.
+pub fn format_escalated_pairs(lang: Lang, open: &OpenPairs) -> String {
+    if open.pairs.is_empty() {
+        return format_open_pairs(lang, &OpenPairs { escalated: 0, ..OpenPairs::default() });
+    }
+    let side = |label: &str, id: i64, mark: Option<&str>, line: Option<&str>| {
+        let mark = mark.map(|m| format!(" [{m}]")).unwrap_or_default();
+        format!("{label} #{id}{mark} {}", truncate_content(line.unwrap_or_default(), CONTENT_PREVIEW_LIMIT))
+    };
+    let mut blocks: Vec<String> = open
+        .pairs
+        .iter()
+        .map(|p| {
+            format!(
+                "{}\n{}",
+                side("NEW", p.new_id, p.new_mark.as_deref(), p.new_line.as_deref()),
+                side("OLD", p.old_id, p.old_mark.as_deref(), p.old_line.as_deref())
+            )
+        })
+        .collect();
+    let more = (open.escalated - open.pairs.len() as i64).max(0);
+    if more > 0 {
+        blocks.push(match lang {
+            Lang::En => format!("(+{more} more waiting, ask again once these are answered)"),
+            Lang::Es => format!("(+{more} más esperando; pídelos de nuevo cuando estos tengan respuesta)"),
+        });
+    }
+    blocks.push(
+        match lang {
+            Lang::En => "Ask the user which memory holds in each pair; record only their answer, with resolve_conflict, user_answered and their words in reason.",
+            Lang::Es => "Pregúntale a la persona qué memoria vale en cada par; registra sólo su respuesta, con resolve_conflict, user_answered y sus palabras en reason.",
+        }
+        .to_string(),
+    );
+    blocks.join("\n\n")
+}
+
 /// What `read_memory` tells the model: which piece it asked for and every
 /// row of the save, then the whole text. A position with no row it may read
 /// is named, so the model knows the text has a gap there. The key shows only
@@ -2421,6 +2460,44 @@ mod tests {
         let open = OpenPairs { pending: 3, escalated: 0, pairs: vec![open_pair(9, 4, None, None), open_pair(12, 4, None, None)] };
         assert_eq!(format_open_pairs(Lang::En, &open), "conflict candidates: none open");
         assert_eq!(format_open_pairs(Lang::Es, &open), "candidatos a conflicto: ninguno abierto");
+    }
+
+    fn escalated_pair(new_id: i64, old_id: i64, new_mark: Option<&str>) -> OpenPair {
+        OpenPair {
+            new_line: Some(format!("the new side {new_id}")),
+            old_line: Some(format!("the old side {old_id}")),
+            ..open_pair(new_id, old_id, new_mark, None)
+        }
+    }
+
+    #[test]
+    fn the_escalated_pairs_show_both_sides_and_leave_the_verdict_to_the_user() {
+        let open = OpenPairs { pending: 3, escalated: 2, pairs: vec![escalated_pair(12, 9, Some("inferred")), escalated_pair(14, 9, None)] };
+        let out = format_escalated_pairs(Lang::En, &open);
+        assert_eq!(
+            out,
+            "NEW #12 [inferred] the new side 12\nOLD #9 the old side 9\n\n\
+             NEW #14 the new side 14\nOLD #9 the old side 9\n\n\
+             Ask the user which memory holds in each pair; record only their answer, with resolve_conflict, user_answered and their words in reason."
+        );
+        assert!(!out.contains("supersedes") && !out.contains("compatible"), "it judges no pair: {out}");
+        let es = format_escalated_pairs(Lang::Es, &open);
+        assert!(es.starts_with("NEW #12 [inferred] the new side 12\nOLD #9"), "{es}");
+        assert!(es.ends_with("registra sólo su respuesta, con resolve_conflict, user_answered y sus palabras en reason."), "{es}");
+    }
+
+    #[test]
+    fn the_escalated_pairs_count_the_ones_left_out() {
+        let open = OpenPairs { pending: 0, escalated: 12, pairs: (1..=10).map(|n| escalated_pair(100 + n, n, None)).collect() };
+        assert!(format_escalated_pairs(Lang::En, &open).contains("\n\n(+2 more waiting, ask again once these are answered)\n\n"));
+        assert!(format_escalated_pairs(Lang::Es, &open).contains("(+2 más esperando; pídelos de nuevo cuando estos tengan respuesta)"));
+    }
+
+    #[test]
+    fn no_escalated_pairs_say_none_open() {
+        let open = OpenPairs { pending: 4, escalated: 0, pairs: Vec::new() };
+        assert_eq!(format_escalated_pairs(Lang::En, &open), "conflict candidates: none open");
+        assert_eq!(format_escalated_pairs(Lang::Es, &open), "candidatos a conflicto: ninguno abierto");
     }
 
     #[test]
