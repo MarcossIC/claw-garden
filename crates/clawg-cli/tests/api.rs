@@ -2499,6 +2499,58 @@ async fn a_search_names_no_pending_deleted_or_hidden_side() {
     assert!(hits.iter().all(|(_, c)| c.is_none()), "a hidden side: {hits:?}");
 }
 
+/// Every row of `memory_conflict` and the dispute columns of `memory`, as
+/// text, to compare before and after.
+async fn dispute_state(h: &Harness) -> Vec<String> {
+    h.ctx
+        .runtime
+        .store
+        .conn_for_test()
+        .call(|c| -> rusqlite::Result<Vec<String>> {
+            let mut rows = Vec::new();
+            let mut pairs = c.prepare("SELECT new_id, old_id, state, distance, created_at FROM memory_conflict ORDER BY new_id, old_id")?;
+            for row in pairs.query_map([], |r| {
+                Ok(format!("pair {}-{} {} {:?} {}", r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?, r.get::<_, Option<f64>>(3)?, r.get::<_, i64>(4)?))
+            })? {
+                rows.push(row?);
+            }
+            let mut memories = c.prepare("SELECT id, status, disputed_against, deleted_at FROM memory ORDER BY id")?;
+            for row in memories.query_map([], |r| {
+                Ok(format!("row {} {} {:?} {:?}", r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?, r.get::<_, Option<i64>>(3)?))
+            })? {
+                rows.push(row?);
+            }
+            Ok(rows)
+        })
+        .await
+        .expect("read the dispute state")
+}
+
+#[tokio::test]
+async fn a_waiting_pair_keeps_its_state_while_the_context_marks_it() {
+    let h = Harness::start().await;
+    let (old, new) = seed_dispute(&h).await;
+    note_pairs(&h, vec![(new, old, "escalated")]).await;
+    let before = dispute_state(&h).await;
+
+    let (status, context) = h.post_json("/v1/context", json!({ "agent_id": "agent-http" })).await;
+    assert_eq!(status, 200, "{context}");
+    let prompt = context["prompt"].as_str().expect("prompt");
+    assert!(!prompt.contains("ACTIVE CONFLICTS"), "{prompt}");
+    let line_of = |id: i64| prompt.lines().find(|l| l.contains(&format!(" #{id} "))).unwrap_or_default();
+    assert!(line_of(new).contains(&format!(" conflict=#{old}]")), "{prompt}");
+    assert!(line_of(old).contains(&format!(" conflict=#{new}]")), "{prompt}");
+
+    let hits = conflicts_by_hit(&h, "agent-http", None).await;
+    assert!(hits.contains(&(new, Some(json!([old])))) && hits.contains(&(old, Some(json!([new])))), "both sides found and marked: {hits:?}");
+
+    let (status, listed) = h.get_json("/v1/disputes?agent_id=agent-http&escalated=true").await;
+    assert_eq!(status, 200, "{listed}");
+    assert_eq!((listed["pairs"][0]["new_id"].as_i64(), listed["pairs"][0]["old_id"].as_i64()), (Some(new), Some(old)), "{listed}");
+
+    assert_eq!(dispute_state(&h).await, before, "nothing was judged or moved");
+}
+
 #[tokio::test]
 async fn resolve_rejects_the_same_row() {
     let h = Harness::start().await;
