@@ -1,0 +1,11 @@
+change: summary-on-stop
+objective: "1"
+depends_on: []  # se coordina con conflicts-on-demand (141) y session-lifecycle (99), sin esperarlos
+phase: explore
+artifacts:
+  exploration: done
+  plan: pending
+  apply: pending
+  verify: pending
+  archive: pending
+updated: 2026-11-22
