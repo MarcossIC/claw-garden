@@ -57,12 +57,16 @@
       "name": "delete_memory"
     },
     "list_memories": {
-      "description": "Browse what is stored, newest first, without searching. Use this to show the user their memory inventory or to find an id to delete. Lists every memory you can read, yours and other agents'; `agent` lists one agent's only. Returns one line per memory: id, type, tier, importance, access count, status, `by <agent>` when another agent saved it, and a truncated summary.",
+      "description": "Browse what is stored, newest first, without searching. Use this to show the user their memory inventory or to find an id to delete. Lists every memory you can read, yours and other agents'; `agent` lists one agent's only. Returns one line per memory: id, type, tier, importance, access count, status, `by <agent>` when another agent saved it, and a truncated summary. With `conflicts`, it lists instead the pairs of memories that wait for the user, with both texts.",
       "inputSchema": {
         "properties": {
           "agent": {
             "description": "Only the memories this agent saved, as named after `by` in a listing\nor a search. Lists every agent's you can read when omitted.",
             "type": "string"
+          },
+          "conflicts": {
+            "description": "Lists the pairs of memories that wait for the user to say which holds,\nwith both texts, instead of rows.",
+            "type": "boolean"
           },
           "limit": {
             "description": "How many rows to return, 1 to 100. Defaults to 50.",

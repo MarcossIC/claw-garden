@@ -26,7 +26,13 @@ pub const DESCRIPTIONS: &[(&str, Option<&str>, &str)] = &[
         "Recorre lo guardado, lo más nuevo primero, sin buscar. Úsala para mostrarle a la persona su inventario de \
          memorias o para encontrar un id que borrar. Lista cada memoria que puedes leer, tuyas y de otros agentes; \
          `agent` lista sólo las de un agente. Devuelve una línea por memoria: id, tipo, tier, \
-         importancia, accesos, estado, `by <agent>` cuando la guardó otro agente, y un resumen recortado.",
+         importancia, accesos, estado, `by <agent>` cuando la guardó otro agente, y un resumen recortado. Con \
+         `conflicts`, lista en su lugar los pares de memorias que esperan a la persona, con los dos textos.",
+    ),
+    (
+        "list_memories",
+        Some("conflicts"),
+        "Lista los pares de memorias que esperan que la persona diga cuál vale, con los dos textos, en lugar de filas.",
     ),
     (
         "list_memories",

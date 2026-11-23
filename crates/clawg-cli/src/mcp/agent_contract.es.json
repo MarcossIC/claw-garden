@@ -57,12 +57,16 @@
       "name": "delete_memory"
     },
     "list_memories": {
-      "description": "Recorre lo guardado, lo más nuevo primero, sin buscar. Úsala para mostrarle a la persona su inventario de memorias o para encontrar un id que borrar. Lista cada memoria que puedes leer, tuyas y de otros agentes; `agent` lista sólo las de un agente. Devuelve una línea por memoria: id, tipo, tier, importancia, accesos, estado, `by <agent>` cuando la guardó otro agente, y un resumen recortado.",
+      "description": "Recorre lo guardado, lo más nuevo primero, sin buscar. Úsala para mostrarle a la persona su inventario de memorias o para encontrar un id que borrar. Lista cada memoria que puedes leer, tuyas y de otros agentes; `agent` lista sólo las de un agente. Devuelve una línea por memoria: id, tipo, tier, importancia, accesos, estado, `by <agent>` cuando la guardó otro agente, y un resumen recortado. Con `conflicts`, lista en su lugar los pares de memorias que esperan a la persona, con los dos textos.",
       "inputSchema": {
         "properties": {
           "agent": {
             "description": "Sólo las memorias que guardó este agente, como se nombra después de `by` en un listado o una búsqueda. Sin él, lista las de cada agente que puedes leer.",
             "type": "string"
+          },
+          "conflicts": {
+            "description": "Lista los pares de memorias que esperan que la persona diga cuál vale, con los dos textos, en lugar de filas.",
+            "type": "boolean"
           },
           "limit": {
             "description": "Cuántas filas devolver, de 1 a 100. Por defecto 50.",
