@@ -2396,6 +2396,8 @@ mod tests {
             created_at: 1,
             new_mark: new_mark.map(str::to_owned),
             old_mark: old_mark.map(str::to_owned),
+            new_line: None,
+            old_line: None,
         }
     }
 

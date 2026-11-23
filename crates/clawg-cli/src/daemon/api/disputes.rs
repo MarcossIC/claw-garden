@@ -3,7 +3,7 @@
 use axum::Json;
 use axum::extract::{Query, State};
 use clawg_core::memory::dispute::{
-    judge_pair, open_pairs, OpenPairs, Outcome, Resolution, resolve_dispute_core, ResolveError,
+    judge_pair, open_pairs, Listed, OpenPairs, Outcome, Resolution, resolve_dispute_core, ResolveError,
     Verdict,
 };
 use serde::Deserialize;
@@ -107,7 +107,7 @@ pub(super) async fn disputes(
 ) -> ApiResult<Json<OpenPairs>> {
     let reader = named_reader(&app, q.agent_id.as_deref());
     let project_id = live_project(&app, q.project_id).await?;
-    open_pairs(&app.runtime.store, reader.as_ref(), project_id.as_deref(), OPEN_PAIRS_SHOWN)
+    open_pairs(&app.runtime.store, reader.as_ref(), project_id.as_deref(), Listed::Pending, OPEN_PAIRS_SHOWN)
         .await
         .map(Json)
         .map_err(ApiError::internal)
