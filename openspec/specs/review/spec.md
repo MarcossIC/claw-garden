@@ -44,14 +44,16 @@ Al terminar, MUST cerrar la sesión con:
 
 - `completed` si el CLI salió con 0 y su `result` no trae `is_error`, y `error` en otro caso;
 - los tokens del `usage`, cero los que faltan;
-- el modelo, que es `--model` en minúsculas, o `auto`;
+- el modelo, que se le pasa siempre al CLI: `--model` en minúsculas, si no el que eligió el proyecto de la carpeta, si no el del perfil ([`specs/preferences`](../preferences/spec.md), RM1), y si no `gpt-5.3-codex-high`;
 - el veredicto.
 
 El veredicto es la última línea no vacía del informe cuando es `CLEAN`, `WARNINGS` o `BLOCKED` (sin importar mayúsculas, con o sin `` ` `` o `**`). Si no, es `none`.
 
+Un `review.json` que no se puede leer MUST hacer salir con 1, nombrándolo, sin lanzar el CLI: no se corre un modelo que nadie eligió.
+
 Un CLI que termina sin escribir la línea `init` MUST NOT dejar ninguna fila. `clawg review` muestra entonces su stderr y sale con 1.
 
-**Tests:** `the_cursor_arguments_follow_the_options`, `the_cursor_runs_with_the_review_folder_as_its_home_and_powershell_cache`, `the_init_line_gives_the_session`, `the_result_line_gives_the_report_and_the_usage`, `a_missing_usage_reads_as_zero`, `other_lines_are_skipped`, `a_verdict_is_read_from_the_last_line`, `a_report_without_a_verdict_line_reads_as_none`, `the_model_kept_is_the_one_passed_or_auto`, `the_cursor_cli_is_found_where_its_installer_puts_it`, `a_missing_cursor_cli_names_the_option` en `review.rs`; `a_review_runs_the_cursor_cli_and_records_its_session`, `a_review_whose_cursor_fails_ends_its_session_as_error`, `a_review_whose_cursor_fails_before_starting_leaves_no_row`, `a_resumed_review_starts_as_resume` en `binary.rs`.
+**Tests:** `the_cursor_arguments_follow_the_options`, `the_cursor_runs_with_the_review_folder_as_its_home_and_powershell_cache`, `the_init_line_gives_the_session`, `the_result_line_gives_the_report_and_the_usage`, `a_missing_usage_reads_as_zero`, `other_lines_are_skipped`, `a_verdict_is_read_from_the_last_line`, `a_report_without_a_verdict_line_reads_as_none`, `the_model_is_the_flag_then_the_project_then_the_profile_then_the_default` (`review/prefs.rs`), `the_cursor_cli_is_found_where_its_installer_puts_it`, `a_missing_cursor_cli_names_the_option` en `review.rs`; `a_review_runs_the_cursor_cli_and_records_its_session`, `a_review_whose_cursor_fails_ends_its_session_as_error`, `a_review_whose_cursor_fails_before_starting_leaves_no_row`, `a_resumed_review_starts_as_resume`, `a_review_uses_the_preferred_model`, `a_review_with_a_broken_review_file_is_refused` en `binary.rs`.
 
 ## RV4. La salida
 
@@ -72,3 +74,5 @@ MUST salir con 0 cuando la sesión cerró `completed`. Con `error`, MUST salir c
 - Si quien lanza `clawg review` lo corta, la fila queda abierta hasta que cierra con `idle`, sin tokens, y los procesos del CLI siguen vivos.
 - El login del CLI con otro home sólo se comprobó en Windows.
 - `usage` no está en la documentación del CLI: si deja de venir, los tokens se cuentan como cero.
+- Si Cursor deja de ofrecer `gpt-5.3-codex-high`, una revisión sin preferencia falla como un CLI que no arranca.
+- La preferencia de un proyecto está bajo su id: después de unir o borrar el proyecto ya no aplica.

@@ -45,7 +45,7 @@ Sin preferencia, las instrucciones del servidor, la lista de herramientas (salvo
 
 ## LP3. `clawg preferences`
 
-`clawg preferences [--profile P]` MUST mostrar la preferencia o decir que no hay y que clawg usa el inglés. `clawg preferences set language es|en` MUST escribirla y `clawg preferences unset language` MUST quitarla, y las dos MUST decir que se aplica a las sesiones del cliente que se abran después y que `clawg setup claude-code` reescribe el bloque del protocolo. Un archivo inválido MUST hacer fallar `set` y `unset` con salida 1, nombrando la causa, sin tocarlo. Las frases del comando MUST salir en el idioma preferido después del cambio (en inglés sin preferencia), un `match` sobre `Lang` por frase (`crates/clawg-cli/src/preferences.rs`). MUST NOT necesitar el daemon ni abrir el store.
+`clawg preferences [--profile P]` MUST mostrar la preferencia o decir que no hay y que clawg usa el inglés. `clawg preferences set language es|en` MUST escribirla y `clawg preferences unset language` MUST quitarla, y las dos MUST decir que se aplica a las sesiones del cliente que se abran después y que `clawg setup claude-code` reescribe el bloque del protocolo. Un archivo inválido MUST hacer fallar `set` y `unset` con salida 1, nombrando la causa, sin tocarlo. Las frases del comando MUST salir en el idioma preferido después del cambio (en inglés sin preferencia), un `match` sobre `Lang` por frase (`crates/clawg-cli/src/preferences.rs`). MUST NOT necesitar el daemon ni abrir el store, salvo `--project` de `review-model` (RM1).
 
 #### Escenario: fijar y quitar
 - WHEN se corre `clawg preferences set language es --profile dev`
@@ -54,6 +54,20 @@ Sin preferencia, las instrucciones del servidor, la lista de herramientas (salvo
 - THEN el archivo no tiene `language` y la salida está en inglés
 
 **Test:** `preferences_parses_set_and_unset` (`cli.rs`); `the_preferences_command_speaks_the_language_it_sets` (`preferences.rs` de `clawg-cli`); `preferences_set_and_unset_write_the_profiles_file` (`tests/binary.rs`).
+
+## RM1. El modelo del revisor
+
+`clawg preferences set review-model [MODEL] [--project] [--cursor PATH]` y `clawg preferences unset review-model [--project]` MUST fijar y quitar el modelo que usa `clawg review` ([`specs/review`](../review/spec.md), RV3). Sin `--project` es el del perfil; con `--project`, el del proyecto de la carpeta, cuyo id da el daemon, que se arranca si no corre.
+
+El modelo se guarda en `<data>/review.json`, no en `preferences.json`: `{"version": 1, "model": …, "projects": {"<project_id>": …}}`, con `deny_unknown_fields`, escrito con un archivo temporal y un rename. Así un clawg anterior, que rechaza una clave que no conoce de `preferences.json`, sigue leyendo el idioma. Un archivo ausente es sin preferencia. Uno roto, o de otra `version`, MUST hacer fallar `set` y `unset` con 1 sin tocarlo.
+
+`MODEL` MUST guardarse en minúsculas y sólo si es de 1 a 64 caracteres de `[a-z0-9._-]`. Cuando el CLI de Cursor (`--cursor`, o donde lo deja su instalador) responde a `--list-models`, un `MODEL` que no está en su lista MUST rechazarse con 1 sin cambiar nada; si no responde, MUST guardarse avisando que no se pudo comprobar.
+
+Sin `MODEL` MUST imprimir la lista numerada, con `*` en el modelo vigente. Con una terminal MUST leer un número o un id y guardarlo; sin una, o sin lista, MUST salir con 2 sin cambiar nada, diciendo que se pase `MODEL`.
+
+`clawg preferences` sin acción MUST mostrar, después del idioma, el modelo del perfil, o `gpt-5.3-codex-high` como el de por defecto, y el de cada proyecto. Cada frase MUST salir en el idioma preferido, un `match` sobre `Lang` por frase.
+
+**Tests:** `the_review_preferences_round_trip`, `a_broken_or_newer_file_is_refused`, `a_model_is_kept_only_as_an_id`, `the_model_list_is_read_from_the_cursor_output`, `a_choice_is_a_number_or_an_id_of_the_list`, `every_sentence_is_in_both_languages` en `crates/clawg-cli/src/review/prefs.rs`; `the_preferences_show_the_review_model` en `crates/clawg-cli/src/preferences.rs`; `preferences_parses_set_and_unset` en `cli.rs`; `the_review_model_is_set_and_unset_for_the_profile_and_the_project`, `a_review_model_outside_the_list_is_refused`, `a_review_model_is_kept_when_the_list_cannot_be_read`, `choosing_a_review_model_without_a_terminal_lists_them_and_exits_2`, `a_review_model_set_on_a_broken_file_changes_nothing`, `preferences_set_and_unset_write_the_profiles_file` en `tests/binary.rs`.
 
 ## CL1. El idioma del comando
 

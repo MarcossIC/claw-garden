@@ -82,10 +82,9 @@ Qué se corrió y qué devolvió, los hallazgos de la revisión y lo pendiente e
 `clawg review` runs the Cursor CLI as a reviewer that reads the code and the project's memory but writes nothing, and records its session. Run it in the background, from the repository:
 
 - `--instructions .claude/agents/change-reviewer.md`;
-- `--model` with one of the Cursor plan's models;
 - on stdin, a message with the path of the plan (or the three documents of an older folder), the range of commits, and what the closing checks ran and returned.
 
-Its report ends with `CLEAN`, `WARNINGS` or `BLOCKED`, and its last line names the session. After each review, check that `git status` shows nothing the review left.
+The model is the one `clawg preferences set review-model` chose, for the profile or the project, or `gpt-5.3-codex-high`. Its report ends with `CLEAN`, `WARNINGS` or `BLOCKED`, and its last line names the session. After each review, check that `git status` shows nothing the review left.
 
 The reviewers report and never edit, and the orchestrator decides what to do with each finding: it fixes it, or checks it against the code before acting on it. With two reviewers, a finding both report is fixed, and a finding only one reports is checked against the code before acting on it. A second round reviews only what changed since the first: `clawg review --resume <session>` goes back to the same reviewer, with the message saying what changed. When a third round still has findings, stop fixing and put the approach back in front of the person, or, in autonomous work, close as **Autonomous work** says. A critical finding blocks archiving.
 
