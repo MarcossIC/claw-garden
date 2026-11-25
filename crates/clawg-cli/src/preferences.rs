@@ -34,12 +34,10 @@ pub fn run(base_dir: &Path, change: Option<Option<Lang>>) -> Result<String, Stri
 
 /// The review model of the profile and of each project, as `clawg
 /// preferences` shows it, in `lang`; the cause when `review.json` cannot be read.
-pub fn shown_review(lang: Lang, base_dir: &Path) -> String {
+pub fn shown_review(lang: Lang, base_dir: &Path) -> Result<String, String> {
     use crate::review::prefs;
-    match prefs::load(base_dir) {
-        Ok(review) => prefs::says(lang, &prefs::Said::Shown { prefs: &review }),
-        Err(e) => e.to_string(),
-    }
+    let review = prefs::load(base_dir).map_err(|e| e.to_string())?;
+    Ok(prefs::says(lang, &prefs::Said::Shown { prefs: &review }))
 }
 
 fn shown(language: Option<Lang>) -> String {
@@ -86,16 +84,16 @@ mod tests {
     fn the_preferences_show_the_review_model() {
         use crate::review::prefs::{save, ReviewPrefs, DEFAULT_MODEL};
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(shown_review(Lang::En, dir.path()), format!("review model: {DEFAULT_MODEL} (the default)"));
+        assert_eq!(shown_review(Lang::En, dir.path()).unwrap(), format!("review model: {DEFAULT_MODEL} (the default)"));
         let mut review = ReviewPrefs { model: Some("gemini-3.8-flash-low".into()), ..ReviewPrefs::default() };
         review.projects.insert("repo-7142".into(), "gpt-5.6-sol-high".into());
         save(dir.path(), &review).unwrap();
         assert_eq!(
-            shown_review(Lang::Es, dir.path()),
+            shown_review(Lang::Es, dir.path()).unwrap(),
             "modelo del revisor: gemini-3.8-flash-low\nmodelo del revisor del proyecto repo-7142: gpt-5.6-sol-high"
         );
         std::fs::write(dir.path().join("review.json"), "{ broken").unwrap();
-        assert!(shown_review(Lang::En, dir.path()).contains("review.json is not valid"));
+        assert!(shown_review(Lang::En, dir.path()).unwrap_err().contains("review.json is not valid"));
     }
 
     #[test]

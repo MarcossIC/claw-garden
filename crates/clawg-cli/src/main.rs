@@ -241,7 +241,7 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, CliError> {
             let shows = language.is_none();
             println!("{}", preferences::run(&base_dir, language).map_err(CliError::Failed)?);
             if shows {
-                println!("{}", preferences::shown_review(preferences::language(&base_dir), &base_dir));
+                println!("{}", preferences::shown_review(preferences::language(&base_dir), &base_dir).map_err(CliError::Failed)?);
             }
             Ok(ExitCode::SUCCESS)
         }

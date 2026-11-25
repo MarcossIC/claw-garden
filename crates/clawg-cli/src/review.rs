@@ -207,13 +207,11 @@ fn pretty(value: &Value) -> String {
 /// The CLI's arguments for a run in `workspace`: print mode with every line
 /// as JSON, the folder trusted and its MCP server started without asking.
 /// Never `--force`: what the permissions do not allow is refused.
-pub fn cursor_args(workspace: &Path, model: Option<&str>, resume: Option<&str>) -> Vec<OsString> {
+pub fn cursor_args(workspace: &Path, model: &str, resume: Option<&str>) -> Vec<OsString> {
     let mut args: Vec<OsString> =
         ["-p", "--trust", "--approve-mcps", "--output-format", "stream-json", "--workspace"].map(OsString::from).to_vec();
     args.push(workspace.as_os_str().to_owned());
-    if let Some(model) = model {
-        args.extend(["--model".into(), model.into()]);
-    }
+    args.extend(["--model".into(), model.into()]);
     if let Some(resume) = resume {
         args.extend(["--resume".into(), resume.into()]);
     }
@@ -297,7 +295,7 @@ pub async fn run(opts: ReviewOpts, profile: Profile, base_dir: &Path) -> Result<
     let spawner = ProcessSpawner { base_dir: base_dir.to_path_buf() };
     let client = crate::client::ensure_running(profile, true, &spawner).await?;
     let project = crate::hook::project_of(&client, &workspace).await;
-    let (model, _) = prefs::resolve(opts.model.as_deref(), &chosen, project.as_deref());
+    let model = prefs::resolve(opts.model.as_deref(), &chosen, project.as_deref());
 
     let review_home = base_dir.join("review").join("cursor");
     let dot_cursor = review_home.join(".cursor");
@@ -315,7 +313,7 @@ pub async fn run(opts: ReviewOpts, profile: Profile, base_dir: &Path) -> Result<
     let started = std::time::Instant::now();
     let mut command = Command::new(&cursor);
     command
-        .args(cursor_args(&workspace, Some(&model), opts.resume.as_deref()))
+        .args(cursor_args(&workspace, &model, opts.resume.as_deref()))
         .envs(cursor_env(&review_home))
         .current_dir(&workspace)
         .stdin(Stdio::piped())
@@ -395,7 +393,7 @@ async fn folder_project(profile: Profile, base_dir: &Path) -> Result<Option<Stri
 pub async fn set_model(opts: SetReviewModel, profile: Profile, base_dir: &Path) -> Result<ExitCode, CliError> {
     let lang = preferences::language_in(base_dir).unwrap_or(Lang::En);
     let say = |said: prefs::Said<'_>| prefs::says(lang, &said);
-    let mut chosen = prefs::load(base_dir).map_err(|e| CliError::Failed(format!("{e}; nothing was changed")))?;
+    let chosen = prefs::load(base_dir).map_err(|e| CliError::Failed(format!("{e}; nothing was changed")))?;
     let project = match opts.project {
         true => match folder_project(profile, base_dir).await? {
             Some(project) => Some(project),
@@ -424,7 +422,7 @@ pub async fn set_model(opts: SetReviewModel, profile: Profile, base_dir: &Path) 
                 eprintln!("clawg: {}", say(prefs::Said::NeedsModel));
                 return Ok(ExitCode::from(EXIT_USAGE));
             };
-            let (in_use, _) = prefs::resolve(None, &chosen, project.as_deref());
+            let in_use = prefs::resolve(None, &chosen, project.as_deref());
             println!("{}", say(prefs::Said::ListHeader));
             println!("{}", prefs::numbered(list, &in_use));
             let stdin = std::io::stdin();
@@ -436,9 +434,13 @@ pub async fn set_model(opts: SetReviewModel, profile: Profile, base_dir: &Path) 
             std::io::stdout().flush()?;
             let mut answer = String::new();
             stdin.lock().read_line(&mut answer)?;
-            prefs::choose(&answer, list).ok_or_else(|| CliError::Failed(say(prefs::Said::NotAModel { raw: answer.trim() })))?
+            let answer = answer.trim();
+            prefs::choose(answer, list).ok_or_else(|| CliError::Failed(say(prefs::Said::NotInList { model: answer })))?
         }
     };
+    // Read again: the list or a person at the terminal may have taken a
+    // while, and another choice saved meanwhile is kept.
+    let mut chosen = prefs::load(base_dir).map_err(|e| CliError::Failed(format!("{e}; nothing was changed")))?;
     match &project {
         Some(project) => {
             chosen.projects.insert(project.clone(), model.clone());
@@ -657,8 +659,8 @@ mod tests {
         let workspace = Path::new("/work/repo");
         let words = |args: Vec<OsString>| args.into_iter().map(|a| a.to_string_lossy().into_owned()).collect::<Vec<_>>();
         let base = ["-p", "--trust", "--approve-mcps", "--output-format", "stream-json", "--workspace", "/work/repo"];
-        assert_eq!(words(cursor_args(workspace, None, None)), base);
-        let all = words(cursor_args(workspace, Some("gpt-5.3-codex"), Some("a01efb1a")));
+        assert_eq!(words(cursor_args(workspace, "gpt-5.3-codex", None)), [&base[..], &["--model", "gpt-5.3-codex"]].concat());
+        let all = words(cursor_args(workspace, "gpt-5.3-codex", Some("a01efb1a")));
         assert_eq!(all, [&base[..], &["--model", "gpt-5.3-codex", "--resume", "a01efb1a"]].concat());
         assert!(!all.iter().any(|a| a == "--force" || a == "--yolo"));
     }

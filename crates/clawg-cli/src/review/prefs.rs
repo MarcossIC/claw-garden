@@ -35,6 +35,8 @@ pub enum ReviewPrefsError {
     Json(#[from] serde_json::Error),
     #[error("{FILE} has version {0}; this clawg reads version {VERSION}")]
     Version(u32),
+    #[error("{FILE} names {0:?}, which is not a model id")]
+    NotAModel(String),
 }
 
 /// The file as written. `deny_unknown_fields` because a misspelled key would
@@ -61,6 +63,10 @@ impl ReviewPrefs {
         let on_disk: OnDisk = serde_json::from_str(text)?;
         if on_disk.version != VERSION {
             return Err(ReviewPrefsError::Version(on_disk.version));
+        }
+        // A model edited by hand reaches the CLI as an argument: only an id does.
+        if let Some(bad) = on_disk.model.iter().chain(on_disk.projects.values()).find(|m| model_id(m).as_deref() != Some(m.as_str())) {
+            return Err(ReviewPrefsError::NotAModel(bad.clone()));
         }
         Ok(Self { model: on_disk.model, projects: on_disk.projects })
     }
@@ -104,28 +110,17 @@ pub fn model_id(raw: &str) -> Option<String> {
     id.then_some(model)
 }
 
-/// Where the model of a review came from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ModelSource {
-    Flag,
-    Project,
-    Profile,
-    Default,
-}
-
 /// The model a review uses: `--model`, else the preference of `project`,
 /// else the profile's, else [`DEFAULT_MODEL`].
-pub fn resolve(flag: Option<&str>, prefs: &ReviewPrefs, project: Option<&str>) -> (String, ModelSource) {
+pub fn resolve(flag: Option<&str>, prefs: &ReviewPrefs, project: Option<&str>) -> String {
     if let Some(flag) = flag.map(str::trim).filter(|f| !f.is_empty()) {
-        return (flag.to_ascii_lowercase(), ModelSource::Flag);
+        return flag.to_ascii_lowercase();
     }
-    if let Some(model) = project.and_then(|p| prefs.projects.get(p)) {
-        return (model.clone(), ModelSource::Project);
-    }
-    match &prefs.model {
-        Some(model) => (model.clone(), ModelSource::Profile),
-        None => (DEFAULT_MODEL.to_string(), ModelSource::Default),
-    }
+    project
+        .and_then(|p| prefs.projects.get(p))
+        .or(prefs.model.as_ref())
+        .cloned()
+        .unwrap_or_else(|| DEFAULT_MODEL.to_string())
 }
 
 /// One model as `agent --list-models` lists it.
@@ -287,6 +282,9 @@ mod tests {
         assert!(matches!(ReviewPrefs::parse(r#"{"version":2,"model":"x"}"#), Err(ReviewPrefsError::Version(2))));
         let e = ReviewPrefs::parse(r#"{"version":1,"modelo":"x"}"#).unwrap_err();
         assert!(e.to_string().contains("modelo") && e.to_string().contains(FILE), "{e}");
+        for edited in [r#"{"version":1,"model":"gpt 5 & more"}"#, r#"{"version":1,"projects":{"p":"GPT-5"}}"#] {
+            assert!(matches!(ReviewPrefs::parse(edited), Err(ReviewPrefsError::NotAModel(_))), "{edited}");
+        }
     }
 
     #[test]
@@ -300,15 +298,15 @@ mod tests {
     #[test]
     fn the_model_is_the_flag_then_the_project_then_the_profile_then_the_default() {
         let mut prefs = ReviewPrefs::default();
-        assert_eq!(resolve(None, &prefs, Some("p")), (DEFAULT_MODEL.to_string(), ModelSource::Default));
+        assert_eq!(resolve(None, &prefs, Some("p")), DEFAULT_MODEL);
         prefs.model = Some("gemini-3.8-flash-low".into());
-        assert_eq!(resolve(None, &prefs, Some("p")), ("gemini-3.8-flash-low".to_string(), ModelSource::Profile));
+        assert_eq!(resolve(None, &prefs, Some("p")), "gemini-3.8-flash-low");
         prefs.projects.insert("p".into(), "gpt-5.6-sol-high".into());
-        assert_eq!(resolve(None, &prefs, Some("p")), ("gpt-5.6-sol-high".to_string(), ModelSource::Project));
-        assert_eq!(resolve(None, &prefs, Some("q")).1, ModelSource::Profile, "another project's choice is not this one's");
-        assert_eq!(resolve(None, &prefs, None).1, ModelSource::Profile);
-        assert_eq!(resolve(Some("GPT-5.3-Codex"), &prefs, Some("p")), ("gpt-5.3-codex".to_string(), ModelSource::Flag));
-        assert_eq!(resolve(Some("  "), &prefs, Some("p")).1, ModelSource::Project, "a blank flag is none");
+        assert_eq!(resolve(None, &prefs, Some("p")), "gpt-5.6-sol-high");
+        assert_eq!(resolve(None, &prefs, Some("q")), "gemini-3.8-flash-low", "another project's choice is not this one's");
+        assert_eq!(resolve(None, &prefs, None), "gemini-3.8-flash-low");
+        assert_eq!(resolve(Some("GPT-5.3-Codex"), &prefs, Some("p")), "gpt-5.3-codex");
+        assert_eq!(resolve(Some("  "), &prefs, Some("p")), "gpt-5.6-sol-high", "a blank flag is none");
     }
 
     #[test]

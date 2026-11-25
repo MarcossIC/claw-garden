@@ -1289,6 +1289,41 @@ fn choosing_a_review_model_without_a_terminal_lists_them_and_exits_2() {
 }
 
 #[test]
+fn choosing_a_review_model_without_a_list_exits_2() {
+    let sandbox = Sandbox::new();
+    let (root, _) = review_repo(&sandbox);
+    let missing = sandbox.home.join("no-cursor-here").join("agent");
+    let out = preferences_in(&sandbox, &root, &["set", "review-model", "--cursor", missing.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr_of(&out));
+    assert!(stderr_of(&out).contains("could not be read") && stderr_of(&out).contains("set review-model MODEL"), "{}", stderr_of(&out));
+    assert!(!sandbox.data_dir().join("review.json").exists());
+}
+
+#[test]
+fn a_review_model_is_kept_when_the_cursor_cli_fails_to_list() {
+    let sandbox = Sandbox::new();
+    let (root, _) = review_repo(&sandbox);
+    let failing = fake_cursor(&sandbox.home.join("fake-failing"), &[], "not logged in", 1);
+    let out = preferences_in(&sandbox, &root, &["set", "review-model", "gpt-5.6-sol-high", "--cursor", failing.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+    assert!(stderr_of(&out).contains("not logged in"), "the CLI's own words: {}", stderr_of(&out));
+    assert_eq!(review_file(&sandbox)["model"], "gpt-5.6-sol-high");
+}
+
+#[test]
+fn the_review_model_of_a_project_starts_the_daemon() {
+    let sandbox = Sandbox::new();
+    let (root, _) = review_repo(&sandbox);
+    let list = fake_model_list(&sandbox);
+    let out = preferences_in(&sandbox, &root, &["set", "review-model", "gpt-5.6-sol-high", "--project", "--cursor", list.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+    let projects = review_file(&sandbox)["projects"].clone();
+    assert_eq!(projects.as_object().map(|p| p.len()), Some(1), "{projects}");
+    let stop = sandbox.run(&["stop", "--profile", "dev"]);
+    assert_eq!(stop.status.code(), Some(0), "a daemon was started: {}", stderr_of(&stop));
+}
+
+#[test]
 fn a_review_model_set_on_a_broken_file_changes_nothing() {
     let sandbox = Sandbox::new();
     let (root, _) = review_repo(&sandbox);
@@ -2935,9 +2970,7 @@ async fn preferences_set_and_unset_write_the_profiles_file() {
     let file = sandbox.data_dir().join("preferences.json");
     let shown = sandbox.run(&["preferences", "--profile", "dev"]);
     assert_eq!(
-        (shown.status.code(), stdout_of(&shown).trim().replace("
-", "
-")),
+        (shown.status.code(), stdout_of(&shown).trim().replace("\r\n", "\n")),
         (Some(0), "no language preference: clawg uses English
 review model: gpt-5.3-codex-high (the default)".to_string())
     );
@@ -2948,9 +2981,7 @@ review model: gpt-5.3-codex-high (the default)".to_string())
     let written: Value = serde_json::from_str(&std::fs::read_to_string(&file).expect("the file")).unwrap();
     assert_eq!(written, json!({ "version": 1, "language": "es" }));
     assert_eq!(
-        stdout_of(&sandbox.run(&["preferences", "--profile", "dev"])).trim().replace("
-", "
-"),
+        stdout_of(&sandbox.run(&["preferences", "--profile", "dev"])).trim().replace("\r\n", "\n"),
         "idioma: español
 modelo del revisor: gpt-5.3-codex-high (el de por defecto)"
     );
