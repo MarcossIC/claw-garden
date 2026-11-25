@@ -54,6 +54,9 @@ pub struct RowView {
     pub starts: BTreeMap<String, u64>,
     pub calls: BTreeMap<String, CallCount>,
     pub saves: BTreeMap<String, u64>,
+    pub tokens: BTreeMap<String, u64>,
+    pub models: BTreeMap<String, u64>,
+    pub verdicts: BTreeMap<String, u64>,
 }
 
 impl RowView {
@@ -79,6 +82,9 @@ impl RowView {
             starts: BTreeMap::new(),
             calls: BTreeMap::new(),
             saves: BTreeMap::new(),
+            tokens: BTreeMap::new(),
+            models: BTreeMap::new(),
+            verdicts: BTreeMap::new(),
         };
         for ((kind, name), count) in &row.counts {
             match kind {
@@ -86,6 +92,9 @@ impl RowView {
                 CountKind::Call => view.calls.entry(name.clone()).or_default().count += count,
                 CountKind::FailedCall => view.calls.entry(name.clone()).or_default().failed += count,
                 CountKind::Save => *view.saves.entry(name.clone()).or_default() += count,
+                CountKind::Tokens => *view.tokens.entry(name.clone()).or_default() += count,
+                CountKind::Model => *view.models.entry(name.clone()).or_default() += count,
+                CountKind::Verdict => *view.verdicts.entry(name.clone()).or_default() += count,
             }
         }
         view
@@ -129,6 +138,9 @@ pub struct Group {
     pub starts: BTreeMap<String, u64>,
     pub calls: BTreeMap<String, CallCount>,
     pub saves: BTreeMap<String, u64>,
+    pub tokens: BTreeMap<String, u64>,
+    pub models: BTreeMap<String, u64>,
+    pub verdicts: BTreeMap<String, u64>,
     /// The sessions that saved a `session_summary`.
     pub with_summary: u64,
     pub with_summary_pct: f64,
@@ -199,6 +211,11 @@ pub fn report(rows: &[SessionRow], by: SessionsBy, since_ms: i64, now_ms: i64) -
         }
         for (memory_type, n) in &view.saves {
             *group.saves.entry(memory_type.clone()).or_default() += n;
+        }
+        for (sums, counts) in [(&mut group.tokens, &view.tokens), (&mut group.models, &view.models), (&mut group.verdicts, &view.verdicts)] {
+            for (name, n) in counts {
+                *sums.entry(name.clone()).or_default() += n;
+            }
         }
         if view.saves.get(MemoryType::SessionSummary.as_str()).is_some_and(|n| *n > 0) {
             group.with_summary += 1;
@@ -311,6 +328,40 @@ mod tests {
         assert_eq!(json["groups"][0]["key"], serde_json::Value::Null);
         assert_eq!(json["groups"][1]["calls"]["search_memory"], serde_json::json!({ "count": 6, "failed": 1 }));
         assert_eq!(report(&[], SessionsBy::Project, 0, NOW).groups, []);
+    }
+
+    #[test]
+    fn a_report_sums_the_tokens_models_and_verdicts() {
+        let start = NOW - HOUR;
+        let first = counting(
+            ended(row("r1", "cursor-review", Some("p"), start, start + MINUTE), start + MINUTE, "completed"),
+            &[
+                (CountKind::Tokens, "input", 100),
+                (CountKind::Tokens, "output", 10),
+                (CountKind::Model, "gpt-5.3-codex", 1),
+                (CountKind::Verdict, "warnings", 1),
+            ],
+        );
+        let second = counting(
+            ended(row("r1", "cursor-review", Some("p"), start + 2 * MINUTE, start + 3 * MINUTE), start + 3 * MINUTE, "completed"),
+            &[(CountKind::Tokens, "input", 40), (CountKind::Model, "gpt-5.3-codex", 1), (CountKind::Verdict, "clean", 1)],
+        );
+        let plain = row("s", "claude-code", Some("p"), start, start + MINUTE);
+
+        let view = RowView::of(&first, NOW);
+        assert_eq!(view.tokens, BTreeMap::from([("input".to_string(), 100), ("output".to_string(), 10)]));
+        assert_eq!(view.models, BTreeMap::from([("gpt-5.3-codex".to_string(), 1)]));
+        assert_eq!(view.verdicts, BTreeMap::from([("warnings".to_string(), 1)]));
+        let none = RowView::of(&plain, NOW);
+        assert!(none.tokens.is_empty() && none.models.is_empty() && none.verdicts.is_empty());
+
+        let by_project = report(&[first, second, plain], SessionsBy::Project, 0, NOW);
+        let p = &by_project.groups[0];
+        assert_eq!(p.tokens, BTreeMap::from([("input".to_string(), 140), ("output".to_string(), 10)]));
+        assert_eq!(p.models, BTreeMap::from([("gpt-5.3-codex".to_string(), 2)]));
+        assert_eq!(p.verdicts, BTreeMap::from([("clean".to_string(), 1), ("warnings".to_string(), 1)]));
+        let json = serde_json::to_value(p).unwrap();
+        assert_eq!(json["tokens"]["input"], 140);
     }
 
     #[test]
