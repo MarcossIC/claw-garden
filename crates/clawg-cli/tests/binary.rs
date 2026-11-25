@@ -1067,13 +1067,15 @@ async fn a_review_runs_the_cursor_cli_and_records_its_session() {
     let cursor = fake_cursor(&fake, &stream, "", 0);
     let daemon = sandbox.serve().await;
     daemon.wait_until_ready().await;
+    // A hook in the same folder says which project the daemon gives it.
+    session_hook(&sandbox, "session-start", json!({ "session_id": "editor", "cwd": root, "source": "startup" }));
 
     let args = ["--instructions", instructions.to_str().unwrap(), "--cursor", cursor.to_str().unwrap()];
-    let out = review(&sandbox, &root, &args, "Plan: openspec/changes/x/plan.md\nRange: a..b\n");
+    let out = review(&sandbox, &root, &args, "Review: the last two commits\nRange: a..b\n");
     assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
     assert_eq!(
         read_text(&fake.join("prompt.txt")).trim_end(),
-        "You review a change.\nEnd with CLEAN, WARNINGS or BLOCKED.\n\nPlan: openspec/changes/x/plan.md\nRange: a..b",
+        "You review a change.\nEnd with CLEAN, WARNINGS or BLOCKED.\n\nReview: the last two commits\nRange: a..b",
         "the prompt goes in on stdin"
     );
     let printed = stdout_of(&out).replace("\r\n", "\n");
@@ -1098,7 +1100,9 @@ async fn a_review_runs_the_cursor_cli_and_records_its_session() {
     assert_eq!(rows.len(), 1, "{report}");
     let row = &rows[0];
     assert_eq!((&row["agent_id"], &row["client"]), (&json!("cursor-review"), &json!("cursor")), "{report}");
-    assert!(row["project_id"].is_string(), "the project of the folder: {report}");
+    let editor = sessions_report(&sandbox, &["--session", "editor"]);
+    assert!(row["project_id"].is_string(), "{report}");
+    assert_eq!(row["project_id"], editor["rows"][0]["project_id"], "the project of the folder: {report} {editor}");
     assert_eq!((&row["starts"], &row["end_reason"]), (&json!({ "startup": 1 }), &json!("completed")), "{report}");
     assert_eq!(row["tokens"], json!({ "input": 2100, "output": 120, "cache_read": 900 }), "{report}");
     assert_eq!((&row["models"], &row["verdicts"]), (&json!({ "auto": 1 }), &json!({ "warnings": 1 })), "{report}");

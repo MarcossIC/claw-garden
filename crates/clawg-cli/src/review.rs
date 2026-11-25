@@ -175,13 +175,30 @@ pub fn mcp_file(setup: &CursorSetup<'_>) -> String {
     pretty(&json!({ "mcpServers": { setup.server: server } }))
 }
 
+/// What the reviewer may never do, whatever it is allowed: write a file,
+/// with its tools or through `--output`, which `git diff`, `git log` and
+/// `git show` take to truncate and write the file it names.
+pub const DENY: [&str; 2] = ["Write(**)", "Shell(* --output*)"];
+
 /// The reviewer's `.cursor/cli-config.json`: the bridge's tools that read,
-/// the commands it was allowed, and no writing.
+/// the commands it was allowed, and [`DENY`].
 pub fn config_file(server: &str, allow: &[String]) -> String {
     let tools = READ_TOOLS.iter().map(|tool| format!("Mcp({server}:{tool})"));
     let commands = allow.iter().map(|command| format!("Shell({})", command.trim()));
     let allowed: Vec<String> = tools.chain(commands).collect();
-    pretty(&json!({ "version": 1, "permissions": { "allow": allowed, "deny": ["Write(**)"] } }))
+    pretty(&json!({ "version": 1, "permissions": { "allow": allowed, "deny": DENY } }))
+}
+
+/// What the CLI's environment changes: the review's folder as its home, and
+/// as the place of PowerShell's module cache, which the shell it runs
+/// commands in would otherwise write under the reviewed folder, since that
+/// shell does not get `LOCALAPPDATA`.
+pub fn cursor_env(review_home: &Path) -> [(&'static str, PathBuf); 3] {
+    [
+        ("USERPROFILE", review_home.to_path_buf()),
+        ("HOME", review_home.to_path_buf()),
+        ("PSModuleAnalysisCachePath", review_home.join("powershell").join("ModuleAnalysisCache")),
+    ]
 }
 
 /// The reviewer's `.cursor/hooks.json`: none, so no hook of clawg or of the
@@ -270,8 +287,8 @@ pub async fn run(opts: ReviewOpts, profile: Profile, base_dir: &Path) -> Result<
         eprintln!(
             "clawg: {}",
             match lang {
-                Lang::En => "review takes its message on stdin: the plan, the commits to review and what ran",
-                Lang::Es => "review toma su mensaje por stdin: el plan, los commits a revisar y lo que se corrió",
+                Lang::En => "review takes its message on stdin: what to review and what already ran",
+                Lang::Es => "review toma su mensaje por stdin: qué revisar y lo que ya se corrió",
             }
         );
         return Ok(ExitCode::from(EXIT_USAGE));
@@ -311,8 +328,7 @@ pub async fn run(opts: ReviewOpts, profile: Profile, base_dir: &Path) -> Result<
     let mut command = Command::new(&cursor);
     command
         .args(cursor_args(&workspace, opts.model.as_deref(), opts.resume.as_deref()))
-        .env("USERPROFILE", &review_home)
-        .env("HOME", &review_home)
+        .envs(cursor_env(&review_home))
         .current_dir(&workspace)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -512,11 +528,20 @@ mod tests {
                 "Shell(git log)"
             ])
         );
-        assert_eq!(file["permissions"]["deny"], json!(["Write(**)"]));
+        assert_eq!(file["permissions"]["deny"], json!(["Write(**)", "Shell(* --output*)"]));
         assert!(READ_TOOLS.iter().all(|tool| crate::daemon::sessions::TOOLS.contains(tool)), "each is a tool of the bridge");
         for writes in ["save_memory", "delete_memory", "restore_memory", "update_memory", "resolve_conflict", "answer_suggestion", "synthesize"] {
             assert!(!READ_TOOLS.contains(&writes), "{writes} is not allowed");
         }
+    }
+
+    #[test]
+    fn the_cursor_runs_with_the_review_folder_as_its_home_and_powershell_cache() {
+        let home = Path::new("/data/review/cursor");
+        let env = cursor_env(home);
+        let names: Vec<&str> = env.iter().map(|(name, _)| *name).collect();
+        assert_eq!(names, ["USERPROFILE", "HOME", "PSModuleAnalysisCachePath"]);
+        assert!(env.iter().all(|(_, path)| path.starts_with(home)), "{env:?}");
     }
 
     #[test]

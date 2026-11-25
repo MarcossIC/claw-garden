@@ -29,14 +29,14 @@ Antes de lanzar el CLI, `clawg review` MUST crear la carpeta del revisor y su `.
 - `cli-config.json`, que:
   - permite `Mcp(<servidor>:<herramienta>)` sólo para las herramientas que leen (`search_memory`, `recall_context`, `read_memory`, `list_memories`, `search_project`, `memory_status`);
   - permite un `Shell(<comando>)` por cada `--allow`;
-  - niega `Write(**)`.
+  - niega `Write(**)` y `Shell(* --output*)`: con `--output=<archivo>`, en cualquier lugar del comando, `git diff`, `git log` y `git show` truncan y escriben el archivo que nombra.
 - `hooks.json`, con `"version": 1` y ningún hook.
 
 **Tests:** `the_cursor_mcp_file_pins_the_bridge`, `the_cursor_config_allows_only_reading`, `the_cursor_hooks_file_has_no_hook` en `review.rs`; `a_review_runs_the_cursor_cli_and_records_its_session` en `binary.rs`.
 
 ## RV3. La corrida
 
-El CLI MUST correr con `-p --trust --approve-mcps --output-format stream-json --workspace <carpeta>`, más `--model` y `--resume` cuando se dan, y nunca con `--force`. Corre en la carpeta donde corre `clawg review`, con `USERPROFILE` y `HOME` en la carpeta del revisor.
+El CLI MUST correr con `-p --trust --approve-mcps --output-format stream-json --workspace <carpeta>`, más `--model` y `--resume` cuando se dan, y nunca con `--force`. Corre en la carpeta donde corre `clawg review`, con `USERPROFILE` y `HOME` en la carpeta del revisor, y con `PSModuleAnalysisCachePath` dentro de ella. El shell donde el CLI corre los comandos no recibe `LOCALAPPDATA`, y sin esa variable PowerShell escribe su caché en `Microsoft/Windows/PowerShell/` de la carpeta revisada.
 
 Antes de lanzarlo, `clawg review` MUST arrancar el daemon del perfil si no corre y registrar el proyecto de esa carpeta. Al llegar la línea `init`, MUST registrar la sesión: su agente, ese proyecto, cliente `cursor` y `source` `startup`, o `resume` con `--resume` ([`specs/metrics`](../metrics/spec.md), SU13). Las llamadas del puente del revisor se cuentan así en esa fila: el CLI no declara `roots`, y el puente lee la carpeta donde arrancó, que es la del workspace.
 
@@ -51,7 +51,7 @@ El veredicto es la última línea no vacía del informe cuando es `CLEAN`, `WARN
 
 Un CLI que termina sin escribir la línea `init` MUST NOT dejar ninguna fila. `clawg review` muestra entonces su stderr y sale con 1.
 
-**Tests:** `the_cursor_arguments_follow_the_options`, `the_init_line_gives_the_session`, `the_result_line_gives_the_report_and_the_usage`, `a_missing_usage_reads_as_zero`, `other_lines_are_skipped`, `a_verdict_is_read_from_the_last_line`, `a_report_without_a_verdict_line_reads_as_none`, `the_model_kept_is_the_one_passed_or_auto`, `the_cursor_cli_is_found_where_its_installer_puts_it`, `a_missing_cursor_cli_names_the_option` en `review.rs`; `a_review_runs_the_cursor_cli_and_records_its_session`, `a_review_whose_cursor_fails_ends_its_session_as_error`, `a_review_whose_cursor_fails_before_starting_leaves_no_row`, `a_resumed_review_starts_as_resume` en `binary.rs`.
+**Tests:** `the_cursor_arguments_follow_the_options`, `the_cursor_runs_with_the_review_folder_as_its_home_and_powershell_cache`, `the_init_line_gives_the_session`, `the_result_line_gives_the_report_and_the_usage`, `a_missing_usage_reads_as_zero`, `other_lines_are_skipped`, `a_verdict_is_read_from_the_last_line`, `a_report_without_a_verdict_line_reads_as_none`, `the_model_kept_is_the_one_passed_or_auto`, `the_cursor_cli_is_found_where_its_installer_puts_it`, `a_missing_cursor_cli_names_the_option` en `review.rs`; `a_review_runs_the_cursor_cli_and_records_its_session`, `a_review_whose_cursor_fails_ends_its_session_as_error`, `a_review_whose_cursor_fails_before_starting_leaves_no_row`, `a_resumed_review_starts_as_resume` en `binary.rs`.
 
 ## RV4. La salida
 
@@ -63,7 +63,10 @@ MUST salir con 0 cuando la sesión cerró `completed`. Con `error`, MUST salir c
 
 ## Límites conocidos
 
-- `git diff`, `git log` y `git show` aceptan `--output=<archivo>`, que trunca y sobrescribe el archivo que nombra. `Write(**)` no lo cubre, porque es un efecto del comando.
+- Un comando de `--allow` que escribe por otro camino que `--output` no se niega: lo que se permite es lo que pasa el orquestador.
+- La sesión se registra al llegar la línea `init`, mientras el CLI sigue corriendo: una llamada del puente que llegara al daemon antes de ese registro no se contaría. La primera llamada espera una respuesta del modelo, y no se vio pasar.
+- Si el daemon no da un proyecto para la carpeta, la fila queda sin proyecto, y las llamadas del puente, que sí lo tienen, no se cuentan en ella.
+- Dos `clawg review` a la vez en el mismo perfil escriben los mismos archivos de la carpeta del revisor: con `--allow` o `--agent` distintos, uno puede correr con los del otro.
 - Un `.cursor/mcp.json` o `.cursor/hooks.json` del repo revisado también se carga. Un servidor suyo con el nombre del del perfil podría tomar el lugar del puente fijado.
 - Si quien lanza `clawg review` lo corta, la fila queda abierta hasta que cierra con `idle`, sin tokens, y los procesos del CLI siguen vivos.
 - El login del CLI con otro home sólo se comprobó en Windows.
