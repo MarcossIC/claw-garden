@@ -5,7 +5,7 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use clawg_core::memory::merge::MergeReport;
 use clawg_core::metrics::sessions::{
-    Activity, CLIENTS, END_REASONS, HookEvent, label, OTHER, SOURCES, UNSPECIFIED, Who,
+    Activity, CLIENTS, END_REASONS, Ended, HookEvent, label, OTHER, SOURCES, UNSPECIFIED, Usage, VERDICTS, Who,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -39,6 +39,42 @@ pub struct SessionEndRequest {
     pub session_id: String,
     #[serde(default)]
     pub reason: Option<String>,
+    /// What the run spent, as a review reports it.
+    #[serde(default)]
+    pub usage: Option<UsageBody>,
+    /// The model the run used, as its caller named it.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// What a review said of the change.
+    #[serde(default)]
+    pub verdict: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct UsageBody {
+    #[serde(default)]
+    pub input: u64,
+    #[serde(default)]
+    pub output: u64,
+    #[serde(default)]
+    pub cache_read: u64,
+    #[serde(default)]
+    pub cache_write: u64,
+    #[serde(default)]
+    pub reasoning: u64,
+}
+
+/// The longest model id kept.
+const MAX_MODEL_LEN: usize = 64;
+
+/// `raw` in lowercase when it is an id of 1 to [`MAX_MODEL_LEN`] characters
+/// of `[a-z0-9._-]`, or [`OTHER`]: a model is kept as an id, never as a text.
+pub fn model_label(raw: &str) -> String {
+    let model = raw.to_ascii_lowercase();
+    let id = !model.is_empty()
+        && model.len() <= MAX_MODEL_LEN
+        && model.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-'));
+    if id { model } else { OTHER.to_string() }
 }
 
 #[derive(Debug, Deserialize)]
@@ -101,11 +137,29 @@ pub(super) async fn register_session(
 }
 
 /// Closes the row of a session its client says ended, with the reason it
-/// gives. It names no project, so a hook can send it without registering one.
+/// gives and, from a review, what it spent, its model and its verdict. It
+/// names no project, so a hook can send it without registering one.
 pub(super) async fn end_session(State(app): State<Arc<AppCtx>>, Json(body): Json<SessionEndRequest>) -> ApiResult<StatusCode> {
     check_session_id(&body.session_id).map_err(|e| ApiError::bad_request(e.to_string()))?;
     let reason = body.reason.as_deref().map_or(OTHER, |reason| label(&END_REASONS, reason));
-    app.runtime.metrics.sessions().end(&body.session_id, now_ms() as i64, reason);
+    let sessions = app.runtime.metrics.sessions();
+    if body.usage.is_none() && body.model.is_none() && body.verdict.is_none() {
+        sessions.end(&body.session_id, now_ms() as i64, reason);
+        return Ok(StatusCode::NO_CONTENT);
+    }
+    let usage = body.usage.unwrap_or_default();
+    let ended = Ended {
+        usage: Usage {
+            input: usage.input,
+            output: usage.output,
+            cache_read: usage.cache_read,
+            cache_write: usage.cache_write,
+            reasoning: usage.reasoning,
+        },
+        model: body.model.as_deref().map_or_else(|| OTHER.to_string(), model_label),
+        verdict: body.verdict.as_deref().map_or("none", |verdict| label(&VERDICTS, verdict)),
+    };
+    sessions.end_with(&body.session_id, now_ms() as i64, reason, &ended);
     Ok(StatusCode::NO_CONTENT)
 }
 
