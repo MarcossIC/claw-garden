@@ -64,6 +64,7 @@ MUST salir con 0 cuando la sesión cerró `completed`. Con `error`, MUST salir c
 ## Límites conocidos
 
 - Un comando de `--allow` que escribe por otro camino que `--output` no se niega: lo que se permite es lo que pasa el orquestador.
+- `Shell(* --output*)` también niega un comando permitido que use un flag que empieza con `--output`, como `--output-format`.
 - La sesión se registra al llegar la línea `init`, mientras el CLI sigue corriendo: una llamada del puente que llegara al daemon antes de ese registro no se contaría. La primera llamada espera una respuesta del modelo, y no se vio pasar.
 - Si el daemon no da un proyecto para la carpeta, la fila queda sin proyecto, y las llamadas del puente, que sí lo tienen, no se cuentan en ella.
 - Dos `clawg review` a la vez en el mismo perfil escriben los mismos archivos de la carpeta del revisor: con `--allow` o `--agent` distintos, uno puede correr con los del otro.
