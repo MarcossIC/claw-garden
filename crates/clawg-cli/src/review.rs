@@ -13,6 +13,8 @@
 //! Everything that decides is a pure function over text and paths; [`run`]
 //! is the only part that reads, writes or starts anything.
 
+pub mod prefs;
+
 use std::ffi::OsString;
 use std::io::{BufRead, BufReader, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
