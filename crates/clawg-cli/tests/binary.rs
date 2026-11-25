@@ -1080,7 +1080,7 @@ async fn a_review_runs_the_cursor_cli_and_records_its_session() {
     );
     let printed = stdout_of(&out).replace("\r\n", "\n");
     assert!(printed.contains("Findings: one.\nWARNINGS"), "{printed}");
-    assert!(printed.contains("clawg review: session rev-1 · model auto · verdict WARNINGS"), "{printed}");
+    assert!(printed.contains("clawg review: session rev-1 · model gpt-5.3-codex-high · verdict WARNINGS"), "{printed}");
     assert!(printed.contains("tokens 2100 in, 120 out, 900 cache read"), "{printed}");
 
     let review_home = sandbox.data_dir().join("review").join("cursor");
@@ -1105,7 +1105,7 @@ async fn a_review_runs_the_cursor_cli_and_records_its_session() {
     assert_eq!(row["project_id"], editor["rows"][0]["project_id"], "the project of the folder: {report} {editor}");
     assert_eq!((&row["starts"], &row["end_reason"]), (&json!({ "startup": 1 }), &json!("completed")), "{report}");
     assert_eq!(row["tokens"], json!({ "input": 2100, "output": 120, "cache_read": 900 }), "{report}");
-    assert_eq!((&row["models"], &row["verdicts"]), (&json!({ "auto": 1 }), &json!({ "warnings": 1 })), "{report}");
+    assert_eq!((&row["models"], &row["verdicts"]), (&json!({ "gpt-5.3-codex-high": 1 }), &json!({ "warnings": 1 })), "{report}");
 }
 
 #[tokio::test]
@@ -1171,6 +1171,148 @@ fn a_review_without_a_message_is_refused() {
     let args = ["--instructions", instructions.to_str().unwrap(), "--cursor", cursor.to_str().unwrap()];
     let out = review(&sandbox, &root, &args, "  \n");
     assert_eq!(out.status.code(), Some(2), "{}", stderr_of(&out));
+    assert!(!fake.join("prompt.txt").exists(), "the CLI never ran");
+}
+
+
+/// A stand-in for the Cursor CLI whose answer is the model list.
+fn fake_model_list(sandbox: &Sandbox) -> PathBuf {
+    let lines = ["Available models", "", "auto - Auto (default)", "gpt-5.3-codex-high - Codex 5.3 High", "gemini-3.8-flash-low - Gemini 3.8 Flash Low", "gpt-5.6-sol-high - GPT-5.6 Sol High"];
+    fake_cursor(&sandbox.home.join("fake-list"), &lines.map(String::from), "", 0)
+}
+
+fn review_file(sandbox: &Sandbox) -> Value {
+    serde_json::from_str(&read_text(&sandbox.data_dir().join("review.json"))).expect("review.json")
+}
+
+/// `clawg preferences` run in `root`.
+fn preferences_in(sandbox: &Sandbox, root: &Path, args: &[&str]) -> Output {
+    sandbox.command(&[&["preferences"], args, &["--profile", "dev"]].concat()).current_dir(root).output().expect("clawg preferences")
+}
+
+#[tokio::test]
+async fn a_review_uses_the_preferred_model() {
+    let sandbox = Sandbox::new();
+    let (root, instructions) = review_repo(&sandbox);
+    let list = fake_model_list(&sandbox);
+    let fake = sandbox.home.join("fake-cursor");
+    let cursor = fake_cursor(&fake, &[review_init("rev-p"), review_result("rev-p", "ok\nCLEAN", false)], "", 0);
+    let daemon = sandbox.serve().await;
+    daemon.wait_until_ready().await;
+    let list = list.to_str().unwrap();
+
+    let out = preferences_in(&sandbox, &root, &["set", "review-model", "gemini-3.8-flash-low", "--cursor", list]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+    let args = ["--instructions", instructions.to_str().unwrap(), "--cursor", cursor.to_str().unwrap()];
+    let out = review(&sandbox, &root, &args, "review it");
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+    assert!(read_text(&fake.join("args.txt")).contains("--model gemini-3.8-flash-low"), "{}", read_text(&fake.join("args.txt")));
+
+    let out = preferences_in(&sandbox, &root, &["set", "review-model", "gpt-5.6-sol-high", "--project", "--cursor", list]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+    let out = review(&sandbox, &root, &args, "review it again");
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+    assert!(read_text(&fake.join("args.txt")).contains("--model gpt-5.6-sol-high"), "the project's choice comes first");
+
+    stop(&sandbox, &daemon).await;
+    let report = sessions_report(&sandbox, &["--session", "rev-p"]);
+    let models: Vec<&Value> = report["rows"].as_array().expect("rows").iter().map(|row| &row["models"]).collect();
+    assert_eq!(models, [&json!({ "gemini-3.8-flash-low": 1 }), &json!({ "gpt-5.6-sol-high": 1 })], "{report}");
+}
+
+#[tokio::test]
+async fn the_review_model_is_set_and_unset_for_the_profile_and_the_project() {
+    let sandbox = Sandbox::new();
+    let (root, _) = review_repo(&sandbox);
+    let list = fake_model_list(&sandbox);
+    let list = list.to_str().unwrap();
+    let daemon = sandbox.serve().await;
+    daemon.wait_until_ready().await;
+
+    let set = |args: &[&str]| {
+        let out = preferences_in(&sandbox, &root, args);
+        assert_eq!(out.status.code(), Some(0), "{args:?}: {}", stderr_of(&out));
+        stdout_of(&out)
+    };
+    assert!(set(&["set", "review-model", "GPT-5.3-Codex-High", "--cursor", list]).contains("gpt-5.3-codex-high"));
+    set(&["set", "review-model", "gemini-3.8-flash-low", "--project", "--cursor", list]);
+    let file = review_file(&sandbox);
+    assert_eq!(file["model"], "gpt-5.3-codex-high", "{file}");
+    let projects = file["projects"].as_object().expect("projects");
+    assert_eq!(projects.values().collect::<Vec<_>>(), [&json!("gemini-3.8-flash-low")], "{file}");
+    let shown = set(&[]);
+    assert!(shown.contains("review model: gpt-5.3-codex-high") && shown.contains("gemini-3.8-flash-low"), "{shown}");
+
+    set(&["unset", "review-model", "--project"]);
+    assert_eq!(review_file(&sandbox), json!({ "version": 1, "model": "gpt-5.3-codex-high" }));
+    set(&["unset", "review-model"]);
+    assert_eq!(review_file(&sandbox), json!({ "version": 1 }));
+    assert!(set(&[]).contains("gpt-5.3-codex-high (the default)"));
+}
+
+#[test]
+fn a_review_model_outside_the_list_is_refused() {
+    let sandbox = Sandbox::new();
+    let (root, _) = review_repo(&sandbox);
+    let list = fake_model_list(&sandbox);
+    let out = preferences_in(&sandbox, &root, &["set", "review-model", "gpt-9-imaginary", "--cursor", list.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr_of(&out));
+    assert!(stderr_of(&out).contains("set review-model` without a model"), "{}", stderr_of(&out));
+    assert!(!sandbox.data_dir().join("review.json").exists(), "nothing was written");
+    let out = preferences_in(&sandbox, &root, &["set", "review-model", "gpt 5", "--cursor", list.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(1), "not an id: {}", stderr_of(&out));
+}
+
+#[test]
+fn a_review_model_is_kept_when_the_list_cannot_be_read() {
+    let sandbox = Sandbox::new();
+    let (root, _) = review_repo(&sandbox);
+    let missing = sandbox.home.join("no-cursor-here").join("agent");
+    let out = preferences_in(&sandbox, &root, &["set", "review-model", "gpt-5.6-sol-high", "--cursor", missing.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+    assert!(stderr_of(&out).contains("could not be read"), "{}", stderr_of(&out));
+    assert_eq!(review_file(&sandbox)["model"], "gpt-5.6-sol-high");
+}
+
+#[test]
+fn choosing_a_review_model_without_a_terminal_lists_them_and_exits_2() {
+    let sandbox = Sandbox::new();
+    let (root, _) = review_repo(&sandbox);
+    let list = fake_model_list(&sandbox);
+    let out = preferences_in(&sandbox, &root, &["set", "review-model", "--cursor", list.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr_of(&out));
+    let shown = stdout_of(&out);
+    assert!(shown.contains("*  2. gpt-5.3-codex-high - Codex 5.3 High"), "the default is the one in use: {shown}");
+    assert!(shown.contains("   3. gemini-3.8-flash-low - Gemini 3.8 Flash Low"), "{shown}");
+    assert!(stderr_of(&out).contains("set review-model MODEL"), "{}", stderr_of(&out));
+    assert!(!sandbox.data_dir().join("review.json").exists());
+}
+
+#[test]
+fn a_review_model_set_on_a_broken_file_changes_nothing() {
+    let sandbox = Sandbox::new();
+    let (root, _) = review_repo(&sandbox);
+    std::fs::create_dir_all(sandbox.data_dir()).unwrap();
+    std::fs::write(sandbox.data_dir().join("review.json"), "{ half an edit").unwrap();
+    let missing = sandbox.home.join("no-cursor-here").join("agent");
+    let out = preferences_in(&sandbox, &root, &["set", "review-model", "gpt-5.6-sol-high", "--cursor", missing.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr_of(&out));
+    assert!(stderr_of(&out).contains("nothing was changed"), "{}", stderr_of(&out));
+    assert_eq!(read_text(&sandbox.data_dir().join("review.json")), "{ half an edit");
+}
+
+#[tokio::test]
+async fn a_review_with_a_broken_review_file_is_refused() {
+    let sandbox = Sandbox::new();
+    let (root, instructions) = review_repo(&sandbox);
+    let fake = sandbox.home.join("fake-cursor");
+    let cursor = fake_cursor(&fake, &[review_init("never")], "", 0);
+    std::fs::create_dir_all(sandbox.data_dir()).unwrap();
+    std::fs::write(sandbox.data_dir().join("review.json"), r#"{"version":1,"modelo":"x"}"#).unwrap();
+    let args = ["--instructions", instructions.to_str().unwrap(), "--cursor", cursor.to_str().unwrap()];
+    let out = review(&sandbox, &root, &args, "review it");
+    assert_eq!(out.status.code(), Some(1), "{}", stderr_of(&out));
+    assert!(stderr_of(&out).contains("review.json"), "{}", stderr_of(&out));
     assert!(!fake.join("prompt.txt").exists(), "the CLI never ran");
 }
 
@@ -2792,14 +2934,26 @@ async fn preferences_set_and_unset_write_the_profiles_file() {
     let sandbox = Sandbox::new();
     let file = sandbox.data_dir().join("preferences.json");
     let shown = sandbox.run(&["preferences", "--profile", "dev"]);
-    assert_eq!((shown.status.code(), stdout_of(&shown).trim()), (Some(0), "no language preference: clawg uses English"));
+    assert_eq!(
+        (shown.status.code(), stdout_of(&shown).trim().replace("
+", "
+")),
+        (Some(0), "no language preference: clawg uses English
+review model: gpt-5.3-codex-high (the default)".to_string())
+    );
 
     let set = sandbox.run(&["preferences", "set", "language", "es", "--profile", "dev"]);
     assert_eq!(set.status.code(), Some(0), "{}", stderr_of(&set));
     assert!(stdout_of(&set).starts_with("Idioma: español."), "{}", stdout_of(&set));
     let written: Value = serde_json::from_str(&std::fs::read_to_string(&file).expect("the file")).unwrap();
     assert_eq!(written, json!({ "version": 1, "language": "es" }));
-    assert_eq!(stdout_of(&sandbox.run(&["preferences", "--profile", "dev"])).trim(), "idioma: español");
+    assert_eq!(
+        stdout_of(&sandbox.run(&["preferences", "--profile", "dev"])).trim().replace("
+", "
+"),
+        "idioma: español
+modelo del revisor: gpt-5.3-codex-high (el de por defecto)"
+    );
 
     let unset = sandbox.run(&["preferences", "unset", "language", "--profile", "dev"]);
     assert_eq!(unset.status.code(), Some(0), "{}", stderr_of(&unset));

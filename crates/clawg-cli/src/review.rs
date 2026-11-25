@@ -25,7 +25,7 @@ use clawg_core::paths::Profile;
 use clawg_core::preferences::{self, Lang};
 use serde_json::{json, Value};
 
-use crate::cli::ReviewOpts;
+use crate::cli::{ReviewOpts, SetReviewModel};
 use crate::client::{DaemonClient, EndedRun, ProcessSpawner, SessionEvent};
 use crate::error::CliError;
 
@@ -39,9 +39,6 @@ pub const DEFAULT_ALLOW: [&str; 3] = ["git diff", "git log", "git show"];
 /// The bridge's tools the reviewer may call: those that read. It saves,
 /// changes and settles nothing; what it learns comes back in its report.
 pub const READ_TOOLS: [&str; 6] = ["search_memory", "recall_context", "read_memory", "list_memories", "search_project", "memory_status"];
-
-/// The model kept for a run that named none: the CLI's own default.
-pub const AUTO_MODEL: &str = "auto";
 
 /// The client a review's session is recorded under.
 const CLIENT: &str = "cursor";
@@ -133,12 +130,6 @@ pub fn read_line(line: &str) -> Line {
         }
         _ => Line::Other,
     }
-}
-
-/// The model a run is kept under: the one it was given, in lowercase, or
-/// [`AUTO_MODEL`].
-pub fn kept_model(model: Option<&str>) -> String {
-    model.map(str::trim).filter(|m| !m.is_empty()).map_or_else(|| AUTO_MODEL.to_string(), str::to_ascii_lowercase)
 }
 
 /// What the files of the reviewer's `.cursor` are made from.
@@ -295,23 +286,18 @@ pub async fn run(opts: ReviewOpts, profile: Profile, base_dir: &Path) -> Result<
         );
         return Ok(ExitCode::from(EXIT_USAGE));
     }
+    // A choice that cannot be read stops the review: going on with the
+    // default would run a model nobody chose, without a word.
+    let chosen = prefs::load(base_dir).map_err(|e| CliError::Failed(e.to_string()))?;
     let instructions = std::fs::read_to_string(&opts.instructions)?;
-    let cursor = match &opts.cursor {
-        Some(cursor) => cursor.clone(),
-        None => find_cursor(
-            cfg!(windows),
-            std::env::var_os("LOCALAPPDATA").map(PathBuf::from).as_deref(),
-            std::env::var_os("PATH").as_deref(),
-            Path::is_file,
-        )
-        .ok_or_else(|| CliError::Failed(missing_cursor(lang)))?,
-    };
+    let cursor = cursor_cli(opts.cursor.as_deref()).ok_or_else(|| CliError::Failed(missing_cursor(lang)))?;
     let home = clawg_core::paths::home_dir().ok_or(clawg_core::paths::PathsError::NoHome)?;
     let workspace = std::env::current_dir()?;
 
     let spawner = ProcessSpawner { base_dir: base_dir.to_path_buf() };
     let client = crate::client::ensure_running(profile, true, &spawner).await?;
     let project = crate::hook::project_of(&client, &workspace).await;
+    let (model, _) = prefs::resolve(opts.model.as_deref(), &chosen, project.as_deref());
 
     let review_home = base_dir.join("review").join("cursor");
     let dot_cursor = review_home.join(".cursor");
@@ -329,7 +315,7 @@ pub async fn run(opts: ReviewOpts, profile: Profile, base_dir: &Path) -> Result<
     let started = std::time::Instant::now();
     let mut command = Command::new(&cursor);
     command
-        .args(cursor_args(&workspace, opts.model.as_deref(), opts.resume.as_deref()))
+        .args(cursor_args(&workspace, Some(&model), opts.resume.as_deref()))
         .envs(cursor_env(&review_home))
         .current_dir(&workspace)
         .stdin(Stdio::piped())
@@ -352,7 +338,6 @@ pub async fn run(opts: ReviewOpts, profile: Profile, base_dir: &Path) -> Result<
     };
     let outcome = ran.outcome.unwrap_or_else(|| Outcome { is_error: true, ..Outcome::default() });
     let completed = ran.succeeded && !outcome.is_error;
-    let model = kept_model(opts.model.as_deref());
     let said = verdict(&outcome.report);
     let ended = EndedRun { usage: outcome.usage, model: &model, verdict: said };
     if let Err(e) = client.end_session_with(&session_id, if completed { "completed" } else { "error" }, &ended).await {
@@ -365,6 +350,121 @@ pub async fn run(opts: ReviewOpts, profile: Profile, base_dir: &Path) -> Result<
         eprint!("{}", ran.stderr);
         return Ok(ExitCode::from(EXIT_FAILURE));
     }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// The Cursor CLI: `explicit`, or where its installer puts it.
+fn cursor_cli(explicit: Option<&Path>) -> Option<PathBuf> {
+    match explicit {
+        Some(cursor) => Some(cursor.to_path_buf()),
+        None => find_cursor(
+            cfg!(windows),
+            std::env::var_os("LOCALAPPDATA").map(PathBuf::from).as_deref(),
+            std::env::var_os("PATH").as_deref(),
+            Path::is_file,
+        ),
+    }
+}
+
+/// The models `cursor --list-models` prints, or why there are none.
+fn list_models(cursor: Option<&Path>, lang: Lang) -> Result<Vec<prefs::ListedModel>, String> {
+    let cursor = cursor.ok_or_else(|| missing_cursor(lang))?;
+    let out = Command::new(cursor)
+        .arg("--list-models")
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("{}: {e}", cursor.display()))?;
+    let list = prefs::parse_model_list(&String::from_utf8_lossy(&out.stdout));
+    if !out.status.success() || list.is_empty() {
+        let said = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        return Err(if said.is_empty() { format!("{} --list-models: {}", cursor.display(), out.status) } else { said });
+    }
+    Ok(list)
+}
+
+/// The project id the daemon gives this folder, starting the daemon if it is
+/// not running.
+async fn folder_project(profile: Profile, base_dir: &Path) -> Result<Option<String>, CliError> {
+    let spawner = ProcessSpawner { base_dir: base_dir.to_path_buf() };
+    let client = crate::client::ensure_running(profile, true, &spawner).await?;
+    Ok(crate::hook::project_of(&client, &std::env::current_dir()?).await)
+}
+
+/// `clawg preferences set review-model`: the model given, or one chosen
+/// from the Cursor CLI's list, kept for the profile or this folder's project.
+pub async fn set_model(opts: SetReviewModel, profile: Profile, base_dir: &Path) -> Result<ExitCode, CliError> {
+    let lang = preferences::language_in(base_dir).unwrap_or(Lang::En);
+    let say = |said: prefs::Said<'_>| prefs::says(lang, &said);
+    let mut chosen = prefs::load(base_dir).map_err(|e| CliError::Failed(format!("{e}; nothing was changed")))?;
+    let project = match opts.project {
+        true => match folder_project(profile, base_dir).await? {
+            Some(project) => Some(project),
+            None => return Err(CliError::Failed(say(prefs::Said::NoProject))),
+        },
+        false => None,
+    };
+    let listed = list_models(cursor_cli(opts.cursor.as_deref()).as_deref(), lang);
+    let model = match &opts.model {
+        Some(raw) => {
+            let model = prefs::model_id(raw).ok_or_else(|| CliError::Failed(say(prefs::Said::NotAModel { raw })))?;
+            match &listed {
+                Ok(list) if !list.iter().any(|m| m.id == model) => {
+                    return Err(CliError::Failed(say(prefs::Said::NotInList { model: &model })));
+                }
+                Ok(_) => {}
+                Err(why) => eprintln!("clawg: {}", say(prefs::Said::ListUnread { why })),
+            }
+            model
+        }
+        None => {
+            let Ok(list) = &listed else {
+                if let Err(why) = &listed {
+                    eprintln!("clawg: {}", say(prefs::Said::ListUnread { why }));
+                }
+                eprintln!("clawg: {}", say(prefs::Said::NeedsModel));
+                return Ok(ExitCode::from(EXIT_USAGE));
+            };
+            let (in_use, _) = prefs::resolve(None, &chosen, project.as_deref());
+            println!("{}", say(prefs::Said::ListHeader));
+            println!("{}", prefs::numbered(list, &in_use));
+            let stdin = std::io::stdin();
+            if !stdin.is_terminal() {
+                eprintln!("clawg: {}", say(prefs::Said::NeedsModel));
+                return Ok(ExitCode::from(EXIT_USAGE));
+            }
+            print!("{}", say(prefs::Said::Prompt));
+            std::io::stdout().flush()?;
+            let mut answer = String::new();
+            stdin.lock().read_line(&mut answer)?;
+            prefs::choose(&answer, list).ok_or_else(|| CliError::Failed(say(prefs::Said::NotAModel { raw: answer.trim() })))?
+        }
+    };
+    match &project {
+        Some(project) => {
+            chosen.projects.insert(project.clone(), model.clone());
+        }
+        None => chosen.model = Some(model.clone()),
+    }
+    prefs::save(base_dir, &chosen).map_err(|e| CliError::Failed(e.to_string()))?;
+    println!("{}", say(prefs::Said::Set { model: &model, project: project.is_some() }));
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `clawg preferences unset review-model`: the profile's choice, or this
+/// folder's project's, taken away.
+pub async fn unset_model(project: bool, profile: Profile, base_dir: &Path) -> Result<ExitCode, CliError> {
+    let lang = preferences::language_in(base_dir).unwrap_or(Lang::En);
+    let mut chosen = prefs::load(base_dir).map_err(|e| CliError::Failed(format!("{e}; nothing was changed")))?;
+    if project {
+        let Some(project) = folder_project(profile, base_dir).await? else {
+            return Err(CliError::Failed(prefs::says(lang, &prefs::Said::NoProject)));
+        };
+        chosen.projects.remove(&project);
+    } else {
+        chosen.model = None;
+    }
+    prefs::save(base_dir, &chosen).map_err(|e| CliError::Failed(e.to_string()))?;
+    println!("{}", prefs::says(lang, &prefs::Said::Unset { project }));
     Ok(ExitCode::SUCCESS)
 }
 
@@ -583,10 +683,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn the_model_kept_is_the_one_passed_or_auto() {
-        assert_eq!(kept_model(Some("GPT-5.3-Codex")), "gpt-5.3-codex");
-        assert_eq!(kept_model(None), AUTO_MODEL);
-        assert_eq!(kept_model(Some("  ")), AUTO_MODEL);
-    }
 }

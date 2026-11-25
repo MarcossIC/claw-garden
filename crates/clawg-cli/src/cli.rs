@@ -339,7 +339,8 @@ pub struct ReviewOpts {
     #[arg(long, value_name = "FILE")]
     pub instructions: PathBuf,
     /// The model the Cursor CLI runs (`agent --list-models` lists them).
-    /// Without it, Cursor's default, kept as `auto`.
+    /// Without it, the project's choice, the profile's (`clawg preferences
+    /// set review-model`), or `gpt-5.3-codex-high`.
     #[arg(long, value_name = "MODEL")]
     pub model: Option<String>,
     /// Go on with the review of this session, as the line after a report
@@ -873,34 +874,59 @@ pub fn sharing_profile<'a>(action: Option<&'a SharingAction>, own: &'a ProfileAr
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
 pub enum PreferencesAction {
-    /// Set a preference: `language es` or `language en`.
+    /// Set a preference: `language es|en`, or `review-model [MODEL]`.
+    #[command(subcommand)]
     Set(SetPreference),
     /// Take a preference away, back to how clawg behaves without it.
+    #[command(subcommand)]
     Unset(UnsetPreference),
 }
 
-/// What a preference is about. One for now; the next preference is another
-/// value here.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-pub enum PreferenceKey {
-    Language,
+/// A preference and the value it is set to.
+#[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
+pub enum SetPreference {
+    /// The language clawg speaks and saves in: `es` or `en`.
+    Language {
+        #[arg(value_parser = parse_lang)]
+        value: Lang,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+    /// The model `clawg review` runs. Without MODEL, the Cursor CLI's list
+    /// of models is shown to choose from.
+    ReviewModel(SetReviewModel),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, clap::Args)]
-pub struct SetPreference {
-    pub key: PreferenceKey,
-    /// `es` or `en`.
-    #[arg(value_parser = parse_lang)]
-    pub value: Lang,
+pub struct SetReviewModel {
+    /// A model of the Cursor CLI, as `agent --list-models` names it.
+    pub model: Option<String>,
+    /// For the project of this folder alone, not the whole profile. The
+    /// daemon names the project, and is started if it is not running.
+    #[arg(long)]
+    pub project: bool,
+    /// The Cursor CLI that lists the models. Without it, where its
+    /// installer puts it.
+    #[arg(long, value_name = "PATH")]
+    pub cursor: Option<PathBuf>,
     #[command(flatten)]
     pub profile: ProfileArg,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, clap::Args)]
-pub struct UnsetPreference {
-    pub key: PreferenceKey,
-    #[command(flatten)]
-    pub profile: ProfileArg,
+/// A preference to take away.
+#[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
+pub enum UnsetPreference {
+    Language {
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+    ReviewModel {
+        /// The project of this folder's choice, not the profile's.
+        #[arg(long)]
+        project: bool,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
 }
 
 fn parse_lang(raw: &str) -> Result<Lang, String> {
@@ -911,8 +937,10 @@ impl PreferencesAction {
     /// The `--profile` the action was given, if any.
     pub fn profile(&self) -> &ProfileArg {
         match self {
-            PreferencesAction::Set(s) => &s.profile,
-            PreferencesAction::Unset(u) => &u.profile,
+            PreferencesAction::Set(SetPreference::Language { profile, .. })
+            | PreferencesAction::Set(SetPreference::ReviewModel(SetReviewModel { profile, .. }))
+            | PreferencesAction::Unset(UnsetPreference::Language { profile })
+            | PreferencesAction::Unset(UnsetPreference::ReviewModel { profile, .. }) => profile,
         }
     }
 }
@@ -1705,22 +1733,15 @@ mod tests {
         assert_eq!(
             parse(&["clawg", "preferences", "set", "language", "es", "--profile", "dev"]).command,
             Command::Preferences {
-                action: Some(PreferencesAction::Set(SetPreference {
-                    key: PreferenceKey::Language,
-                    value: Lang::Es,
-                    profile: dev.clone()
-                })),
+                action: Some(PreferencesAction::Set(SetPreference::Language { value: Lang::Es, profile: dev.clone() })),
                 profile: ProfileArg { profile: None },
             }
         );
         assert_eq!(
             parse(&["clawg", "preferences", "--profile", "dev", "unset", "language"]).command,
             Command::Preferences {
-                action: Some(PreferencesAction::Unset(UnsetPreference {
-                    key: PreferenceKey::Language,
-                    profile: ProfileArg { profile: None }
-                })),
-                profile: dev,
+                action: Some(PreferencesAction::Unset(UnsetPreference::Language { profile: ProfileArg { profile: None } })),
+                profile: dev.clone(),
             }
         );
         for bad in [["clawg", "preferences", "set", "language", "fr"], ["clawg", "preferences", "set", "idioma", "es"]] {
@@ -1732,6 +1753,27 @@ mod tests {
             panic!("expected preferences");
         };
         assert_eq!(preferences_profile(action.as_ref(), &profile).profile.as_deref(), Some("dev"));
+
+        let model = |args: &[&str]| {
+            let all = [&["clawg", "preferences", "set", "review-model"][..], args].concat();
+            let Command::Preferences { action: Some(PreferencesAction::Set(SetPreference::ReviewModel(opts))), .. } = parse(&all).command
+            else {
+                panic!("expected set review-model");
+            };
+            opts
+        };
+        let plain = model(&["gpt-5.3-codex-high"]);
+        assert_eq!((plain.model.as_deref(), plain.project, plain.cursor), (Some("gpt-5.3-codex-high"), false, None));
+        let listed = model(&["--project", "--cursor", "bin/agent", "--profile", "dev"]);
+        assert_eq!((listed.model, listed.project), (None, true), "without a model the list is shown");
+        assert_eq!((listed.cursor, listed.profile), (Some(PathBuf::from("bin/agent")), dev.clone()));
+        assert_eq!(
+            parse(&["clawg", "preferences", "unset", "review-model", "--project"]).command,
+            Command::Preferences {
+                action: Some(PreferencesAction::Unset(UnsetPreference::ReviewModel { project: true, profile: ProfileArg { profile: None } })),
+                profile: ProfileArg { profile: None },
+            }
+        );
     }
 
     fn hide_of(args: &[&str]) -> Exclusion {
