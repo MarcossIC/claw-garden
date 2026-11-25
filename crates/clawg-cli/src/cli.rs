@@ -318,12 +318,46 @@ pub enum Command {
         #[command(flatten)]
         profile: ProfileArg,
     },
+    /// Have the Cursor CLI review a change with this profile's memory, able
+    /// to read but not to write, and record its session: the instructions
+    /// come from a file, the message from stdin, and the report goes to
+    /// stdout with a line on the session.
+    Review(ReviewOpts),
     /// Add or remove a directory on the user PATH (Windows). The installer
     /// runs this so `clawg` works from any new terminal.
     Path {
         #[command(subcommand)]
         action: PathAction,
     },
+}
+
+/// What `clawg review` is given.
+#[derive(Debug, Clone, PartialEq, Eq, clap::Args)]
+pub struct ReviewOpts {
+    /// The reviewer's instructions, such as an agent file; a frontmatter at
+    /// its top is left out.
+    #[arg(long, value_name = "FILE")]
+    pub instructions: PathBuf,
+    /// The model the Cursor CLI runs (`agent --list-models` lists them).
+    /// Without it, Cursor's default, kept as `auto`.
+    #[arg(long, value_name = "MODEL")]
+    pub model: Option<String>,
+    /// Go on with the review of this session, as the line after a report
+    /// names it.
+    #[arg(long, value_name = "SESSION")]
+    pub resume: Option<String>,
+    /// A command the reviewer may run, one per flag, matched by its first
+    /// words. The default lets it read the history.
+    #[arg(long = "allow", value_name = "COMMAND", default_values_t = crate::review::DEFAULT_ALLOW.map(String::from))]
+    pub allow: Vec<String>,
+    /// The agent id the reviewer reads memories as.
+    #[arg(long, value_parser = parse_agent, default_value = crate::review::DEFAULT_AGENT)]
+    pub agent: String,
+    /// The Cursor CLI to run. Without it, where its installer puts it.
+    #[arg(long, value_name = "PATH")]
+    pub cursor: Option<PathBuf>,
+    #[command(flatten)]
+    pub profile: ProfileArg,
 }
 
 /// What `clawg export` writes.
@@ -1810,6 +1844,50 @@ mod tests {
             Command::Secrets { mask_reasons: true, yes: true, profile: ProfileArg { profile: None } }
         );
         assert!(Cli::try_parse_from(["clawg", "secrets", "--yes"]).is_err(), "--yes confirms a rewrite");
+    }
+
+    fn review_of(args: &[&str]) -> ReviewOpts {
+        let all = [&["clawg", "review"][..], args].concat();
+        let Command::Review(opts) = parse(&all).command else { panic!("review") };
+        opts
+    }
+
+    #[test]
+    fn review_requires_its_instructions() {
+        assert!(Cli::try_parse_from(["clawg", "review"]).is_err());
+        assert_eq!(review_of(&["--instructions", "agents/reviewer.md"]).instructions, PathBuf::from("agents/reviewer.md"));
+    }
+
+    #[test]
+    fn review_takes_its_model_resume_agent_and_cursor() {
+        let plain = review_of(&["--instructions", "r.md"]);
+        assert_eq!((plain.model, plain.resume, plain.agent.as_str(), plain.cursor), (None, None, "cursor-review", None));
+        let opts = review_of(&[
+            "--instructions",
+            "r.md",
+            "--model",
+            "gpt-5.3-codex",
+            "--resume",
+            "a01efb1a",
+            "--agent",
+            "reviewer",
+            "--cursor",
+            "bin/agent",
+            "--profile",
+            "dev",
+        ]);
+        assert_eq!(opts.model.as_deref(), Some("gpt-5.3-codex"));
+        assert_eq!(opts.resume.as_deref(), Some("a01efb1a"));
+        assert_eq!((opts.agent.as_str(), opts.cursor), ("reviewer", Some(PathBuf::from("bin/agent"))));
+        assert_eq!(opts.profile, ProfileArg { profile: Some("dev".into()) });
+        assert!(Cli::try_parse_from(["clawg", "review", "--instructions", "r.md", "--agent", " "]).is_err(), "a blank agent");
+    }
+
+    #[test]
+    fn review_allows_git_diff_log_and_show_by_default() {
+        assert_eq!(review_of(&["--instructions", "r.md"]).allow, ["git diff", "git log", "git show"]);
+        let opts = review_of(&["--instructions", "r.md", "--allow", "git diff", "--allow", "cargo test -p clawg-core"]);
+        assert_eq!(opts.allow, ["git diff", "cargo test -p clawg-core"], "given ones replace the default");
     }
 
     #[test]

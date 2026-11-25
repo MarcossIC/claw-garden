@@ -24,6 +24,7 @@ use clawg_cli::error::CliError;
 use clawg_cli::export;
 use clawg_cli::hook;
 use clawg_cli::import;
+use clawg_cli::review;
 use clawg_cli::mcp;
 use clawg_cli::memories;
 use clawg_cli::metrics;
@@ -290,6 +291,12 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, CliError> {
             };
             println!("{text}");
             Ok(ExitCode::from(code))
+        }
+
+        Command::Review(opts) => {
+            let profile = opts.profile.resolve()?;
+            let base_dir = data_dir(profile)?;
+            review::run(opts, profile, &base_dir).await
         }
 
         Command::Path { action } => {

@@ -981,6 +981,195 @@ async fn a_session_end_closes_the_session_and_what_follows_opens_another() {
     assert_eq!(by_project["groups"][0]["open"], 1, "{by_project}");
 }
 
+// ── Reviews ─────────────────────────────────────────────────────────────────
+
+const REVIEW_INSTRUCTIONS: &str = "---\nname: reviewer\ntools: Read\n---\n\nYou review a change.\nEnd with CLEAN, WARNINGS or BLOCKED.\n";
+
+fn review_init(session_id: &str) -> String {
+    json!({ "type": "system", "subtype": "init", "session_id": session_id, "model": "Fake Model", "cwd": "x" }).to_string()
+}
+
+fn review_result(session_id: &str, report: &str, is_error: bool) -> String {
+    json!({
+        "type": "result", "subtype": "success", "is_error": is_error, "duration_ms": 1200, "result": report,
+        "session_id": session_id,
+        "usage": { "inputTokens": 2100, "outputTokens": 120, "cacheReadTokens": 900, "cacheWriteTokens": 0 }
+    })
+    .to_string()
+}
+
+/// A stand-in for the Cursor CLI in `dir`: it keeps its stdin, its
+/// arguments and the home it was given, writes `stream` on stdout and
+/// `stderr` on stderr, and exits with `code`.
+fn fake_cursor(dir: &Path, stream: &[String], stderr: &str, code: i32) -> PathBuf {
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::write(dir.join("stream.jsonl"), stream.iter().map(|line| format!("{line}\n")).collect::<String>()).unwrap();
+    let d = dir.display();
+    if cfg!(windows) {
+        let path = dir.join("agent.cmd");
+        let say = if stderr.is_empty() { String::new() } else { format!("echo {stderr} 1>&2\r\n") };
+        let script = format!(
+            "@echo off\r\nfindstr \"^\" > \"{d}\\prompt.txt\"\r\necho %* > \"{d}\\args.txt\"\r\necho %USERPROFILE%> \"{d}\\home.txt\"\r\ntype \"{d}\\stream.jsonl\"\r\n{say}exit /b {code}\r\n"
+        );
+        std::fs::write(&path, script).unwrap();
+        path
+    } else {
+        let path = dir.join("agent");
+        let say = if stderr.is_empty() { String::new() } else { format!("echo '{stderr}' 1>&2\n") };
+        let script = format!(
+            "#!/bin/sh\ncat > '{d}/prompt.txt'\necho \"$@\" > '{d}/args.txt'\nprintf '%s\\n' \"$HOME\" > '{d}/home.txt'\ncat '{d}/stream.jsonl'\n{say}exit {code}\n"
+        );
+        std::fs::write(&path, script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        path
+    }
+}
+
+/// A repository folder with the reviewer's instructions, where a review runs.
+fn review_repo(sandbox: &Sandbox) -> (PathBuf, PathBuf) {
+    let root = sandbox.home.join("repo");
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    let instructions = root.join("reviewer.md");
+    std::fs::write(&instructions, REVIEW_INSTRUCTIONS).unwrap();
+    (root, instructions)
+}
+
+/// `clawg review` in `root` with `message` on stdin.
+fn review(sandbox: &Sandbox, root: &Path, args: &[&str], message: &str) -> Output {
+    let mut child = sandbox
+        .command(&[&["review", "--profile", "dev"], args].concat())
+        .current_dir(root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn clawg review");
+    // A refused review exits before reading stdin, and the write may then find the pipe closed.
+    let _ = child.stdin.take().expect("stdin").write_all(message.as_bytes());
+    child.wait_with_output().expect("clawg review")
+}
+
+fn read_text(path: &Path) -> String {
+    std::fs::read_to_string(path).unwrap_or_default().replace("\r\n", "\n")
+}
+
+#[tokio::test]
+async fn a_review_runs_the_cursor_cli_and_records_its_session() {
+    let sandbox = Sandbox::new();
+    let (root, instructions) = review_repo(&sandbox);
+    let fake = sandbox.home.join("fake-cursor");
+    let tool_call = json!({ "type": "tool_call", "subtype": "started" }).to_string();
+    let stream = [review_init("rev-1"), tool_call, review_result("rev-1", "Findings: one.\nWARNINGS", false)];
+    let cursor = fake_cursor(&fake, &stream, "", 0);
+    let daemon = sandbox.serve().await;
+    daemon.wait_until_ready().await;
+
+    let args = ["--instructions", instructions.to_str().unwrap(), "--cursor", cursor.to_str().unwrap()];
+    let out = review(&sandbox, &root, &args, "Plan: openspec/changes/x/plan.md\nRange: a..b\n");
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+    assert_eq!(
+        read_text(&fake.join("prompt.txt")).trim_end(),
+        "You review a change.\nEnd with CLEAN, WARNINGS or BLOCKED.\n\nPlan: openspec/changes/x/plan.md\nRange: a..b",
+        "the prompt goes in on stdin"
+    );
+    let printed = stdout_of(&out).replace("\r\n", "\n");
+    assert!(printed.contains("Findings: one.\nWARNINGS"), "{printed}");
+    assert!(printed.contains("clawg review: session rev-1 · model auto · verdict WARNINGS"), "{printed}");
+    assert!(printed.contains("tokens 2100 in, 120 out, 900 cache read"), "{printed}");
+
+    let review_home = sandbox.data_dir().join("review").join("cursor");
+    assert_eq!(read_text(&fake.join("home.txt")).trim(), review_home.to_str().unwrap(), "the CLI runs with the review's home");
+    for file in ["mcp.json", "cli-config.json", "hooks.json"] {
+        assert!(review_home.join(".cursor").join(file).is_file(), "{file}");
+    }
+    #[cfg(unix)]
+    assert_eq!(mode_of(&review_home), 0o700);
+    let mcp: Value = serde_json::from_str(&read_text(&review_home.join(".cursor").join("mcp.json"))).unwrap();
+    assert_eq!(mcp["mcpServers"]["clawg-dev"]["args"], json!(["mcp", "--profile", "dev", "--agent", "cursor-review"]));
+    assert_eq!(mcp["mcpServers"]["clawg-dev"]["env"]["CLAWG_TEST_EMBEDDER"], "fake", "a test build passes its stand-ins on");
+
+    stop(&sandbox, &daemon).await;
+    let report = sessions_report(&sandbox, &["--session", "rev-1"]);
+    let rows = report["rows"].as_array().expect("rows");
+    assert_eq!(rows.len(), 1, "{report}");
+    let row = &rows[0];
+    assert_eq!((&row["agent_id"], &row["client"]), (&json!("cursor-review"), &json!("cursor")), "{report}");
+    assert!(row["project_id"].is_string(), "the project of the folder: {report}");
+    assert_eq!((&row["starts"], &row["end_reason"]), (&json!({ "startup": 1 }), &json!("completed")), "{report}");
+    assert_eq!(row["tokens"], json!({ "input": 2100, "output": 120, "cache_read": 900 }), "{report}");
+    assert_eq!((&row["models"], &row["verdicts"]), (&json!({ "auto": 1 }), &json!({ "warnings": 1 })), "{report}");
+}
+
+#[tokio::test]
+async fn a_review_whose_cursor_fails_ends_its_session_as_error() {
+    let sandbox = Sandbox::new();
+    let (root, instructions) = review_repo(&sandbox);
+    let fake = sandbox.home.join("fake-cursor");
+    let cursor = fake_cursor(&fake, &[review_init("rev-err"), review_result("rev-err", "the model refused", true)], "", 0);
+    let daemon = sandbox.serve().await;
+    daemon.wait_until_ready().await;
+
+    let args = ["--instructions", instructions.to_str().unwrap(), "--cursor", cursor.to_str().unwrap(), "--model", "GPT-5.3-Codex"];
+    let out = review(&sandbox, &root, &args, "review it");
+    assert_eq!(out.status.code(), Some(1), "{}", stderr_of(&out));
+    stop(&sandbox, &daemon).await;
+    let report = sessions_report(&sandbox, &["--session", "rev-err"]);
+    let row = &report["rows"][0];
+    assert_eq!((&row["end_reason"], &row["models"]), (&json!("error"), &json!({ "gpt-5.3-codex": 1 })), "{report}");
+}
+
+#[tokio::test]
+async fn a_review_whose_cursor_fails_before_starting_leaves_no_row() {
+    let sandbox = Sandbox::new();
+    let (root, instructions) = review_repo(&sandbox);
+    let cursor = fake_cursor(&sandbox.home.join("fake-cursor"), &[], "not logged in", 1);
+    let daemon = sandbox.serve().await;
+    daemon.wait_until_ready().await;
+
+    let args = ["--instructions", instructions.to_str().unwrap(), "--cursor", cursor.to_str().unwrap()];
+    let out = review(&sandbox, &root, &args, "review it");
+    assert_eq!(out.status.code(), Some(1), "{}", stderr_of(&out));
+    assert!(stderr_of(&out).contains("not logged in"), "the CLI's own words: {}", stderr_of(&out));
+    stop(&sandbox, &daemon).await;
+    let by_project = sessions_report(&sandbox, &[]);
+    assert_eq!(by_project["groups"], json!([]), "{by_project}");
+}
+
+#[tokio::test]
+async fn a_resumed_review_starts_as_resume() {
+    let sandbox = Sandbox::new();
+    let (root, instructions) = review_repo(&sandbox);
+    let fake = sandbox.home.join("fake-cursor");
+    let cursor = fake_cursor(&fake, &[review_init("rev-1"), review_result("rev-1", "Second round.\nCLEAN", false)], "", 0);
+    let daemon = sandbox.serve().await;
+    daemon.wait_until_ready().await;
+
+    let args = ["--instructions", instructions.to_str().unwrap(), "--cursor", cursor.to_str().unwrap(), "--resume", "rev-1"];
+    let out = review(&sandbox, &root, &args, "what changed since your report");
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+    assert!(read_text(&fake.join("args.txt")).contains("--resume rev-1"), "{}", read_text(&fake.join("args.txt")));
+    stop(&sandbox, &daemon).await;
+    let report = sessions_report(&sandbox, &["--session", "rev-1"]);
+    let row = &report["rows"][0];
+    assert_eq!((&row["starts"], &row["verdicts"]), (&json!({ "resume": 1 }), &json!({ "clean": 1 })), "{report}");
+}
+
+#[test]
+fn a_review_without_a_message_is_refused() {
+    let sandbox = Sandbox::new();
+    let (root, instructions) = review_repo(&sandbox);
+    let fake = sandbox.home.join("fake-cursor");
+    let cursor = fake_cursor(&fake, &[review_init("never")], "", 0);
+    let args = ["--instructions", instructions.to_str().unwrap(), "--cursor", cursor.to_str().unwrap()];
+    let out = review(&sandbox, &root, &args, "  \n");
+    assert_eq!(out.status.code(), Some(2), "{}", stderr_of(&out));
+    assert!(!fake.join("prompt.txt").exists(), "the CLI never ran");
+}
+
 #[tokio::test]
 async fn a_stop_hook_blocks_once_and_exits_0() {
     let sandbox = Sandbox::new();
