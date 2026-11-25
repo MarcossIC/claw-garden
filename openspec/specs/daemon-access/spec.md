@@ -342,7 +342,7 @@ Las rutas `POST /v1/imports`, `GET /v1/imports/{id}` y `DELETE /v1/imports/{id}`
 `POST /v1/sessions`, `POST /v1/sessions/end`, `POST /v1/sessions/calls` y `POST /v1/sessions/summary` MUST estar detrás del guardia y del token como todo `/v1`; las tres primeras MUST contestar `204` sin cuerpo, y `/v1/sessions/summary` (`session_id`) contesta `{"ask": bool}`: sí una sola vez por sesión, cuando su fila abierta guardó algo que vale resumir y ningún resumen, sin registrar un proyecto ni cargar el modelo ([`specs/hooks`](../hooks/spec.md), SS1), y `400` con un id inválido. Todas se miden como cualquier ruta por su plantilla. Qué cuenta cada una, y con qué sesión, está en [`specs/metrics`](../metrics/spec.md), SU6:
 
 - `POST /v1/sessions` (`agent_id`, `project_id` opcional, `session_id`) registra la sesión vigente del agente y del proyecto, y toma además `event` (`start` o `prompt`), `source` y `client`, los tres opcionales;
-- `POST /v1/sessions/end` (`session_id`, `reason` opcional) cierra la fila abierta de ese id y no toma proyecto;
+- `POST /v1/sessions/end` (`session_id`, `reason` opcional, y `usage`, `model` y `verdict` opcionales, de `clawg review`) cierra la fila abierta de ese id, contando antes lo que trae ([`specs/metrics`](../metrics/spec.md), SU6), y no toma proyecto;
 - `POST /v1/sessions/calls` (`agent_id`, `project_id` opcional, `tool`, `failed`) cuenta una llamada a una herramienta.
 
 `PROJECT_INPUTS` (IJ13) las clasifica: `("POST", "/sessions", Some("body.project_id"))`, `("POST", "/sessions/end", None)` y `("POST", "/sessions/calls", Some("body.project_id"))`.

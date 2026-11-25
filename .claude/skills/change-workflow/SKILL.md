@@ -73,7 +73,21 @@ Qué se corrió y qué devolvió, los hallazgos de la revisión y lo pendiente e
 
 **Closing checks.** The full suite and both clippy runs go once, on the last commit. A result is reported from the output of the command that produced it.
 
-**Review.** After the closing checks, launch the `change-reviewer` agent with the path of the plan (or the three documents of an older folder) and the range of commits: once for a medium change, twice in parallel for a large one, neither run seeing the other's report. The reviewer reports and never edits; the implementer fixes. With two reviewers, a finding both report is fixed, and a finding only one reports is checked against the code before acting on it. A second round reviews only what changed since the first. When a third round still has findings, stop fixing and put the approach back in front of the person, or, in autonomous work, close as **Autonomous work** says. A critical finding blocks archiving.
+**Review.** After the closing checks, the session that implemented, the orchestrator, launches the reviewers:
+
+- A medium change is reviewed by `clawg review` alone.
+- A large change is reviewed by the `change-reviewer` agent and `clawg review` in parallel, neither seeing the other's report.
+- Without the Cursor CLI (a cloud session, for example), `change-reviewer` takes the place of `clawg review`.
+
+`clawg review` runs the Cursor CLI as a reviewer that reads the code and the project's memory but writes nothing, and records its session. Run it in the background, from the repository:
+
+- `--instructions .claude/agents/change-reviewer.md`;
+- `--model` with one of the Cursor plan's models;
+- on stdin, a message with the path of the plan (or the three documents of an older folder), the range of commits, and what the closing checks ran and returned.
+
+Its report ends with `CLEAN`, `WARNINGS` or `BLOCKED`, and its last line names the session. After each review, check that `git status` shows nothing the review left.
+
+The reviewers report and never edit, and the orchestrator decides what to do with each finding: it fixes it, or checks it against the code before acting on it. With two reviewers, a finding both report is fixed, and a finding only one reports is checked against the code before acting on it. A second round reviews only what changed since the first: `clawg review --resume <session>` goes back to the same reviewer, with the message saying what changed. When a third round still has findings, stop fixing and put the approach back in front of the person, or, in autonomous work, close as **Autonomous work** says. A critical finding blocks archiving.
 
 **Verification and archive.** Write under `Verificación` what ran and what it returned, each review finding with what was done about it, and what only a local run can check, following the `verify` rules of `openspec/config.yaml`. Then archive as `openspec/README.md` and the `archive` rules describe.
 
