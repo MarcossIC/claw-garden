@@ -278,11 +278,11 @@ pub fn says(lang: Lang, said: &Said<'_>) -> String {
         },
         Said::PickFamily => match lang {
             Lang::En => "Choose a family".to_string(),
-            Lang::Es => "Elegí una familia".to_string(),
+            Lang::Es => "Elige una familia".to_string(),
         },
         Said::PickVersion => match lang {
             Lang::En => "choose a version".to_string(),
-            Lang::Es => "elegí una versión".to_string(),
+            Lang::Es => "elige una versión".to_string(),
         },
         Said::KeysToOpen { top: true } => match lang {
             Lang::En => "↑↓ move · Enter or Space: open · Esc or q: leave".to_string(),

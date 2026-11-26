@@ -88,7 +88,8 @@ hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
 http-body-util = "0.1"
 tower-service = "0.3"
 
-# `kill(pid, 0)` for the Unix side of `process.rs`. Already in the lockfile.
+# `kill(pid, 0)` for the Unix side of `process.rs`, and the tty read key by key
+# for the model picker (see `review/terminal.rs`). Already in the lockfile.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 

@@ -13,9 +13,9 @@
 //! Everything that decides is a pure function over text and paths; [`run`]
 //! is the only part that reads, writes or starts anything.
 
-pub mod picker;
+mod picker;
 pub mod prefs;
-pub mod terminal;
+mod terminal;
 
 use std::ffi::OsString;
 use std::io::{BufRead, BufReader, IsTerminal, Read, Write};
@@ -418,6 +418,27 @@ fn picked(outcome: picker::Outcome, lang: Lang) -> Result<String, String> {
     }
 }
 
+/// Ends a choice and returns what to say of it. A model is kept in
+/// `review.json`, for `project` or for the profile; a choice that was not
+/// made is no failure, and leaves the file as it is.
+fn conclude(choice: Result<String, String>, base_dir: &Path, lang: Lang, project: Option<&str>) -> Result<String, CliError> {
+    let model = match choice {
+        Ok(model) => model,
+        Err(not_chosen) => return Ok(not_chosen),
+    };
+    // Read again: the list or a person at the terminal may have taken a
+    // while, and another choice saved meanwhile is kept.
+    let mut chosen = prefs::load(base_dir).map_err(|e| CliError::Failed(prefs::says(lang, &prefs::Said::Unchanged { why: &e.to_string() })))?;
+    match project {
+        Some(project) => {
+            chosen.projects.insert(project.to_string(), model.clone());
+        }
+        None => chosen.model = Some(model.clone()),
+    }
+    prefs::save(base_dir, &chosen).map_err(|e| CliError::Failed(e.to_string()))?;
+    Ok(prefs::says(lang, &prefs::Said::Set { model: &model, project: project.is_some() }))
+}
+
 /// The project id the daemon gives this folder, starting the daemon if it is
 /// not running.
 async fn folder_project(profile: Profile, base_dir: &Path) -> Result<Option<String>, CliError> {
@@ -440,7 +461,7 @@ pub async fn set_model(opts: SetReviewModel, profile: Profile, base_dir: &Path) 
         false => None,
     };
     let listed = list_models(cursor_cli(opts.cursor.as_deref()).as_deref(), lang);
-    let model = match &opts.model {
+    let choice = match &opts.model {
         Some(raw) => {
             let model = prefs::model_id(raw).ok_or_else(|| CliError::Failed(say(prefs::Said::NotAModel { raw })))?;
             match &listed {
@@ -450,7 +471,7 @@ pub async fn set_model(opts: SetReviewModel, profile: Profile, base_dir: &Path) 
                 Ok(_) => {}
                 Err(why) => eprintln!("clawg: {}", say(prefs::Said::ListUnread { why })),
             }
-            model
+            Ok(model)
         }
         None => {
             let Ok(list) = &listed else {
@@ -468,13 +489,7 @@ pub async fn set_model(opts: SetReviewModel, profile: Profile, base_dir: &Path) 
                 Ask::Typed | Ask::Nobody => None,
             };
             match with_keys {
-                Some(outcome) => match picked(outcome?, lang) {
-                    Ok(model) => model,
-                    Err(not_chosen) => {
-                        println!("{not_chosen}");
-                        return Ok(ExitCode::SUCCESS);
-                    }
-                },
+                Some(outcome) => picked(outcome?, lang),
                 // No picker: the whole list, and its number or id typed.
                 None => {
                     println!("{}", say(prefs::Said::ListHeader));
@@ -488,22 +503,12 @@ pub async fn set_model(opts: SetReviewModel, profile: Profile, base_dir: &Path) 
                     let mut answer = String::new();
                     stdin.lock().read_line(&mut answer)?;
                     let answer = answer.trim();
-                    prefs::choose(answer, list).ok_or_else(|| CliError::Failed(say(prefs::Said::NotInList { model: answer })))?
+                    Ok(prefs::choose(answer, list).ok_or_else(|| CliError::Failed(say(prefs::Said::NotInList { model: answer })))?)
                 }
             }
         }
     };
-    // Read again: the list or a person at the terminal may have taken a
-    // while, and another choice saved meanwhile is kept.
-    let mut chosen = prefs::load(base_dir).map_err(|e| CliError::Failed(prefs::says(lang, &prefs::Said::Unchanged { why: &e.to_string() })))?;
-    match &project {
-        Some(project) => {
-            chosen.projects.insert(project.clone(), model.clone());
-        }
-        None => chosen.model = Some(model.clone()),
-    }
-    prefs::save(base_dir, &chosen).map_err(|e| CliError::Failed(e.to_string()))?;
-    println!("{}", say(prefs::Said::Set { model: &model, project: project.is_some() }));
+    println!("{}", conclude(choice, base_dir, lang, project.as_deref())?);
     Ok(ExitCode::SUCCESS)
 }
 
@@ -599,7 +604,35 @@ mod tests {
         assert!(es.contains("no se cambió nada"), "{es}");
         let en = picked(picker::Outcome::Cancelled, Lang::En).unwrap_err();
         assert!(en.contains("nothing was changed"), "{en}");
-        assert_eq!(picked(picker::Outcome::Open, Lang::En), Err(en), "a picker that ended without a choice chose none");
+        assert_eq!(picked(picker::Outcome::Open, Lang::En), Err(en.clone()), "a picker that ended without a choice chose none");
+
+        // It is no failure, and `review.json` is left as it was: absent, or
+        // byte for byte what it held.
+        let dir = tempfile::tempdir().unwrap();
+        let cancelled = || picked(picker::Outcome::Cancelled, Lang::En);
+        assert_eq!(conclude(cancelled(), dir.path(), Lang::En, None).unwrap(), en);
+        assert!(!prefs::file_in(dir.path()).exists(), "nothing was written");
+        let hand_written = "{\"version\":1,\n \"model\":\"gemini-3.8-flash-low\"}";
+        std::fs::write(prefs::file_in(dir.path()), hand_written).unwrap();
+        assert_eq!(conclude(cancelled(), dir.path(), Lang::En, Some("repo-7142")).unwrap(), en);
+        assert_eq!(std::fs::read_to_string(prefs::file_in(dir.path())).unwrap(), hand_written);
+    }
+
+    #[test]
+    fn a_chosen_model_is_kept_for_the_profile_or_the_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let said = conclude(Ok("gpt-5.6-sol-high".into()), dir.path(), Lang::En, None).unwrap();
+        assert!(said.starts_with("Review model: gpt-5.6-sol-high."), "{said}");
+        let said = conclude(Ok("gemini-3.8-flash-low".into()), dir.path(), Lang::Es, Some("repo-7142")).unwrap();
+        assert!(said.contains("proyecto de esta carpeta: gemini-3.8-flash-low"), "{said}");
+        let kept = prefs::load(dir.path()).unwrap();
+        assert_eq!(kept.model.as_deref(), Some("gpt-5.6-sol-high"), "the project's choice leaves the profile's");
+        assert_eq!(kept.projects.get("repo-7142").map(String::as_str), Some("gemini-3.8-flash-low"));
+
+        std::fs::write(prefs::file_in(dir.path()), "{ broken").unwrap();
+        let refused = conclude(Ok("auto".into()), dir.path(), Lang::En, None).unwrap_err();
+        assert!(refused.to_string().ends_with("nothing was changed"), "{refused}");
+        assert_eq!(std::fs::read_to_string(prefs::file_in(dir.path())).unwrap(), "{ broken");
     }
 
     #[test]

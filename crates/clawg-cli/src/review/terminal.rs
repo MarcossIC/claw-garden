@@ -74,7 +74,12 @@ impl Terminal for RawTerminal {
 
     fn read(&mut self) -> std::io::Result<Vec<Key>> {
         let mut bytes = [0u8; 1024];
-        let read = std::io::stdin().lock().read(&mut bytes)?;
+        let read = match std::io::stdin().lock().read(&mut bytes) {
+            // A signal cut the wait short, a resize among them: no key, and
+            // the frame is drawn again at the size the terminal has now.
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => return Ok(Vec::new()),
+            read => read?,
+        };
         // A closed input has no key left to wait for.
         if read == 0 {
             return Ok(vec![Key::Quit]);
@@ -167,6 +172,7 @@ mod platform {
 
 #[cfg(unix)]
 mod platform {
+    use std::io::IsTerminal;
     use std::mem::MaybeUninit;
     use std::os::fd::AsRawFd;
 
@@ -184,6 +190,10 @@ mod platform {
     }
 
     pub fn raw() -> Option<Saved> {
+        // The frames go to the output, so it has to be a terminal as well.
+        if !std::io::stdout().is_terminal() {
+            return None;
+        }
         let input = std::io::stdin().as_raw_fd();
         let mut termios = MaybeUninit::<libc::termios>::uninit();
         // SAFETY: `input` is this process's standard input and `termios` is a

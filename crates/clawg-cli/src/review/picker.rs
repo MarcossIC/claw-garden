@@ -313,12 +313,17 @@ impl Picker {
         ];
         let foot: Vec<Line> =
             std::iter::once(Line::blank()).chain(self.help(lang).into_iter().map(|help| Line::new(Tone::Dim, format!("  {help}")))).collect();
-        let space = rows.saturating_sub(head.len() + foot.len());
+        // The title and the keys are shown while three rows still fit
+        // between them; a shorter terminal is all rows.
+        let around = head.len() + foot.len();
+        let framed = rows >= around + list.len().min(3);
+        let space = if framed { rows - around } else { rows };
         let mut lines = Vec::new();
-        if head.len() + list.len() + foot.len() <= rows {
+        if framed {
             lines.extend(head);
+        }
+        if list.len() <= space {
             lines.extend(list);
-            lines.extend(foot);
         } else if space >= 3 {
             // A line above the rows and one below say how many do not fit.
             let shown = window(list.len(), self.cursor, space - 2);
@@ -326,14 +331,15 @@ impl Picker {
                 0 => Line::blank(),
                 _ => Line::new(Tone::Dim, format!("  {}", says(lang, &Said::More { above, rows: hidden }))),
             };
-            lines.extend(head);
             lines.push(more(true, shown.start));
+            lines.extend(list[shown.clone()].iter().cloned());
             lines.push(more(false, list.len() - shown.end));
-            lines.splice(lines.len() - 1..lines.len() - 1, list[shown].iter().cloned());
-            lines.extend(foot);
         } else {
-            // Too short a terminal for anything but rows.
-            lines.extend(list[window(list.len(), self.cursor, rows)].iter().cloned());
+            // Under three lines there is room for rows alone.
+            lines.extend(list[window(list.len(), self.cursor, space)].iter().cloned());
+        }
+        if framed {
+            lines.extend(foot);
         }
         // One column short of the width: a line that reaches the last column
         // makes some terminals start another.
@@ -424,6 +430,9 @@ pub fn decode(bytes: &[u8]) -> Vec<Key> {
                     }
                     at += 2;
                 }
+                // The key that follows is read on its own: an escape never
+                // takes another escape, or Ctrl-C, with it.
+                Some(0x1b | 0x03) => {}
                 // Alt with a key.
                 Some(_) => at += 1,
             },
@@ -581,6 +590,9 @@ kimi-k2.7-code - Kimi K2.7 Code
                 f.versions.iter().map(|v| list.iter().position(|l| *l == v.models[0]).expect("listed")).collect();
             assert!(first.windows(2).all(|w| w[0] < w[1]), "{}: {first:?}", f.label);
         }
+        let firsts: Vec<usize> =
+            all.iter().map(|f| list.iter().position(|l| *l == f.versions[0].models[0]).expect("listed")).collect();
+        assert!(firsts.windows(2).all(|w| w[0] < w[1]), "the families too: {firsts:?}");
         grouped.sort_by_key(|m| list.iter().position(|l| l == *m));
         assert!(grouped.iter().zip(&list).all(|(a, b)| *a == b));
         assert_eq!(families(&[]), []);
@@ -745,7 +757,8 @@ kimi-k2.7-code - Kimi K2.7 Code
         assert_eq!(line(&versions, "Claude Opus 5.5 1M").tone, Tone::Bright);
         assert!(line(&versions, "Claude Opus 5.5 1M").text.contains("en uso"));
         assert_eq!(line(&versions, "Claude Sonnet 4.6 1M").tone, Tone::Dim);
-        assert!(line(&versions, "elegí una versión").text.starts_with("Claude ›"), "{versions:#?}");
+        assert!(line(&versions, "elige una versión").text.starts_with("Claude ›"), "{versions:#?}");
+        assert_eq!(self::picker("auto").frame(Lang::Es, 40, 100)[2].text, "Elige una familia");
     }
 
     #[test]
@@ -830,6 +843,22 @@ kimi-k2.7-code - Kimi K2.7 Code
         assert!(!top.iter().any(|l| l.text.trim().starts_with("↑ ")), "nothing is above the first: {top:#?}");
         assert!(says(&top, "↓ 24 más"), "{top:#?}");
 
+        // Too short for the title and the keys: the rows, and still how many
+        // do not fit.
+        press(&mut versions, &[Key::Down; 12]);
+        let short = versions.frame(Lang::Es, 8, 80);
+        assert_eq!(short.len(), 8, "{short:#?}");
+        assert!(says(&short, "↑ 9 más") && says(&short, "↓ 15 más"), "{short:#?}");
+        assert!(!short.iter().any(|l| l.text.contains("Modelo del revisor")), "{short:#?}");
+        let three = versions.frame(Lang::Es, 3, 80);
+        assert_eq!(three.len(), 3);
+        assert!(says(&three, "↑ 12 más") && says(&three, "↓ 17 más") && three[1].text.starts_with("› Big 12"), "{three:#?}");
+        let two = versions.frame(Lang::Es, 2, 80);
+        assert!(two.len() == 2 && two.iter().all(|l| l.text.contains("Big")), "under three lines, rows alone: {two:#?}");
+        let fits = picker("auto").frame(Lang::Es, 8, 80);
+        assert_eq!(fits.len(), 7, "seven families fit in eight lines without the title: {fits:#?}");
+        assert!(fits.iter().all(|l| !l.text.contains("más")), "{fits:#?}");
+
         assert_eq!(window(30, 29, 6), 24..30);
         assert_eq!(window(3, 2, 10), 0..3);
         assert_eq!(window(0, 0, 5), 0..0);
@@ -859,6 +888,10 @@ kimi-k2.7-code - Kimi K2.7 Code
         assert_eq!(decode(b"\x1b[B\x1b[B\r"), [Key::Down, Key::Down, Key::Pick], "the keys of one read, in order");
         assert_eq!(decode(b"\r\r"), [Key::Pick, Key::Pick]);
         assert_eq!(decode(b"\x1b[5~\x1b[A"), [Key::Up], "a page key is skipped whole");
+        assert_eq!(decode(b"\x1b\x03"), [Key::Quit], "an escape never swallows Ctrl-C");
+        assert_eq!(decode(b"\x1b\x1b"), [Key::Back], "nor the escape after it");
+        assert_eq!(decode(b"\x1b\x1b[2 q"), [], "and the tail of what follows it is never read as keys");
+        assert_eq!(decode(b"\x1b\r"), [], "Alt with a key is not that key");
 
         let none: [&[u8]; 10] = [b"", b"x", "ñ".as_bytes(), b"\x1b[C", b"\x1b[5~", b"\x1b[1;5A", b"\x1bq", b"\x1b[", b"\x1bO", b"\x1bOP"];
         for other in none {
