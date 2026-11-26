@@ -25,7 +25,7 @@ description: "Proportion. Use when starting, planning, implementing, reviewing o
 
 **Autonomous work.** A session works autonomously when it runs in the background (`claude --bg`, a scheduled task, a cloud session), when another session launched it to orchestrate, or when the person said to carry on alone. An autonomous session never waits for an answer: it finishes the work, or leaves it closed and explained.
 
-- The plan review approves the plan. Once `plan.md` is written, launch the `change-reviewer` agent in plan mode with the path of the plan (or the three documents of an older folder) and the original request, quoted: once for a medium change, twice in parallel for a large one, neither run seeing the other's report. Findings are handled as under **Review**. When a round returns `CLEAN` or `WARNINGS`, the plan is approved: note it under `Registro` and implement it.
+- The plan review approves the plan. Once `plan.md` is written, launch the reviewers as under **Review**, in plan mode: the message says "plan mode" and gives the path of the plan (or the three documents of an older folder) and the original request, quoted. A medium change has `clawg review` alone; a large one has `clawg review` and the `change-reviewer` agent in parallel, neither seeing the other's report. Findings are handled as under **Review**. When a round returns `CLEAN` or `WARNINGS`, the plan is approved: note it under `Registro` and implement it.
 - What would need a question is decided by the narrowest reading of the request and noted under `Registro` with its reason. Nothing the request does not name is added to settle a doubt.
 - When a third round, of the plan or of the change, still has findings, stop fixing and do not wait: leave the work committed on its branch, unmerged, with the open findings under `Verificación`, and end with them in the final answer.
 - What truly needs the person (deleting or migrating stored data that cannot be rebuilt, a release, touching the real data profiles, permissions or credentials) is not done: implement the rest and end by saying what was left out and why.
@@ -73,16 +73,16 @@ Qué se corrió y qué devolvió, los hallazgos de la revisión y lo pendiente e
 
 **Closing checks.** The full suite and both clippy runs go once, on the last commit. A result is reported from the output of the command that produced it.
 
-**Review.** After the closing checks, the session that implemented, the orchestrator, launches the reviewers:
+**Review.** After the closing checks, the session that implemented, the orchestrator, launches the reviewers. The first reviewer is always `clawg review`, a model outside Claude; the `change-reviewer` agent is only ever the second:
 
 - A medium change is reviewed by `clawg review` alone.
-- A large change is reviewed by the `change-reviewer` agent and `clawg review` in parallel, neither seeing the other's report.
+- A large change is reviewed by `clawg review` and the `change-reviewer` agent in parallel, neither seeing the other's report.
 - Without the Cursor CLI (a cloud session, for example), `change-reviewer` takes the place of `clawg review`.
 
-`clawg review` runs the Cursor CLI as a reviewer that reads the code and the project's memory but writes nothing, and records its session. Run it in the background, from the repository:
+`clawg review` runs the Cursor CLI as a reviewer that reads the code and the project's memory but writes nothing, and records its session. It follows the same instructions as `change-reviewer`, plan mode included. Run it in the background, from the repository:
 
 - `--instructions .claude/agents/change-reviewer.md`;
-- on stdin, a message with the path of the plan (or the three documents of an older folder), the range of commits, and what the closing checks ran and returned.
+- on stdin, a message with the path of the plan (or the three documents of an older folder), the range of commits, and what the closing checks ran and returned; for a plan review, "plan mode", the path of the plan and the original request, quoted.
 
 The model is the one `clawg preferences set review-model` chose, for the profile or the project, or `gpt-5.3-codex-high`. Its report ends with `CLEAN`, `WARNINGS` or `BLOCKED`, and its last line names the session. After each review, check that `git status` shows nothing the review left.
 
