@@ -1229,7 +1229,7 @@ El decaimiento lee el reloj al buscar, así que las dos corridas de una comparac
 ## Banco de rendimiento del daemon
 
 ```
-cargo test -p clawg-cli --test perf_bench -- --ignored --nocapture
+cargo test -p clawg-cli --test integration -- --ignored --nocapture perf_bench::
 perf-bench diff FIRST SECOND [--fail-on-regression]
 ```
 

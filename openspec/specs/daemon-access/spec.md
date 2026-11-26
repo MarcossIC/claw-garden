@@ -220,7 +220,7 @@ En un sistema sin AF_UNIX el daemon MUST servir TCP en el puerto del perfil (obl
 
 Con un build `testing` y un daemon arrancado con `--port`, `DaemonClient` por AF_UNIX MUST NOT superar la media de `DaemonClient` por TCP en más de un 10 % en ninguno de cinco escenarios: cuatro con `health()` (secuencial con conexión reutilizada, conexión nueva por petición, 8 en paralelo y ráfaga de 32 clientes) y uno con cuerpo real (el puente secuencial con conexión reutilizada y una respuesta de unos 8 KB), cada uno con la mediana de 3 corridas tras un precalentamiento. La ráfaga MUST terminar sin fallas en ninguna corrida.
 
-**Test:** `the_socket_is_not_slower_than_tcp` (`tests/transport_bar.rs`, ignorado: corre optimizado con `cargo test -p clawg-cli --release --test transport_bar -- --ignored --nocapture`). La medición al archivar, con la mayor razón en 0,80, en el [verify](../../changes/archive/2026-10-20-windows-socket/verify.md).
+**Test:** `the_socket_is_not_slower_than_tcp` (`tests/transport_bar.rs`, ignorado: corre optimizado con `cargo test -p clawg-cli --release --test integration -- --ignored --nocapture transport_bar::`). La medición al archivar, con la mayor razón en 0,80, en el [verify](../../changes/archive/2026-10-20-windows-socket/verify.md).
 
 ## R13. Una segunda cuenta no alcanza ni reemplaza el socket (Windows, manual)
 
