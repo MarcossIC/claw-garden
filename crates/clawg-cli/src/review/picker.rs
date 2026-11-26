@@ -386,6 +386,94 @@ fn window(len: usize, cursor: usize, height: usize) -> std::ops::Range<usize> {
     start..start + height
 }
 
+/// The key an arrow's last byte names; the right arrow is none of the picker's.
+fn arrow(last: u8) -> Option<Key> {
+    match last {
+        b'A' => Some(Key::Up),
+        b'B' => Some(Key::Down),
+        b'D' => Some(Key::Back),
+        _ => None,
+    }
+}
+
+/// The keys in `bytes`, what a terminal sent in one read. Anything that is
+/// not one of the picker's keys is skipped whole, so the tail of a sequence
+/// is never read as a key.
+pub fn decode(bytes: &[u8]) -> Vec<Key> {
+    let mut keys = Vec::new();
+    let mut at = 0;
+    while let Some(&byte) = bytes.get(at) {
+        at += 1;
+        match byte {
+            0x1b => match bytes.get(at) {
+                // A sequence arrives whole, so an escape with nothing after
+                // it is the Esc key.
+                None => keys.push(Key::Back),
+                Some(b'[') => {
+                    let parameters = at + 1;
+                    at = parameters;
+                    while bytes.get(at).is_some_and(|b| (0x20..=0x3f).contains(b)) {
+                        at += 1;
+                    }
+                    // With parameters it is another key: a page, or an arrow
+                    // with Ctrl held.
+                    let bare = at == parameters;
+                    if let Some(&last) = bytes.get(at) {
+                        at += 1;
+                        keys.extend(arrow(last).filter(|_| bare));
+                    }
+                }
+                Some(b'O') => {
+                    if let Some(&last) = bytes.get(at + 1) {
+                        keys.extend(arrow(last));
+                    }
+                    at += 2;
+                }
+                // Alt with a key.
+                Some(_) => at += 1,
+            },
+            b'\r' => {
+                // One Enter is one press, however the terminal ends a line:
+                // read as two, it would mark a model and confirm it.
+                if bytes.get(at) == Some(&b'\n') {
+                    at += 1;
+                }
+                keys.push(Key::Pick);
+            }
+            b'\n' | b' ' => keys.push(Key::Pick),
+            0x7f | 0x08 => keys.push(Key::Back),
+            0x03 | b'q' | b'Q' => keys.push(Key::Quit),
+            _ => {}
+        }
+    }
+    keys
+}
+
+/// The terminal a picker runs over.
+pub trait Terminal {
+    /// Its rows and its columns.
+    fn size(&self) -> (usize, usize);
+    /// The keys pressed since the last read, after waiting for one.
+    fn read(&mut self) -> std::io::Result<Vec<Key>>;
+    /// Shows `frame` in place of what it showed.
+    fn draw(&mut self, frame: &[Line]) -> std::io::Result<()>;
+}
+
+/// Shows `picker` on `terminal` and follows its keys until a model is chosen
+/// or the choice is cancelled.
+pub fn run(picker: &mut Picker, lang: Lang, terminal: &mut impl Terminal) -> std::io::Result<Outcome> {
+    loop {
+        let (rows, cols) = terminal.size();
+        terminal.draw(&picker.frame(lang, rows, cols))?;
+        for key in terminal.read()? {
+            match picker.press(key) {
+                Outcome::Open => {}
+                done => return Ok(done),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -751,5 +839,85 @@ kimi-k2.7-code - Kimi K2.7 Code
         assert_eq!(window(3, 2, 10), 0..3);
         assert_eq!(window(0, 0, 5), 0..0);
         assert_eq!(Picker::new(&[], "auto").frame(Lang::Es, 0, 0), [], "no list and no terminal: nothing, and no panic");
+    }
+
+    #[test]
+    fn keys_are_read_from_the_bytes_a_terminal_sends() {
+        let one = |bytes: &[u8], key: Key| assert_eq!(decode(bytes), [key], "{bytes:?}");
+        for up in [&b"\x1b[A"[..], b"\x1bOA"] {
+            one(up, Key::Up);
+        }
+        for down in [&b"\x1b[B"[..], b"\x1bOB"] {
+            one(down, Key::Down);
+        }
+        for pick in [&b"\r"[..], b"\n", b" "] {
+            one(pick, Key::Pick);
+        }
+        one(b"\r\n", Key::Pick);
+        for back in [&b"\x1b"[..], b"\x1b[D", b"\x1bOD", b"\x7f", b"\x08"] {
+            one(back, Key::Back);
+        }
+        for quit in [&b"\x03"[..], b"q", b"Q"] {
+            one(quit, Key::Quit);
+        }
+
+        assert_eq!(decode(b"\x1b[B\x1b[B\r"), [Key::Down, Key::Down, Key::Pick], "the keys of one read, in order");
+        assert_eq!(decode(b"\r\r"), [Key::Pick, Key::Pick]);
+        assert_eq!(decode(b"\x1b[5~\x1b[A"), [Key::Up], "a page key is skipped whole");
+
+        let none: [&[u8]; 10] = [b"", b"x", "ñ".as_bytes(), b"\x1b[C", b"\x1b[5~", b"\x1b[1;5A", b"\x1bq", b"\x1b[", b"\x1bO", b"\x1bOP"];
+        for other in none {
+            assert_eq!(decode(other), [], "{other:?}");
+        }
+    }
+
+    /// A terminal that answers each read with the next of `reads` and keeps
+    /// what it was told to draw.
+    struct Scripted {
+        reads: std::collections::VecDeque<Vec<Key>>,
+        drawn: Vec<Vec<Line>>,
+    }
+
+    impl Scripted {
+        fn new(reads: &[&[Key]]) -> Self {
+            Self { reads: reads.iter().map(|keys| keys.to_vec()).collect(), drawn: Vec::new() }
+        }
+    }
+
+    impl Terminal for Scripted {
+        fn size(&self) -> (usize, usize) {
+            (10, 60)
+        }
+
+        fn read(&mut self) -> std::io::Result<Vec<Key>> {
+            self.reads.pop_front().ok_or_else(|| std::io::ErrorKind::UnexpectedEof.into())
+        }
+
+        fn draw(&mut self, frame: &[Line]) -> std::io::Result<()> {
+            self.drawn.push(frame.to_vec());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn the_picker_runs_over_a_terminal_until_a_choice_or_a_cancel() {
+        let mut terminal = Scripted::new(&[&[Key::Down], &[Key::Pick], &[Key::Down, Key::Pick], &[], &[Key::Pick], &[Key::Quit]]);
+        let chosen = run(&mut picker("not-listed"), Lang::Es, &mut terminal).unwrap();
+        assert_eq!(chosen, Outcome::Chosen("gpt-5.3-codex-high".into()));
+        assert_eq!(terminal.drawn.len(), 5, "one frame before each read");
+        assert_eq!(terminal.reads.len(), 1, "nothing is read after the choice");
+        assert!(line(&terminal.drawn[0], "Auto").text.starts_with("› "), "{:#?}", terminal.drawn[0]);
+        assert!(line(&terminal.drawn[1], "Codex").text.starts_with("› "));
+        assert!(line(&terminal.drawn[3], "gpt-5.3-codex-high").text.starts_with("› ● "), "{:#?}", terminal.drawn[3]);
+        assert_eq!(terminal.drawn[3], terminal.drawn[4], "a read of no key draws the same");
+        assert!(terminal.drawn.iter().all(|frame| frame.len() <= 10 && frame.iter().all(|l| l.text.chars().count() < 60)));
+
+        let mut left = Scripted::new(&[&[Key::Down, Key::Pick, Key::Pick], &[Key::Back, Key::Back, Key::Pick]]);
+        assert_eq!(run(&mut picker("not-listed"), Lang::En, &mut left).unwrap(), Outcome::Cancelled, "back from the families");
+        assert_eq!(left.drawn.len(), 2);
+
+        let mut closed = Scripted::new(&[&[Key::Down]]);
+        let error = run(&mut picker("not-listed"), Lang::En, &mut closed).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof, "a terminal that fails ends the picker");
     }
 }
