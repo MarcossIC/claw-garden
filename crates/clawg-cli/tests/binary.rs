@@ -1359,7 +1359,10 @@ async fn a_stop_hook_blocks_once_and_exits_0() {
     std::fs::create_dir_all(root.join(".git")).unwrap();
     let daemon = sandbox.serve().await;
     daemon.wait_until_ready().await;
-    let (status, registered) = daemon.post("/v1/projects", json!({ "root_path": root.to_string_lossy(), "assigned": true })).await;
+    // The root the hook registers is canonical; on Windows a temp dir under a
+    // short 8.3 name is not, and would be another project.
+    let resolved = clawg_core::memory::ProjectIdentity::resolve(&root).root;
+    let (status, registered) = daemon.post("/v1/projects", json!({ "root_path": resolved.to_string_lossy(), "assigned": true })).await;
     assert_eq!(status, 200, "{registered}");
     session_hook(&sandbox, "session-start", json!({ "session_id": "session-s", "cwd": root, "source": "startup" }));
     let (status, body) = daemon
