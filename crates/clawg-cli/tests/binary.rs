@@ -1315,6 +1315,7 @@ fn the_review_model_of_a_project_starts_the_daemon() {
     let sandbox = Sandbox::new();
     let (root, _) = review_repo(&sandbox);
     let list = fake_model_list(&sandbox);
+    let _stop = StopOnDrop { home: sandbox.home.clone() };
     let out = preferences_in(&sandbox, &root, &["set", "review-model", "gpt-5.6-sol-high", "--project", "--cursor", list.to_str().unwrap()]);
     assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
     let projects = review_file(&sandbox)["projects"].clone();
