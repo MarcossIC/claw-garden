@@ -393,7 +393,7 @@ async fn folder_project(profile: Profile, base_dir: &Path) -> Result<Option<Stri
 pub async fn set_model(opts: SetReviewModel, profile: Profile, base_dir: &Path) -> Result<ExitCode, CliError> {
     let lang = preferences::language_in(base_dir).unwrap_or(Lang::En);
     let say = |said: prefs::Said<'_>| prefs::says(lang, &said);
-    let chosen = prefs::load(base_dir).map_err(|e| CliError::Failed(format!("{e}; nothing was changed")))?;
+    let chosen = prefs::load(base_dir).map_err(|e| CliError::Failed(prefs::says(lang, &prefs::Said::Unchanged { why: &e.to_string() })))?;
     let project = match opts.project {
         true => match folder_project(profile, base_dir).await? {
             Some(project) => Some(project),
@@ -440,7 +440,7 @@ pub async fn set_model(opts: SetReviewModel, profile: Profile, base_dir: &Path) 
     };
     // Read again: the list or a person at the terminal may have taken a
     // while, and another choice saved meanwhile is kept.
-    let mut chosen = prefs::load(base_dir).map_err(|e| CliError::Failed(format!("{e}; nothing was changed")))?;
+    let mut chosen = prefs::load(base_dir).map_err(|e| CliError::Failed(prefs::says(lang, &prefs::Said::Unchanged { why: &e.to_string() })))?;
     match &project {
         Some(project) => {
             chosen.projects.insert(project.clone(), model.clone());
@@ -456,7 +456,7 @@ pub async fn set_model(opts: SetReviewModel, profile: Profile, base_dir: &Path) 
 /// folder's project's, taken away.
 pub async fn unset_model(project: bool, profile: Profile, base_dir: &Path) -> Result<ExitCode, CliError> {
     let lang = preferences::language_in(base_dir).unwrap_or(Lang::En);
-    let mut chosen = prefs::load(base_dir).map_err(|e| CliError::Failed(format!("{e}; nothing was changed")))?;
+    let mut chosen = prefs::load(base_dir).map_err(|e| CliError::Failed(prefs::says(lang, &prefs::Said::Unchanged { why: &e.to_string() })))?;
     if project {
         let Some(project) = folder_project(profile, base_dir).await? else {
             return Err(CliError::Failed(prefs::says(lang, &prefs::Said::NoProject)));

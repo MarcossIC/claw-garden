@@ -175,6 +175,8 @@ pub enum Said<'a> {
     NotAModel { raw: &'a str },
     /// The folder has no project to keep a model for.
     NoProject,
+    /// `review.json` could not be read, so it was left as it was.
+    Unchanged { why: &'a str },
 }
 
 /// `said` in `lang`.
@@ -242,6 +244,10 @@ pub fn says(lang: Lang, said: &Said<'_>) -> String {
         Said::NoProject => match lang {
             Lang::En => "This folder has no project the daemon can name; nothing was changed.".to_string(),
             Lang::Es => "Esta carpeta no tiene un proyecto que el daemon pueda nombrar; no se cambió nada.".to_string(),
+        },
+        Said::Unchanged { why } => match lang {
+            Lang::En => format!("{why}; nothing was changed"),
+            Lang::Es => format!("{why}; no se cambió nada"),
         },
     }
 }
@@ -351,6 +357,7 @@ mod tests {
             Said::NeedsModel,
             Said::NotAModel { raw: "x y" },
             Said::NoProject,
+            Said::Unchanged { why: "review.json is broken" },
         ];
         for said in &all {
             let (en, es) = (says(Lang::En, said), says(Lang::Es, said));
@@ -359,5 +366,6 @@ mod tests {
         }
         assert!(says(Lang::En, &Said::Shown { prefs: &none }).contains(DEFAULT_MODEL));
         assert!(says(Lang::Es, &Said::Shown { prefs: &prefs }).contains("proyecto p: n"));
+        assert_eq!(says(Lang::Es, &Said::Unchanged { why: "roto" }), "roto; no se cambió nada");
     }
 }
