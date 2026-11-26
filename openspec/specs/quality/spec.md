@@ -119,7 +119,7 @@ Reconocer el atributo en una línea MUST ser una función pura (`hides_dead_code
 
 Un test bajo `crates/*/tests` que abre un runtime con `MemoryRuntime::open` MUST llamar a `MemoryRuntime::close` antes de terminar. Soltar un runtime sólo le avisa al hilo de su conexión, y en Windows un archivo abierto no se puede borrar: `tempfile` se rinde sin error, el store queda en el temporal del sistema y ningún test falla. Un test de integración no alcanza `crate::test_dir`, que en `src/` detecta este caso. El test de esta convención MUST fallar con la ruta, relativa a `crates/`, y el nombre de cada test que no cierra.
 
-Reconocerlo MUST ser una función pura (`tests_leaving_a_store_open`, `crates/clawg-cli/tests/conventions.rs:1668`). Lee el texto de cada test: un `.close().await` alcanza, así que un test con dos runtimes puede dejar uno abierto.
+Reconocerlo MUST ser una función pura (`tests_leaving_a_store_open`, `crates/clawg-cli/tests/conventions.rs:1805`). Lee el texto de cada test: un `.close().await` alcanza, así que un test con dos runtimes puede dejar uno abierto.
 
 #### Escenario: un test que abre en disco y no cierra
 - GIVEN un test con `MemoryRuntime::open` y sin `.close().await`
@@ -131,16 +131,16 @@ Reconocerlo MUST ser una función pura (`tests_leaving_a_store_open`, `crates/cl
 - WHEN corre la convención
 - THEN no cuenta
 
-**Test:** `an_integration_test_closes_the_store_it_opens_on_disk` (`conventions.rs:1707`) y el puro `tests_leaving_a_store_open_names_each_test_without_a_close` (`conventions.rs:1679`).
+**Test:** `an_integration_test_closes_the_store_it_opens_on_disk` (`conventions.rs:1844`) y el puro `tests_leaving_a_store_open_names_each_test_without_a_close` (`conventions.rs:1816`).
 
 ## R8. La suite compila en la memoria de una máquina de desarrollo
 
 Cada rustc o enlazador de un binario de test ocupa entre uno y tres gigabytes, cada binario de test enlaza el árbol entero de dependencias, y cargo corre por defecto un job por núcleo lógico. Con 16 núcleos, la compilación supera los 32 GB. La línea base, las mediciones y lo que se descartó están en el [plan](../../changes/suite-memory/plan.md).
 
-- Cada crate con una carpeta `tests/` MUST decir `autotests = false` en `[package]` y declarar el `[[test]]` `integration` en `tests/integration.rs`. Todo `.rs` de la raíz de `tests/` MUST ser `integration.rs`, un `mod` que `integration.rs` declara o el archivo de un `[[test]]` propio del manifiesto, como `e5_golden`, que necesita la feature `eval`. Reconocerlo MUST ser una función pura (`test_files_outside_the_integration_binary`, `crates/clawg-cli/tests/conventions.rs:1942`).
+- Cada crate con una carpeta `tests/` MUST decir `autotests = false` en `[package]` y declarar el `[[test]]` `integration` en `tests/integration.rs`. Todo `.rs` de la raíz de `tests/` MUST ser `integration.rs`, un `mod` que `integration.rs` declara o el archivo de un `[[test]]` propio del manifiesto, como `e5_golden`, que necesita la feature `eval`. Reconocerlo MUST ser una función pura (`test_files_outside_the_integration_binary`, `crates/clawg-cli/tests/conventions.rs:2025`).
 - `.cargo/config.toml` MUST decir `linker = "rust-lld"` en `[target.x86_64-pc-windows-msvc]`.
 - `.cargo/config.toml` MUST fijar `jobs` en `[build]` con un entero positivo.
-- Un workflow de `.github/workflows/` que compila (`cargo build`, `test`, `clippy` o `check`) MUST decir `CARGO_BUILD_JOBS: default`. En una máquina con menos núcleos, un número fijo correría más jobs de los que tiene.
+- Cada job de un workflow de `.github/workflows/` que corre cargo (`cargo build`, `test`, `clippy`, `check`, `run`, `doc`, `bench` o `nextest`) MUST tener `CARGO_BUILD_JOBS: default` en una línea que no sea un comentario, propia o del `env` del workflow. Reconocerlo MUST ser una función pura (`jobs_running_cargo_without_the_jobs_cap`, `conventions.rs:1986`). En una máquina con menos núcleos, un número fijo correría más jobs de los que tiene.
 
 #### Escenario: un archivo de test suelto
 - GIVEN un `tests/loose.rs` que ningún `mod` de `integration.rs` declara y que no es un `[[test]]` del manifiesto
@@ -148,11 +148,11 @@ Cada rustc o enlazador de un binario de test ocupa entre uno y tres gigabytes, c
 - THEN falla y nombra el crate y el archivo
 
 #### Escenario: un workflow que compila sin levantar el tope
-- GIVEN un workflow que corre `cargo test` sin `CARGO_BUILD_JOBS: default`
+- GIVEN un job que corre `cargo test` y tiene `CARGO_BUILD_JOBS: default` sólo en un comentario
 - WHEN corre la convención
-- THEN falla y nombra el workflow
+- THEN falla y nombra el workflow y el job
 
-**Test:** `each_crate_builds_one_integration_binary` (`conventions.rs:2004`) y el puro `test_files_outside_the_integration_binary_names_each_one` (`conventions.rs:1995`), `windows_links_with_rust_lld` (`conventions.rs:1905`), `the_build_caps_its_jobs` (`conventions.rs:1913`) y `ci_lifts_the_jobs_cap` (`conventions.rs:1922`).
+**Test:** `each_crate_builds_one_integration_binary` (`conventions.rs:2087`) y el puro `test_files_outside_the_integration_binary_names_each_one` (`conventions.rs:2078`), `windows_links_with_rust_lld` (`conventions.rs:1905`), `the_build_caps_its_jobs` (`conventions.rs:1913`), y `ci_lifts_the_jobs_cap` (`conventions.rs:1922`) con el puro `jobs_running_cargo_without_the_jobs_cap_reads_each_job` (`conventions.rs:1995`).
 
 ## CD1. Un error llega a `main` con su tipo y su texto
 
