@@ -75,8 +75,7 @@ impl Terminal for RawTerminal {
     fn read(&mut self) -> std::io::Result<Vec<Key>> {
         let mut bytes = [0u8; 1024];
         let read = match std::io::stdin().lock().read(&mut bytes) {
-            // A signal cut the wait short, a resize among them: no key, and
-            // the frame is drawn again at the size the terminal has now.
+            // A signal cut the wait short: no key, and the frame is drawn again.
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => return Ok(Vec::new()),
             read => read?,
         };
