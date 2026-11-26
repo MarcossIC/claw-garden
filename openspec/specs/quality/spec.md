@@ -8,6 +8,7 @@ Fuente de verdad de las redes de tests que vigilan lo que el modelo ve del servi
 - [clippy-enforced](../../changes/archive/2026-11-03-clippy-enforced/proposal.md), archivado el 2026-11-03, cuyo código salió en 0.73.0 (CE1, CE3 y CE4 en R6: qué lints de clippy rigen, cómo se anota una excepción y qué dicen los docs; CE2 está en [`specs/install`](../install/spec.md), «CI»).
 - [cli-dispatch](../../changes/archive/2026-11-04-cli-dispatch/proposal.md), archivado el 2026-11-04, sale en 0.75.0 (CD1 a CD4). No cambió ningún comando: el binario de antes y el de después dieron la misma salida, el mismo stderr y el mismo código en 244 casos, y `crates/clawg-cli/tests/binary.rs` pasó sin editarse ([verify](../../changes/archive/2026-11-04-cli-dispatch/verify.md#el-binario-de-antes-y-el-de-después)).
 - [memory-module-layout](../../changes/archive/2026-11-13-memory-module-layout/proposal.md), archivado el 2026-11-13, sale en 0.87.0 (ML1 a ML5, en «Las carpetas de `memory`»). Sus R1 a R5 son ML1 a ML5 acá, para no chocar con los ids de esta spec. R6, que ninguna firma, tipo ni respuesta cambia, es de conservación y no se consolida. R7, que las citas de las specs, de `docs/reference` y del golden de docs nombren archivos que existen, fue un barrido de una vez ([verify](../../changes/archive/2026-11-13-memory-module-layout/verify.md#las-citas)). El motivo del reparto y de cada grupo en círculo está en su [diseño](../../changes/archive/2026-11-13-memory-module-layout/design.md#d1-el-reparto).
+- [suite-memory](../../changes/archive/2026-11-25-suite-memory/plan.md), archivado el 2026-11-25, sale en 0.95.0 (R8). Con 8 jobs, `rust-lld` y un binario de integración por crate, compilar los tests pasó de cortarse con los jobs por defecto a un pico de 7,3 GB en 92 s ([verificación](../../changes/archive/2026-11-25-suite-memory/plan.md#verificación)).
 
 ## Definiciones
 
@@ -135,7 +136,7 @@ Reconocerlo MUST ser una función pura (`tests_leaving_a_store_open`, `crates/cl
 
 ## R8. La suite compila en la memoria de una máquina de desarrollo
 
-Cada rustc o enlazador de un binario de test ocupa entre uno y tres gigabytes, cada binario de test enlaza el árbol entero de dependencias, y cargo corre por defecto un job por núcleo lógico. Con 16 núcleos, la compilación supera los 32 GB. La línea base, las mediciones y lo que se descartó están en el [plan](../../changes/suite-memory/plan.md).
+Cada rustc o enlazador de un binario de test ocupa entre uno y tres gigabytes, cada binario de test enlaza el árbol entero de dependencias, y cargo corre por defecto un job por núcleo lógico. Con 16 núcleos, la compilación supera los 32 GB. La línea base, las mediciones y lo que se descartó están en el [plan](../../changes/archive/2026-11-25-suite-memory/plan.md).
 
 - Cada crate con una carpeta `tests/` MUST decir `autotests = false` en `[package]` y declarar el `[[test]]` `integration` en `tests/integration.rs`. Todo `.rs` de la raíz de `tests/` MUST ser `integration.rs`, un `mod` que `integration.rs` declara o el archivo de un `[[test]]` propio del manifiesto, como `e5_golden`, que necesita la feature `eval`. Reconocerlo MUST ser una función pura (`test_files_outside_the_integration_binary`, `crates/clawg-cli/tests/conventions.rs:2025`).
 - `.cargo/config.toml` MUST decir `linker = "rust-lld"` en `[target.x86_64-pc-windows-msvc]`.

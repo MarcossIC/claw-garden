@@ -1,0 +1,11 @@
+change: suite-memory
+objective: "1-5"
+depends_on: []
+phase: archived
+artifacts:
+  exploration: skipped  # las mediciones van en el plan, bajo Problema
+  plan: done  # aprobado por la persona
+  apply: done
+  verify: done  # change-reviewer WARNINGS y clawg review CLEAN, en la ronda 2
+  archive: done
+updated: 2026-11-25
