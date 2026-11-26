@@ -104,7 +104,7 @@ Lo que ningún test alcanza, porque necesita una consola real: que el modo crudo
 - Desvío: `ICRNL`, `IXON` e `IEXTEN` no se tocan en Unix. El decodificador ya lee `\n` como Enter, y H19 sólo pide `ICANON`, `ECHO` e `ISIG`.
 - Sin comprobar todavía: el lado de Unix de `review/terminal.rs` no se compiló en local (no hay toolchain de Linux en la máquina donde se implementó); lo compila y lo testea el CI. Sus llamadas se contrastaron con las definiciones de `libc` 0.2.184 para `x86_64-unknown-linux-gnu`.
 - Sin comprobar todavía: el selector sobre una consola real. Un intento de manejarlo con teclas inyectadas en una consola oculta se abandonó; queda la prueba a mano de Verificación.
-- Desvío de H17: el selector dibuja un cuadro por lectura, no por tecla. Varias teclas de una misma lectura dan un solo cuadro, porque de los intermedios sólo se vería el último, y una lectura sin ninguna tecla del selector dibuja otra vez, que es lo que recoge un cambio de tamaño.
+- Desvío de H17: el selector dibuja un cuadro por lectura, no por tecla. Varias teclas de una misma lectura dan un solo cuadro, porque de los intermedios sólo se vería el último, y una lectura sin ninguna tecla del selector dibuja otra vez. Un cambio de tamaño de la terminal se ve recién con la tecla siguiente: el tamaño se lee antes de cada cuadro, y nada despierta la lectura cuando cambia.
 - Desvío de H15: con menos de tres líneas no entran la fila del cursor y las dos de cuántas quedan; ahí van las filas solas. Quedó escrito en RM2.
 - Después de la primera ronda de revisión: `conclude` reúne en `review.rs` el final de una elección, para que el test de la cancelación pruebe también que `review.json` queda como estaba; `picker` y `terminal` pasaron a ser módulos privados de `review`; las dos frases nuevas con imperativo quedaron de tú, como pide CL3.
 - `ESC O D` vuelve un paso igual que `ESC [ D`: es la flecha izquierda de una terminal en modo de aplicación. H16 sólo nombraba la segunda.
@@ -137,6 +137,13 @@ Lo que ningún test alcanza, porque necesita una consola real: que el modo crudo
 | El ancho se cuenta en caracteres, no en columnas | `change-reviewer` | límite conocido en RM2 |
 | Ningún test cubre la caída al número tipeado cuando la terminal no se deja leer tecla por tecla | `change-reviewer` | sin terminal no hay cómo provocarlo en un test; entra en la prueba a mano |
 | Anteriores a este cambio: `Said::NeedsModel` y `missing_cursor` en voseo; una línea vacía en el número tipeado sale con 1 y un mensaje que empieza con un espacio | `clawg review` | no se tocan en este cambio |
+
+### Revisión, ronda 2 (sobre `7636ba67..84342a31`)
+
+`clawg review` (la misma sesión, con `--resume`) y `change-reviewer` terminaron en `WARNINGS`. Los dos dan por resueltos los hallazgos de la ronda 1 que se arreglaron, sin ningún test aflojado, y dejan abiertas sólo las dos comprobaciones de abajo. `change-reviewer` sumó dos cosas:
+
+- `9e969bde` junta varios arreglos en un commit, contra la regla de un cambio coherente por commit. No se pierde nada; partirlo es reescribir la historia, y no se hizo.
+- El comentario de `RawTerminal::read` y una línea de Registro decían que una lectura interrumpida recoge un cambio de tamaño. No es así: nada despierta la lectura cuando la terminal cambia de tamaño. Corregidos los dos textos; el código no cambia.
 
 ### Pendiente en local
 

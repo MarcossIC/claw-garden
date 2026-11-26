@@ -1,11 +1,11 @@
 change: review-model-picker
 objective: "4"
 depends_on: []
-phase: apply
+phase: verify
 artifacts:
   exploration: skipped  # la lista real del CLI y el código que se toca van en el plan, bajo Problema
   plan: done  # aprobado por la persona el 2026-11-26
   apply: done  # los cinco pasos y un arreglo de clippy; falta la prueba a mano en una consola real
-  verify: pending
+  verify: pending  # dos rondas de revisión en WARNINGS; faltan la prueba en una consola real y el CI de Linux
   archive: pending
 updated: 2026-11-26
