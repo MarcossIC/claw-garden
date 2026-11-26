@@ -1900,3 +1900,11 @@ fn the_embedded_key_list_has_the_primary_and_backup_keys_and_not_the_test_key() 
         "a release must never trust the key the tests sign with"
     );
 }
+
+#[test]
+fn windows_links_with_rust_lld() {
+    // link.exe needs about half again the memory of rust-lld for each test
+    // binary, and the suite links several of them at once.
+    let config = read_repo_file(".cargo/config.toml");
+    assert_eq!(manifest_value(&config, "target.x86_64-pc-windows-msvc", "linker").as_deref(), Some(r#""rust-lld""#));
+}

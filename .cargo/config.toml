@@ -1,0 +1,4 @@
+# rust-lld ships with the toolchain and links a test binary in about two thirds
+# of the memory link.exe takes; the suite links several such binaries at once.
+[target.x86_64-pc-windows-msvc]
+linker = "rust-lld"
