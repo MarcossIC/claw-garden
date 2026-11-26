@@ -44,6 +44,7 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
       CARGO_INCREMENTAL: 0
+      CARGO_BUILD_JOBS: default
     steps:
       # This workflow is what release.yml waits for, so its actions are pinned
       # as there, and the token does not stay in .git/config for the build.

@@ -190,6 +190,25 @@ pub fn home_dir() -> Option<PathBuf> {
     dirs::home_dir()
 }
 
+/// The variables that point a `testing` build at a test's home and model,
+/// with their values where set, for a clawg started by a client that passes
+/// on only the variables it is told to. A build without `testing` reads
+/// neither, so it passes on none.
+#[cfg(feature = "testing")]
+pub fn test_env() -> Vec<(&'static str, std::ffi::OsString)> {
+    [TEST_HOME_VAR, crate::memory::upkeep::bootstrap::TEST_EMBEDDER_VAR]
+        .into_iter()
+        .filter_map(|var| std::env::var_os(var).filter(|value| !value.is_empty()).map(|value| (var, value)))
+        .collect()
+}
+
+/// The variables a `testing` build reads to find a test's home and model:
+/// none in this build.
+#[cfg(not(feature = "testing"))]
+pub fn test_env() -> Vec<(&'static str, std::ffi::OsString)> {
+    Vec::new()
+}
+
 /// Data directory for `profile` under the user's home directory.
 pub fn data_dir(profile: Profile) -> Result<PathBuf, PathsError> {
     data_dir_in(home_dir(), profile)

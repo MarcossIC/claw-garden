@@ -1,14 +1,15 @@
 //! `clawg preferences`: show or change the user's preferences.
 //!
-//! Works on `<data>/preferences.json` alone, never the store, so it runs with
-//! or without the daemon. Its sentences come in the language a change leaves
-//! set, one `match` per sentence, so neither language can be left without one.
+//! The language works on `<data>/preferences.json` alone, never the store, so
+//! it runs with or without the daemon. Its sentences come in the language a
+//! change leaves set, one `match` per sentence, so neither language can be
+//! left without one. The review model lives in `<data>/review.json`
+//! ([`crate::review::prefs`]); only its `--project` needs the daemon.
 
 use std::path::Path;
 
 use clawg_core::preferences::{self, Lang};
 
-use crate::cli::PreferencesAction;
 
 /// The language a command speaks to the user in: the profile's preference,
 /// read once, and English without one or with a file that cannot be read.
@@ -16,22 +17,27 @@ pub fn language(base_dir: &Path) -> Lang {
     preferences::language_in(base_dir).unwrap_or(Lang::En)
 }
 
-/// Applies `action` (none shows the preferences) and returns what to print.
-pub fn run(base_dir: &Path, action: Option<&PreferencesAction>) -> Result<String, String> {
+/// Applies `change` to the language, `Some(None)` taking it away, and
+/// returns what to print; `None` shows it.
+pub fn run(base_dir: &Path, change: Option<Option<Lang>>) -> Result<String, String> {
     // An unreadable file is never overwritten: it may be a hand edit halfway
     // done, and a later clawg may have written keys this one cannot read.
-    let mut current = preferences::load(base_dir).map_err(|e| match action {
+    let mut current = preferences::load(base_dir).map_err(|e| match change {
         None => e.to_string(),
         Some(_) => format!("{e}; nothing was changed"),
     })?;
-    let language = match action {
-        None => return Ok(shown(current.language)),
-        Some(PreferencesAction::Set(s)) => Some(s.value),
-        Some(PreferencesAction::Unset(_)) => None,
-    };
+    let Some(language) = change else { return Ok(shown(current.language)) };
     current.language = language;
     preferences::save(base_dir, &current).map_err(|e| e.to_string())?;
     Ok(applied(language))
+}
+
+/// The review model of the profile and of each project, as `clawg
+/// preferences` shows it, in `lang`; the cause when `review.json` cannot be read.
+pub fn shown_review(lang: Lang, base_dir: &Path) -> Result<String, String> {
+    use crate::review::prefs;
+    let review = prefs::load(base_dir).map_err(|e| e.to_string())?;
+    Ok(prefs::says(lang, &prefs::Said::Shown { prefs: &review }))
 }
 
 fn shown(language: Option<Lang>) -> String {
@@ -64,15 +70,30 @@ fn applied(language: Option<Lang>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::{PreferenceKey, ProfileArg, SetPreference, UnsetPreference};
     use clawg_core::paths::preferences_file;
 
-    fn set(lang: Lang) -> PreferencesAction {
-        PreferencesAction::Set(SetPreference { key: PreferenceKey::Language, value: lang, profile: ProfileArg::default() })
+    fn set(lang: Lang) -> Option<Lang> {
+        Some(lang)
     }
 
-    fn unset() -> PreferencesAction {
-        PreferencesAction::Unset(UnsetPreference { key: PreferenceKey::Language, profile: ProfileArg::default() })
+    fn unset() -> Option<Lang> {
+        None
+    }
+
+    #[test]
+    fn the_preferences_show_the_review_model() {
+        use crate::review::prefs::{save, ReviewPrefs, DEFAULT_MODEL};
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(shown_review(Lang::En, dir.path()).unwrap(), format!("review model: {DEFAULT_MODEL} (the default)"));
+        let mut review = ReviewPrefs { model: Some("gemini-3.8-flash-low".into()), ..ReviewPrefs::default() };
+        review.projects.insert("repo-7142".into(), "gpt-5.6-sol-high".into());
+        save(dir.path(), &review).unwrap();
+        assert_eq!(
+            shown_review(Lang::Es, dir.path()).unwrap(),
+            "modelo del revisor: gemini-3.8-flash-low\nmodelo del revisor del proyecto repo-7142: gpt-5.6-sol-high"
+        );
+        std::fs::write(dir.path().join("review.json"), "{ broken").unwrap();
+        assert!(shown_review(Lang::En, dir.path()).unwrap_err().contains("review.json is not valid"));
     }
 
     #[test]
@@ -80,17 +101,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(run(dir.path(), None).unwrap(), "no language preference: clawg uses English");
 
-        let es = run(dir.path(), Some(&set(Lang::Es))).unwrap();
+        let es = run(dir.path(), Some(set(Lang::Es))).unwrap();
         assert!(es.starts_with("Idioma: español."), "{es}");
         assert!(es.contains("sesiones de Claude Code") && es.contains("clawg setup claude-code"), "{es}");
         assert_eq!(run(dir.path(), None).unwrap(), "idioma: español");
 
-        let en = run(dir.path(), Some(&set(Lang::En))).unwrap();
+        let en = run(dir.path(), Some(set(Lang::En))).unwrap();
         assert!(en.starts_with("Language: English."), "{en}");
         assert!(en.contains("Claude Code sessions") && en.contains("clawg setup claude-code"), "{en}");
         assert_eq!(run(dir.path(), None).unwrap(), "language: English");
 
-        let none = run(dir.path(), Some(&unset())).unwrap();
+        let none = run(dir.path(), Some(unset())).unwrap();
         assert!(none.starts_with("No language preference: clawg uses English."), "{none}");
         assert!(none.contains("clawg setup claude-code"), "{none}");
         assert_eq!(clawg_core::preferences::language_in(dir.path()), None);
@@ -100,7 +121,7 @@ mod tests {
     fn a_command_speaks_english_without_a_readable_preference() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(language(dir.path()), Lang::En);
-        run(dir.path(), Some(&set(Lang::Es))).unwrap();
+        run(dir.path(), Some(set(Lang::Es))).unwrap();
         assert_eq!(language(dir.path()), Lang::Es);
         std::fs::write(preferences_file(dir.path()), "not json").unwrap();
         assert_eq!(language(dir.path()), Lang::En);
@@ -115,7 +136,7 @@ mod tests {
         let shown = run(dir.path(), None).unwrap_err();
         assert!(shown.contains("preferences.json is not valid"), "{shown}");
         for action in [set(Lang::En), unset()] {
-            let refused = run(dir.path(), Some(&action)).unwrap_err();
+            let refused = run(dir.path(), Some(action)).unwrap_err();
             assert!(refused.ends_with("nothing was changed"), "{refused}");
         }
         assert_eq!(std::fs::read_to_string(preferences_file(dir.path())).unwrap(), hand_edit);

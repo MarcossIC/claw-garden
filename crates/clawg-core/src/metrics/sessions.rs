@@ -6,9 +6,10 @@
 //! Nothing here reads a clock or a file: every call is given its time, so the
 //! rules are tested with times as data.
 //!
-//! A row holds three ids (the client's session, the agent, the project) and,
-//! besides them, only values of closed sets written here or by the caller:
-//! never a text, a path or anything about the user.
+//! A row holds three ids (the client's session, the agent, the project), the
+//! model of a review as an id its caller checked, and besides them only
+//! values of closed sets written here or by the caller: never a text, a path
+//! or anything about the user.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -36,6 +37,46 @@ pub const END_REASONS: [&str; 9] =
 
 pub const CLIENTS: [&str; 2] = ["claude-code", "cursor"];
 
+/// The tokens a session's end reports, by the name each is counted under.
+pub const TOKEN_KINDS: [&str; 5] = ["input", "output", "cache_read", "cache_write", "reasoning"];
+
+/// What a review said of the change, read from its report; `none` when it
+/// ended without saying.
+pub const VERDICTS: [&str; 4] = ["clean", "warnings", "blocked", "none"];
+
+/// The tokens a client spent in one run of a session.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Usage {
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+    pub reasoning: u64,
+}
+
+impl Usage {
+    /// Each token kind of [`TOKEN_KINDS`] with its count.
+    pub fn by_kind(&self) -> [(&'static str, u64); 5] {
+        [
+            ("input", self.input),
+            ("output", self.output),
+            ("cache_read", self.cache_read),
+            ("cache_write", self.cache_write),
+            ("reasoning", self.reasoning),
+        ]
+    }
+}
+
+/// What the end of a run reports besides its reason: what it spent, the
+/// model it ran, already an id, and its verdict, one of [`VERDICTS`] or
+/// [`OTHER`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ended {
+    pub usage: Usage,
+    pub model: String,
+    pub verdict: &'static str,
+}
+
 /// `raw` as `set` writes it, or [`OTHER`]: what is kept is never the text
 /// that came in.
 pub fn label(set: &[&'static str], raw: &str) -> &'static str {
@@ -58,20 +99,39 @@ pub enum CountKind {
     FailedCall,
     /// Accepted saves, by memory type.
     Save,
+    /// Tokens spent, by [`TOKEN_KINDS`].
+    Tokens,
+    /// The runs of each model.
+    Model,
+    /// The runs of each verdict of [`VERDICTS`].
+    Verdict,
 }
 
 impl CountKind {
+    pub const ALL: [CountKind; 7] = [
+        CountKind::Start,
+        CountKind::Call,
+        CountKind::FailedCall,
+        CountKind::Save,
+        CountKind::Tokens,
+        CountKind::Model,
+        CountKind::Verdict,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             CountKind::Start => "start",
             CountKind::Call => "call",
             CountKind::FailedCall => "failed_call",
             CountKind::Save => "save",
+            CountKind::Tokens => "tokens",
+            CountKind::Model => "model",
+            CountKind::Verdict => "verdict",
         }
     }
 
     pub fn parse(raw: &str) -> Option<Self> {
-        [CountKind::Start, CountKind::Call, CountKind::FailedCall, CountKind::Save].into_iter().find(|k| k.as_str() == raw)
+        Self::ALL.into_iter().find(|k| k.as_str() == raw)
     }
 }
 
@@ -101,7 +161,11 @@ impl SessionRow {
     }
 
     fn add(&mut self, kind: CountKind, name: &'static str) {
-        *self.counts.entry((kind, name.to_string())).or_insert(0) += 1;
+        self.add_n(kind, name.to_string(), 1);
+    }
+
+    fn add_n(&mut self, kind: CountKind, name: String, n: u64) {
+        *self.counts.entry((kind, name)).or_insert(0) += n;
     }
 
     fn close(&mut self, at_ms: i64, reason: &'static str) {
@@ -339,6 +403,26 @@ impl SessionLog {
         state.close(session_id, at_ms, reason);
     }
 
+    /// [`SessionLog::end`] for a run that reports what it spent, its model
+    /// and its verdict, counted in the open row before it closes. The tokens
+    /// of a kind with none are not counted.
+    pub fn end_with(&self, session_id: &str, at_ms: i64, reason: &'static str, ended: &Ended) {
+        if !self.enabled() {
+            return;
+        }
+        let mut state = self.lock();
+        state.settle(session_id, at_ms);
+        if let Some(open) = state.open.get_mut(session_id) {
+            let row = &mut open.row;
+            for (kind, n) in ended.usage.by_kind().into_iter().filter(|(_, n)| *n > 0) {
+                row.add_n(CountKind::Tokens, kind.to_string(), n);
+            }
+            row.add_n(CountKind::Model, ended.model.clone(), 1);
+            row.add(CountKind::Verdict, ended.verdict);
+        }
+        state.close(session_id, at_ms, reason);
+    }
+
     /// Closes as idle every open row that went [`IDLE_CLOSE_MS`] without an
     /// event before `now_ms`.
     pub fn close_idle(&self, now_ms: i64) {
@@ -517,10 +601,46 @@ mod tests {
         assert_eq!(label(&END_REASONS, "/home/someone"), OTHER);
         assert_eq!(label(&CLIENTS, "cursor"), "cursor");
         assert_eq!(label(&CLIENTS, ""), OTHER);
-        for kind in [CountKind::Start, CountKind::Call, CountKind::FailedCall, CountKind::Save] {
+        for kind in CountKind::ALL {
             assert_eq!(CountKind::parse(kind.as_str()), Some(kind));
         }
         assert_eq!(CountKind::parse("prompt"), None);
+        assert_eq!(label(&VERDICTS, "warnings"), "warnings");
+        assert_eq!(label(&VERDICTS, "LGTM"), OTHER);
+    }
+
+    #[test]
+    fn an_end_with_usage_counts_its_tokens() {
+        let log = log();
+        log.hook(who("s", Some("p")), T, HookEvent::Start("startup"));
+        let usage = Usage { input: 22_038, output: 652, cache_read: 14_825, cache_write: 0, reasoning: 0 };
+        log.end_with("s", T + MINUTE, "completed", &Ended { usage, model: "auto".into(), verdict: "none" });
+
+        let rows = rows_of(&log, "s");
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.count(CountKind::Tokens, "input"), 22_038);
+        assert_eq!(row.count(CountKind::Tokens, "output"), 652);
+        assert_eq!(row.count(CountKind::Tokens, "cache_read"), 14_825);
+        let tokens: Vec<&str> =
+            row.counts.keys().filter(|(kind, _)| *kind == CountKind::Tokens).map(|(_, name)| name.as_str()).collect();
+        assert_eq!(tokens, ["cache_read", "input", "output"], "only the tokens above zero");
+    }
+
+    #[test]
+    fn an_end_with_usage_counts_its_model_and_verdict() {
+        let log = log();
+        log.hook(who("s", Some("p")), T, HookEvent::Start("startup"));
+        log.end_with("s", T + MINUTE, "completed", &Ended { usage: Usage::default(), model: "gpt-5.3-codex".into(), verdict: "warnings" });
+
+        let rows = rows_of(&log, "s");
+        let row = &rows[0];
+        assert_eq!(row.count(CountKind::Model, "gpt-5.3-codex"), 1);
+        assert_eq!(row.count(CountKind::Verdict, "warnings"), 1);
+        assert_eq!((row.ended_at_ms, row.end_reason.as_deref()), (Some(T + MINUTE), Some("completed")));
+
+        log.end_with("nobody", T, "completed", &Ended { usage: Usage::default(), model: "auto".into(), verdict: "none" });
+        assert_eq!(log.take(), Pending::default(), "an end without an open row counts nothing");
     }
 
     #[test]

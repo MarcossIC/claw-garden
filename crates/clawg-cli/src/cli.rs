@@ -318,12 +318,47 @@ pub enum Command {
         #[command(flatten)]
         profile: ProfileArg,
     },
+    /// Have the Cursor CLI review a change with this profile's memory, able
+    /// to read but not to write, and record its session: the instructions
+    /// come from a file, the message from stdin, and the report goes to
+    /// stdout with a line on the session.
+    Review(ReviewOpts),
     /// Add or remove a directory on the user PATH (Windows). The installer
     /// runs this so `clawg` works from any new terminal.
     Path {
         #[command(subcommand)]
         action: PathAction,
     },
+}
+
+/// What `clawg review` is given.
+#[derive(Debug, Clone, PartialEq, Eq, clap::Args)]
+pub struct ReviewOpts {
+    /// The reviewer's instructions, such as an agent file; a frontmatter at
+    /// its top is left out.
+    #[arg(long, value_name = "FILE")]
+    pub instructions: PathBuf,
+    /// The model the Cursor CLI runs (`agent --list-models` lists them).
+    /// Without it, the project's choice, the profile's (`clawg preferences
+    /// set review-model`), or `gpt-5.3-codex-high`.
+    #[arg(long, value_name = "MODEL")]
+    pub model: Option<String>,
+    /// Go on with the review of this session, as the line after a report
+    /// names it.
+    #[arg(long, value_name = "SESSION")]
+    pub resume: Option<String>,
+    /// A command the reviewer may run, one per flag, matched by its first
+    /// words. The default lets it read the history.
+    #[arg(long = "allow", value_name = "COMMAND", default_values_t = crate::review::DEFAULT_ALLOW.map(String::from))]
+    pub allow: Vec<String>,
+    /// The agent id the reviewer reads memories as.
+    #[arg(long, value_parser = parse_agent, default_value = crate::review::DEFAULT_AGENT)]
+    pub agent: String,
+    /// The Cursor CLI to run. Without it, where its installer puts it.
+    #[arg(long, value_name = "PATH")]
+    pub cursor: Option<PathBuf>,
+    #[command(flatten)]
+    pub profile: ProfileArg,
 }
 
 /// What `clawg export` writes.
@@ -839,34 +874,59 @@ pub fn sharing_profile<'a>(action: Option<&'a SharingAction>, own: &'a ProfileAr
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
 pub enum PreferencesAction {
-    /// Set a preference: `language es` or `language en`.
+    /// Set a preference: `language es|en`, or `review-model [MODEL]`.
+    #[command(subcommand)]
     Set(SetPreference),
     /// Take a preference away, back to how clawg behaves without it.
+    #[command(subcommand)]
     Unset(UnsetPreference),
 }
 
-/// What a preference is about. One for now; the next preference is another
-/// value here.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-pub enum PreferenceKey {
-    Language,
+/// A preference and the value it is set to.
+#[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
+pub enum SetPreference {
+    /// The language clawg speaks and saves in: `es` or `en`.
+    Language {
+        #[arg(value_parser = parse_lang)]
+        value: Lang,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+    /// The model `clawg review` runs. Without MODEL, the Cursor CLI's list
+    /// of models is shown to choose from.
+    ReviewModel(SetReviewModel),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, clap::Args)]
-pub struct SetPreference {
-    pub key: PreferenceKey,
-    /// `es` or `en`.
-    #[arg(value_parser = parse_lang)]
-    pub value: Lang,
+pub struct SetReviewModel {
+    /// A model of the Cursor CLI, as `agent --list-models` names it.
+    pub model: Option<String>,
+    /// For the project of this folder alone, not the whole profile. The
+    /// daemon names the project, and is started if it is not running.
+    #[arg(long)]
+    pub project: bool,
+    /// The Cursor CLI that lists the models. Without it, where its
+    /// installer puts it.
+    #[arg(long, value_name = "PATH")]
+    pub cursor: Option<PathBuf>,
     #[command(flatten)]
     pub profile: ProfileArg,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, clap::Args)]
-pub struct UnsetPreference {
-    pub key: PreferenceKey,
-    #[command(flatten)]
-    pub profile: ProfileArg,
+/// A preference to take away.
+#[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
+pub enum UnsetPreference {
+    Language {
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+    ReviewModel {
+        /// The project of this folder's choice, not the profile's.
+        #[arg(long)]
+        project: bool,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
 }
 
 fn parse_lang(raw: &str) -> Result<Lang, String> {
@@ -877,8 +937,10 @@ impl PreferencesAction {
     /// The `--profile` the action was given, if any.
     pub fn profile(&self) -> &ProfileArg {
         match self {
-            PreferencesAction::Set(s) => &s.profile,
-            PreferencesAction::Unset(u) => &u.profile,
+            PreferencesAction::Set(SetPreference::Language { profile, .. })
+            | PreferencesAction::Set(SetPreference::ReviewModel(SetReviewModel { profile, .. }))
+            | PreferencesAction::Unset(UnsetPreference::Language { profile })
+            | PreferencesAction::Unset(UnsetPreference::ReviewModel { profile, .. }) => profile,
         }
     }
 }
@@ -1671,22 +1733,15 @@ mod tests {
         assert_eq!(
             parse(&["clawg", "preferences", "set", "language", "es", "--profile", "dev"]).command,
             Command::Preferences {
-                action: Some(PreferencesAction::Set(SetPreference {
-                    key: PreferenceKey::Language,
-                    value: Lang::Es,
-                    profile: dev.clone()
-                })),
+                action: Some(PreferencesAction::Set(SetPreference::Language { value: Lang::Es, profile: dev.clone() })),
                 profile: ProfileArg { profile: None },
             }
         );
         assert_eq!(
             parse(&["clawg", "preferences", "--profile", "dev", "unset", "language"]).command,
             Command::Preferences {
-                action: Some(PreferencesAction::Unset(UnsetPreference {
-                    key: PreferenceKey::Language,
-                    profile: ProfileArg { profile: None }
-                })),
-                profile: dev,
+                action: Some(PreferencesAction::Unset(UnsetPreference::Language { profile: ProfileArg { profile: None } })),
+                profile: dev.clone(),
             }
         );
         for bad in [["clawg", "preferences", "set", "language", "fr"], ["clawg", "preferences", "set", "idioma", "es"]] {
@@ -1698,6 +1753,27 @@ mod tests {
             panic!("expected preferences");
         };
         assert_eq!(preferences_profile(action.as_ref(), &profile).profile.as_deref(), Some("dev"));
+
+        let model = |args: &[&str]| {
+            let all = [&["clawg", "preferences", "set", "review-model"][..], args].concat();
+            let Command::Preferences { action: Some(PreferencesAction::Set(SetPreference::ReviewModel(opts))), .. } = parse(&all).command
+            else {
+                panic!("expected set review-model");
+            };
+            opts
+        };
+        let plain = model(&["gpt-5.3-codex-high"]);
+        assert_eq!((plain.model.as_deref(), plain.project, plain.cursor), (Some("gpt-5.3-codex-high"), false, None));
+        let listed = model(&["--project", "--cursor", "bin/agent", "--profile", "dev"]);
+        assert_eq!((listed.model, listed.project), (None, true), "without a model the list is shown");
+        assert_eq!((listed.cursor, listed.profile), (Some(PathBuf::from("bin/agent")), dev.clone()));
+        assert_eq!(
+            parse(&["clawg", "preferences", "unset", "review-model", "--project"]).command,
+            Command::Preferences {
+                action: Some(PreferencesAction::Unset(UnsetPreference::ReviewModel { project: true, profile: ProfileArg { profile: None } })),
+                profile: ProfileArg { profile: None },
+            }
+        );
     }
 
     fn hide_of(args: &[&str]) -> Exclusion {
@@ -1810,6 +1886,50 @@ mod tests {
             Command::Secrets { mask_reasons: true, yes: true, profile: ProfileArg { profile: None } }
         );
         assert!(Cli::try_parse_from(["clawg", "secrets", "--yes"]).is_err(), "--yes confirms a rewrite");
+    }
+
+    fn review_of(args: &[&str]) -> ReviewOpts {
+        let all = [&["clawg", "review"][..], args].concat();
+        let Command::Review(opts) = parse(&all).command else { panic!("review") };
+        opts
+    }
+
+    #[test]
+    fn review_requires_its_instructions() {
+        assert!(Cli::try_parse_from(["clawg", "review"]).is_err());
+        assert_eq!(review_of(&["--instructions", "agents/reviewer.md"]).instructions, PathBuf::from("agents/reviewer.md"));
+    }
+
+    #[test]
+    fn review_takes_its_model_resume_agent_and_cursor() {
+        let plain = review_of(&["--instructions", "r.md"]);
+        assert_eq!((plain.model, plain.resume, plain.agent.as_str(), plain.cursor), (None, None, "cursor-review", None));
+        let opts = review_of(&[
+            "--instructions",
+            "r.md",
+            "--model",
+            "gpt-5.3-codex",
+            "--resume",
+            "a01efb1a",
+            "--agent",
+            "reviewer",
+            "--cursor",
+            "bin/agent",
+            "--profile",
+            "dev",
+        ]);
+        assert_eq!(opts.model.as_deref(), Some("gpt-5.3-codex"));
+        assert_eq!(opts.resume.as_deref(), Some("a01efb1a"));
+        assert_eq!((opts.agent.as_str(), opts.cursor), ("reviewer", Some(PathBuf::from("bin/agent"))));
+        assert_eq!(opts.profile, ProfileArg { profile: Some("dev".into()) });
+        assert!(Cli::try_parse_from(["clawg", "review", "--instructions", "r.md", "--agent", " "]).is_err(), "a blank agent");
+    }
+
+    #[test]
+    fn review_allows_git_diff_log_and_show_by_default() {
+        assert_eq!(review_of(&["--instructions", "r.md"]).allow, ["git diff", "git log", "git show"]);
+        let opts = review_of(&["--instructions", "r.md", "--allow", "git diff", "--allow", "cargo test -p clawg-core"]);
+        assert_eq!(opts.allow, ["git diff", "cargo test -p clawg-core"], "given ones replace the default");
     }
 
     #[test]

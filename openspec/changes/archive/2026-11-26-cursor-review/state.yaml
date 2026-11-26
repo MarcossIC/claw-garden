@@ -1,0 +1,11 @@
+change: cursor-review
+objective: "4"
+depends_on: []
+phase: archived
+artifacts:
+  exploration: skipped  # las pruebas del CLI de Cursor van en el plan, bajo Problema
+  plan: done  # aprobado en la ronda 2 por las dos revisiones de plan, WARNINGS
+  apply: done
+  verify: done  # parte 2: change-reviewer WARNINGS en la ronda 2, clawg review WARNINGS en la ronda 3
+  archive: done
+updated: 2026-11-26

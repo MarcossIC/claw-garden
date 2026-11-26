@@ -10,6 +10,7 @@ Fuente de verdad de qué peticiones llegan a la API HTTP del daemon antes de mir
 - [import-job](../../changes/archive/2026-10-30-import-job/proposal.md), archivado el 2026-10-30, que sale en 0.68.0: agrega IJ12 a IJ14 (el bloque `import` de `/health`, las rutas de trabajos en `PROJECT_INPUTS` y detrás del guardia y el token). Qué hace un trabajo de importación está en [`specs/portability`](../portability/spec.md) (IJ1 a IJ11 e IJ15 a IJ17).
 - [session-usage](../../changes/archive/2026-11-11-session-usage/proposal.md), archivado el 2026-11-11, sale en 0.81.0: SU6 de esa spec entra como SU6 (las rutas `POST /v1/sessions`, `/v1/sessions/end` y `/v1/sessions/calls`, detrás del guardia y del token). Qué cuenta cada una está en [`specs/metrics`](../metrics/spec.md) (SU1 a SU12).
 - [docs-index-status](../../changes/archive/2026-11-12-docs-index-status/proposal.md), archivado el 2026-11-12, sale en 0.83.0: agrega ST3 y ST5 (el bloque `docs_index` de `/health`, sacado de la memoria del proceso, y lo que `clawg status` muestra de él). Son IS3 e IS5 en la spec de ese cambio y ST3 y ST5 acá, con el mismo prefijo que llevan en [`specs/project-docs`](../project-docs/spec.md), donde IS ya nombra los requisitos de docs-index-speed. Qué guarda el índice de cada refresco y la línea de log (ST1, ST2, ST4 y ST6) están en esa spec.
+- [cursor-review](../../changes/archive/2026-11-26-cursor-review/plan.md), archivado el 2026-11-26, sale en 0.96.0: `usage`, `model` y `verdict` en `POST /v1/sessions/end` (SU6).
 
 ## Definiciones
 
@@ -220,7 +221,7 @@ En un sistema sin AF_UNIX el daemon MUST servir TCP en el puerto del perfil (obl
 
 Con un build `testing` y un daemon arrancado con `--port`, `DaemonClient` por AF_UNIX MUST NOT superar la media de `DaemonClient` por TCP en más de un 10 % en ninguno de cinco escenarios: cuatro con `health()` (secuencial con conexión reutilizada, conexión nueva por petición, 8 en paralelo y ráfaga de 32 clientes) y uno con cuerpo real (el puente secuencial con conexión reutilizada y una respuesta de unos 8 KB), cada uno con la mediana de 3 corridas tras un precalentamiento. La ráfaga MUST terminar sin fallas en ninguna corrida.
 
-**Test:** `the_socket_is_not_slower_than_tcp` (`tests/transport_bar.rs`, ignorado: corre optimizado con `cargo test -p clawg-cli --release --test transport_bar -- --ignored --nocapture`). La medición al archivar, con la mayor razón en 0,80, en el [verify](../../changes/archive/2026-10-20-windows-socket/verify.md).
+**Test:** `the_socket_is_not_slower_than_tcp` (`tests/transport_bar.rs`, ignorado: corre optimizado con `cargo test -p clawg-cli --release --test integration -- --ignored --nocapture transport_bar::`). La medición al archivar, con la mayor razón en 0,80, en el [verify](../../changes/archive/2026-10-20-windows-socket/verify.md).
 
 ## R13. Una segunda cuenta no alcanza ni reemplaza el socket (Windows, manual)
 
@@ -342,7 +343,7 @@ Las rutas `POST /v1/imports`, `GET /v1/imports/{id}` y `DELETE /v1/imports/{id}`
 `POST /v1/sessions`, `POST /v1/sessions/end`, `POST /v1/sessions/calls` y `POST /v1/sessions/summary` MUST estar detrás del guardia y del token como todo `/v1`; las tres primeras MUST contestar `204` sin cuerpo, y `/v1/sessions/summary` (`session_id`) contesta `{"ask": bool}`: sí una sola vez por sesión, cuando su fila abierta guardó algo que vale resumir y ningún resumen, sin registrar un proyecto ni cargar el modelo ([`specs/hooks`](../hooks/spec.md), SS1), y `400` con un id inválido. Todas se miden como cualquier ruta por su plantilla. Qué cuenta cada una, y con qué sesión, está en [`specs/metrics`](../metrics/spec.md), SU6:
 
 - `POST /v1/sessions` (`agent_id`, `project_id` opcional, `session_id`) registra la sesión vigente del agente y del proyecto, y toma además `event` (`start` o `prompt`), `source` y `client`, los tres opcionales;
-- `POST /v1/sessions/end` (`session_id`, `reason` opcional) cierra la fila abierta de ese id y no toma proyecto;
+- `POST /v1/sessions/end` (`session_id`, `reason` opcional, y `usage`, `model` y `verdict` opcionales, de `clawg review`) cierra la fila abierta de ese id, contando antes lo que trae ([`specs/metrics`](../metrics/spec.md), SU6), y no toma proyecto;
 - `POST /v1/sessions/calls` (`agent_id`, `project_id` opcional, `tool`, `failed`) cuenta una llamada a una herramienta.
 
 `PROJECT_INPUTS` (IJ13) las clasifica: `("POST", "/sessions", Some("body.project_id"))`, `("POST", "/sessions/end", None)` y `("POST", "/sessions/calls", Some("body.project_id"))`.

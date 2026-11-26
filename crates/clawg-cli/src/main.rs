@@ -15,7 +15,7 @@ use std::process::ExitCode;
 use clawg_cli::backup;
 use clawg_cli::cli::{
     is_bare_invocation, is_hook_invocation, preferences_profile, sharing_profile, Cli, Command,
-    ProfileArg, SetupClient,
+    PreferencesAction, ProfileArg, SetPreference, SetupClient, UnsetPreference,
 };
 use clawg_cli::daemon::lifecycle::now_ms;
 use clawg_cli::daemon::serve;
@@ -24,6 +24,7 @@ use clawg_cli::error::CliError;
 use clawg_cli::export;
 use clawg_cli::hook;
 use clawg_cli::import;
+use clawg_cli::review;
 use clawg_cli::mcp;
 use clawg_cli::memories;
 use clawg_cli::metrics;
@@ -226,7 +227,22 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, CliError> {
         Command::Preferences { action, profile } => {
             let profile = preferences_profile(action.as_ref(), &profile).resolve()?;
             let base_dir = data_dir(profile)?;
-            println!("{}", preferences::run(&base_dir, action.as_ref()).map_err(CliError::Failed)?);
+            let language = match action {
+                None => None,
+                Some(PreferencesAction::Set(SetPreference::Language { value, .. })) => Some(Some(value)),
+                Some(PreferencesAction::Unset(UnsetPreference::Language { .. })) => Some(None),
+                Some(PreferencesAction::Set(SetPreference::ReviewModel(opts))) => {
+                    return review::set_model(opts, profile, &base_dir).await;
+                }
+                Some(PreferencesAction::Unset(UnsetPreference::ReviewModel { project, .. })) => {
+                    return review::unset_model(project, profile, &base_dir).await;
+                }
+            };
+            let shows = language.is_none();
+            println!("{}", preferences::run(&base_dir, language).map_err(CliError::Failed)?);
+            if shows {
+                println!("{}", preferences::shown_review(preferences::language(&base_dir), &base_dir).map_err(CliError::Failed)?);
+            }
             Ok(ExitCode::SUCCESS)
         }
 
@@ -290,6 +306,12 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, CliError> {
             };
             println!("{text}");
             Ok(ExitCode::from(code))
+        }
+
+        Command::Review(opts) => {
+            let profile = opts.profile.resolve()?;
+            let base_dir = data_dir(profile)?;
+            review::run(opts, profile, &base_dir).await
         }
 
         Command::Path { action } => {

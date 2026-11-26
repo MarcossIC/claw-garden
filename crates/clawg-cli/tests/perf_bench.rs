@@ -4,7 +4,7 @@
 //!
 //! The bench itself is ignored, so CI never runs it; the tests of its pure
 //! parts run with the suite. Run it with
-//! `cargo test -p clawg-cli --test perf_bench -- --ignored --nocapture`
+//! `cargo test -p clawg-cli --test integration -- --ignored --nocapture perf_bench::`
 //! (`--release` measures an optimized daemon), and compare two of its files
 //! with `cargo run -p clawg-eval --bin perf-bench -- diff A B`.
 //!
@@ -836,7 +836,7 @@ fn now_ms() -> i64 {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "a benchmark: run it with `cargo test -p clawg-cli --test perf_bench -- --ignored --nocapture`"]
+#[ignore = "a benchmark: run it with `cargo test -p clawg-cli --test integration -- --ignored --nocapture perf_bench::`"]
 async fn bench() {
     let config = Config::from_vars(|k| std::env::var(k).ok()).unwrap_or_else(|e| panic!("{e}"));
     let started_at_ms = now_ms();

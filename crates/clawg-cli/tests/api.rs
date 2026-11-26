@@ -7081,7 +7081,8 @@ async fn no_text_path_or_user_reaches_a_session_row() {
     assert_eq!(h.post_json("/v1/search", search).await.0, 200);
     let call = json!({ "agent_id": "agent-http", "project_id": app, "tool": "SECRET-tool", "failed": true });
     assert_eq!(h.post_json("/v1/sessions/calls", call).await.0, 204);
-    assert_eq!(h.post_json("/v1/sessions/end", json!({ "session_id": "s-1", "reason": "SECRET reason" })).await.0, 204);
+    let end = json!({ "session_id": "s-1", "reason": "SECRET reason", "model": "/SECRET/model", "verdict": "SECRET verdict" });
+    assert_eq!(h.post_json("/v1/sessions/end", end).await.0, 204);
 
     let rows = h.ctx.runtime.metrics.sessions().take().rows;
     assert_eq!(rows.len(), 1);
@@ -7092,6 +7093,71 @@ async fn no_text_path_or_user_reaches_a_session_row() {
     let names: Vec<(CountKind, &str)> = row.counts.keys().map(|(kind, name)| (*kind, name.as_str())).collect();
     assert_eq!(
         names,
-        [(CountKind::Start, "other"), (CountKind::Call, "other"), (CountKind::FailedCall, "other"), (CountKind::Save, "unspecified")]
+        [
+            (CountKind::Start, "other"),
+            (CountKind::Call, "other"),
+            (CountKind::FailedCall, "other"),
+            (CountKind::Save, "unspecified"),
+            (CountKind::Model, "other"),
+            (CountKind::Verdict, "other"),
+        ]
     );
+}
+
+#[tokio::test]
+async fn a_session_end_counts_the_usage_model_and_verdict() {
+    let h = keeping_sessions().await;
+    hook_event(&h, json!({ "agent_id": "cursor-review", "session_id": "r-1", "event": "start", "source": "startup", "client": "cursor" })).await;
+    let usage = json!({ "input": 22038, "output": 652, "cache_read": 14825, "cache_write": 0, "reasoning": 667 });
+    let end = json!({ "session_id": "r-1", "reason": "completed", "usage": usage, "model": "gpt-5.3-codex", "verdict": "warnings" });
+    assert_eq!(h.post_json("/v1/sessions/end", end).await.0, 204);
+
+    let rows = session_rows(&h, "r-1");
+    assert_eq!(rows.len(), 1);
+    let row = &rows[0];
+    assert_eq!((row.client.as_str(), row.end_reason.as_deref()), ("cursor", Some("completed")));
+    let tokens = |kind| row.count(CountKind::Tokens, kind);
+    assert_eq!((tokens("input"), tokens("output"), tokens("cache_read"), tokens("reasoning")), (22038, 652, 14825, 667));
+    assert_eq!(tokens("cache_write"), 0);
+    assert_eq!((row.count(CountKind::Model, "gpt-5.3-codex"), row.count(CountKind::Verdict, "warnings")), (1, 1));
+}
+
+#[tokio::test]
+async fn a_session_end_keeps_a_model_only_as_an_id() {
+    let h = keeping_sessions().await;
+    let models = [
+        ("r-upper", "GPT-5.3-Codex", "gpt-5.3-codex"),
+        ("r-auto", "auto", "auto"),
+        ("r-space", "gpt 5", "other"),
+        ("r-path", "C:/models/x", "other"),
+        ("r-long", &"m".repeat(65), "other"),
+        ("r-empty", "", "other"),
+    ];
+    for (id, model, _) in &models {
+        hook_event(&h, json!({ "agent_id": "cursor-review", "session_id": id, "event": "start" })).await;
+        let end = json!({ "session_id": id, "reason": "completed", "model": model, "verdict": "clean" });
+        assert_eq!(h.post_json("/v1/sessions/end", end).await.0, 204);
+    }
+    let rows = h.ctx.runtime.metrics.sessions().take().rows;
+    for (id, _, kept) in models {
+        let row = rows.iter().find(|r| r.session_id == id).expect("a row");
+        let names: Vec<&str> = row.counts.keys().filter(|(kind, _)| *kind == CountKind::Model).map(|(_, n)| n.as_str()).collect();
+        assert_eq!(names, [kept], "{id}");
+    }
+}
+
+#[tokio::test]
+async fn a_session_end_keeps_a_verdict_of_its_set() {
+    let h = keeping_sessions().await;
+    for (id, verdict) in [("r-1", "blocked"), ("r-2", "none"), ("r-3", "LGTM")] {
+        hook_event(&h, json!({ "agent_id": "cursor-review", "session_id": id, "event": "start" })).await;
+        let end = json!({ "session_id": id, "reason": "completed", "model": "auto", "verdict": verdict });
+        assert_eq!(h.post_json("/v1/sessions/end", end).await.0, 204);
+    }
+    let rows = h.ctx.runtime.metrics.sessions().take().rows;
+    let verdict = |id: &str| {
+        let row = rows.iter().find(|r| r.session_id == id).expect("a row");
+        row.counts.keys().filter(|(kind, _)| *kind == CountKind::Verdict).map(|(_, n)| n.clone()).collect::<Vec<_>>()
+    };
+    assert_eq!((verdict("r-1"), verdict("r-2"), verdict("r-3")), (vec!["blocked".to_string()], vec!["none".to_string()], vec!["other".to_string()]));
 }

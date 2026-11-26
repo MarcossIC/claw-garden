@@ -7,6 +7,10 @@ license.workspace = true
 repository.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+# Each file of `tests/` is a module of the one `integration` binary below: a
+# test binary links the whole dependency tree, and cargo links them in parallel.
+# `e5_golden` keeps a binary of its own, which only the `eval` feature builds.
+autotests = false
 
 [lints]
 workspace = true
@@ -64,6 +68,10 @@ tree-sitter-python.workspace = true
 tokenizers.workspace = true
 ignore.workspace = true
 regex.workspace = true
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
 
 [[test]]
 name = "e5_golden"

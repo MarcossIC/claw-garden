@@ -993,6 +993,14 @@ pub struct SessionEvent<'a> {
     pub client: &'a str,
 }
 
+/// What the end of a review run tells the daemon besides its reason.
+#[derive(Debug, Clone, Copy)]
+pub struct EndedRun<'a> {
+    pub usage: clawg_core::metrics::sessions::Usage,
+    pub model: &'a str,
+    pub verdict: &'a str,
+}
+
 /// A handle on one daemon: its address, its token, and a reusable HTTP client.
 #[derive(Debug, Clone)]
 pub struct DaemonClient {
@@ -1305,6 +1313,27 @@ impl DaemonClient {
     /// gave one. It names no project, so nothing is registered.
     pub async fn end_session(&self, session_id: &str, reason: Option<&str>) -> Result<(), ClientError> {
         let body = serde_json::json!({ "session_id": session_id, "reason": reason });
+        let answer = self.send(Call::new(reqwest::Method::POST, "/v1/sessions/end").json(&body)?).await?;
+        check_status(&answer)
+    }
+
+    /// [`DaemonClient::end_session`] for a run that reports what it spent,
+    /// its model and its verdict, which the daemon counts in its row.
+    pub async fn end_session_with(&self, session_id: &str, reason: &str, ended: &EndedRun<'_>) -> Result<(), ClientError> {
+        let usage = &ended.usage;
+        let body = serde_json::json!({
+            "session_id": session_id,
+            "reason": reason,
+            "usage": {
+                "input": usage.input,
+                "output": usage.output,
+                "cache_read": usage.cache_read,
+                "cache_write": usage.cache_write,
+                "reasoning": usage.reasoning,
+            },
+            "model": ended.model,
+            "verdict": ended.verdict,
+        });
         let answer = self.send(Call::new(reqwest::Method::POST, "/v1/sessions/end").json(&body)?).await?;
         check_status(&answer)
     }

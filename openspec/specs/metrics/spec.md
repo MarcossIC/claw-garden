@@ -11,6 +11,7 @@ Fuente de verdad del comportamiento actual de las métricas de uso del daemon: q
 - [retire-legacy-kinds](../../changes/archive/2026-11-07-retire-legacy-kinds/proposal.md), archivado el 2026-11-07, que sale en 0.79.0 (sólo los brazos de `search.duration`, sin `knn_episodic` ni `knn_skill`, y `search.knn_retry`, que sólo lleva `table` `memory`: lo que [`specs/retrieval`](../retrieval/spec.md) RL4 quita).
 - [session-usage](../../changes/archive/2026-11-11-session-usage/proposal.md), archivado el 2026-11-11, sale en 0.81.0: SU1 a SU12 de esa spec, con los mismos ids; cambian R3 y R4, el primer invariante y el límite «Sin etiqueta de agente».
 - [conflicts-on-demand](../../changes/archive/2026-11-23-conflicts-on-demand/proposal.md), archivado el 2026-11-23, que sale en 0.93.0: CO11 de esa spec suma a R14 la etiqueta `state` de `context.cut`.
+- [cursor-review](../../changes/archive/2026-11-26-cursor-review/plan.md), archivado el 2026-11-26, sale en 0.96.0: los contadores `tokens`, `model` y `verdict` de una sesión, en SU1, SU2, SU6 y SU11, y el modelo como cuarto identificador en los invariantes.
 
 ## Definiciones
 
@@ -228,7 +229,7 @@ Cada uno de estos MUST registrarse como un evento (R2) que el escritor guarda en
 `metrics.db` lleva, además de las tablas de R3, dos más (R3 dice cómo las recibe un archivo anterior y cómo se lee uno de un esquema más nuevo):
 
 - `session`: `session_id`, `started_at_ms`, `agent_id`, `project_id` (puede ser nulo), `client`, `utc_offset_s`, `last_seen_at_ms`, `last_save_at_ms`, `ended_at_ms`, `end_reason`, `prompts` y `empty_searches`, con clave (`session_id`, `started_at_ms`);
-- `session_count`: `session_id`, `started_at_ms`, `kind`, `name` y `count`, con clave (`session_id`, `started_at_ms`, `kind`, `name`). `kind` es `start`, `call`, `failed_call` o `save`.
+- `session_count`: `session_id`, `started_at_ms`, `kind`, `name` y `count`, con clave (`session_id`, `started_at_ms`, `kind`, `name`). `kind` es `start`, `call`, `failed_call`, `save`, `tokens`, `model` o `verdict`. Los tres últimos los escribe sólo el fin de una revisión (SU13) y no cambian el esquema: un clawg anterior los salta al leer (`store.rs`, la lectura de `session_count`), y uno que reescribe una fila abierta que los tenía los pierde.
 
 `memory.db` MUST NOT cambiar: ni su esquema, ni sus migraciones, ni lo que se guarda en él.
 
@@ -237,7 +238,7 @@ Cada uno de estos MUST registrarse como un evento (R2) que el escritor guarda en
 - WHEN se lo lee en sólo lectura, y después el daemon lo abre para escribir
 - THEN la lectura no da ninguna sesión y no cambia la versión; al abrirlo para escribir queda en la versión 3, las tres filas siguen iguales y una sesión escrita se lee de vuelta
 
-**Tests:** `a_file_of_schema_2_gets_its_sessions_and_keeps_its_rows`, `a_newer_schema_is_refused_untouched` en `crates/clawg-core/src/metrics/store.rs`.
+**Tests:** `a_file_of_schema_2_gets_its_sessions_and_keeps_its_rows`, `a_newer_schema_is_refused_untouched`, `review_counts_are_written_and_read_back`, `a_count_of_a_kind_this_clawg_does_not_know_is_skipped` en `crates/clawg-core/src/metrics/store.rs`.
 
 ## SU2. Una fila por sesión
 
@@ -250,6 +251,9 @@ El primer evento de hook de un id que no tiene una fila abierta MUST abrir una, 
 | una llamada a una herramienta | `kind` `call` y `name` la herramienta; si falló, también `kind` `failed_call` |
 | un save aceptado | `kind` `save` y `name` el tipo de memoria, y `last_save_at_ms` |
 | una búsqueda sin ningún hit | `empty_searches` |
+| los tokens de una revisión, mayores que cero | `kind` `tokens` y `name` `input`, `output`, `cache_read`, `cache_write` o `reasoning` |
+| el modelo de una revisión | `kind` `model` y `name` el modelo |
+| el veredicto de una revisión | `kind` `verdict` y `name` el veredicto |
 
 Cada `name` y el `client` MUST salir de un conjunto cerrado:
 
@@ -257,13 +261,16 @@ Cada `name` y el `client` MUST salir de un conjunto cerrado:
 - herramienta: las del contrato del agente (SU8);
 - tipo de memoria: los de `MemoryType`; un save que no declara tipo, `unspecified`;
 - `client`: `claude-code`, `cursor`;
-- `end_reason`: `clear`, `resume`, `logout`, `prompt_input_exit`, `completed`, `aborted`, `error`, `window_close`, `user_close`, `idle`.
+- `end_reason`: `clear`, `resume`, `logout`, `prompt_input_exit`, `completed`, `aborted`, `error`, `window_close`, `user_close`, `idle`;
+- veredicto: `clean`, `warnings`, `blocked`, `none`.
+
+El modelo no sale de un conjunto cerrado: es un id de 1 a 64 caracteres de `[a-z0-9._-]`, ya en minúsculas, u `other`.
 
 Un evento de hook que no dice qué pasó (el cuerpo de `POST /v1/sessions` de un clawg anterior) MUST abrir o seguir la fila sin contar nada. Una actividad atribuida a un id del que este daemon no tiene fila abierta ni cerrada MUST descartarse: sólo un evento de hook trae la identidad con la que se abre una fila.
 
 El proyecto de una fila es el del evento que la abrió y no cambia con los eventos siguientes.
 
-**Tests:** `a_session_opens_on_its_first_event_and_counts_what_follows`, `activity_of_an_unknown_session_is_dropped`, `a_name_outside_its_set_is_other` en `crates/clawg-core/src/metrics/sessions.rs`.
+**Tests:** `a_session_opens_on_its_first_event_and_counts_what_follows`, `activity_of_an_unknown_session_is_dropped`, `a_name_outside_its_set_is_other`, `an_end_with_usage_counts_its_tokens`, `an_end_with_usage_counts_its_model_and_verdict` en `crates/clawg-core/src/metrics/sessions.rs`.
 
 ## SU3. El cierre
 
@@ -313,14 +320,14 @@ Una fila cuya `last_seen_at_ms` tiene más de `HOURS_KEPT_MS` (400 días) MUST b
 Todas detrás del token; contestan `204` sin cuerpo, salvo `POST /v1/sessions/summary`, que lee la fila abierta de una sesión y contesta `{"ask": bool}` ([`specs/hooks`](../hooks/spec.md), SS1). Su lugar entre las rutas del daemon está en [`specs/daemon-access`](../daemon-access/spec.md), SU6.
 
 - `POST /v1/sessions` MUST registrar la sesión vigente del agente y del proyecto, y además aceptar `event` (`start` o `prompt`), `source` y `client`, los tres opcionales. Es un evento de hook de esa sesión (SU2). Un `event` desconocido MUST contar como uno que no dice qué pasó.
-- `POST /v1/sessions/end` (`session_id`, `reason` opcional) MUST cerrar la fila abierta de ese id (SU3). No toma proyecto y no registra ninguno. Un `session_id` inválido es un 400, con la misma regla que `POST /v1/sessions`.
+- `POST /v1/sessions/end` (`session_id`, `reason` opcional) MUST cerrar la fila abierta de ese id (SU3). No toma proyecto y no registra ninguno. Un `session_id` inválido es un 400, con la misma regla que `POST /v1/sessions`. Con `usage` (`input`, `output`, `cache_read`, `cache_write`, `reasoning`), `model` o `verdict`, opcionales, MUST contar antes en la fila abierta los tokens mayores que cero, el modelo y el veredicto (SU2). El modelo se pasa a minúsculas y es `other` si después no es un id; sin `model`, `other`. Un veredicto fuera de su conjunto es `other`, y sin `verdict`, `none`.
 - `POST /v1/sessions/calls` (`agent_id`, `project_id` opcional, `tool`, `failed`) MUST contar una llamada para la sesión vigente de ese agente y ese proyecto. Sin sesión vigente, no cuenta nada.
 
 `POST /v1/memories` MUST contar un save cuando lo acepta en el outbox (no cuando contesta por un `operation_id` cuyo save sigue esperando o falló) y lo selló con una sesión. `POST /v1/search` MUST contar una búsqueda vacía cuando no devuelve ningún hit, para la sesión vigente del agente y del proyecto de la petición; una búsqueda sobre varios proyectos no se atribuye.
 
 Nada de esto MUST cambiar lo que esas rutas contestan ni lo que se guarda en `memory.db`.
 
-**Tests:** `a_hook_event_opens_the_row_of_its_session_and_counts`, `a_daemon_that_keeps_no_metrics_keeps_no_sessions`, `a_session_end_closes_its_row_with_the_reason`, `a_tool_call_counts_for_the_session_of_its_agent_and_project`, `an_accepted_save_and_an_empty_search_count_for_their_session` en `crates/clawg-cli/tests/api.rs`.
+**Tests:** `a_hook_event_opens_the_row_of_its_session_and_counts`, `a_daemon_that_keeps_no_metrics_keeps_no_sessions`, `a_session_end_closes_its_row_with_the_reason`, `a_session_end_counts_the_usage_model_and_verdict`, `a_session_end_keeps_a_model_only_as_an_id`, `a_session_end_keeps_a_verdict_of_its_set`, `a_tool_call_counts_for_the_session_of_its_agent_and_project`, `an_accepted_save_and_an_empty_search_count_for_their_session` en `crates/clawg-cli/tests/api.rs`.
 
 ## SU7. Unir y borrar proyectos
 
@@ -362,6 +369,7 @@ Sin `--session`: `by`, `since_ms`, `idle_close_ms` y `groups`, de las filas cuya
 - `duration_ms` (`total`, `mean` y `max`), del comienzo al cierre; de una fila abierta, hasta su última actividad;
 - `since_last_save_ms` (`sessions`, `mean` y `max`), del último save al cierre, de las filas cerradas que guardaron algo;
 - `prompts`, `empty_searches`, `starts` por `source`, `calls` por herramienta (`count` y `failed`) y `saves` por tipo;
+- `tokens` por tipo, `models` y `verdicts`, sumados, vacíos donde ninguna fila los tiene;
 - `with_summary` y `with_summary_pct`: las filas que guardaron un `session_summary`.
 
 Una fila abierta cuya última actividad tiene 6 horas o más MUST leerse como cerrada con `idle` en esa hora, aunque el archivo todavía la tenga abierta.
@@ -375,7 +383,7 @@ Sin `metrics.db` MUST salir con 1 diciendo que el daemon lo escribe salvo con `C
 - WHEN se reporta por proyecto
 - THEN el grupo P trae `sessions` 2, `ended` con `clear` 1 e `idle` 1, `open` 0 y `with_summary_pct` 50, y hay un grupo con `key` nulo
 
-**Tests:** `a_report_groups_sessions_by_project_agent_and_day`, `an_open_session_past_six_hours_reads_as_idle`, `the_time_since_the_last_save_counts_closed_sessions_that_saved` en `session_report.rs`; `the_sessions_report_reads_the_file_without_a_daemon`, `one_session_is_listed_with_each_of_its_rows` en `crates/clawg-cli/src/metrics.rs`; `metrics_sessions_takes_a_grouping_an_age_and_a_session` en `cli.rs`.
+**Tests:** `a_report_groups_sessions_by_project_agent_and_day`, `an_open_session_past_six_hours_reads_as_idle`, `the_time_since_the_last_save_counts_closed_sessions_that_saved`, `a_report_sums_the_tokens_models_and_verdicts` en `session_report.rs`; `the_sessions_report_reads_the_file_without_a_daemon`, `one_session_is_listed_with_each_of_its_rows` en `crates/clawg-cli/src/metrics.rs`; `metrics_sessions_takes_a_grouping_an_age_and_a_session` en `cli.rs`.
 
 ## SU12. De punta a punta
 
@@ -384,17 +392,23 @@ Sin `metrics.db` MUST salir con 1 diciendo que el daemon lo escribe salvo con `C
 - `a_daemon_keeps_each_session_across_a_restart_and_reports_them`: un `session-start` con id S; dos llamadas por el puente y un `user-prompt-submit`; un `session-start` con `source=clear` e id S2; un reinicio del daemon y un prompt de S2. Da S con 2 llamadas y 1 prompt, S2 con una sola fila que empezó antes del reinicio y tiene su prompt, y el reporte por proyecto con las dos.
 - `a_session_end_closes_the_session_and_what_follows_opens_another`: un `session-end` de S con motivo `clear` la cierra con ese motivo, y un prompt posterior de S abre una fila nueva.
 
+## SU13. La sesión de una revisión
+
+`clawg review` ([`specs/review`](../review/spec.md)) MUST registrar la sesión que nombra el CLI de Cursor con `POST /v1/sessions` (evento `start`, `source` `startup` o `resume`, cliente `cursor`), para su agente y el proyecto de la carpeta donde corre, y MUST cerrarla con `POST /v1/sessions/end`, `completed` o `error`, con su `usage`, su modelo y su veredicto. Las llamadas del puente del revisor se cuentan en esa fila como las de cualquier puente (SU8).
+
+**Tests:** `a_review_runs_the_cursor_cli_and_records_its_session`, `a_review_whose_cursor_fails_ends_its_session_as_error`, `a_resumed_review_starts_as_resume` en `crates/clawg-cli/tests/binary.rs`.
+
 ## Invariantes
 
 - Nada de esto sale de la máquina.
 - **Las series y los eventos son cerrados:** ninguna etiqueta de una serie y ningún detalle de un evento lleva texto de una memoria, una consulta, una ruta de fichero o un id. Cada valor sale de un conjunto cerrado escrito en el código.
-- **`session` y `session_count` son el único lugar de `metrics.db` con ids,** y sólo con tres: el de la sesión que da el cliente, el del agente y el del proyecto. Todo otro valor de texto de esas tablas (`client`, `end_reason`, `kind`, `name`) sale de un conjunto cerrado.
+- **`session` y `session_count` son el único lugar de `metrics.db` con ids,** y sólo con tres: el de la sesión que da el cliente, el del agente y el del proyecto. Además, el modelo de una revisión es un cuarto identificador, acotado a 1 a 64 caracteres de `[a-z0-9._-]`. Todo otro valor de texto de esas tablas (`client`, `end_reason`, `kind`, `name`) sale de un conjunto cerrado.
 - **Está prohibido en todo `metrics.db`, estas tablas incluidas:** el texto de una memoria, de una consulta o de un prompt; una ruta de fichero o de carpeta, el `cwd` y el `transcript_path` del hook incluidos; y el usuario: su nombre, su email (el `user_email` de Cursor) o cualquier otro dato que lo identifique.
 - `memory.db`, su esquema y lo que ve el modelo no cambian por las métricas.
 - Ninguna serie cambia lo que el daemon hace ni lo que contesta. Una medición que falla se deja fuera; nunca falla una petición ni para un worker.
 - Borrar `metrics.db` sólo pierde la historia de métricas; el próximo arranque lo crea de nuevo.
 
-**Test:** `no_text_path_or_user_reaches_a_session_row` en `crates/clawg-cli/tests/api.rs`: un prompt, una consulta, un save y un hook con `cwd`, `transcript_path` y `user_email` no dejan en las filas nada más que los tres ids y valores de los conjuntos cerrados.
+**Test:** `no_text_path_or_user_reaches_a_session_row` en `crates/clawg-cli/tests/api.rs`: un prompt, una consulta, un save, un hook con `cwd`, `transcript_path` y `user_email`, y un fin con un `model` y un `verdict` que son texto, no dejan en las filas nada más que los tres ids y valores de los conjuntos cerrados.
 
 ## Límites conocidos
 

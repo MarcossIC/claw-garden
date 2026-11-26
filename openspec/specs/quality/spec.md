@@ -1,6 +1,6 @@
 # quality — Especificación
 
-Fuente de verdad de las redes de tests que vigilan lo que el modelo ve del servidor MCP, la convención de no esconder código muerto y la de no dejar un store abierto en un test de integración, de cómo se organiza por dentro el despacho de los comandos de `clawg`, de en qué carpetas vive el código de `clawg_core::memory` y qué carpeta puede nombrar a cuál, y de dónde están documentados esos chequeos. Ninguno cambia el comportamiento de un comando, una ruta o una herramienta. Lo que hace cada herramienta está en [`specs/mcp`](../mcp/spec.md), y lo que dice cada comando, en la spec de su dominio.
+Fuente de verdad de las redes de tests que vigilan lo que el modelo ve del servidor MCP, la convención de no esconder código muerto y la de no dejar un store abierto en un test de integración, de qué mantiene la compilación de la suite dentro de la memoria de una máquina de desarrollo, de cómo se organiza por dentro el despacho de los comandos de `clawg`, de en qué carpetas vive el código de `clawg_core::memory` y qué carpeta puede nombrar a cuál, y de dónde están documentados esos chequeos. Ninguno cambia el comportamiento de un comando, una ruta o una herramienta. Lo que hace cada herramienta está en [`specs/mcp`](../mcp/spec.md), y lo que dice cada comando, en la spec de su dominio.
 
 **Origen:**
 - [quality-guards](../../changes/archive/2026-10-15-quality-guards/proposal.md), archivado el 2026-10-15. Los ids de requisito son los de esa spec. R5 (borrar el código sin llamador que escondían los `allow`) fue un arreglo de una vez y no queda como requisito: lo que impide que vuelva es R4 y el comando de `clippy` de R6. R3 (que la línea `MCP tools` de `.claude/CLAUDE.md` nombrara las herramientas registradas) se quitó: ningún test lee un archivo de instrucciones para agentes (R6).
@@ -8,6 +8,7 @@ Fuente de verdad de las redes de tests que vigilan lo que el modelo ve del servi
 - [clippy-enforced](../../changes/archive/2026-11-03-clippy-enforced/proposal.md), archivado el 2026-11-03, cuyo código salió en 0.73.0 (CE1, CE3 y CE4 en R6: qué lints de clippy rigen, cómo se anota una excepción y qué dicen los docs; CE2 está en [`specs/install`](../install/spec.md), «CI»).
 - [cli-dispatch](../../changes/archive/2026-11-04-cli-dispatch/proposal.md), archivado el 2026-11-04, sale en 0.75.0 (CD1 a CD4). No cambió ningún comando: el binario de antes y el de después dieron la misma salida, el mismo stderr y el mismo código en 244 casos, y `crates/clawg-cli/tests/binary.rs` pasó sin editarse ([verify](../../changes/archive/2026-11-04-cli-dispatch/verify.md#el-binario-de-antes-y-el-de-después)).
 - [memory-module-layout](../../changes/archive/2026-11-13-memory-module-layout/proposal.md), archivado el 2026-11-13, sale en 0.87.0 (ML1 a ML5, en «Las carpetas de `memory`»). Sus R1 a R5 son ML1 a ML5 acá, para no chocar con los ids de esta spec. R6, que ninguna firma, tipo ni respuesta cambia, es de conservación y no se consolida. R7, que las citas de las specs, de `docs/reference` y del golden de docs nombren archivos que existen, fue un barrido de una vez ([verify](../../changes/archive/2026-11-13-memory-module-layout/verify.md#las-citas)). El motivo del reparto y de cada grupo en círculo está en su [diseño](../../changes/archive/2026-11-13-memory-module-layout/design.md#d1-el-reparto).
+- [suite-memory](../../changes/archive/2026-11-25-suite-memory/plan.md), archivado el 2026-11-25, sale en 0.95.0 (R8). Con 8 jobs, `rust-lld` y un binario de integración por crate, compilar los tests pasó de cortarse con los jobs por defecto a un pico de 7,3 GB en 92 s ([verificación](../../changes/archive/2026-11-25-suite-memory/plan.md#verificación)).
 
 ## Definiciones
 
@@ -119,7 +120,7 @@ Reconocer el atributo en una línea MUST ser una función pura (`hides_dead_code
 
 Un test bajo `crates/*/tests` que abre un runtime con `MemoryRuntime::open` MUST llamar a `MemoryRuntime::close` antes de terminar. Soltar un runtime sólo le avisa al hilo de su conexión, y en Windows un archivo abierto no se puede borrar: `tempfile` se rinde sin error, el store queda en el temporal del sistema y ningún test falla. Un test de integración no alcanza `crate::test_dir`, que en `src/` detecta este caso. El test de esta convención MUST fallar con la ruta, relativa a `crates/`, y el nombre de cada test que no cierra.
 
-Reconocerlo MUST ser una función pura (`tests_leaving_a_store_open`, `crates/clawg-cli/tests/conventions.rs:1668`). Lee el texto de cada test: un `.close().await` alcanza, así que un test con dos runtimes puede dejar uno abierto.
+Reconocerlo MUST ser una función pura (`tests_leaving_a_store_open`, `crates/clawg-cli/tests/conventions.rs:1805`). Lee el texto de cada test: un `.close().await` alcanza, así que un test con dos runtimes puede dejar uno abierto.
 
 #### Escenario: un test que abre en disco y no cierra
 - GIVEN un test con `MemoryRuntime::open` y sin `.close().await`
@@ -131,7 +132,28 @@ Reconocerlo MUST ser una función pura (`tests_leaving_a_store_open`, `crates/cl
 - WHEN corre la convención
 - THEN no cuenta
 
-**Test:** `an_integration_test_closes_the_store_it_opens_on_disk` (`conventions.rs:1707`) y el puro `tests_leaving_a_store_open_names_each_test_without_a_close` (`conventions.rs:1679`).
+**Test:** `an_integration_test_closes_the_store_it_opens_on_disk` (`conventions.rs:1844`) y el puro `tests_leaving_a_store_open_names_each_test_without_a_close` (`conventions.rs:1816`).
+
+## R8. La suite compila en la memoria de una máquina de desarrollo
+
+Cada rustc o enlazador de un binario de test ocupa entre uno y tres gigabytes, cada binario de test enlaza el árbol entero de dependencias, y cargo corre por defecto un job por núcleo lógico. Con 16 núcleos, la compilación supera los 32 GB. La línea base, las mediciones y lo que se descartó están en el [plan](../../changes/archive/2026-11-25-suite-memory/plan.md).
+
+- Cada crate con una carpeta `tests/` MUST decir `autotests = false` en `[package]` y declarar el `[[test]]` `integration` en `tests/integration.rs`. Todo `.rs` de la raíz de `tests/` MUST ser `integration.rs`, un `mod` que `integration.rs` declara o el archivo de un `[[test]]` propio del manifiesto, como `e5_golden`, que necesita la feature `eval`. Reconocerlo MUST ser una función pura (`test_files_outside_the_integration_binary`, `crates/clawg-cli/tests/conventions.rs:2025`).
+- `.cargo/config.toml` MUST decir `linker = "rust-lld"` en `[target.x86_64-pc-windows-msvc]`.
+- `.cargo/config.toml` MUST fijar `jobs` en `[build]` con un entero positivo.
+- Cada job de un workflow de `.github/workflows/` que corre cargo (`cargo build`, `test`, `clippy`, `check`, `run`, `doc`, `bench` o `nextest`) MUST tener `CARGO_BUILD_JOBS: default` en una línea que no sea un comentario, propia o del `env` del workflow. Reconocerlo MUST ser una función pura (`jobs_running_cargo_without_the_jobs_cap`, `conventions.rs:1986`). En una máquina con menos núcleos, un número fijo correría más jobs de los que tiene.
+
+#### Escenario: un archivo de test suelto
+- GIVEN un `tests/loose.rs` que ningún `mod` de `integration.rs` declara y que no es un `[[test]]` del manifiesto
+- WHEN corre la convención
+- THEN falla y nombra el crate y el archivo
+
+#### Escenario: un workflow que compila sin levantar el tope
+- GIVEN un job que corre `cargo test` y tiene `CARGO_BUILD_JOBS: default` sólo en un comentario
+- WHEN corre la convención
+- THEN falla y nombra el workflow y el job
+
+**Test:** `each_crate_builds_one_integration_binary` (`conventions.rs:2087`) y el puro `test_files_outside_the_integration_binary_names_each_one` (`conventions.rs:2078`), `windows_links_with_rust_lld` (`conventions.rs:1905`), `the_build_caps_its_jobs` (`conventions.rs:1913`), y `ci_lifts_the_jobs_cap` (`conventions.rs:1922`) con el puro `jobs_running_cargo_without_the_jobs_cap_reads_each_job` (`conventions.rs:1995`).
 
 ## CD1. Un error llega a `main` con su tipo y su texto
 
@@ -293,7 +315,7 @@ Los grupos de más de un módulo en los que cada uno depende de los demás, dire
 La regla MUST fallar tanto por un grupo que no está listado como por uno listado que ya no existe, y MUST imprimir cada grupo que encontró con su tamaño y la cantidad de módulos de `memory`, para que la cuenta se pueda leer de ahí:
 
 ```bash
-cargo test -p clawg-cli --test conventions the_memory_modules_cycle_only_where_listed
+cargo test -p clawg-cli --test integration conventions::the_memory_modules_cycle_only_where_listed
 ```
 
 #### Escenario: un ciclo nuevo

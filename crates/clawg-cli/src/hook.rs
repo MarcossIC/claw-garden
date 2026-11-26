@@ -725,7 +725,7 @@ fn remember(dir: &Path, tool: &str, session: &str, observed: &[Observation]) -> 
 /// letting the daemon read its files. A daemon that cannot register reads as
 /// the id derived from the root, as the bridge reads it; one from before
 /// assigned ids that refuses the root, as nothing.
-async fn project_of(client: &DaemonClient, cwd: &Path) -> Option<String> {
+pub(crate) async fn project_of(client: &DaemonClient, cwd: &Path) -> Option<String> {
     let cwd = cwd.to_path_buf();
     let identity = blocking(move || ProjectIdentity::resolve(&cwd)).await?;
     let legacy = identity.legacy_ids();

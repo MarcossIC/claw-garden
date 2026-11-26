@@ -1900,3 +1900,216 @@ fn the_embedded_key_list_has_the_primary_and_backup_keys_and_not_the_test_key() 
         "a release must never trust the key the tests sign with"
     );
 }
+
+#[test]
+fn windows_links_with_rust_lld() {
+    // link.exe needs about half again the memory of rust-lld for each test
+    // binary, and the suite links several of them at once.
+    let config = read_repo_file(".cargo/config.toml");
+    assert_eq!(manifest_value(&config, "target.x86_64-pc-windows-msvc", "linker").as_deref(), Some(r#""rust-lld""#));
+}
+
+#[test]
+fn the_build_caps_its_jobs() {
+    // By default cargo runs one job per logical core, and each rustc or linker
+    // of a test binary takes one to three gigabytes.
+    let config = read_repo_file(".cargo/config.toml");
+    let jobs = manifest_value(&config, "build", "jobs").expect("[build] sets jobs");
+    assert!(jobs.parse::<u32>().is_ok_and(|n| n > 0), "jobs is a positive integer, not {jobs}");
+}
+
+#[test]
+fn ci_lifts_the_jobs_cap() {
+    // A fixed cap is not a ceiling: on a runner with fewer cores it would run
+    // more jobs than the runner has.
+    let workflows = repo_root().join(".github/workflows");
+    let mut compiling = 0;
+    let mut uncapped = Vec::new();
+    for entry in fs::read_dir(&workflows).expect("read .github/workflows").flatten() {
+        let path = entry.path();
+        let text = fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        compiling += jobs_running_cargo(&text).len();
+        for job in jobs_running_cargo_without_the_jobs_cap(&text) {
+            uncapped.push(format!("{}: {job}", path.display()));
+        }
+    }
+    assert!(compiling > 0, "no workflow job runs cargo");
+    assert!(uncapped.is_empty(), "set CARGO_BUILD_JOBS: default in the env of each job that runs cargo:\n{}", uncapped.join("\n"));
+}
+
+/// The lines of a workflow before `jobs:`, and each job with its lines, all
+/// without comment lines. A job is a key two spaces in under `jobs:`.
+fn workflow_jobs(workflow: &str) -> (Vec<&str>, Vec<(&str, Vec<&str>)>) {
+    let mut preamble = Vec::new();
+    let mut jobs: Vec<(&str, Vec<&str>)> = Vec::new();
+    let mut in_jobs = false;
+    for line in workflow.lines().filter(|line| !line.trim_start().starts_with('#')) {
+        if !line.starts_with(' ') && !line.trim().is_empty() {
+            in_jobs = line.trim_end() == "jobs:";
+            if !in_jobs {
+                preamble.push(line);
+            }
+            continue;
+        }
+        if !in_jobs {
+            preamble.push(line);
+            continue;
+        }
+        let job_key = line.strip_prefix("  ").filter(|rest| !rest.starts_with(' ')).and_then(|rest| rest.trim_end().strip_suffix(':'));
+        match (job_key, jobs.last_mut()) {
+            (Some(name), _) => jobs.push((name, Vec::new())),
+            (None, Some((_, lines))) => lines.push(line),
+            (None, None) => {}
+        }
+    }
+    (preamble, jobs)
+}
+
+fn runs_cargo(lines: &[&str]) -> bool {
+    let commands = ["build", "test", "clippy", "check", "run", "doc", "bench", "nextest"];
+    lines.iter().any(|line| commands.iter().any(|command| line.contains(&format!("cargo {command}"))))
+}
+
+fn sets_the_jobs_cap_default(lines: &[&str]) -> bool {
+    lines.iter().any(|line| line.trim() == "CARGO_BUILD_JOBS: default")
+}
+
+/// The jobs of a workflow that run cargo.
+fn jobs_running_cargo(workflow: &str) -> Vec<&str> {
+    let (_, jobs) = workflow_jobs(workflow);
+    jobs.into_iter().filter(|(_, lines)| runs_cargo(lines)).map(|(name, _)| name).collect()
+}
+
+/// The jobs of a workflow that run cargo with the jobs cap of
+/// `.cargo/config.toml`: neither the job nor the workflow sets
+/// `CARGO_BUILD_JOBS: default`.
+fn jobs_running_cargo_without_the_jobs_cap(workflow: &str) -> Vec<&str> {
+    let (preamble, jobs) = workflow_jobs(workflow);
+    if sets_the_jobs_cap_default(&preamble) {
+        return Vec::new();
+    }
+    jobs.into_iter().filter(|(_, lines)| runs_cargo(lines) && !sets_the_jobs_cap_default(lines)).map(|(name, _)| name).collect()
+}
+
+#[test]
+fn jobs_running_cargo_without_the_jobs_cap_reads_each_job() {
+    let workflow = "\
+on: push
+jobs:
+  lint:
+    env:
+      CARGO_BUILD_JOBS: default
+    steps:
+      - run: cargo clippy --workspace
+  test:
+    env:
+      # CARGO_BUILD_JOBS: default
+      CARGO_TERM_COLOR: always
+    steps:
+      - run: |
+          cargo test --workspace
+  docs:
+    steps:
+      - run: echo cargo is not run here
+      # - run: cargo build
+";
+    assert_eq!(jobs_running_cargo(workflow), ["lint", "test"]);
+    assert_eq!(jobs_running_cargo_without_the_jobs_cap(workflow), ["test"]);
+    let capped_for_all = format!("env:\n  CARGO_BUILD_JOBS: default\n{workflow}");
+    assert!(jobs_running_cargo_without_the_jobs_cap(&capped_for_all).is_empty());
+}
+
+/// The `.rs` files at the root of a crate's `tests/` that no test binary but
+/// their own would build: neither `integration.rs`, nor a `mod` that
+/// `integration` declares, nor the file of a `[[test]]` of the manifest.
+fn test_files_outside_the_integration_binary(files: &[&str], integration: Option<&str>, manifest: &str) -> Vec<String> {
+    let declared: Vec<&str> = integration
+        .unwrap_or("")
+        .lines()
+        .filter_map(|line| {
+            let mut line = line.trim();
+            while line.starts_with("#[") {
+                line = line.split_once(']').map_or("", |(_, rest)| rest).trim();
+            }
+            line.strip_prefix("mod ")?.strip_suffix(';').map(str::trim)
+        })
+        .collect();
+    let own: Vec<String> = manifest_test_targets(manifest)
+        .into_iter()
+        .filter(|(name, _)| name != "integration")
+        .map(|(name, path)| path.unwrap_or(format!("tests/{name}.rs")))
+        .collect();
+    files
+        .iter()
+        .filter(|file| **file != "integration.rs")
+        .filter(|file| !declared.contains(&file.trim_end_matches(".rs")))
+        .filter(|file| !own.contains(&format!("tests/{file}")))
+        .map(|file| file.to_string())
+        .collect()
+}
+
+/// The `name` and `path` of each `[[test]]` of a manifest.
+fn manifest_test_targets(manifest: &str) -> Vec<(String, Option<String>)> {
+    let mut targets: Vec<(String, Option<String>)> = Vec::new();
+    let mut inside = false;
+    for line in manifest.lines() {
+        let line = line.split(" #").next().unwrap_or("").trim();
+        if line.starts_with('[') {
+            inside = line == "[[test]]";
+            if inside {
+                targets.push((String::new(), None));
+            }
+            continue;
+        }
+        let (Some(target), Some((key, value))) = (targets.last_mut().filter(|_| inside), line.split_once('=')) else {
+            continue;
+        };
+        let value = value.trim().trim_matches('"').to_string();
+        match key.trim() {
+            "name" => target.0 = value,
+            "path" => target.1 = Some(value),
+            _ => {}
+        }
+    }
+    targets
+}
+
+#[test]
+fn test_files_outside_the_integration_binary_names_each_one() {
+    let manifest = "[package]\nautotests = false\n\n[[test]]\nname = \"integration\"\npath = \"tests/integration.rs\"\n\n[[test]]\nname = \"golden\"\nrequired-features = [\"eval\"]\n";
+    let integration = "//! docs\nmod api;\n#[cfg(windows)] mod socket;\n// mod commented;\n";
+    let files = ["integration.rs", "api.rs", "socket.rs", "golden.rs", "commented.rs", "loose.rs"];
+    assert_eq!(test_files_outside_the_integration_binary(&files, Some(integration), manifest), ["commented.rs", "loose.rs"]);
+    assert_eq!(test_files_outside_the_integration_binary(&["api.rs"], None, ""), ["api.rs"]);
+}
+
+#[test]
+fn each_crate_builds_one_integration_binary() {
+    // Each test binary links the whole dependency tree, and cargo links them
+    // in parallel: one per crate keeps the number of links down.
+    let crates = repo_root().join("crates");
+    for krate in fs::read_dir(&crates).expect("read crates/").flatten() {
+        let tests = krate.path().join("tests");
+        let Ok(entries) = fs::read_dir(&tests) else { continue };
+        let files: Vec<String> = entries
+            .flatten()
+            .filter(|e| e.path().is_file())
+            .filter_map(|e| e.file_name().to_str().map(str::to_string))
+            .filter(|name| name.ends_with(".rs"))
+            .collect();
+        if files.is_empty() {
+            continue;
+        }
+        let name = krate.file_name().to_string_lossy().to_string();
+        let manifest = fs::read_to_string(krate.path().join("Cargo.toml")).expect("read the manifest");
+        assert_eq!(manifest_value(&manifest, "package", "autotests").as_deref(), Some("false"), "{name} sets autotests = false");
+        assert!(
+            manifest_test_targets(&manifest).contains(&("integration".to_string(), Some("tests/integration.rs".to_string()))),
+            "{name} declares the [[test]] integration at tests/integration.rs"
+        );
+        let integration = fs::read_to_string(tests.join("integration.rs")).ok();
+        let files: Vec<&str> = files.iter().map(String::as_str).collect();
+        let outside = test_files_outside_the_integration_binary(&files, integration.as_deref(), &manifest);
+        assert!(outside.is_empty(), "{name}: declare each as a `mod` of tests/integration.rs: {outside:?}");
+    }
+}

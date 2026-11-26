@@ -1110,6 +1110,47 @@ PRAGMA user_version = 2;";
     }
 
     #[test]
+    fn review_counts_are_written_and_read_back() {
+        let dir = crate::test_dir::test_dir();
+        let path = dir.path().join(METRICS_FILE);
+        let mut db = MetricsDb::open(&path, NOW).unwrap();
+        let mut review = session("r", Some("p"), NOW, NOW + 5);
+        review.counts.insert((CountKind::Tokens, "input".into()), 22_038);
+        review.counts.insert((CountKind::Tokens, "cache_read".into()), 14_825);
+        review.counts.insert((CountKind::Model, "gpt-5.3-codex".into()), 1);
+        review.counts.insert((CountKind::Verdict, "warnings".into()), 1);
+        review.ended_at_ms = Some(NOW + 5);
+        review.end_reason = Some("completed".into());
+        db.write_sessions(&rows(vec![review.clone()])).unwrap();
+        drop(db);
+
+        let db = MetricsDb::open_read_only(&path).unwrap();
+        assert_eq!(db.sessions_of("r").unwrap(), [review]);
+    }
+
+    #[test]
+    fn a_count_of_a_kind_this_clawg_does_not_know_is_skipped() {
+        let dir = crate::test_dir::test_dir();
+        let path = dir.path().join(METRICS_FILE);
+        let mut db = MetricsDb::open(&path, NOW).unwrap();
+        let mut known = session("s", Some("p"), NOW, NOW + 5);
+        known.counts.insert((CountKind::Call, "search_memory".into()), 2);
+        db.write_sessions(&rows(vec![known.clone()])).unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO session_count (session_id, started_at_ms, kind, name, count) VALUES ('s', ?1, 'from_a_later_clawg', 'x', 7)",
+                params![NOW],
+            )
+            .unwrap();
+        drop(db);
+
+        let db = MetricsDb::open_read_only(&path).unwrap();
+        let version: i64 = db.conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(version, 3);
+        assert_eq!(db.sessions_of("s").unwrap(), [known], "the row and the counts it knows, nothing else");
+    }
+
+    #[test]
     fn sessions_are_written_whole_and_read_back() {
         let dir = crate::test_dir::test_dir();
         let path = dir.path().join(METRICS_FILE);
