@@ -194,6 +194,8 @@ pub enum Said<'a> {
     TwoPresses,
     /// How many rows do not fit, above the ones shown or below them.
     More { above: bool, rows: usize },
+    /// The picker was left without a model confirmed.
+    NotChosen,
 }
 
 /// `said` in `lang`.
@@ -305,6 +307,10 @@ pub fn says(lang: Lang, said: &Said<'_>) -> String {
                 Lang::Es => format!("{arrow} {rows} más"),
             }
         }
+        Said::NotChosen => match lang {
+            Lang::En => "No model was chosen; nothing was changed.".to_string(),
+            Lang::Es => "No se eligió ningún modelo; no se cambió nada.".to_string(),
+        },
     }
 }
 
@@ -424,6 +430,7 @@ mod tests {
             Said::TwoPresses,
             Said::More { above: true, rows: 3 },
             Said::More { above: false, rows: 3 },
+            Said::NotChosen,
         ];
         for said in &all {
             let (en, es) = (says(Lang::En, said), says(Lang::Es, said));

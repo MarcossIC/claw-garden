@@ -15,6 +15,7 @@
 
 pub mod picker;
 pub mod prefs;
+pub mod terminal;
 
 use std::ffi::OsString;
 use std::io::{BufRead, BufReader, IsTerminal, Read, Write};
@@ -381,6 +382,42 @@ fn list_models(cursor: Option<&Path>, lang: Lang) -> Result<Vec<prefs::ListedMod
     Ok(list)
 }
 
+/// How a model is asked for when none was given.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ask {
+    /// With the picker, which reads keys and draws on the terminal.
+    Keys,
+    /// By its number or its id, read as a line: what is shown goes somewhere
+    /// the picker cannot draw on.
+    Typed,
+    /// Not at all: nobody is there to answer.
+    Nobody,
+}
+
+fn how_to_ask(stdin_is_terminal: bool, stdout_is_terminal: bool) -> Ask {
+    match (stdin_is_terminal, stdout_is_terminal) {
+        (false, _) => Ask::Nobody,
+        (true, true) => Ask::Keys,
+        (true, false) => Ask::Typed,
+    }
+}
+
+/// The picker over this process's terminal; `None` when the terminal cannot
+/// be read key by key. The terminal is as it was when this returns.
+fn pick_with_keys(list: &[prefs::ListedModel], in_use: &str, lang: Lang) -> Option<std::io::Result<picker::Outcome>> {
+    let mut terminal = terminal::RawTerminal::enter()?;
+    Some(picker::run(&mut picker::Picker::new(list, in_use), lang, &mut terminal))
+}
+
+/// What a finished picker leaves: the model to keep, or what to say of a
+/// choice that was not made.
+fn picked(outcome: picker::Outcome, lang: Lang) -> Result<String, String> {
+    match outcome {
+        picker::Outcome::Chosen(model) => Ok(model),
+        picker::Outcome::Open | picker::Outcome::Cancelled => Err(prefs::says(lang, &prefs::Said::NotChosen)),
+    }
+}
+
 /// The project id the daemon gives this folder, starting the daemon if it is
 /// not running.
 async fn folder_project(profile: Profile, base_dir: &Path) -> Result<Option<String>, CliError> {
@@ -424,19 +461,36 @@ pub async fn set_model(opts: SetReviewModel, profile: Profile, base_dir: &Path) 
                 return Ok(ExitCode::from(EXIT_USAGE));
             };
             let in_use = prefs::resolve(None, &chosen, project.as_deref());
-            println!("{}", say(prefs::Said::ListHeader));
-            println!("{}", prefs::numbered(list, &in_use));
             let stdin = std::io::stdin();
-            if !stdin.is_terminal() {
-                eprintln!("clawg: {}", say(prefs::Said::NeedsModel));
-                return Ok(ExitCode::from(EXIT_USAGE));
+            let ask = how_to_ask(stdin.is_terminal(), std::io::stdout().is_terminal());
+            let with_keys = match ask {
+                Ask::Keys => pick_with_keys(list, &in_use, lang),
+                Ask::Typed | Ask::Nobody => None,
+            };
+            match with_keys {
+                Some(outcome) => match picked(outcome?, lang) {
+                    Ok(model) => model,
+                    Err(not_chosen) => {
+                        println!("{not_chosen}");
+                        return Ok(ExitCode::SUCCESS);
+                    }
+                },
+                // No picker: the whole list, and its number or id typed.
+                None => {
+                    println!("{}", say(prefs::Said::ListHeader));
+                    println!("{}", prefs::numbered(list, &in_use));
+                    if ask == Ask::Nobody {
+                        eprintln!("clawg: {}", say(prefs::Said::NeedsModel));
+                        return Ok(ExitCode::from(EXIT_USAGE));
+                    }
+                    print!("{}", say(prefs::Said::Prompt));
+                    std::io::stdout().flush()?;
+                    let mut answer = String::new();
+                    stdin.lock().read_line(&mut answer)?;
+                    let answer = answer.trim();
+                    prefs::choose(answer, list).ok_or_else(|| CliError::Failed(say(prefs::Said::NotInList { model: answer })))?
+                }
             }
-            print!("{}", say(prefs::Said::Prompt));
-            std::io::stdout().flush()?;
-            let mut answer = String::new();
-            stdin.lock().read_line(&mut answer)?;
-            let answer = answer.trim();
-            prefs::choose(answer, list).ok_or_else(|| CliError::Failed(say(prefs::Said::NotInList { model: answer })))?
         }
     };
     // Read again: the list or a person at the terminal may have taken a
@@ -529,6 +583,24 @@ async fn drive(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_picker_needs_both_ends_on_a_terminal() {
+        assert_eq!(how_to_ask(true, true), Ask::Keys);
+        assert_eq!(how_to_ask(true, false), Ask::Typed, "a person answers, but the screen is not theirs to draw on");
+        assert_eq!(how_to_ask(false, true), Ask::Nobody);
+        assert_eq!(how_to_ask(false, false), Ask::Nobody);
+    }
+
+    #[test]
+    fn a_cancelled_choice_says_nothing_changed() {
+        assert_eq!(picked(picker::Outcome::Chosen("gpt-5.6-sol-high".into()), Lang::Es), Ok("gpt-5.6-sol-high".to_string()));
+        let es = picked(picker::Outcome::Cancelled, Lang::Es).unwrap_err();
+        assert!(es.contains("no se cambió nada"), "{es}");
+        let en = picked(picker::Outcome::Cancelled, Lang::En).unwrap_err();
+        assert!(en.contains("nothing was changed"), "{en}");
+        assert_eq!(picked(picker::Outcome::Open, Lang::En), Err(en), "a picker that ended without a choice chose none");
+    }
 
     #[test]
     fn the_prompt_is_the_instructions_without_frontmatter_and_the_message() {
