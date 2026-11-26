@@ -1908,3 +1908,30 @@ fn windows_links_with_rust_lld() {
     let config = read_repo_file(".cargo/config.toml");
     assert_eq!(manifest_value(&config, "target.x86_64-pc-windows-msvc", "linker").as_deref(), Some(r#""rust-lld""#));
 }
+
+#[test]
+fn the_build_caps_its_jobs() {
+    // By default cargo runs one job per logical core, and each rustc or linker
+    // of a test binary takes one to three gigabytes.
+    let config = read_repo_file(".cargo/config.toml");
+    let jobs = manifest_value(&config, "build", "jobs").expect("[build] sets jobs");
+    assert!(jobs.parse::<u32>().is_ok_and(|n| n > 0), "jobs is a positive integer, not {jobs}");
+}
+
+#[test]
+fn ci_lifts_the_jobs_cap() {
+    // A fixed cap is not a ceiling: on a runner with fewer cores it would run
+    // more jobs than the runner has.
+    let workflows = repo_root().join(".github/workflows");
+    let mut checked = Vec::new();
+    for entry in fs::read_dir(&workflows).expect("read .github/workflows").flatten() {
+        let path = entry.path();
+        let text = fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let compiles = ["cargo build", "cargo test", "cargo clippy", "cargo check"].iter().any(|command| text.contains(command));
+        if compiles {
+            assert!(text.contains("CARGO_BUILD_JOBS: default"), "{} compiles and must set CARGO_BUILD_JOBS: default", path.display());
+            checked.push(path);
+        }
+    }
+    assert!(!checked.is_empty(), "no workflow compiles");
+}

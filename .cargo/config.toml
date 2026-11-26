@@ -2,3 +2,10 @@
 # of the memory link.exe takes; the suite links several such binaries at once.
 [target.x86_64-pc-windows-msvc]
 linker = "rust-lld"
+
+# By default cargo runs one job per logical core, and a rustc or a linker of a
+# test binary takes one to three gigabytes: on 16 cores the build outgrows
+# 32 GB. CI lifts the cap with CARGO_BUILD_JOBS=default, since on a runner with
+# fewer cores a fixed number would run more jobs than it has.
+[build]
+jobs = 8
