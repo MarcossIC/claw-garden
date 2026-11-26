@@ -104,6 +104,43 @@ Lo que ningún test alcanza, porque necesita una consola real: que el modo crudo
 - Desvío: `ICRNL`, `IXON` e `IEXTEN` no se tocan en Unix. El decodificador ya lee `\n` como Enter, y H19 sólo pide `ICANON`, `ECHO` e `ISIG`.
 - Sin comprobar todavía: el lado de Unix de `review/terminal.rs` no se compiló en local (no hay toolchain de Linux en la máquina donde se implementó); lo compila y lo testea el CI. Sus llamadas se contrastaron con las definiciones de `libc` 0.2.184 para `x86_64-unknown-linux-gnu`.
 - Sin comprobar todavía: el selector sobre una consola real. Un intento de manejarlo con teclas inyectadas en una consola oculta se abandonó; queda la prueba a mano de Verificación.
-- Dónde quedó: falta la prueba a mano, la suite entera, las dos revisiones, Verificación y el archivo. Los dos clippy pasan sobre `dbd8025b`.
+- Desvío de H17: el selector dibuja un cuadro por lectura, no por tecla. Varias teclas de una misma lectura dan un solo cuadro, porque de los intermedios sólo se vería el último, y una lectura sin ninguna tecla del selector dibuja otra vez, que es lo que recoge un cambio de tamaño.
+- Desvío de H15: con menos de tres líneas no entran la fila del cursor y las dos de cuántas quedan; ahí van las filas solas. Quedó escrito en RM2.
+- Después de la primera ronda de revisión: `conclude` reúne en `review.rs` el final de una elección, para que el test de la cancelación pruebe también que `review.json` queda como estaba; `picker` y `terminal` pasaron a ser módulos privados de `review`; las dos frases nuevas con imperativo quedaron de tú, como pide CL3.
+- `ESC O D` vuelve un paso igual que `ESC [ D`: es la flecha izquierda de una terminal en modo de aplicación. H16 sólo nombraba la segunda.
 
 ## Verificación
+
+### Lo que se corrió
+
+- `cargo test --workspace --target-dir target-test`, en Windows, sobre `9e969bde`: salida 0, y cada binario de tests termina en `ok`.
+- `cargo clippy --locked --workspace --all-targets --target-dir target-test -- -D warnings` y `cargo clippy --locked -p clawg-cli --target-dir target-test -- -D warnings`, sobre `9e969bde`: sin hallazgos.
+- La regla de agrupar contra la lista real del CLI de Cursor del 2026-11-26, con un test temporal: 284 modelos en 11 familias, 15 versiones en Claude y 20 modelos en la versión más grande.
+
+### Revisión, ronda 1 (sobre `bc279703..7636ba67`)
+
+`clawg review` (sesión `4915209e-1b4b-4b8a-945d-9e5495261cd0`) terminó en `BLOCKED` y `change-reviewer` en `WARNINGS`. Los dos coinciden en que H1 a H14, H16 a H18, H20 y H21 se cumplen, y en lo que sigue.
+
+| Hallazgo | Quién | Qué se hizo |
+|---|---|---|
+| H22: la salida 0 y `review.json` intacto tras cancelar sólo se leían en el código | los dos | `conclude` reúne el final de una elección y `a_cancelled_choice_says_nothing_changed` prueba que una cancelación devuelve `Ok` y deja el archivo ausente o idéntico byte a byte (`9e969bde`). La corrida en una consola real sigue pendiente, abajo |
+| El selector no corrió en una consola real | los dos | pendiente en local, abajo |
+| H15: en una terminal baja no se decía cuántas filas quedan | los dos | arreglado: sin lugar para el título, van las filas con sus dos líneas de cuántas quedan; con menos de tres líneas, las filas solas. Con test para 8, 3 y 2 líneas |
+| H19: el lado de Unix no se compiló ni corrió | los dos | pendiente del CI, abajo |
+| `decode`: un Esc se llevaba el Esc o el Ctrl-C siguiente, y la cola de `ESC ESC [ 2 q` se leía como Enter y `q` | `clawg review` | confirmado contra el código y arreglado, con los tres casos en `keys_are_read_from_the_bytes_a_terminal_sends` |
+| `picker` y `terminal` eran módulos públicos sin uso fuera de `review` | `clawg review` | privados. En Unix, `raw` exige también que la salida sea una terminal, como ya hacía en Windows |
+| «Elegí una familia» y «elegí una versión» en voseo, contra CL3 | `clawg review` | pasadas a tú |
+| Una lectura interrumpida por una señal cortaba el comando; el comentario de `libc` en `Cargo.toml` no nombraba `review/terminal.rs` | `clawg review`; el comentario, los dos | la lectura interrumpida no entrega teclas y se redibuja; comentario al día |
+| El test del orden no afirmaba el de las familias entre sí | `clawg review` | agregado |
+| H17: un cuadro por lectura, no por tecla | `change-reviewer` | confirmado; es lo que se quería y quedó como desvío en Registro |
+| Un Esc partido de su secuencia por una terminal lenta se lee como Esc | `change-reviewer` | confirmado; no se arregla en este cambio y quedó como límite conocido en RM2: vuelve un paso o cancela sin cambiar nada |
+| El ancho se cuenta en caracteres, no en columnas | `change-reviewer` | límite conocido en RM2 |
+| Ningún test cubre la caída al número tipeado cuando la terminal no se deja leer tecla por tecla | `change-reviewer` | sin terminal no hay cómo provocarlo en un test; entra en la prueba a mano |
+| Anteriores a este cambio: `Said::NeedsModel` y `missing_cursor` en voseo; una línea vacía en el número tipeado sale con 1 y un mensaje que empieza con un espacio | `clawg review` | no se tocan en este cambio |
+
+### Pendiente en local
+
+El cambio no se archiva hasta que estas dos comprobaciones queden anotadas acá:
+
+1. **El selector en una consola real**, en Windows (Windows Terminal y la consola clásica) y en una terminal de Unix. Con la entrada y la salida en la terminal, `clawg preferences set review-model` abre el selector; `↑` y `↓` mueven la barra; Enter o Espacio abren una familia y una versión; Esc vuelve un paso; una pulsación marca un modelo y otra sobre el marcado lo guarda en `review.json`; `q` y Ctrl-C salen con 0 y dejan el archivo como estaba; al salir, la consola muestra lo que tenía y vuelve a hacer eco de lo que se escribe. Si las flechas no llegan como secuencias en Windows, se lee con `ReadConsoleInputW`, como dice Decisión.
+2. **H19 en Linux**: que el CI compile `review/terminal.rs` y pase `terminal::tests::the_termios_for_the_picker` y los dos clippy.
