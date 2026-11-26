@@ -1923,17 +1923,100 @@ fn ci_lifts_the_jobs_cap() {
     // A fixed cap is not a ceiling: on a runner with fewer cores it would run
     // more jobs than the runner has.
     let workflows = repo_root().join(".github/workflows");
-    let mut checked = Vec::new();
+    let mut compiling = 0;
+    let mut uncapped = Vec::new();
     for entry in fs::read_dir(&workflows).expect("read .github/workflows").flatten() {
         let path = entry.path();
         let text = fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-        let compiles = ["cargo build", "cargo test", "cargo clippy", "cargo check"].iter().any(|command| text.contains(command));
-        if compiles {
-            assert!(text.contains("CARGO_BUILD_JOBS: default"), "{} compiles and must set CARGO_BUILD_JOBS: default", path.display());
-            checked.push(path);
+        compiling += jobs_running_cargo(&text).len();
+        for job in jobs_running_cargo_without_the_jobs_cap(&text) {
+            uncapped.push(format!("{}: {job}", path.display()));
         }
     }
-    assert!(!checked.is_empty(), "no workflow compiles");
+    assert!(compiling > 0, "no workflow job runs cargo");
+    assert!(uncapped.is_empty(), "set CARGO_BUILD_JOBS: default in the env of each job that runs cargo:\n{}", uncapped.join("\n"));
+}
+
+/// The lines of a workflow before `jobs:`, and each job with its lines, all
+/// without comment lines. A job is a key two spaces in under `jobs:`.
+fn workflow_jobs(workflow: &str) -> (Vec<&str>, Vec<(&str, Vec<&str>)>) {
+    let mut preamble = Vec::new();
+    let mut jobs: Vec<(&str, Vec<&str>)> = Vec::new();
+    let mut in_jobs = false;
+    for line in workflow.lines().filter(|line| !line.trim_start().starts_with('#')) {
+        if !line.starts_with(' ') && !line.trim().is_empty() {
+            in_jobs = line.trim_end() == "jobs:";
+            if !in_jobs {
+                preamble.push(line);
+            }
+            continue;
+        }
+        if !in_jobs {
+            preamble.push(line);
+            continue;
+        }
+        let job_key = line.strip_prefix("  ").filter(|rest| !rest.starts_with(' ')).and_then(|rest| rest.trim_end().strip_suffix(':'));
+        match (job_key, jobs.last_mut()) {
+            (Some(name), _) => jobs.push((name, Vec::new())),
+            (None, Some((_, lines))) => lines.push(line),
+            (None, None) => {}
+        }
+    }
+    (preamble, jobs)
+}
+
+fn runs_cargo(lines: &[&str]) -> bool {
+    let commands = ["build", "test", "clippy", "check", "run", "doc", "bench", "nextest"];
+    lines.iter().any(|line| commands.iter().any(|command| line.contains(&format!("cargo {command}"))))
+}
+
+fn sets_the_jobs_cap_default(lines: &[&str]) -> bool {
+    lines.iter().any(|line| line.trim() == "CARGO_BUILD_JOBS: default")
+}
+
+/// The jobs of a workflow that run cargo.
+fn jobs_running_cargo(workflow: &str) -> Vec<&str> {
+    let (_, jobs) = workflow_jobs(workflow);
+    jobs.into_iter().filter(|(_, lines)| runs_cargo(lines)).map(|(name, _)| name).collect()
+}
+
+/// The jobs of a workflow that run cargo with the jobs cap of
+/// `.cargo/config.toml`: neither the job nor the workflow sets
+/// `CARGO_BUILD_JOBS: default`.
+fn jobs_running_cargo_without_the_jobs_cap(workflow: &str) -> Vec<&str> {
+    let (preamble, jobs) = workflow_jobs(workflow);
+    if sets_the_jobs_cap_default(&preamble) {
+        return Vec::new();
+    }
+    jobs.into_iter().filter(|(_, lines)| runs_cargo(lines) && !sets_the_jobs_cap_default(lines)).map(|(name, _)| name).collect()
+}
+
+#[test]
+fn jobs_running_cargo_without_the_jobs_cap_reads_each_job() {
+    let workflow = "\
+on: push
+jobs:
+  lint:
+    env:
+      CARGO_BUILD_JOBS: default
+    steps:
+      - run: cargo clippy --workspace
+  test:
+    env:
+      # CARGO_BUILD_JOBS: default
+      CARGO_TERM_COLOR: always
+    steps:
+      - run: |
+          cargo test --workspace
+  docs:
+    steps:
+      - run: echo cargo is not run here
+      # - run: cargo build
+";
+    assert_eq!(jobs_running_cargo(workflow), ["lint", "test"]);
+    assert_eq!(jobs_running_cargo_without_the_jobs_cap(workflow), ["test"]);
+    let capped_for_all = format!("env:\n  CARGO_BUILD_JOBS: default\n{workflow}");
+    assert!(jobs_running_cargo_without_the_jobs_cap(&capped_for_all).is_empty());
 }
 
 /// The `.rs` files at the root of a crate's `tests/` that no test binary but
