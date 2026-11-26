@@ -177,6 +177,23 @@ pub enum Said<'a> {
     NoProject,
     /// `review.json` could not be read, so it was left as it was.
     Unchanged { why: &'a str },
+    /// The line at the top of the picker.
+    PickerTitle,
+    /// What marks the family, the version and the model in use.
+    InUse,
+    /// Above the families.
+    PickFamily,
+    /// After a family's name, above its versions.
+    PickVersion,
+    /// The keys of a screen whose rows open; `top` is the first, which
+    /// going back leaves.
+    KeysToOpen { top: bool },
+    /// The keys of the screen of models.
+    KeysToMark,
+    /// That a model takes two presses: one marks it, another confirms it.
+    TwoPresses,
+    /// How many rows do not fit, above the ones shown or below them.
+    More { above: bool, rows: usize },
 }
 
 /// `said` in `lang`.
@@ -249,6 +266,45 @@ pub fn says(lang: Lang, said: &Said<'_>) -> String {
             Lang::En => format!("{why}; nothing was changed"),
             Lang::Es => format!("{why}; no se cambió nada"),
         },
+        Said::PickerTitle => match lang {
+            Lang::En => "Review model".to_string(),
+            Lang::Es => "Modelo del revisor".to_string(),
+        },
+        Said::InUse => match lang {
+            Lang::En => "in use".to_string(),
+            Lang::Es => "en uso".to_string(),
+        },
+        Said::PickFamily => match lang {
+            Lang::En => "Choose a family".to_string(),
+            Lang::Es => "Elegí una familia".to_string(),
+        },
+        Said::PickVersion => match lang {
+            Lang::En => "choose a version".to_string(),
+            Lang::Es => "elegí una versión".to_string(),
+        },
+        Said::KeysToOpen { top: true } => match lang {
+            Lang::En => "↑↓ move · Enter or Space: open · Esc or q: leave".to_string(),
+            Lang::Es => "↑↓ mover · Enter o Espacio: abrir · Esc o q: salir".to_string(),
+        },
+        Said::KeysToOpen { top: false } => match lang {
+            Lang::En => "↑↓ move · Enter or Space: open · Esc: back · q: leave".to_string(),
+            Lang::Es => "↑↓ mover · Enter o Espacio: abrir · Esc: volver · q: salir".to_string(),
+        },
+        Said::KeysToMark => match lang {
+            Lang::En => "↑↓ move · Enter or Space: mark · Esc: back · q: leave".to_string(),
+            Lang::Es => "↑↓ mover · Enter o Espacio: marcar · Esc: volver · q: salir".to_string(),
+        },
+        Said::TwoPresses => match lang {
+            Lang::En => "Two steps: the first press marks (●), another on the marked one confirms.".to_string(),
+            Lang::Es => "Dos pasos: la primera pulsación marca (●), otra sobre el marcado confirma.".to_string(),
+        },
+        Said::More { above, rows } => {
+            let arrow = if *above { '↑' } else { '↓' };
+            match lang {
+                Lang::En => format!("{arrow} {rows} more"),
+                Lang::Es => format!("{arrow} {rows} más"),
+            }
+        }
     }
 }
 
@@ -358,6 +414,16 @@ mod tests {
             Said::NotAModel { raw: "x y" },
             Said::NoProject,
             Said::Unchanged { why: "review.json is broken" },
+            Said::PickerTitle,
+            Said::InUse,
+            Said::PickFamily,
+            Said::PickVersion,
+            Said::KeysToOpen { top: true },
+            Said::KeysToOpen { top: false },
+            Said::KeysToMark,
+            Said::TwoPresses,
+            Said::More { above: true, rows: 3 },
+            Said::More { above: false, rows: 3 },
         ];
         for said in &all {
             let (en, es) = (says(Lang::En, said), says(Lang::Es, said));

@@ -4,7 +4,9 @@
 //! Everything here is pure: how a list is grouped, what a key does and what
 //! is drawn. The terminal it runs over is a trait, so a test can stand in for it.
 
-use super::prefs::ListedModel;
+use clawg_core::preferences::Lang;
+
+use super::prefs::{says, ListedModel, Said};
 
 /// The words an id ends with that say how hard and how fast a model works,
 /// never which model it is.
@@ -216,6 +218,172 @@ impl Picker {
         }
         Outcome::Open
     }
+
+    /// The rows of the screen shown, all of them, each as wide as the widest
+    /// so that the cursor's bar is even.
+    fn list(&self, lang: Lang) -> Vec<Line> {
+        let in_use = |place: Place| self.in_use == Some(place);
+        // Each row's text, whether it is what `clawg review` uses now, and
+        // whether it is the marked model.
+        let rows: Vec<(String, bool, bool)> = match self.screen {
+            Screen::Families => {
+                let width = self.families.iter().map(|f| f.label.chars().count()).max().unwrap_or(0);
+                let used = self.in_use.map(|(family, _, _)| family);
+                self.families
+                    .iter()
+                    .enumerate()
+                    .map(|(i, f)| (format!("{:<width$}  {:>3}", f.label, f.model_count()), used == Some(i), false))
+                    .collect()
+            }
+            Screen::Versions { family } => {
+                let versions = &self.families[family].versions;
+                let width = versions.iter().map(|v| v.label.chars().count()).max().unwrap_or(0);
+                let used = self.in_use.filter(|(f, _, _)| *f == family).map(|(_, version, _)| version);
+                versions
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| (format!("{:<width$}  {:>3}", v.label, v.models.len()), used == Some(i), false))
+                    .collect()
+            }
+            Screen::Models { family, version } => {
+                let models = &self.families[family].versions[version].models;
+                let names: Vec<String> = models.iter().map(|m| m.name.split_whitespace().collect::<Vec<_>>().join(" ")).collect();
+                let name_width = names.iter().map(|n| n.chars().count()).max().unwrap_or(0);
+                let id_width = models.iter().map(|m| m.id.len()).max().unwrap_or(0);
+                models
+                    .iter()
+                    .zip(&names)
+                    .enumerate()
+                    .map(|(i, (m, name))| {
+                        let marked = self.marked == Some(i);
+                        let circle = if marked { '●' } else { '○' };
+                        (format!("{circle} {name:<name_width$}  {:<id_width$}", m.id), in_use((family, version, i)), marked)
+                    })
+                    .collect()
+            }
+        };
+        let in_use_word = says(lang, &Said::InUse);
+        let mut lines: Vec<Line> = rows
+            .into_iter()
+            .enumerate()
+            .map(|(i, (text, used, marked))| {
+                let pointer = if i == self.cursor { "› " } else { "  " };
+                let tag = if used { format!("   {in_use_word}") } else { String::new() };
+                let tone = match (i == self.cursor, used || marked) {
+                    (true, _) => Tone::Bright,
+                    (false, true) => Tone::Plain,
+                    (false, false) => Tone::Dim,
+                };
+                Line { text: format!("{pointer}{text}{tag}"), tone }
+            })
+            .collect();
+        let width = lines.iter().map(|l| l.text.chars().count()).max().unwrap_or(0);
+        for line in &mut lines {
+            line.text = format!("{:<width$}", line.text);
+        }
+        lines
+    }
+
+    /// Where the screen shown is, for the line above its rows.
+    fn crumb(&self, lang: Lang) -> String {
+        match self.screen {
+            Screen::Families => says(lang, &Said::PickFamily),
+            Screen::Versions { family } => format!("{} › {}", self.families[family].label, says(lang, &Said::PickVersion)),
+            Screen::Models { family, version } => {
+                format!("{} › {}", self.families[family].label, self.families[family].versions[version].label)
+            }
+        }
+    }
+
+    /// The keys of the screen shown; on the models, also that one takes two
+    /// presses.
+    fn help(&self, lang: Lang) -> Vec<String> {
+        match self.screen {
+            Screen::Families => vec![says(lang, &Said::KeysToOpen { top: true })],
+            Screen::Versions { .. } => vec![says(lang, &Said::KeysToOpen { top: false })],
+            Screen::Models { .. } => vec![says(lang, &Said::KeysToMark), says(lang, &Said::TwoPresses)],
+        }
+    }
+
+    /// What a terminal of `rows` by `cols` shows: never more lines than
+    /// `rows`, none wider than `cols`, and the cursor's row always among them.
+    pub fn frame(&self, lang: Lang, rows: usize, cols: usize) -> Vec<Line> {
+        let rows = rows.max(1);
+        let list = self.list(lang);
+        let head = [
+            Line::new(Tone::Plain, says(lang, &Said::PickerTitle)),
+            Line::blank(),
+            Line::new(Tone::Plain, self.crumb(lang)),
+            Line::blank(),
+        ];
+        let foot: Vec<Line> =
+            std::iter::once(Line::blank()).chain(self.help(lang).into_iter().map(|help| Line::new(Tone::Dim, format!("  {help}")))).collect();
+        let space = rows.saturating_sub(head.len() + foot.len());
+        let mut lines = Vec::new();
+        if head.len() + list.len() + foot.len() <= rows {
+            lines.extend(head);
+            lines.extend(list);
+            lines.extend(foot);
+        } else if space >= 3 {
+            // A line above the rows and one below say how many do not fit.
+            let shown = window(list.len(), self.cursor, space - 2);
+            let more = |above: bool, hidden: usize| match hidden {
+                0 => Line::blank(),
+                _ => Line::new(Tone::Dim, format!("  {}", says(lang, &Said::More { above, rows: hidden }))),
+            };
+            lines.extend(head);
+            lines.push(more(true, shown.start));
+            lines.push(more(false, list.len() - shown.end));
+            lines.splice(lines.len() - 1..lines.len() - 1, list[shown].iter().cloned());
+            lines.extend(foot);
+        } else {
+            // Too short a terminal for anything but rows.
+            lines.extend(list[window(list.len(), self.cursor, rows)].iter().cloned());
+        }
+        // One column short of the width: a line that reaches the last column
+        // makes some terminals start another.
+        let width = cols.saturating_sub(1).max(1);
+        for line in &mut lines {
+            if line.text.chars().count() > width {
+                line.text = line.text.chars().take(width).collect();
+            }
+        }
+        lines
+    }
+}
+
+/// How bright a line of the picker is drawn: the cursor's row brightest, what
+/// is in use or marked next, the rest behind them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tone {
+    Dim,
+    Plain,
+    Bright,
+}
+
+/// One line of the picker's screen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Line {
+    pub text: String,
+    pub tone: Tone,
+}
+
+impl Line {
+    fn new(tone: Tone, text: impl Into<String>) -> Self {
+        Self { text: text.into(), tone }
+    }
+
+    fn blank() -> Self {
+        Self::new(Tone::Plain, "")
+    }
+}
+
+/// The rows of a list of `len` that fit in `height` lines with `cursor`
+/// among them.
+fn window(len: usize, cursor: usize, height: usize) -> std::ops::Range<usize> {
+    let height = height.min(len);
+    let start = cursor.saturating_sub(height / 2).min(len - height);
+    start..start + height
 }
 
 #[cfg(test)]
@@ -457,5 +625,131 @@ kimi-k2.7-code - Kimi K2.7 Code
         assert_eq!(press(&mut versions, &[Key::Pick, Key::Quit]), Outcome::Cancelled);
         let mut models = on_models(CODEX, 0);
         assert_eq!(press(&mut models, &[Key::Pick, Key::Quit]), Outcome::Cancelled, "a marked model is not chosen by leaving");
+    }
+
+    /// The one line of `frame` with `word` in it.
+    fn line<'a>(frame: &'a [Line], word: &str) -> &'a Line {
+        let with: Vec<&Line> = frame.iter().filter(|l| l.text.contains(word)).collect();
+        assert_eq!(with.len(), 1, "{word:?} in {frame:#?}");
+        with[0]
+    }
+
+    #[test]
+    fn the_family_in_use_is_brighter_and_the_cursor_brightest() {
+        let mut picker = picker("claude-opus-5-5-medium");
+        picker.press(Key::Down);
+        let frame = picker.frame(Lang::Es, 40, 100);
+        let (cursor, used) = (line(&frame, "Grok"), line(&frame, "Claude"));
+        assert_eq!(cursor.tone, Tone::Bright);
+        assert!(cursor.text.starts_with("› Grok"), "{cursor:?}");
+        assert_eq!(used.tone, Tone::Plain);
+        assert!(used.text.starts_with("  Claude") && used.text.contains("en uso"), "{used:?}");
+        for other in ["Auto", "Codex", "GPT", "Gemini", "Kimi"] {
+            let other = line(&frame, other);
+            assert_eq!(other.tone, Tone::Dim, "{other:?}");
+            assert!(other.text.starts_with("  ") && !other.text.contains("en uso"), "{other:?}");
+        }
+        assert!(line(&frame, "Claude").text.contains("  7"), "with how many models it has: {frame:#?}");
+
+        picker.press(Key::Up);
+        let on_it = picker.frame(Lang::En, 40, 100);
+        let used = line(&on_it, "Claude");
+        assert_eq!(used.tone, Tone::Bright, "the cursor on the family in use");
+        assert!(used.text.starts_with("› Claude") && used.text.contains("in use"), "{used:?}");
+
+        picker.press(Key::Pick);
+        let versions = picker.frame(Lang::Es, 40, 100);
+        assert_eq!(line(&versions, "Claude Opus 5.5 1M").tone, Tone::Bright);
+        assert!(line(&versions, "Claude Opus 5.5 1M").text.contains("en uso"));
+        assert_eq!(line(&versions, "Claude Sonnet 4.6 1M").tone, Tone::Dim);
+        assert!(line(&versions, "elegí una versión").text.starts_with("Claude ›"), "{versions:#?}");
+    }
+
+    #[test]
+    fn each_model_has_a_circle_filled_when_marked() {
+        let mut picker = on_models(CODEX, 0);
+        let frame = picker.frame(Lang::Es, 40, 100);
+        for (id, name) in [("gpt-5.3-codex-low", "Codex 5.3 Low"), ("gpt-5.3-codex-high", "Codex 5.3 High")] {
+            let row = line(&frame, id);
+            assert!(row.text.contains("○") && row.text.contains(name), "{row:?}");
+        }
+        assert!(line(&frame, "Codex ›").text.ends_with("Codex 5.3"), "{frame:#?}");
+
+        press(&mut picker, &[Key::Down, Key::Pick, Key::Down]);
+        let frame = picker.frame(Lang::Es, 40, 100);
+        let marked = line(&frame, "gpt-5.3-codex-high");
+        assert!(marked.text.starts_with("  ● Codex 5.3 High"), "{marked:?}");
+        assert_eq!(marked.tone, Tone::Plain, "marked, and brighter than the rest for it");
+        assert!(line(&frame, "gpt-5.3-codex-low").text.starts_with("  ○"));
+        assert!(line(&frame, "gpt-5.3-codex-xhigh-fast").text.starts_with("› ○"), "the cursor is not the mark");
+
+        let mut used = self::picker("gpt-5.3-codex-low");
+        press(&mut used, &[Key::Pick, Key::Down]);
+        let row = used.frame(Lang::En, 40, 100);
+        let row = line(&row, "gpt-5.3-codex-low");
+        assert!(row.text.starts_with("  ○") && row.text.contains("in use"), "in use is not marked: {row:?}");
+        assert_eq!(row.tone, Tone::Plain);
+
+        let mut spaced = Picker::new(&[model("grok-4.7-low", "Grok 4.7  Low"), model("grok-4.7-high", "Grok 4.7  High")], "auto");
+        spaced.press(Key::Pick);
+        assert!(line(&spaced.frame(Lang::En, 40, 100), "grok-4.7-high").text.contains("Grok 4.7 High"));
+    }
+
+    #[test]
+    fn the_help_says_the_second_press_confirms() {
+        let models = on_models(CODEX, 0);
+        let es = models.frame(Lang::Es, 40, 100);
+        let two = line(&es, "confirma");
+        assert!(two.text.contains("marca") && two.text.contains("●") && two.text.contains("otra"), "{two:?}");
+        assert!(line(&es, "Espacio").text.contains("marcar"), "{es:#?}");
+        let en = models.frame(Lang::En, 40, 100);
+        let two = line(&en, "confirms");
+        assert!(two.text.contains("marks") && two.text.contains("●") && two.text.contains("another"), "{two:?}");
+        for lang in [Lang::Es, Lang::En] {
+            for help in models.help(lang).iter().chain(&picker("auto").help(lang)) {
+                assert!(help.chars().count() + 2 < 80, "it fits a terminal of 80 columns: {help}");
+            }
+        }
+        assert!(line(&picker("auto").frame(Lang::Es, 40, 100), "Espacio").text.contains("abrir"));
+    }
+
+    #[test]
+    fn a_frame_fits_the_terminal_and_keeps_the_cursor_in_view() {
+        let many: Vec<ListedModel> = (0..30).map(|i| model(&format!("big-{i}"), &format!("Big {i}"))).collect();
+        let mut versions = Picker::new(&many, "big-0");
+        press(&mut versions, &[vec![Key::Pick], vec![Key::Down; 12]].concat());
+        let mut screens = vec![versions.clone(), picker("claude-opus-5-low"), on_models(CLAUDE, 1)];
+        press(&mut versions, &[Key::Up; 13]);
+        screens.push(versions.clone());
+        for picker in &screens {
+            for rows in 1..=40 {
+                for cols in [1, 2, 9, 40, 80, 200] {
+                    let frame = picker.frame(Lang::Es, rows, cols);
+                    assert!(frame.len() <= rows, "{rows}x{cols}: {} lines", frame.len());
+                    assert!(frame.iter().all(|l| l.text.chars().count() <= cols), "{rows}x{cols}: {frame:#?}");
+                    let cursors = frame.iter().filter(|l| l.text.starts_with('›')).count();
+                    assert_eq!(cursors, 1, "{rows}x{cols}: {frame:#?}");
+                }
+            }
+        }
+
+        press(&mut versions, &[Key::Down; 13]);
+        let frame = versions.frame(Lang::Es, 14, 80);
+        assert_eq!(frame.len(), 14);
+        let says = |frame: &[Line], said: &str| frame.iter().any(|l| l.text.trim() == said);
+        assert!(says(&frame, "↑ 9 más") && says(&frame, "↓ 15 más"), "{frame:#?}");
+        assert!(line(&frame, "Big 12").text.starts_with("› "), "{frame:#?}");
+        assert!(frame.iter().any(|l| l.text.contains("Big 9 ")) && !frame.iter().any(|l| l.text.contains("Big 8 ")), "{frame:#?}");
+        assert!(says(&versions.frame(Lang::En, 14, 80), "↓ 15 more"));
+
+        press(&mut versions, &[Key::Up; 12]);
+        let top = versions.frame(Lang::Es, 14, 80);
+        assert!(!top.iter().any(|l| l.text.trim().starts_with("↑ ")), "nothing is above the first: {top:#?}");
+        assert!(says(&top, "↓ 24 más"), "{top:#?}");
+
+        assert_eq!(window(30, 29, 6), 24..30);
+        assert_eq!(window(3, 2, 10), 0..3);
+        assert_eq!(window(0, 0, 5), 0..0);
+        assert_eq!(Picker::new(&[], "auto").frame(Lang::Es, 0, 0), [], "no list and no terminal: nothing, and no panic");
     }
 }
