@@ -3,7 +3,7 @@
 Fuente de verdad del comportamiento actual de `clawg review`: el CLI de Cursor revisa un cambio con la memoria del perfil, puede leer pero no escribir, y la corrida queda registrada como una sesión (`crates/clawg-cli/src/review.rs`). Quien la lanza, el orquestador, lee el informe y decide qué hacer con él.
 
 **Origen:**
-- [cursor-review](../../changes/archive/2026-11-25-cursor-review/plan.md), archivado el 2026-11-25, que sale en 0.95.0.
+- [cursor-review](../../changes/archive/2026-11-26-cursor-review/plan.md), archivado el 2026-11-26, sale en 0.96.0.
 
 ## Definiciones
 

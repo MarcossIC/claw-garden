@@ -11,6 +11,7 @@ Fuente de verdad del comportamiento actual de las métricas de uso del daemon: q
 - [retire-legacy-kinds](../../changes/archive/2026-11-07-retire-legacy-kinds/proposal.md), archivado el 2026-11-07, que sale en 0.79.0 (sólo los brazos de `search.duration`, sin `knn_episodic` ni `knn_skill`, y `search.knn_retry`, que sólo lleva `table` `memory`: lo que [`specs/retrieval`](../retrieval/spec.md) RL4 quita).
 - [session-usage](../../changes/archive/2026-11-11-session-usage/proposal.md), archivado el 2026-11-11, sale en 0.81.0: SU1 a SU12 de esa spec, con los mismos ids; cambian R3 y R4, el primer invariante y el límite «Sin etiqueta de agente».
 - [conflicts-on-demand](../../changes/archive/2026-11-23-conflicts-on-demand/proposal.md), archivado el 2026-11-23, que sale en 0.93.0: CO11 de esa spec suma a R14 la etiqueta `state` de `context.cut`.
+- [cursor-review](../../changes/archive/2026-11-26-cursor-review/plan.md), archivado el 2026-11-26, sale en 0.96.0: los contadores `tokens`, `model` y `verdict` de una sesión, en SU1, SU2, SU6 y SU11, y el modelo como cuarto identificador en los invariantes.
 
 ## Definiciones
 

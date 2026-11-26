@@ -10,6 +10,7 @@ Fuente de verdad de qué peticiones llegan a la API HTTP del daemon antes de mir
 - [import-job](../../changes/archive/2026-10-30-import-job/proposal.md), archivado el 2026-10-30, que sale en 0.68.0: agrega IJ12 a IJ14 (el bloque `import` de `/health`, las rutas de trabajos en `PROJECT_INPUTS` y detrás del guardia y el token). Qué hace un trabajo de importación está en [`specs/portability`](../portability/spec.md) (IJ1 a IJ11 e IJ15 a IJ17).
 - [session-usage](../../changes/archive/2026-11-11-session-usage/proposal.md), archivado el 2026-11-11, sale en 0.81.0: SU6 de esa spec entra como SU6 (las rutas `POST /v1/sessions`, `/v1/sessions/end` y `/v1/sessions/calls`, detrás del guardia y del token). Qué cuenta cada una está en [`specs/metrics`](../metrics/spec.md) (SU1 a SU12).
 - [docs-index-status](../../changes/archive/2026-11-12-docs-index-status/proposal.md), archivado el 2026-11-12, sale en 0.83.0: agrega ST3 y ST5 (el bloque `docs_index` de `/health`, sacado de la memoria del proceso, y lo que `clawg status` muestra de él). Son IS3 e IS5 en la spec de ese cambio y ST3 y ST5 acá, con el mismo prefijo que llevan en [`specs/project-docs`](../project-docs/spec.md), donde IS ya nombra los requisitos de docs-index-speed. Qué guarda el índice de cada refresco y la línea de log (ST1, ST2, ST4 y ST6) están en esa spec.
+- [cursor-review](../../changes/archive/2026-11-26-cursor-review/plan.md), archivado el 2026-11-26, sale en 0.96.0: `usage`, `model` y `verdict` en `POST /v1/sessions/end` (SU6).
 
 ## Definiciones
 
