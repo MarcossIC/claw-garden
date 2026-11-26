@@ -91,6 +91,133 @@ pub fn families(list: &[ListedModel]) -> Vec<Family> {
         .collect()
 }
 
+/// A key the picker answers to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Key {
+    Up,
+    Down,
+    /// Enter or the space bar: open a family or a version, mark a model, or
+    /// confirm the marked one.
+    Pick,
+    /// One step back, out of the picker from the families.
+    Back,
+    Quit,
+}
+
+/// What a key left.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Outcome {
+    /// Still choosing.
+    Open,
+    /// The id of the model confirmed.
+    Chosen(String),
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Screen {
+    Families,
+    Versions { family: usize },
+    Models { family: usize, version: usize },
+}
+
+/// Where a model is: its family, its version in that family, its place in
+/// that version.
+type Place = (usize, usize, usize);
+
+fn place_of(families: &[Family], id: &str) -> Option<Place> {
+    families.iter().enumerate().find_map(|(f, family)| {
+        family.versions.iter().enumerate().find_map(|(v, version)| version.models.iter().position(|m| m.id == id).map(|m| (f, v, m)))
+    })
+}
+
+/// The choice under way: the screen shown, the row the cursor is on and the
+/// model marked. A model is chosen in two presses, one that marks it and one
+/// on the marked model that confirms it, so that a key held down or pressed
+/// on the wrong row does not change the reviewer.
+#[derive(Debug, Clone)]
+pub struct Picker {
+    families: Vec<Family>,
+    in_use: Option<Place>,
+    screen: Screen,
+    cursor: usize,
+    marked: Option<usize>,
+}
+
+impl Picker {
+    /// The picker of `list`, on the family of the model `in_use`.
+    pub fn new(list: &[ListedModel], in_use: &str) -> Self {
+        let families = families(list);
+        let in_use = place_of(&families, in_use);
+        Self { cursor: in_use.map_or(0, |(family, _, _)| family), families, in_use, screen: Screen::Families, marked: None }
+    }
+
+    fn rows(&self) -> usize {
+        match self.screen {
+            Screen::Families => self.families.len(),
+            Screen::Versions { family } => self.families[family].versions.len(),
+            Screen::Models { family, version } => self.families[family].versions[version].models.len(),
+        }
+    }
+
+    /// What `key` does to the choice.
+    pub fn press(&mut self, key: Key) -> Outcome {
+        let rows = self.rows();
+        match key {
+            Key::Quit => return Outcome::Cancelled,
+            Key::Pick => return self.pick(),
+            Key::Back => return self.back(),
+            Key::Up if rows > 0 => self.cursor = (self.cursor + rows - 1) % rows,
+            Key::Down if rows > 0 => self.cursor = (self.cursor + 1) % rows,
+            Key::Up | Key::Down => {}
+        }
+        Outcome::Open
+    }
+
+    fn pick(&mut self) -> Outcome {
+        match self.screen {
+            Screen::Families => match self.families.get(self.cursor).map(|family| family.versions.len()) {
+                None => {}
+                Some(1) => self.open_models(self.cursor, 0),
+                Some(_) => {
+                    let family = self.cursor;
+                    self.screen = Screen::Versions { family };
+                    self.cursor = self.in_use.filter(|(f, _, _)| *f == family).map_or(0, |(_, version, _)| version);
+                }
+            },
+            Screen::Versions { family } => self.open_models(family, self.cursor),
+            Screen::Models { family, version } => {
+                if self.marked == Some(self.cursor) {
+                    return Outcome::Chosen(self.families[family].versions[version].models[self.cursor].id.clone());
+                }
+                self.marked = Some(self.cursor);
+            }
+        }
+        Outcome::Open
+    }
+
+    fn open_models(&mut self, family: usize, version: usize) {
+        self.screen = Screen::Models { family, version };
+        self.cursor = self.in_use.filter(|(f, v, _)| (*f, *v) == (family, version)).map_or(0, |(_, _, model)| model);
+        self.marked = None;
+    }
+
+    fn back(&mut self) -> Outcome {
+        match self.screen {
+            Screen::Families => return Outcome::Cancelled,
+            Screen::Versions { family } => (self.screen, self.cursor) = (Screen::Families, family),
+            Screen::Models { family, version } => {
+                self.marked = None;
+                (self.screen, self.cursor) = match self.families[family].versions.len() {
+                    1 => (Screen::Families, family),
+                    _ => (Screen::Versions { family }, version),
+                };
+            }
+        }
+        Outcome::Open
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -206,5 +333,129 @@ kimi-k2.7-code - Kimi K2.7 Code
         grouped.sort_by_key(|m| list.iter().position(|l| l == *m));
         assert!(grouped.iter().zip(&list).all(|(a, b)| *a == b));
         assert_eq!(families(&[]), []);
+    }
+
+    const AUTO: usize = 0;
+    const CODEX: usize = 1;
+    const CLAUDE: usize = 3;
+    const KIMI: usize = 6;
+
+    fn picker(in_use: &str) -> Picker {
+        Picker::new(&listed(), in_use)
+    }
+
+    /// The outcome of the last of `keys`.
+    fn press(picker: &mut Picker, keys: &[Key]) -> Outcome {
+        keys.iter().map(|key| picker.press(*key)).last().expect("a key")
+    }
+
+    /// A picker on the models of the family at `family`, through its version
+    /// at `version` when it has more than one.
+    fn on_models(family: usize, version: usize) -> Picker {
+        let mut picker = picker("not-listed");
+        let down = |n: usize| vec![Key::Down; n];
+        press(&mut picker, &[down(family), vec![Key::Pick]].concat());
+        if matches!(picker.screen, Screen::Versions { .. }) {
+            press(&mut picker, &[down(version), vec![Key::Pick]].concat());
+        }
+        assert_eq!(picker.screen, Screen::Models { family, version });
+        picker
+    }
+
+    #[test]
+    fn the_picker_opens_on_the_family_in_use() {
+        let mut picker = picker("claude-opus-5-5-medium");
+        assert_eq!((picker.screen, picker.cursor), (Screen::Families, CLAUDE));
+        assert_eq!(picker.press(Key::Pick), Outcome::Open);
+        assert_eq!((picker.screen, picker.cursor), (Screen::Versions { family: CLAUDE }, 1), "and on its version");
+        picker.press(Key::Pick);
+        assert_eq!((picker.screen, picker.cursor), (Screen::Models { family: CLAUDE, version: 1 }, 1), "and on the model");
+        assert_eq!(picker.marked, None, "the model in use is not marked for the person");
+
+        let mut elsewhere = self::picker("claude-opus-5-5-medium");
+        press(&mut elsewhere, &[Key::Pick, Key::Up, Key::Pick]);
+        assert_eq!((elsewhere.screen, elsewhere.cursor), (Screen::Models { family: CLAUDE, version: 0 }, 0), "another version opens on its first");
+
+        let unlisted = self::picker("gpt-9-imaginary");
+        assert_eq!((unlisted.screen, unlisted.cursor), (Screen::Families, AUTO));
+    }
+
+    #[test]
+    fn the_cursor_moves_and_wraps() {
+        let mut families = picker("not-listed");
+        assert_eq!(press(&mut families, &[Key::Down, Key::Down]), Outcome::Open);
+        assert_eq!(families.cursor, 2);
+        press(&mut families, &[Key::Up, Key::Up, Key::Up]);
+        assert_eq!(families.cursor, KIMI, "up from the first is the last");
+        families.press(Key::Down);
+        assert_eq!(families.cursor, AUTO, "down from the last is the first");
+
+        let mut versions = picker("not-listed");
+        press(&mut versions, &[vec![Key::Down; CLAUDE], vec![Key::Pick, Key::Up]].concat());
+        assert_eq!((versions.screen, versions.cursor), (Screen::Versions { family: CLAUDE }, 2));
+
+        let mut models = on_models(CLAUDE, 1);
+        press(&mut models, &[Key::Down, Key::Down, Key::Down]);
+        assert_eq!(models.cursor, 0, "three models, three steps round");
+
+        let mut empty = Picker::new(&[], "auto");
+        assert_eq!(press(&mut empty, &[Key::Up, Key::Down, Key::Pick]), Outcome::Open, "nothing to move over");
+    }
+
+    #[test]
+    fn a_family_opens_its_versions_or_its_only_versions_models() {
+        let mut claude = picker("not-listed");
+        press(&mut claude, &[vec![Key::Down; CLAUDE], vec![Key::Pick]].concat());
+        assert_eq!((claude.screen, claude.cursor), (Screen::Versions { family: CLAUDE }, 0));
+
+        let mut codex = picker("not-listed");
+        press(&mut codex, &[Key::Down, Key::Pick]);
+        assert_eq!((codex.screen, codex.cursor), (Screen::Models { family: CODEX, version: 0 }, 0), "one version: straight to its models");
+    }
+
+    #[test]
+    fn a_model_is_marked_first_and_chosen_on_the_second_press() {
+        let mut picker = on_models(CODEX, 0);
+        picker.press(Key::Down);
+        assert_eq!(picker.press(Key::Pick), Outcome::Open, "the first press chooses nothing");
+        assert_eq!(picker.marked, Some(1));
+        assert_eq!(picker.press(Key::Pick), Outcome::Chosen("gpt-5.3-codex-high".into()));
+    }
+
+    #[test]
+    fn marking_another_model_moves_the_mark() {
+        let mut picker = on_models(CODEX, 0);
+        assert_eq!(press(&mut picker, &[Key::Pick, Key::Down, Key::Pick]), Outcome::Open, "a press on another model confirms none");
+        assert_eq!(picker.marked, Some(1));
+        assert_eq!(picker.press(Key::Pick), Outcome::Chosen("gpt-5.3-codex-high".into()));
+
+        let mut moved = on_models(CODEX, 0);
+        press(&mut moved, &[Key::Pick, Key::Down, Key::Down]);
+        assert_eq!(moved.marked, Some(0), "moving the cursor leaves the mark where it was");
+        assert_eq!(press(&mut moved, &[Key::Down, Key::Pick]), Outcome::Chosen("gpt-5.3-codex-low".into()));
+    }
+
+    #[test]
+    fn back_leaves_one_step_and_cancels_at_the_families() {
+        let mut claude = on_models(CLAUDE, 1);
+        assert_eq!(press(&mut claude, &[Key::Pick, Key::Back]), Outcome::Open);
+        assert_eq!((claude.screen, claude.cursor, claude.marked), (Screen::Versions { family: CLAUDE }, 1, None));
+        assert_eq!(press(&mut claude, &[Key::Pick, Key::Pick]), Outcome::Open, "the mark did not survive the step back");
+        assert_eq!(press(&mut claude, &[Key::Back, Key::Back]), Outcome::Open);
+        assert_eq!((claude.screen, claude.cursor), (Screen::Families, CLAUDE));
+        assert_eq!(claude.press(Key::Back), Outcome::Cancelled);
+
+        let mut codex = on_models(CODEX, 0);
+        assert_eq!(codex.press(Key::Back), Outcome::Open);
+        assert_eq!((codex.screen, codex.cursor), (Screen::Families, CODEX), "no versions screen to go back to");
+    }
+
+    #[test]
+    fn quitting_cancels_from_any_screen() {
+        assert_eq!(picker("auto").press(Key::Quit), Outcome::Cancelled);
+        let mut versions = picker("claude-opus-5-low");
+        assert_eq!(press(&mut versions, &[Key::Pick, Key::Quit]), Outcome::Cancelled);
+        let mut models = on_models(CODEX, 0);
+        assert_eq!(press(&mut models, &[Key::Pick, Key::Quit]), Outcome::Cancelled, "a marked model is not chosen by leaving");
     }
 }
