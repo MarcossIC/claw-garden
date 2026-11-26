@@ -36,7 +36,7 @@ Antes de lanzar el CLI, `clawg review` MUST crear la carpeta del revisor y su `.
 
 ## RV3. La corrida
 
-El CLI MUST correr con `-p --trust --approve-mcps --output-format stream-json --workspace <carpeta>`, más `--model` y `--resume` cuando se dan, y nunca con `--force`. Corre en la carpeta donde corre `clawg review`, con `USERPROFILE` y `HOME` en la carpeta del revisor, y con `PSModuleAnalysisCachePath` dentro de ella. El shell donde el CLI corre los comandos no recibe `LOCALAPPDATA`, y sin esa variable PowerShell escribe su caché en `Microsoft/Windows/PowerShell/` de la carpeta revisada.
+El CLI MUST correr con `-p --trust --approve-mcps --output-format stream-json --workspace <carpeta> --model <modelo>`, más `--resume` cuando se da, y nunca con `--force`. Corre en la carpeta donde corre `clawg review`, con `USERPROFILE` y `HOME` en la carpeta del revisor, y con `PSModuleAnalysisCachePath` dentro de ella. El shell donde el CLI corre los comandos no recibe `LOCALAPPDATA`, y sin esa variable PowerShell escribe su caché en `Microsoft/Windows/PowerShell/` de la carpeta revisada.
 
 Antes de lanzarlo, `clawg review` MUST arrancar el daemon del perfil si no corre y registrar el proyecto de esa carpeta. Al llegar la línea `init`, MUST registrar la sesión: su agente, ese proyecto, cliente `cursor` y `source` `startup`, o `resume` con `--resume` ([`specs/metrics`](../metrics/spec.md), SU13). Las llamadas del puente del revisor se cuentan así en esa fila: el CLI no declara `roots`, y el puente lee la carpeta donde arrancó, que es la del workspace.
 
