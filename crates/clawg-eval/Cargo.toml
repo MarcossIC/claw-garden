@@ -10,6 +10,9 @@ rust-version.workspace = true
 
 # No library target: this crate is only the evaluation binaries.
 autobins = false
+# Each file of `tests/` is a module of the one `integration` binary below: a
+# test binary links the whole dependency tree, and cargo links them in parallel.
+autotests = false
 
 [lints]
 workspace = true
@@ -48,6 +51,10 @@ path = "src/bin/perf-bench/main.rs"
 [[bin]]
 name = "agent-eval"
 path = "src/bin/agent-eval/main.rs"
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
 
 [dependencies]
 clawg-core = { workspace = true, features = ["eval"] }

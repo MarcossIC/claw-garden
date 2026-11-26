@@ -1935,3 +1935,98 @@ fn ci_lifts_the_jobs_cap() {
     }
     assert!(!checked.is_empty(), "no workflow compiles");
 }
+
+/// The `.rs` files at the root of a crate's `tests/` that no test binary but
+/// their own would build: neither `integration.rs`, nor a `mod` that
+/// `integration` declares, nor the file of a `[[test]]` of the manifest.
+fn test_files_outside_the_integration_binary(files: &[&str], integration: Option<&str>, manifest: &str) -> Vec<String> {
+    let declared: Vec<&str> = integration
+        .unwrap_or("")
+        .lines()
+        .filter_map(|line| {
+            let mut line = line.trim();
+            while line.starts_with("#[") {
+                line = line.split_once(']').map_or("", |(_, rest)| rest).trim();
+            }
+            line.strip_prefix("mod ")?.strip_suffix(';').map(str::trim)
+        })
+        .collect();
+    let own: Vec<String> = manifest_test_targets(manifest)
+        .into_iter()
+        .filter(|(name, _)| name != "integration")
+        .map(|(name, path)| path.unwrap_or(format!("tests/{name}.rs")))
+        .collect();
+    files
+        .iter()
+        .filter(|file| **file != "integration.rs")
+        .filter(|file| !declared.contains(&file.trim_end_matches(".rs")))
+        .filter(|file| !own.contains(&format!("tests/{file}")))
+        .map(|file| file.to_string())
+        .collect()
+}
+
+/// The `name` and `path` of each `[[test]]` of a manifest.
+fn manifest_test_targets(manifest: &str) -> Vec<(String, Option<String>)> {
+    let mut targets: Vec<(String, Option<String>)> = Vec::new();
+    let mut inside = false;
+    for line in manifest.lines() {
+        let line = line.split(" #").next().unwrap_or("").trim();
+        if line.starts_with('[') {
+            inside = line == "[[test]]";
+            if inside {
+                targets.push((String::new(), None));
+            }
+            continue;
+        }
+        let (Some(target), Some((key, value))) = (targets.last_mut().filter(|_| inside), line.split_once('=')) else {
+            continue;
+        };
+        let value = value.trim().trim_matches('"').to_string();
+        match key.trim() {
+            "name" => target.0 = value,
+            "path" => target.1 = Some(value),
+            _ => {}
+        }
+    }
+    targets
+}
+
+#[test]
+fn test_files_outside_the_integration_binary_names_each_one() {
+    let manifest = "[package]\nautotests = false\n\n[[test]]\nname = \"integration\"\npath = \"tests/integration.rs\"\n\n[[test]]\nname = \"golden\"\nrequired-features = [\"eval\"]\n";
+    let integration = "//! docs\nmod api;\n#[cfg(windows)] mod socket;\n// mod commented;\n";
+    let files = ["integration.rs", "api.rs", "socket.rs", "golden.rs", "commented.rs", "loose.rs"];
+    assert_eq!(test_files_outside_the_integration_binary(&files, Some(integration), manifest), ["commented.rs", "loose.rs"]);
+    assert_eq!(test_files_outside_the_integration_binary(&["api.rs"], None, ""), ["api.rs"]);
+}
+
+#[test]
+fn each_crate_builds_one_integration_binary() {
+    // Each test binary links the whole dependency tree, and cargo links them
+    // in parallel: one per crate keeps the number of links down.
+    let crates = repo_root().join("crates");
+    for krate in fs::read_dir(&crates).expect("read crates/").flatten() {
+        let tests = krate.path().join("tests");
+        let Ok(entries) = fs::read_dir(&tests) else { continue };
+        let files: Vec<String> = entries
+            .flatten()
+            .filter(|e| e.path().is_file())
+            .filter_map(|e| e.file_name().to_str().map(str::to_string))
+            .filter(|name| name.ends_with(".rs"))
+            .collect();
+        if files.is_empty() {
+            continue;
+        }
+        let name = krate.file_name().to_string_lossy().to_string();
+        let manifest = fs::read_to_string(krate.path().join("Cargo.toml")).expect("read the manifest");
+        assert_eq!(manifest_value(&manifest, "package", "autotests").as_deref(), Some("false"), "{name} sets autotests = false");
+        assert!(
+            manifest_test_targets(&manifest).contains(&("integration".to_string(), Some("tests/integration.rs".to_string()))),
+            "{name} declares the [[test]] integration at tests/integration.rs"
+        );
+        let integration = fs::read_to_string(tests.join("integration.rs")).ok();
+        let files: Vec<&str> = files.iter().map(String::as_str).collect();
+        let outside = test_files_outside_the_integration_binary(&files, integration.as_deref(), &manifest);
+        assert!(outside.is_empty(), "{name}: declare each as a `mod` of tests/integration.rs: {outside:?}");
+    }
+}

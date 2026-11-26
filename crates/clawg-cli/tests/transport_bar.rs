@@ -2,7 +2,7 @@
 //!
 //! A debug build says nothing about the bar, and a run takes a while, so the
 //! test is ignored. Run it optimized:
-//! `cargo test -p clawg-cli --release --test transport_bar -- --ignored --nocapture`
+//! `cargo test -p clawg-cli --release --test integration -- --ignored --nocapture transport_bar::`
 //!
 //! The daemon is the `testing` build of the binary under test with the fake
 //! model. Both sides are `DaemonClient::from_data_dir`, as a hook builds its
@@ -305,7 +305,7 @@ fn micros(d: Duration) -> f64 {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "a benchmark: run it optimized with `cargo test -p clawg-cli --release --test transport_bar -- --ignored --nocapture`"]
+#[ignore = "a benchmark: run it optimized with `cargo test -p clawg-cli --release --test integration -- --ignored --nocapture transport_bar::`"]
 async fn the_socket_is_not_slower_than_tcp() {
     let home = tempfile::tempdir().expect("tempdir");
     let daemon = start_daemon(home.path()).await;

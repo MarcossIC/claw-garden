@@ -4,7 +4,7 @@
 //! A measurement, not a behavior: the tests are ignored and assert nothing but
 //! what they need to run. A peak only rises, so each runs alone, in a process
 //! of its own, and prints one JSON line per format:
-//! `cargo test -p clawg-cli --test import_memory -- --ignored --exact by_body --nocapture`
+//! `cargo test -p clawg-cli --test integration -- --ignored --exact import_memory::by_body --nocapture`
 //! (likewise `by_path`). The client's peak of the second format includes the
 //! first's, so for a clean figure of each, name one with
 //! `IMPORT_MEMORY_FORMAT=clawg` or `IMPORT_MEMORY_FORMAT=engram`.

@@ -7,6 +7,9 @@ license.workspace = true
 repository.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+# Each file of `tests/` is a module of the one `integration` binary below: a
+# test binary links the whole dependency tree, and cargo links them in parallel.
+autotests = false
 
 [lints]
 workspace = true
@@ -23,6 +26,10 @@ path = "src/main.rs"
 [lib]
 name = "clawg_cli"
 path = "src/lib.rs"
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
 
 [dependencies]
 clawg-core.workspace = true
