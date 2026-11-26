@@ -65,32 +65,27 @@ fn shared_words(models: &[ListedModel]) -> String {
 
 /// `list` by family and version, each in the order the list first names it.
 pub fn families(list: &[ListedModel]) -> Vec<Family> {
-    let mut grouped: Vec<(String, Vec<(String, Vec<ListedModel>)>)> = Vec::new();
+    let mut families: Vec<Family> = Vec::new();
     for model in list {
-        let (family, key) = (family_label(model), version_key(&model.id));
-        let at = grouped.iter().position(|(label, _)| *label == family).unwrap_or_else(|| {
-            grouped.push((family, Vec::new()));
-            grouped.len() - 1
+        let (label, key) = (family_label(model), version_key(&model.id));
+        let at = families.iter().position(|family| family.label == label).unwrap_or_else(|| {
+            families.push(Family { label, versions: Vec::new() });
+            families.len() - 1
         });
-        let versions = &mut grouped[at].1;
-        match versions.iter_mut().find(|(k, _)| *k == key) {
-            Some((_, models)) => models.push(model.clone()),
-            None => versions.push((key, vec![model.clone()])),
+        // Until every model is in its version, a version goes by its key.
+        let versions = &mut families[at].versions;
+        match versions.iter_mut().find(|version| version.label == key) {
+            Some(version) => version.models.push(model.clone()),
+            None => versions.push(Version { label: key, models: vec![model.clone()] }),
         }
     }
-    grouped
-        .into_iter()
-        .map(|(label, versions)| Family {
-            label,
-            versions: versions
-                .into_iter()
-                .map(|(key, models)| {
-                    let shared = shared_words(&models);
-                    Version { label: if shared.is_empty() { key } else { shared }, models }
-                })
-                .collect(),
-        })
-        .collect()
+    for version in families.iter_mut().flat_map(|family| &mut family.versions) {
+        let shared = shared_words(&version.models);
+        if !shared.is_empty() {
+            version.label = shared;
+        }
+    }
+    families
 }
 
 /// A key the picker answers to.
